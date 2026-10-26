@@ -3,6 +3,7 @@
 mod file;
 mod mem;
 mod misc;
+mod net;
 pub mod table;
 mod thread;
 
@@ -102,6 +103,17 @@ fn dispatch(p: &mut Process, tf: &TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
         nr::sync => Ok(0),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),
         nr::flock => p.fds.get(a[0]).map(|_| 0),
+
+        // sockets
+        nr::socketpair => net::socketpair(p, a[0], a[1], a[2], a[3]),
+        nr::sendto => net::sendto(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::recvfrom => net::recvfrom(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::sendmsg => net::sendmsg(p, a[0], a[1], a[2]),
+        nr::recvmsg => net::recvmsg(p, a[0], a[1], a[2]),
+        nr::getsockopt => net::getsockopt(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::setsockopt => net::setsockopt(p, a[0], a[1], a[2]),
+        nr::shutdown => net::shutdown(p, a[0], a[1]),
+        nr::getsockname | nr::getpeername => net::getname(p, a[0], a[1], a[2]),
 
         // memory
         nr::brk => mem::brk(p, a[0]),

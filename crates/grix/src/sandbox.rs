@@ -106,6 +106,20 @@ impl RunOutput {
     }
 }
 
+/// Hardware virtualization if this host can run an arm64 guest natively,
+/// otherwise emulation.
+fn default_accel() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        if cfg!(target_os = "macos") {
+            return "hvf";
+        }
+        if cfg!(target_os = "linux") && std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
+            return "kvm";
+        }
+    }
+    "tcg"
+}
+
 /// Configure a [`Sandbox`]: what the program can see and do.
 #[derive(Clone)]
 pub struct SandboxBuilder {
@@ -142,7 +156,7 @@ impl Default for SandboxBuilder {
                 ),
             ),
             qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
-            accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| "tcg".into()),
+            accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| default_accel().into()),
         }
     }
 }
@@ -208,7 +222,8 @@ impl SandboxBuilder {
         self
     }
 
-    /// QEMU accelerator: `tcg` (default, works everywhere) or `hvf`/`kvm`.
+    /// QEMU accelerator: `hvf` (macOS), `kvm` (Linux) or `tcg` (emulation, works
+    /// everywhere). Defaults to hardware virtualization when the host has it.
     pub fn accel(mut self, accel: impl Into<String>) -> Self {
         self.accel = accel.into();
         self

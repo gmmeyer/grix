@@ -7,7 +7,7 @@ use spin::Mutex;
 
 use crate::errno::*;
 use crate::fs::{Dev, Ino};
-use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd};
+use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd, SocketEnd};
 
 pub const MAX_FDS: usize = 1024;
 
@@ -25,6 +25,8 @@ pub enum FileKind {
     Node(Ino),
     Dev(Dev, Ino),
     Pipe(PipeEnd),
+    /// AF_UNIX stream socket from socketpair().
+    Socket(SocketEnd),
     EventFd(Arc<Mutex<EventFd>>),
     Epoll(Arc<Mutex<Epoll>>),
 }
@@ -39,6 +41,7 @@ impl FileKind {
             FileKind::Stdout | FileKind::Stderr => (EPOLLOUT, 0),
             FileKind::Node(_) | FileKind::Dev(..) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Pipe(end) => end.poll(),
+            FileKind::Socket(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).
             FileKind::Epoll(_) => (0, 0),

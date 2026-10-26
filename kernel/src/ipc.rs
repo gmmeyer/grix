@@ -108,3 +108,33 @@ impl EventFd {
         changed();
     }
 }
+
+// ---------------------------------------------------------------- local sockets
+
+/// One end of an AF_UNIX stream socket pair: two pipes, one per direction.
+/// `None` once that direction has been shut down.
+pub struct SocketEnd {
+    pub rx: Option<PipeEnd>,
+    pub tx: Option<PipeEnd>,
+}
+
+pub fn socketpair() -> (SocketEnd, SocketEnd) {
+    let (a_read, a_write) = pipe();
+    let (b_read, b_write) = pipe();
+    (SocketEnd { rx: Some(a_read), tx: Some(b_write) }, SocketEnd { rx: Some(b_read), tx: Some(a_write) })
+}
+
+pub const EPOLLRDHUP: u32 = 0x2000;
+
+impl SocketEnd {
+    pub fn poll(&self) -> (u32, u64) {
+        let (rmask, rver) = self.rx.as_ref().map_or((EPOLLIN | EPOLLRDHUP, 0), |r| {
+            let (m, v) = r.poll();
+            // Peer shut down writing: readable (EOF) and RDHUP.
+            (if m & EPOLLHUP != 0 { (m & !EPOLLHUP) | EPOLLIN | EPOLLRDHUP } else { m }, v)
+        });
+        let (wmask, wver) = self.tx.as_ref().map_or((0, 0), |t| t.poll());
+        let hup = if rmask & EPOLLRDHUP != 0 && (self.tx.is_none() || wmask & EPOLLERR != 0) { EPOLLHUP } else { 0 };
+        (rmask | (wmask & !EPOLLERR) | hup, rver.wrapping_add(wver))
+    }
+}

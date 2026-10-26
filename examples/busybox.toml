@@ -12,7 +12,7 @@ timeout_secs = 30
 LANG = "C"
 
 [[import]]
-host = "../fixtures/build/alpine/busybox.static"
+host = "../fixtures/build/alpine/bin/busybox.static"
 guest = "/bin/busybox"
 
 [[import]]

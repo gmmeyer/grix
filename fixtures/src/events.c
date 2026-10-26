@@ -11,6 +11,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -137,6 +138,22 @@ int main(void) {
     struct timeval tv = {5, 0};
     CHECK(select(p[0] + 1, &rs, 0, 0, &tv) == 1 && FD_ISSET(p[0], &rs));
     pthread_join(t, 0);
+
+    // 7. AF_UNIX socket pair: both directions, peek, non-blocking, shutdown.
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+    CHECK(send(sv[0], "ping", 4, 0) == 4);
+    CHECK(recv(sv[1], buf, sizeof buf, MSG_PEEK) == 4);
+    CHECK(recv(sv[1], buf, sizeof buf, 0) == 4 && memcmp(buf, "ping", 4) == 0);
+    CHECK(write(sv[1], "pong", 4) == 4);
+    CHECK(read(sv[0], buf, sizeof buf) == 4 && memcmp(buf, "pong", 4) == 0);
+    CHECK(recv(sv[0], buf, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    int type = 0;
+    socklen_t len = sizeof type;
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &type, &len) == 0 && type == SOCK_STREAM);
+    CHECK(shutdown(sv[1], SHUT_WR) == 0);
+    CHECK(recv(sv[0], buf, sizeof buf, 0) == 0);  // EOF
+    CHECK(socket(AF_INET, SOCK_STREAM, 0) == -1 && errno == EPERM);  // network still gated
 
     printf("events ok\n");
     return 0;

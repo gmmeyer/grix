@@ -12,7 +12,9 @@ use crate::fd::{
     Epoll, FdEntry, FileKind, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile, Registration, new_file,
 };
 use crate::fs::{self, Dev, Ino, Kind, ROOT, S_IFIFO, StatInfo};
-use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF};
+
+const S_IFSOCK: u32 = 0o140000;
+use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
 use crate::process::Process;
 use crate::rng;
 use crate::time;
@@ -75,6 +77,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600),
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::get().stat(*ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600),
+        FileKind::Socket(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777),
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_) | FileKind::Epoll(_) => anon(0x2000_0000 + fd, 0o600),
     })
@@ -177,27 +180,12 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
     match &f.kind {
         FileKind::Stdin => Ok(0),
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
-        FileKind::Pipe(end) => {
-            if end.write {
-                return Err(EBADF);
-            }
-            let mut pipe = end.pipe.lock();
-            if pipe.buf.is_empty() {
-                if pipe.writers == 0 {
-                    return Ok(0);
-                }
-                drop(pipe);
-                return would_block(p, nonblock);
-            }
-            let n = (count as usize).min(pipe.buf.len());
-            let (a, b) = pipe.buf.as_slices();
-            let first = n.min(a.len());
-            copy_out(&mut p.aspace, buf, &a[..first])?;
-            copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
-            pipe.buf.drain(..n);
-            pipe.touch();
-            Ok(n as u64)
-        }
+        FileKind::Pipe(end) if end.write => Err(EBADF),
+        FileKind::Pipe(end) => pipe_read(p, end, buf, count, nonblock, false),
+        FileKind::Socket(s) => match &s.rx {
+            Some(rx) => pipe_read(p, rx, buf, count, nonblock, false),
+            None => Ok(0), // shut down for reading
+        },
         FileKind::EventFd(e) => {
             if count < 8 {
                 return Err(EINVAL);
@@ -257,31 +245,16 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
         FileKind::Stderr => Channel::Stderr,
         FileKind::Dev(..) => return Ok(count),
         FileKind::Stdin | FileKind::Node(_) | FileKind::Epoll(_) => return Err(EBADF),
-        FileKind::Pipe(end) => {
-            if !end.write {
-                return Err(EBADF);
-            }
-            if count == 0 {
-                return Ok(0);
-            }
-            let mut pipe = end.pipe.lock();
-            if pipe.readers == 0 {
-                drop(pipe);
-                super::misc::signal_self(p, 13, "SIGPIPE: wrote to a pipe with no readers")?;
-                return Err(EPIPE);
-            }
-            // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
-            let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
-            if pipe.space() < need {
-                drop(pipe);
-                return would_block(p, nonblock);
-            }
-            let n = (count as usize).min(pipe.space());
-            let mut tmp = alloc::vec![0u8; n];
-            copy_in(&mut p.aspace, buf, &mut tmp)?;
-            pipe.buf.extend(tmp);
-            pipe.touch();
-            return Ok(n as u64);
+        FileKind::Pipe(end) if !end.write => return Err(EBADF),
+        FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
+        FileKind::Socket(s) => {
+            return match &s.tx {
+                Some(tx) => pipe_write(p, tx, buf, count, nonblock, true),
+                None => {
+                    super::misc::signal_self(p, 13, "SIGPIPE: wrote to a socket that was shut down")?;
+                    Err(EPIPE)
+                }
+            };
         }
         FileKind::EventFd(e) => {
             if count < 8 {
@@ -316,8 +289,64 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
     Ok(count)
 }
 
+/// Read from a pipe (or one direction of a socket). `peek` leaves the data in place.
+pub(super) fn pipe_read(p: &mut Process, end: &PipeEnd, buf: u64, count: u64, nonblock: bool, peek: bool) -> SysResult {
+    let mut pipe = end.pipe.lock();
+    if pipe.buf.is_empty() {
+        if pipe.writers == 0 {
+            return Ok(0);
+        }
+        drop(pipe);
+        return would_block(p, nonblock);
+    }
+    let n = (count as usize).min(pipe.buf.len());
+    let (a, b) = pipe.buf.as_slices();
+    let first = n.min(a.len());
+    copy_out(&mut p.aspace, buf, &a[..first])?;
+    copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
+    if !peek {
+        pipe.buf.drain(..n);
+        pipe.touch();
+    }
+    Ok(n as u64)
+}
+
+/// Write to a pipe (or one direction of a socket).
+pub(super) fn pipe_write(
+    p: &mut Process,
+    end: &PipeEnd,
+    buf: u64,
+    count: u64,
+    nonblock: bool,
+    sigpipe: bool,
+) -> SysResult {
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut pipe = end.pipe.lock();
+    if pipe.readers == 0 {
+        drop(pipe);
+        if sigpipe {
+            super::misc::signal_self(p, 13, "SIGPIPE: wrote to a pipe with no readers")?;
+        }
+        return Err(EPIPE);
+    }
+    // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
+    let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
+    if pipe.space() < need {
+        drop(pipe);
+        return would_block(p, nonblock);
+    }
+    let n = (count as usize).min(pipe.space());
+    let mut tmp = alloc::vec![0u8; n];
+    copy_in(&mut p.aspace, buf, &mut tmp)?;
+    pipe.buf.extend(tmp);
+    pipe.touch();
+    Ok(n as u64)
+}
+
 /// EAGAIN for non-blocking files, otherwise block until I/O state changes.
-fn would_block(p: &mut Process, nonblock: bool) -> SysResult {
+pub(super) fn would_block(p: &mut Process, nonblock: bool) -> SysResult {
     if nonblock {
         return Err(EAGAIN);
     }
@@ -630,6 +659,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
         FIONREAD => {
             let avail = match &entry.file.lock().kind {
                 FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
+                FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
                 FileKind::Stdin => 0,
                 _ => return Err(ENOTTY),
             };

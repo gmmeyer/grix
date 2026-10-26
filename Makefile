@@ -12,7 +12,9 @@ host:
 
 fixtures:
 	./fixtures/build.sh
-	./fixtures/fetch-alpine.sh
+	python3 -I tools/alpine.py --out fixtures/build/alpine busybox-static busybox
+	python3 -I tools/alpine.py --out fixtures/build/python python3
+	python3 -I tools/alpine.py --out fixtures/build/node nodejs
 
 test: kernel fixtures
 	cargo test --workspace

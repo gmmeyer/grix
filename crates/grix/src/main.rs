@@ -141,8 +141,16 @@ fn run(args: RunArgs) -> Result<i32> {
         eprint!("{}", out.kernel_log);
     }
     if !args.quiet {
+        // Programs probe many paths that legitimately don't exist; list them only with -v.
+        let mut missing = 0;
         for e in &out.events {
-            eprintln!("grix: {e}");
+            match e {
+                grix::GuestEvent::MissingPath { .. } if !args.verbose => missing += 1,
+                _ => eprintln!("grix: {e}"),
+            }
+        }
+        if missing > 0 {
+            eprintln!("grix: {missing} path(s) were looked up but not imported (-v lists them)");
         }
     }
     match &out.status {

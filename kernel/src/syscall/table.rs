@@ -168,20 +168,20 @@ syscalls! {
     178 gettid Core;
     179 sysinfo Core;
     198 socket Cap(Net);
-    199 socketpair Cap(Net);
+    199 socketpair Core; // AF_UNIX pairs are local IPC; others need `net`
     200 bind Cap(Net);
     201 listen Cap(Net);
     202 accept Cap(Net);
     203 connect Cap(Net);
-    204 getsockname Cap(Net);
-    205 getpeername Cap(Net);
-    206 sendto Cap(Net);
-    207 recvfrom Cap(Net);
-    208 setsockopt Cap(Net);
-    209 getsockopt Cap(Net);
-    210 shutdown Cap(Net);
-    211 sendmsg Cap(Net);
-    212 recvmsg Cap(Net);
+    204 getsockname Core; // acts on existing sockets; see net.rs
+    205 getpeername Core; // acts on existing sockets; see net.rs
+    206 sendto Core; // acts on existing sockets; see net.rs
+    207 recvfrom Core; // acts on existing sockets; see net.rs
+    208 setsockopt Core; // acts on existing sockets; see net.rs
+    209 getsockopt Core; // acts on existing sockets; see net.rs
+    210 shutdown Core; // acts on existing sockets; see net.rs
+    211 sendmsg Core; // acts on existing sockets; see net.rs
+    212 recvmsg Core; // acts on existing sockets; see net.rs
     214 brk Core;
     215 munmap Core;
     216 mremap Core;

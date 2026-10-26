@@ -180,7 +180,7 @@ fn timeout() {
 
 fn busybox_sandbox() -> Sandbox {
     Sandbox::builder()
-        .import(fixture("alpine/busybox.static"), "/bin/busybox")
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
         .unwrap()
         .file("/data/t.txt", "line one\nline two\nthree\n", 0o644)
         .unwrap()
@@ -217,7 +217,7 @@ fn alpine_static_busybox_applets() {
 #[test]
 fn alpine_dynamically_linked_busybox() {
     let sb = Sandbox::builder()
-        .import(fixture("alpine/busybox"), "/bin/busybox")
+        .import(fixture("alpine/bin/busybox"), "/bin/busybox")
         .unwrap()
         .import(fixture("alpine/lib"), "/lib")
         .unwrap()
@@ -269,7 +269,8 @@ fn pipes_eventfd_epoll_poll_select() {
     let out = run(with("events").allow(Capability::Threads), &["/bin/events"]);
     assert_eq!(out.stdout_str(), "events ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));
-    assert!(out.events.is_empty(), "{:?}", out.events);
+    // The fixture checks that AF_INET sockets are still denied.
+    assert_eq!(out.missing_capabilities(), ["net"]);
 }
 
 #[test]
