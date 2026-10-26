@@ -18,11 +18,11 @@ cat: can't open '/etc/passwd': No such file or directory
 grix: missing /etc/passwd: not imported
 ```
 
-> **Status: early prototype (milestone 1).** It runs single-threaded,
-> single-process Linux programs: static, static-PIE, and dynamically linked
-> musl binaries. That includes Alpine's prebuilt busybox, and the test suite
-> covers all three. Threads, fork/exec, signal handlers, writable files and
-> networking are gated by capabilities but **not implemented yet**. See
+> **Status: early prototype.** It runs unmodified **Python 3.12** and
+> **Node 22** (Alpine's builds), busybox, and static, static-PIE or
+> dynamically linked musl programs, with threads, pipes, eventfd and epoll.
+> Processes (fork/exec), signal handlers, writable files and networking are
+> gated by capabilities but **not implemented yet**. See
 > [Compatibility](#compatibility) and [Roadmap](#roadmap).
 
 ## Quick start
@@ -31,17 +31,23 @@ Requirements: macOS or Linux on any host, Rust (stable), QEMU
 (`qemu-system-aarch64`), and [zig](https://ziglang.org) to build the C test programs.
 
 ```sh
-make            # kernel + host CLI + test fixtures (fetches pinned Alpine busybox)
+make            # kernel + host CLI + test fixtures (downloads Alpine busybox, python3, nodejs)
 make test       # unit tests + end-to-end tests that boot the kernel in QEMU
 
 ./target/release/grix run -i fixtures/build/hello:/bin/hello -e GREETING=hi -- /bin/hello world
 ./target/release/grix run -m examples/busybox.toml
 ./target/release/grix run --json -m examples/busybox.toml     # machine-readable result
 ./target/release/grix caps                                    # list capabilities
+
+# Language runtimes: import a whole root filesystem and allow threads.
+./target/release/grix run -a threads -i fixtures/build/python:/ -- /usr/bin/python3 -c 'print(6*7)'
+./target/release/grix run -a threads -i fixtures/build/node:/ -- /usr/bin/node -e 'console.log(6*7)'
 ```
 
-On Apple Silicon, `GRIX_ACCEL=hvf` uses hardware virtualization: runs
-take about 0.2s instead of 0.8s under emulation.
+grix uses hardware virtualization when the host has it (Hypervisor.framework
+on Apple Silicon, KVM on arm64 Linux) and QEMU's emulator otherwise. Set
+`GRIX_ACCEL=tcg|hvf|kvm` to choose. A Node script that boots, starts a worker
+thread and exits takes about 0.9s with HVF, 9s emulated.
 
 ## Using it from an agent (Rust)
 
@@ -83,9 +89,30 @@ timeout_secs = 30
 LANG = "C"
 
 [[import]]
-host = "../fixtures/build/alpine/busybox.static"   # relative to the manifest
+host = "../fixtures/build/alpine/bin/busybox.static"   # relative to the manifest
 guest = "/bin/busybox"
 ```
+
+## What you can import
+
+Anything that is a file. `import` copies host files and directories
+(recursively, keeping modes and symlinks) into the sandbox's filesystem:
+
+- **Programs**: any AArch64 Linux executable, static or dynamic. For a
+  dynamic one, also import its loader and libraries.
+- **Whole runtimes**: `tools/alpine.py --out DIR pkg...` resolves Alpine
+  packages and their dependencies into a directory you import at `/`. This
+  is how the Python and Node fixtures are built. The same works for `ruby`,
+  `perl`, `lua`, `git`, `sqlite`, `jq`, ...
+- **Libraries and code**: a `site-packages` or `node_modules` tree, a
+  project checkout, scripts written by the agent (`file()` takes inline
+  contents).
+- **Data and config**: inputs, CA certificates (`/etc/ssl`), timezone data,
+  `/etc/passwd` stubs. `missing ...` events tell you what a program looked
+  for and didn't find.
+
+Everything imported is read-only and lives in guest memory, so total size is
+bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 
 ## Capability model
 
@@ -94,6 +121,7 @@ guest = "/bin/busybox"
 | Files | Only imported paths exist (read-only), plus `/dev/{null,zero,random,urandom}`, `/proc/self/exe`, empty `/tmp` | `import` / `file` |
 | Environment | Empty | `env` |
 | Memory, time, randomness, stdout/stderr | Always available | `memory_mb`, `timeout` limit them |
+| Local IPC: pipes, eventfd, epoll, AF_UNIX socket pairs | Always available | — |
 | `fs_write` | Denied | `allow(Capability::FsWrite)` |
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
@@ -160,30 +188,35 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Works today | Not yet |
 |---|---|
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Threads (`clone(CLONE_THREAD)`), futex blocking |
-| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ppoll` | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
-| `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Signal handlers (`sigaction` is recorded; delivery isn't) |
-| Clocks, `nanosleep`, `getrandom` (ChaCha20, host-seeded + RNDR) | Writable filesystem (`fs_write`), pipes, `eventfd`, `epoll` |
-| Faults become signals (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/...) | Sockets (`net`), stdin from the host |
-| Apple Silicon: HVF hardware virtualization and TCG | x86_64 guests; Linux/KVM hosts are untested |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Network sockets (`net`), stdin from the host |
+| Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
+| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | Signal handlers (`sigaction` is recorded; delivery isn't). Go needs this |
+| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Writable filesystem (`fs_write`) |
+| `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
+| Clocks, blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR) | x86_64 guests |
+| Faults become signals (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | Linux/KVM hosts are untested |
 
-Verified programs: the C fixtures in `fixtures/src`, plus Alpine's static and
-dynamic busybox (`sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …).
+Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
+and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
+Alpine's **python3** (threads, asyncio, hashlib, json) and **nodejs**
+(timers, crypto, fs, worker_threads).
 
 ## Roadmap
 
-1. **Threads and blocking**: scheduler, timer interrupts (GIC), real futex
-   waits, signal delivery and `rt_sigreturn`. This unlocks Go, Python, Node, Java and Rust std threads.
-2. **Writable filesystem**: tmpfs with a size limit (`fs_write`), pipes,
-   eventfd/epoll, and stdin from the host.
-3. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
-4. **Networking**: virtio-net, with egress allow-lists enforced on the *host* side (`net`).
+1. **Networking** (`net`), so web servers can run: socket syscalls in the
+   guest, proxied to the host, which enforces allow-lists for outbound
+   connections and forwards listening ports. The guest needs no TCP/IP stack.
+2. **Signal delivery** and `rt_sigreturn` (Go's preemption, Python's
+   SIGINT, Node's process.on('SIGTERM')).
+3. **Writable filesystem**: tmpfs with a size limit (`fs_write`), optionally
+   exported back to the host, and stdin from the host.
+4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
-   QEMU. That means faster boots, a smaller attack surface, and an
-   `grix` crate with no external dependencies.
-6. **Agent integrations**: an MCP server and Python bindings; runtime images
-   (python, node) as importable bundles.
-7. **x86_64 guest**.
+   QEMU. That means faster boots, a smaller attack surface, and a `grix`
+   crate with no external dependencies. Also faster I/O than the serial port.
+6. **Agent integrations**: an MCP server and Python bindings; prebuilt
+   runtime bundles; snapshots for instant start.
+7. **SMP and x86_64 guests**.
 
 ## Repository layout
 
@@ -193,8 +226,11 @@ crates/grix/       host library + `grix` CLI (builds images, runs QEMU, decodes 
 kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/arch/        boot.S (MMU bring-up), vectors.S (traps), system registers
   src/mm/          frame allocator, page tables, address spaces / VMAs
+  src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
+  src/ipc.rs       pipes, eventfds, socket pairs
   src/syscall/     Linux syscall table (+ capability gates) and implementations
-fixtures/          C test programs (built with zig) + pinned Alpine binaries
+fixtures/          C test programs (built with zig); build/ also gets Alpine runtimes
+tools/alpine.py    Alpine package resolver for building importable root filesystems
 examples/          example manifests
 ```
 

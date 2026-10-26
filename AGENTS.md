@@ -8,7 +8,7 @@ what the project is and how to use it, see [README.md](README.md).
 ```sh
 make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 make host        # host CLI      -> target/release/grix
-make fixtures    # C test programs (zig) + pinned Alpine busybox/musl (network)
+make fixtures    # C test programs (zig) + Alpine busybox, python3, nodejs (network, cached)
 make test        # everything; end-to-end tests boot the kernel in QEMU
 make check       # clippy for host and kernel
 ```
@@ -17,12 +17,15 @@ make check       # clippy for host and kernel
   `kernel/.cargo/config.toml`. Build it from inside `kernel/` or with `make kernel`.
   `cargo test` at the root does **not** rebuild it, so after changing kernel code
   run `make kernel` (or `make test`) before the end-to-end tests.
-- End-to-end tests live in `crates/grix/tests/guest.rs`. They need QEMU,
-  the built kernel, and `fixtures/build/`. Missing pieces fail loudly; they are
+- End-to-end tests live in `crates/grix/tests/guest.rs` (C fixtures, busybox)
+  and `crates/grix/tests/runtimes.rs` (Python, Node). They need QEMU, the
+  built kernel, and `fixtures/build/`. Missing pieces fail loudly; they are
   never skipped.
-- `GRIX_ACCEL=hvf` runs tests with hardware virtualization on Apple Silicon.
-  Run the suite with both `tcg` (default) and `hvf` when touching boot, MMU,
-  cache or page-table code: real hardware catches mistakes that emulation hides.
+- Tests use hardware virtualization when available (HVF/KVM). Also run them
+  with `GRIX_ACCEL=tcg` when touching boot, MMU, cache, page-table, timer or
+  scheduler code. Emulation and real hardware catch different mistakes, and
+  timing-dependent bugs show up differently on each. Concurrency changes
+  deserve a stress loop (run the `threads`/`events` fixtures 30× each).
 - Debugging a guest: `grix run -v ...` prints the kernel log, and `--json`
   shows status, output and events together. A kernel panic message ends up in
   `RunOutput::kernel_log`.
@@ -36,9 +39,17 @@ physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
 the image (`fs.rs`), loads the ELF (`elf.rs`, `process.rs`), and drops to EL0.
 After that, every bit of kernel work happens in an exception handler
-(`arch/mod.rs` → `syscall/` or demand paging in `mm/aspace.rs`). Everything
-the guest says goes out as frames on the PL011 UART (`console.rs`, format in
-`crates/abi/src/wire.rs`).
+(`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
+interrupt in `sched.rs`). Everything the guest says goes out as frames on the
+PL011 UART (`console.rs`, format in `crates/abi/src/wire.rs`).
+
+Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
+registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must
+wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
+returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
+another thread's state into the trap frame. I/O waits are *restarted*: when
+`ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
+from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
 
 ## Invariants: don't break these
 
@@ -70,6 +81,11 @@ the guest says goes out as frames on the PL011 UART (`console.rs`, format in
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).
+9. **The kernel never blocks inside a syscall.** There is one kernel stack,
+   so waiting means returning `EBLOCKED` after recording a wait. Anything
+   that can make a blocked I/O call succeed (data, space, closing an end,
+   epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
+   stay masked in the kernel; don't unmask them.
 
 ## Adding a syscall
 
