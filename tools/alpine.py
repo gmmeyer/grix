@@ -109,9 +109,16 @@ def install(name, pkg, out):
         for m in t.getmembers():
             if m.name.startswith(".") or m.isdev() or m.isfifo():
                 continue
-            dest = os.path.join(out, m.name)
-            if not os.path.realpath(dest).startswith(os.path.realpath(out) + os.sep):
+            dest = os.path.join(out, os.path.normpath(m.name))
+            # Resolve only the parent: dest itself may be a symlink from an earlier run
+            # (e.g. bin/sh -> /bin/busybox), which is replaced below, never followed.
+            root = os.path.realpath(out)
+            parent = os.path.realpath(os.path.dirname(dest))
+            if os.path.basename(dest) in ("", ".", "..") or not (
+                    parent == root or parent.startswith(root + os.sep)):
                 sys.exit(f"alpine.py: {filename} has unsafe path {m.name!r}")
+            if not m.isdir() and os.path.islink(dest):
+                os.remove(dest)
             if m.isdir():
                 os.makedirs(dest, exist_ok=True)
             elif m.issym():

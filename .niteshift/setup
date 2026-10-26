@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Prepares a sandbox for grix: Rust (host + bare-metal aarch64 kernel target), QEMU for the
+# end-to-end tests, zig for the C fixtures, then builds kernel, host CLI and fixtures so
+# `make test` works immediately. Safe to rerun: every step skips work that is already current.
+#
+# Sandboxes are x86_64 without /dev/kvm, so grix falls back to QEMU's TCG emulator
+# (GRIX_ACCEL=tcg) automatically; end-to-end tests are slower than on HVF/KVM.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ZIG_VERSION=0.15.2
+ZIG_SHA256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
+# --- System packages: QEMU (qemu-system-aarch64) and tools for downloads.
+need=()
+command -v qemu-system-aarch64 >/dev/null || need+=(qemu-system-arm)
+command -v xz >/dev/null || need+=(xz-utils)
+command -v curl >/dev/null || need+=(curl)
+command -v cc >/dev/null || need+=(build-essential) # linker for host Rust builds
+if [ ${#need[@]} -gt 0 ]; then
+  $SUDO apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq --no-install-recommends "${need[@]}"
+fi
+
+# --- Rust via rustup (stable; repo uses edition 2024). The kernel is a separate workspace
+# built for aarch64-unknown-none-softfloat, so that target must be installed too.
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null; then
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+    --no-modify-path -c clippy -c rustfmt
+fi
+rustup toolchain install stable --profile minimal -c clippy -c rustfmt >/dev/null
+rustup target add --toolchain stable aarch64-unknown-none-softfloat >/dev/null
+# Expose the rustup proxies on the default PATH so agent shells and services find them.
+for bin in cargo rustc rustup rustfmt cargo-fmt cargo-clippy clippy-driver rustdoc; do
+  [ -e "$HOME/.cargo/bin/$bin" ] && $SUDO ln -sf "$HOME/.cargo/bin/$bin" "/usr/local/bin/$bin"
+done
+
+# --- zig (C fixtures are cross-compiled with `zig cc -target aarch64-linux-musl`).
+zig_dir="/opt/zig-$ZIG_VERSION"
+if [ ! -x "$zig_dir/zig" ]; then
+  tmp="$(mktemp -d)"
+  curl -sSfL -o "$tmp/zig.tar.xz" \
+    "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+  echo "$ZIG_SHA256  $tmp/zig.tar.xz" | sha256sum -c - >/dev/null
+  $SUDO mkdir -p "$zig_dir"
+  $SUDO tar -xJf "$tmp/zig.tar.xz" -C "$zig_dir" --strip-components=1
+  rm -rf "$tmp"
+fi
+$SUDO ln -sf "$zig_dir/zig" /usr/local/bin/zig
+
+# --- Build everything the tests need. cargo is incremental; the fixture script rebuilds the
+# small C programs (seconds) and tools/alpine.py caches downloads in ~/.cache/grix/alpine.
+make kernel
+make host
+make fixtures
+# Pre-build test binaries so the first `cargo test` doesn't pay for compilation.
+cargo test --workspace --no-run
