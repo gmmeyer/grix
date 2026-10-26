@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agentbox_abi::policy::{Capability, DenyAction};
 use anyhow::{Context, Result, bail};
+use grix_abi::policy::{Capability, DenyAction};
 use serde::Deserialize;
 
 use crate::sandbox::SandboxBuilder;

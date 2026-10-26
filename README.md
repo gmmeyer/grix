@@ -1,20 +1,21 @@
-# agentbox
+# grix
 
-A Rust unikernel for running Linux programs on behalf of AI agents, with
-**least privilege by default**. Each run boots a fresh microVM whose kernel
-runs exactly one unmodified Linux binary. The program sees only the files you
+**grix** (greg + unix) is an *agentbox*: a Rust unikernel for running Linux
+programs on behalf of AI agents, with **least privilege by default**. Each
+run boots a fresh microVM whose kernel runs exactly one unmodified Linux
+binary. The program sees only the files you
 import, and every syscall is checked against the capabilities you grant.
 Anything it tries beyond that is denied and reported back, so the agent can
 see exactly what the program needed.
 
 ```console
-$ agentbox run -i ./build/net:/bin/net -- /bin/net
+$ grix run -i ./build/net:/bin/net -- /bin/net
 socket: Operation not permitted
-agentbox: denied socket: needs capability `net`
+grix: denied socket: needs capability `net`
 
-$ agentbox run -i busybox.static:/bin/busybox -- /bin/busybox cat /etc/passwd
+$ grix run -i busybox.static:/bin/busybox -- /bin/busybox cat /etc/passwd
 cat: can't open '/etc/passwd': No such file or directory
-agentbox: missing /etc/passwd: not imported
+grix: missing /etc/passwd: not imported
 ```
 
 > **Status: early prototype (milestone 1).** It runs single-threaded,
@@ -33,19 +34,19 @@ Requirements: macOS or Linux on any host, Rust (stable), QEMU
 make            # kernel + host CLI + test fixtures (fetches pinned Alpine busybox)
 make test       # unit tests + end-to-end tests that boot the kernel in QEMU
 
-./target/release/agentbox run -i fixtures/build/hello:/bin/hello -e GREETING=hi -- /bin/hello world
-./target/release/agentbox run -m examples/busybox.toml
-./target/release/agentbox run --json -m examples/busybox.toml     # machine-readable result
-./target/release/agentbox caps                                    # list capabilities
+./target/release/grix run -i fixtures/build/hello:/bin/hello -e GREETING=hi -- /bin/hello world
+./target/release/grix run -m examples/busybox.toml
+./target/release/grix run --json -m examples/busybox.toml     # machine-readable result
+./target/release/grix caps                                    # list capabilities
 ```
 
-On Apple Silicon, `AGENTBOX_ACCEL=hvf` uses hardware virtualization: runs
+On Apple Silicon, `GRIX_ACCEL=hvf` uses hardware virtualization: runs
 take about 0.2s instead of 0.8s under emulation.
 
 ## Using it from an agent (Rust)
 
 ```rust
-use agentbox::{Capability, Sandbox};
+use grix::{Capability, Sandbox};
 
 let sandbox = Sandbox::builder()
     .import("./tools/busybox.static", "/bin/busybox")?   // a host file or directory
@@ -69,7 +70,7 @@ state. `run_streaming` delivers stdout/stderr as they arrive.
 
 ## Manifests
 
-The same sandbox written as TOML (`agentbox run -m file.toml [-- cmd...]`):
+The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
 
 ```toml
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
@@ -107,7 +108,7 @@ Events tell you what happened:
 
 - `denied <syscall>: needs capability <cap>`: blocked by policy.
 - `missing <path>: not imported`: the program looked for a file you didn't provide.
-- `unsupported <syscall>`: granted (or harmless), but agentbox doesn't implement it yet.
+- `unsupported <syscall>`: granted (or harmless), but grix doesn't implement it yet.
 - `killed by signal N`: crash or abort, with the faulting address.
 - `could not start`: missing or invalid program.
 
@@ -116,7 +117,7 @@ Events tell you what happened:
 ```
  host process (your agent)                          microVM (QEMU virt, 1 vCPU)
 ┌──────────────────────────────┐                   ┌─────────────────────────────────┐
-│ agentbox crate               │  boot image       │ agentbox kernel (no_std Rust)   │
+│ grix crate                   │  boot image       │ grix kernel (no_std Rust)       │
 │  - collects imports          │ ───────────────►  │  - boots at EL1, high-half MMU  │
 │  - encodes policy+argv+env   │  @0x4800_0000     │  - reads image, builds RO fs    │
 │  - starts QEMU               │                   │  - loads ELF (+ interpreter)    │
@@ -141,7 +142,7 @@ Events tell you what happened:
 ### Security model
 
 The isolation boundary is the **hypervisor**. A program that fully compromised
-the agentbox kernel would still be inside a VM with no network device, no
+the grix kernel would still be inside a VM with no network device, no
 disk, and only the imported files in its memory. The guest kernel's policy
 checks are what make the sandbox *least privilege* and *observable*, but they
 aren't the only wall.
@@ -179,7 +180,7 @@ dynamic busybox (`sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …).
 4. **Networking**: virtio-net, with egress allow-lists enforced on the *host* side (`net`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and an
-   `agentbox` crate with no external dependencies.
+   `grix` crate with no external dependencies.
 6. **Agent integrations**: an MCP server and Python bindings; runtime images
    (python, node) as importable bundles.
 7. **x86_64 guest**.
@@ -188,7 +189,7 @@ dynamic busybox (`sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …).
 
 ```
 crates/abi/        shared host<->guest definitions: boot image, policy, wire protocol (no_std)
-crates/agentbox/   host library + `agentbox` CLI (builds images, runs QEMU, decodes output)
+crates/grix/       host library + `grix` CLI (builds images, runs QEMU, decodes output)
 kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/arch/        boot.S (MMU bring-up), vectors.S (traps), system registers
   src/mm/          frame allocator, page tables, address spaces / VMAs

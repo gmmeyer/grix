@@ -12,9 +12,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentbox_abi::image::IMAGE_BASE;
-use agentbox_abi::wire::{self, Channel, ExitKind, FrameDecoder};
 use anyhow::{Context, Result};
+use grix_abi::image::IMAGE_BASE;
+use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder};
 
 pub(crate) struct VmConfig {
     pub qemu: PathBuf,
@@ -57,7 +57,7 @@ impl Drop for TempFile {
 fn write_temp(image: &[u8]) -> Result<TempFile> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("agentbox-{}-{n}.img", std::process::id()));
+    let path = std::env::temp_dir().join(format!("grix-{}-{n}.img", std::process::id()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -76,7 +76,7 @@ pub(crate) fn run(
 ) -> Result<VmEnd> {
     if !cfg.kernel.exists() {
         anyhow::bail!(
-            "agentbox kernel not found at {} (build it with `make kernel` or set AGENTBOX_KERNEL)",
+            "grix kernel not found at {} (build it with `make kernel` or set GRIX_KERNEL)",
             cfg.kernel.display()
         );
     }

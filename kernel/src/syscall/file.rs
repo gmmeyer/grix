@@ -1,9 +1,9 @@
 //! File and descriptor syscalls over the read-only imported filesystem.
 
-use agentbox_abi::policy::Capability;
-use agentbox_abi::wire::Channel;
 use alloc::string::String;
 use alloc::vec::Vec;
+use grix_abi::policy::Capability;
+use grix_abi::wire::Channel;
 
 use super::{require, table::nr};
 use crate::console;

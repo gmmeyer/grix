@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 int main(int argc, char **argv) {
-    printf("hello from agentbox! argc=%d\n", argc);
+    printf("hello from grix! argc=%d\n", argc);
     for (int i = 0; i < argc; i++) printf("argv[%d]=%s\n", i, argv[i]);
     const char *g = getenv("GREETING");
     printf("GREETING=%s\n", g ? g : "(unset)");

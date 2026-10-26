@@ -1,4 +1,4 @@
-//! Definitions shared by the agentbox host library and the guest kernel.
+//! Definitions shared by the grix host library and the guest kernel.
 //!
 //! Everything that crosses the host/guest boundary lives here so the two sides
 //! cannot drift apart:

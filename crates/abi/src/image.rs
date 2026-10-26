@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::policy::{DenyAction, Policy};
 
-pub const MAGIC: [u8; 8] = *b"AGNTBOX1";
+pub const MAGIC: [u8; 8] = *b"GRIXIMG1";
 pub const HEADER_LEN: usize = 24;
 
 /// Guest physical memory layout (QEMU `virt` machine).

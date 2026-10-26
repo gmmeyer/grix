@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/abi", "crates/agentbox"]
+members = ["crates/abi", "crates/grix"]
 exclude = ["kernel"]
 
 [workspace.package]

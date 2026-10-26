@@ -5,8 +5,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use agentbox_abi::image::{Entry, EntryKind};
 use anyhow::{Context, Result, bail};
+use grix_abi::image::{Entry, EntryKind};
 
 #[derive(Clone, Debug)]
 pub(crate) enum Node {

@@ -1,6 +1,6 @@
 [package]
-name = "agentbox-kernel"
-description = "agentbox guest kernel: runs one Linux program with a capability-scoped syscall layer"
+name = "grix-kernel"
+description = "grix guest kernel: runs one Linux program with a capability-scoped syscall layer"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -9,12 +9,12 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [[bin]]
-name = "agentbox-kernel"
+name = "grix-kernel"
 test = false
 bench = false
 
 [dependencies]
-agentbox-abi = { path = "../crates/abi" }
+grix-abi = { path = "../crates/abi" }
 linked_list_allocator = "0.10"
 spin = "0.10"
 

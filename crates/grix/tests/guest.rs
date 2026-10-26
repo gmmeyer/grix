@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentbox::{Capability, DenyAction, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
+use grix::{Capability, DenyAction, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
 
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
@@ -31,7 +31,7 @@ fn run(b: SandboxBuilder, argv: &[&str]) -> RunOutput {
 fn args_env_output_and_exit_status() {
     let out = run(with("hello").env("GREETING", "hi"), &["/bin/hello", "world"]);
     assert_eq!(out.status, ExitStatus::Exited(7));
-    assert_eq!(out.stdout_str(), "hello from agentbox! argc=2\nargv[0]=/bin/hello\nargv[1]=world\nGREETING=hi\n");
+    assert_eq!(out.stdout_str(), "hello from grix! argc=2\nargv[0]=/bin/hello\nargv[1]=world\nGREETING=hi\n");
     assert_eq!(out.stderr_str(), "this goes to stderr\n");
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
@@ -62,7 +62,7 @@ fn reads_imported_files_only() {
 
 #[test]
 fn imported_directory_tree_and_symlinks() {
-    let dir = std::env::temp_dir().join(format!("agentbox-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("grix-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::write(dir.join("a.txt"), "aaaa").unwrap();

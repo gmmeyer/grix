@@ -1,5 +1,5 @@
 [package]
-name = "agentbox"
+name = "grix"
 description = "Run Linux programs in a capability-scoped Rust unikernel"
 version.workspace = true
 edition.workspace = true
@@ -9,11 +9,11 @@ license.workspace = true
 path = "src/lib.rs"
 
 [[bin]]
-name = "agentbox"
+name = "grix"
 path = "src/main.rs"
 
 [dependencies]
-agentbox-abi = { path = "../abi" }
+grix-abi = { path = "../abi" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

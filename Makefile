@@ -1,4 +1,4 @@
-KERNEL := kernel/target/aarch64-unknown-none-softfloat/release/agentbox-kernel
+KERNEL := kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 
 .PHONY: all kernel host fixtures test check clean
 
@@ -8,7 +8,7 @@ kernel:
 	cd kernel && cargo build --release
 
 host:
-	cargo build --release -p agentbox
+	cargo build --release -p grix
 
 fixtures:
 	./fixtures/build.sh

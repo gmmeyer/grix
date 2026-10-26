@@ -1,6 +1,6 @@
 use std::fmt;
 
-use agentbox_abi::wire::Event;
+use grix_abi::wire::Event;
 
 /// Something the guest kernel reported about the program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +52,7 @@ impl fmt::Display for GuestEvent {
                 if !detail.is_empty() {
                     write!(f, " ({detail})")?;
                 }
-                write!(f, ": not implemented by the agentbox kernel yet")
+                write!(f, ": not implemented by the grix kernel yet")
             }
             GuestEvent::MissingPath { path } => write!(f, "missing {path}: not imported"),
             GuestEvent::Fault { signal, addr, pc, detail } => {

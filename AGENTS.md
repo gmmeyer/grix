@@ -6,8 +6,8 @@ what the project is and how to use it, see [README.md](README.md).
 ## Build and test
 
 ```sh
-make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/agentbox-kernel
-make host        # host CLI      -> target/release/agentbox
+make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
+make host        # host CLI      -> target/release/grix
 make fixtures    # C test programs (zig) + pinned Alpine busybox/musl (network)
 make test        # everything; end-to-end tests boot the kernel in QEMU
 make check       # clippy for host and kernel
@@ -17,19 +17,19 @@ make check       # clippy for host and kernel
   `kernel/.cargo/config.toml`. Build it from inside `kernel/` or with `make kernel`.
   `cargo test` at the root does **not** rebuild it, so after changing kernel code
   run `make kernel` (or `make test`) before the end-to-end tests.
-- End-to-end tests live in `crates/agentbox/tests/guest.rs`. They need QEMU,
+- End-to-end tests live in `crates/grix/tests/guest.rs`. They need QEMU,
   the built kernel, and `fixtures/build/`. Missing pieces fail loudly; they are
   never skipped.
-- `AGENTBOX_ACCEL=hvf` runs tests with hardware virtualization on Apple Silicon.
+- `GRIX_ACCEL=hvf` runs tests with hardware virtualization on Apple Silicon.
   Run the suite with both `tcg` (default) and `hvf` when touching boot, MMU,
   cache or page-table code: real hardware catches mistakes that emulation hides.
-- Debugging a guest: `agentbox run -v ...` prints the kernel log, and `--json`
+- Debugging a guest: `grix run -v ...` prints the kernel log, and `--json`
   shows status, output and events together. A kernel panic message ends up in
   `RunOutput::kernel_log`.
 
 ## Architecture in one paragraph
 
-The host (`crates/agentbox`) turns imports, argv/env and a capability `Policy`
+The host (`crates/grix`) turns imports, argv/env and a capability `Policy`
 into a boot image (`crates/abi/src/image.rs`). QEMU loads the image at
 physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`kernel/src`) enables the MMU in `arch/boot.S`, runs in the high half
@@ -69,7 +69,7 @@ the guest says goes out as frames on the PL011 UART (`console.rs`, format in
    them. Semihosting in particular gives the guest host file access.
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
-   (`crates/agentbox/src/image.rs`).
+   (`crates/grix/src/image.rs`).
 
 ## Adding a syscall
 
@@ -80,9 +80,9 @@ the guest says goes out as frames on the PL011 UART (`console.rs`, format in
    in `syscall/file.rs`, `mem.rs` or `misc.rs`. Return `Err(errno)` like Linux.
 3. Add a C fixture in `fixtures/src/` (built automatically by
    `fixtures/build.sh`) or use busybox, plus an end-to-end test in
-   `crates/agentbox/tests/guest.rs` that checks the program's output, its
+   `crates/grix/tests/guest.rs` that checks the program's output, its
    exit status, **and** `events`.
-4. Run `make test`, plus `AGENTBOX_ACCEL=hvf cargo test -p agentbox --test guest` on Apple Silicon.
+4. Run `make test`, plus `GRIX_ACCEL=hvf cargo test -p grix --test guest` on Apple Silicon.
 
 To find what a real program is missing, run it with `--json` and read the
 `unsupported` / `denied` events.

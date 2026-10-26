@@ -2,11 +2,11 @@
 //! plus a few synthetic nodes (/dev/null, /dev/zero, /dev/urandom,
 //! /proc/self/exe). File contents are referenced in place from the boot image.
 
-use agentbox_abi::image::{Entry, EntryKind};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use grix_abi::image::{Entry, EntryKind};
 use spin::Once;
 
 use crate::errno::*;

@@ -1,6 +1,6 @@
 //! Linux AArch64 syscall numbers, names, and the capability each one needs.
 
-use agentbox_abi::policy::Capability;
+use grix_abi::policy::Capability;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {

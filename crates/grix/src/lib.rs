@@ -1,7 +1,7 @@
 //! Run Linux programs inside a capability-scoped Rust unikernel.
 //!
 //! ```no_run
-//! use agentbox::{Capability, Sandbox};
+//! use grix::{Capability, Sandbox};
 //!
 //! let sandbox = Sandbox::builder()
 //!     .import("./build/hello", "/bin/hello")?
@@ -25,7 +25,7 @@ mod manifest;
 mod sandbox;
 mod vmm;
 
-pub use agentbox_abi::policy::{Capability, DenyAction};
 pub use event::GuestEvent;
+pub use grix_abi::policy::{Capability, DenyAction};
 pub use manifest::Manifest;
 pub use sandbox::{ExitStatus, RunOutput, Sandbox, SandboxBuilder, Stream};

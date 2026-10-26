@@ -1,6 +1,6 @@
 //! Time, identity, limits, signals, futex and the remaining small syscalls.
 
-use agentbox_abi::policy::Capability;
+use grix_abi::policy::Capability;
 
 use super::{require, table::nr};
 use crate::errno::*;
@@ -201,7 +201,7 @@ fn clock_gettime(p: &mut Process, clock: u64, tp: u64) -> SysResult {
 
 fn uname(p: &mut Process, buf: u64) -> SysResult {
     let mut b = [0u8; 65 * 6];
-    let fields = ["Linux", "agentbox", "6.1.0-agentbox", "#1 SMP agentbox", "aarch64", "(none)"];
+    let fields = ["Linux", "grix", "6.1.0-grix", "#1 SMP grix", "aarch64", "(none)"];
     for (i, f) in fields.iter().enumerate() {
         b[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
     }

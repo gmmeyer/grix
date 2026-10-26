@@ -3,14 +3,14 @@
 version = 4
 
 [[package]]
-name = "agentbox-abi"
+name = "grix-abi"
 version = "0.1.0"
 
 [[package]]
-name = "agentbox-kernel"
+name = "grix-kernel"
 version = "0.1.0"
 dependencies = [
- "agentbox-abi",
+ "grix-abi",
  "linked_list_allocator",
  "spin",
 ]

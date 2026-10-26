@@ -1,4 +1,4 @@
-//! agentbox guest kernel.
+//! grix guest kernel.
 //!
 //! Boots, reads the boot image the host placed in memory, and runs the one
 //! Linux program it describes. The program sees only the files the host
@@ -24,7 +24,7 @@ mod syscall;
 mod time;
 mod uaccess;
 
-use agentbox_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};
+use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};
 
 use console::klog;
 
@@ -41,6 +41,6 @@ pub extern "C" fn kernel_main() -> ! {
     time::init(img.boot_time_ns);
     rng::init(&img.seed);
     arch::allow_el0_counter();
-    klog!("agentbox kernel: {} MiB RAM, {} imported paths, exec {}\n", img.ram_size >> 20, img.entries.len(), img.exe);
+    klog!("grix kernel: {} MiB RAM, {} imported paths, exec {}\n", img.ram_size >> 20, img.entries.len(), img.exe);
     process::start(img)
 }

@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "agentbox"
-version = "0.1.0"
-dependencies = [
- "agentbox-abi",
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "agentbox-abi"
-version = "0.1.0"
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -125,6 +109,22 @@ name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "grix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "grix-abi",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "grix-abi"
+version = "0.1.0"
 
 [[package]]
 name = "hashbrown"

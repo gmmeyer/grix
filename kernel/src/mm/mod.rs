@@ -4,7 +4,7 @@ pub mod aspace;
 pub mod frame;
 pub mod paging;
 
-use agentbox_abi::image::{MAX_RAM, RAM_BASE};
+use grix_abi::image::{MAX_RAM, RAM_BASE};
 
 pub const PAGE_SIZE: u64 = 4096;
 /// Physical memory is mapped linearly at this offset (TTBR1).

@@ -1,7 +1,7 @@
-//! Serial console (PL011) carrying framed messages to the host. See `agentbox_abi::wire`.
+//! Serial console (PL011) carrying framed messages to the host. See `grix_abi::wire`.
 
-use agentbox_abi::wire::{self, Channel, ExitKind};
 use core::fmt::{self, Write};
+use grix_abi::wire::{self, Channel, ExitKind};
 use spin::Mutex;
 
 use crate::mm::KERNEL_OFFSET;

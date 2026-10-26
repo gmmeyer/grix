@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agentbox_abi::image::{IMAGE_BASE, Image, MAX_RAM, RAM_BASE};
-use agentbox_abi::policy::{Capability, DenyAction, Policy};
-use agentbox_abi::wire::{Channel, Event, ExitKind};
 use anyhow::{Context, Result, bail};
+use grix_abi::image::{IMAGE_BASE, Image, MAX_RAM, RAM_BASE};
+use grix_abi::policy::{Capability, DenyAction, Policy};
+use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
 
 use crate::event::GuestEvent;
@@ -33,7 +33,7 @@ pub enum ExitStatus {
     Signaled(i32),
     /// The program ran past the time limit and was stopped.
     Timeout,
-    /// The guest kernel crashed (a bug in agentbox, see `kernel_log`).
+    /// The guest kernel crashed (a bug in grix, see `kernel_log`).
     KernelPanic,
     /// The VM ended without reporting a status.
     VmFailed(String),
@@ -135,14 +135,14 @@ impl Default for SandboxBuilder {
             uid: 1000,
             gid: 1000,
             kernel: env_path(
-                "AGENTBOX_KERNEL",
+                "GRIX_KERNEL",
                 concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../kernel/target/aarch64-unknown-none-softfloat/release/agentbox-kernel"
+                    "/../../kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"
                 ),
             ),
-            qemu: env_path("AGENTBOX_QEMU", "qemu-system-aarch64"),
-            accel: std::env::var("AGENTBOX_ACCEL").unwrap_or_else(|_| "tcg".into()),
+            qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
+            accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| "tcg".into()),
         }
     }
 }
@@ -308,7 +308,7 @@ impl Sandbox {
             Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
             Channel::Event => match Event::decode(payload) {
                 Ok(e) => out.events.push(e.into()),
-                Err(_) => out.kernel_log.push_str("[agentbox] undecodable event from guest\n"),
+                Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
             Channel::Exit => {}
         })?;

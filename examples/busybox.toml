@@ -1,6 +1,6 @@
 # Run Alpine's static busybox with one data file and nothing else.
-#   make fixtures && cargo run -p agentbox -- run -m examples/busybox.toml
-#   cargo run -p agentbox -- run -m examples/busybox.toml -- /bin/busybox wc -l /data/hello.c
+#   make fixtures && cargo run -p grix -- run -m examples/busybox.toml
+#   cargo run -p grix -- run -m examples/busybox.toml -- /bin/busybox wc -l /data/hello.c
 
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
 capabilities = []        # fs_write, threads, process, net

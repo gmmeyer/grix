@@ -1,12 +1,12 @@
 //! The single process this kernel runs: exec, faults, termination, and
 //! reporting of denied/unimplemented operations.
 
-use agentbox_abi::image::Image;
-use agentbox_abi::policy::{DenyAction, Policy};
-use agentbox_abi::wire::{Event, ExitKind};
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
+use grix_abi::image::Image;
+use grix_abi::policy::{DenyAction, Policy};
+use grix_abi::wire::{Event, ExitKind};
 use spin::Mutex;
 
 use crate::arch::{self, TrapFrame};

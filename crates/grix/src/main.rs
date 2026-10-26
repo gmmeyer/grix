@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use agentbox::{Capability, DenyAction, Manifest, Sandbox, Stream};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use grix::{Capability, DenyAction, Manifest, Sandbox, Stream};
 
 #[derive(Parser)]
-#[command(name = "agentbox", about = "Run Linux programs in a capability-scoped unikernel")]
+#[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -76,7 +76,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("agentbox: {e:#}");
+            eprintln!("grix: {e:#}");
             ExitCode::from(125)
         }
     }
@@ -142,13 +142,13 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     if !args.quiet {
         for e in &out.events {
-            eprintln!("agentbox: {e}");
+            eprintln!("grix: {e}");
         }
     }
     match &out.status {
-        agentbox::ExitStatus::Timeout => eprintln!("agentbox: timed out"),
-        agentbox::ExitStatus::KernelPanic => eprintln!("agentbox: guest kernel panic:\n{}", out.kernel_log),
-        agentbox::ExitStatus::VmFailed(why) => eprintln!("agentbox: {why}"),
+        grix::ExitStatus::Timeout => eprintln!("grix: timed out"),
+        grix::ExitStatus::KernelPanic => eprintln!("grix: guest kernel panic:\n{}", out.kernel_log),
+        grix::ExitStatus::VmFailed(why) => eprintln!("grix: {why}"),
         _ => {}
     }
     Ok(out.status.code())

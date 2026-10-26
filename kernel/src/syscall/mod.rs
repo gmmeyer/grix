@@ -5,7 +5,7 @@ mod mem;
 mod misc;
 pub mod table;
 
-use agentbox_abi::policy::Capability;
+use grix_abi::policy::Capability;
 
 use crate::arch::TrapFrame;
 use crate::errno::*;
