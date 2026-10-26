@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepares a sandbox for grix: Rust (host + bare-metal aarch64 kernel target), QEMU for the
-# end-to-end tests, zig for the C fixtures, then builds kernel, host CLI and fixtures so
+# end-to-end tests, zig for the C fixtures, Go for the Go fixtures, then builds kernel, host CLI and fixtures so
 # `make test` works immediately. Safe to rerun: every step skips work that is already current.
 #
 # Sandboxes are x86_64 without /dev/kvm, so grix falls back to QEMU's TCG emulator
@@ -10,6 +10,8 @@ cd "$(dirname "$0")/.."
 
 ZIG_VERSION=0.15.2
 ZIG_SHA256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+GO_VERSION=1.27.3
+GO_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
 
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -51,6 +53,18 @@ if [ ! -x "$zig_dir/zig" ]; then
   rm -rf "$tmp"
 fi
 $SUDO ln -sf "$zig_dir/zig" /usr/local/bin/zig
+
+# --- Go (Go fixtures are cross-compiled with GOOS=linux GOARCH=arm64; see fixtures/build.sh).
+go_dir="/opt/go-$GO_VERSION"
+if [ ! -x "$go_dir/bin/go" ]; then
+  tmp="$(mktemp -d)"
+  curl -sSfL -o "$tmp/go.tar.gz" "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz"
+  echo "$GO_SHA256  $tmp/go.tar.gz" | sha256sum -c - >/dev/null
+  $SUDO mkdir -p "$go_dir"
+  $SUDO tar -xzf "$tmp/go.tar.gz" -C "$go_dir" --strip-components=1
+  rm -rf "$tmp"
+fi
+$SUDO ln -sf "$go_dir/bin/go" /usr/local/bin/go
 
 # --- Build everything the tests need. cargo is incremental; the fixture script rebuilds the
 # small C programs (seconds) and tools/alpine.py caches downloads in ~/.cache/grix/alpine.
