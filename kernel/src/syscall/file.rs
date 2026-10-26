@@ -277,7 +277,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
             return match &s.tx {
                 Some(tx) => pipe_write(p, tx, buf, count, nonblock, true),
                 None => {
-                    super::misc::signal_self(p, 13, "SIGPIPE: wrote to a socket that was shut down")?;
+                    crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: wrote to a socket that was shut down");
                     Err(EPIPE)
                 }
             };
@@ -353,7 +353,7 @@ pub(super) fn pipe_write(
     if pipe.readers == 0 {
         drop(pipe);
         if sigpipe {
-            super::misc::signal_self(p, 13, "SIGPIPE: wrote to a pipe with no readers")?;
+            crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: wrote to a pipe with no readers");
         }
         return Err(EPIPE);
     }
@@ -376,7 +376,7 @@ pub(super) fn would_block(p: &mut Process, nonblock: bool) -> SysResult {
     if nonblock {
         return Err(EAGAIN);
     }
-    let deadline = p.io_deadline(None);
+    let deadline = p.timeout_deadline(None);
     p.block_io(deadline, Ok(0))
 }
 
@@ -785,7 +785,7 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
         copy_out(&mut p.aspace, fds, &raw)?;
         return Ok(ready);
     }
-    let deadline = p.io_deadline(timeout);
+    let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))
 }
 
@@ -831,7 +831,7 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
         }
         return Ok(count);
     }
-    let deadline = p.io_deadline(timeout);
+    let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))
 }
 
@@ -987,7 +987,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
         copy_out(&mut p.aspace, evp, &out)?;
         return Ok(out.len() as u64 / 16);
     }
-    let deadline = p.io_deadline(timeout);
+    let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))
 }
 

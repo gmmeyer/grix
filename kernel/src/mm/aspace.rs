@@ -14,6 +14,8 @@ use crate::fs::Ino;
 pub const USER_TOP: u64 = 1 << 48;
 pub const STACK_TOP: u64 = 0x0000_ffff_fffe_0000;
 pub const STACK_SIZE: u64 = 8 << 20;
+/// The signal-return trampoline page, above the stack.
+pub const SIGPAGE: u64 = STACK_TOP + 0x1_0000;
 /// mmap allocates top-down from here, leaving a gap below the stack.
 pub const MMAP_TOP: u64 = STACK_TOP - STACK_SIZE - (128 << 20);
 pub const MMAP_BOTTOM: u64 = 1 << 32;
@@ -42,6 +44,8 @@ pub enum Backing {
     /// Private file mapping. Byte `o` of the VMA is `data[offset + o]` while
     /// `o < filesz`, and zero after that (ELF .bss). `ino` names the file.
     File { data: &'static [u8], offset: u64, filesz: u64, ino: Ino },
+    /// Each page starts with the signal-return trampoline (`signal::TRAMPOLINE`).
+    Sigpage,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +67,7 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
+            Backing::Sigpage => Backing::Sigpage,
             Backing::File { data, offset, filesz, ino } => {
                 Backing::File { data, offset: offset + skip, filesz: filesz.saturating_sub(skip), ino }
             }
@@ -244,18 +249,18 @@ impl AddressSpace {
             return Err(FaultError::Segv);
         }
         let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
-        if let Backing::File { data, offset, filesz, .. } = vma.backing {
-            let o = page - vma.start;
-            if o < filesz {
-                let n = (filesz - o).min(PAGE_SIZE);
-                let src = offset + o;
-                let avail = (data.len() as u64).saturating_sub(src).min(n);
-                if avail > 0 {
-                    let src = &data[src as usize..(src + avail) as usize];
-                    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), p2v(pa) as *mut u8, src.len()) };
-                }
+        let src: &[u8] = match vma.backing {
+            Backing::Anon => &[],
+            Backing::Sigpage => &crate::signal::TRAMPOLINE,
+            Backing::File { data, offset, filesz, .. } => {
+                let o = page - vma.start;
+                let n = filesz.saturating_sub(o).min(PAGE_SIZE);
+                let src = (offset + o).min(data.len() as u64);
+                let avail = (data.len() as u64 - src).min(n);
+                &data[src as usize..(src + avail) as usize]
             }
-        }
+        };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), p2v(pa) as *mut u8, src.len()) };
         if vma.prot.exec {
             arch::sync_icache(p2v(pa), PAGE_SIZE);
         }

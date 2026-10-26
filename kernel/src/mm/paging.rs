@@ -24,6 +24,7 @@ pub struct Prot {
 
 impl Prot {
     pub const RW: Prot = Prot { read: true, write: true, exec: false };
+    pub const RX: Prot = Prot { read: true, write: false, exec: true };
 
     /// From Linux PROT_* bits.
     pub fn from_linux(p: u64) -> Prot {

@@ -130,15 +130,15 @@ pub fn sched_yield(p: &mut Process) -> SysResult {
 
 pub fn nanosleep(p: &mut Process, req: u64) -> SysResult {
     let ns = read_timespec_ns(&mut p.aspace, req)?;
-    let deadline = time::monotonic_ns().saturating_add(ns);
-    p.block(WaitOn::Sleep, Some(deadline), Ok(0))
+    let deadline = p.timeout_deadline(Some(ns));
+    p.block(WaitOn::Sleep, deadline, Ok(0))
 }
 
 pub fn clock_nanosleep(p: &mut Process, clock: u64, flags: u64, req: u64) -> SysResult {
     const TIMER_ABSTIME: u64 = 1;
     let ns = read_timespec_ns(&mut p.aspace, req)?;
     let deadline = if flags & TIMER_ABSTIME == 0 {
-        time::monotonic_ns().saturating_add(ns)
+        p.timeout_deadline(Some(ns)).unwrap()
     } else {
         match clock {
             0 | 5 | 11 => time::realtime_to_monotonic(ns), // REALTIME, REALTIME_COARSE, TAI
@@ -221,11 +221,11 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
                 0 => None,
                 t => {
                     let ns = read_timespec_ns(&mut p.aspace, t)?;
-                    Some(match (cmd, op & CLOCK_REALTIME != 0) {
-                        (WAIT, _) => time::monotonic_ns().saturating_add(ns), // relative
-                        (_, true) => time::realtime_to_monotonic(ns),         // absolute, realtime
-                        (_, false) => ns,                                     // absolute, monotonic
-                    })
+                    match (cmd, op & CLOCK_REALTIME != 0) {
+                        (WAIT, _) => p.timeout_deadline(Some(ns)),          // relative
+                        (_, true) => Some(time::realtime_to_monotonic(ns)), // absolute, realtime
+                        (_, false) => Some(ns),                             // absolute, monotonic
+                    }
                 }
             };
             let tid = p.current;

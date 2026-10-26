@@ -15,27 +15,17 @@ use crate::elf;
 use crate::errno::*;
 use crate::fd::FdTable;
 use crate::fs::{self, Ino, Kind, ROOT};
+use crate::mm::PAGE_SIZE;
 pub use crate::mm::aspace::Access;
-use crate::mm::aspace::{AddressSpace, FaultError, STACK_SIZE, STACK_TOP, Vma};
+use crate::mm::aspace::{AddressSpace, Backing, FaultError, SIGPAGE, STACK_SIZE, STACK_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::rng;
+use crate::signal::{self, AltStack, SigQueue};
 use crate::uaccess::copy_out;
 
 pub const PID: u64 = 1;
 /// Linux defaults to a much higher limit; this bounds kernel memory per sandbox.
 pub const MAX_THREADS: usize = 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Signal {
-    Sigill = 4,
-    Sigtrap = 5,
-    Sigbus = 7,
-    Sigfpe = 8,
-    Sigkill = 9,
-    Sigsegv = 11,
-    Sigsys = 31,
-}
 
 #[derive(Clone, Copy, Default)]
 pub struct SigAction {
@@ -55,6 +45,11 @@ pub enum WaitOn {
     /// I/O readiness (pipes, eventfds, epoll). The syscall is restarted from
     /// scratch whenever I/O state changes anywhere.
     Io,
+    /// Any signal that runs a handler (rt_sigsuspend).
+    Signal,
+    /// One of these signals becoming pending (rt_sigtimedwait). The syscall
+    /// is restarted to dequeue it.
+    SigWait(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,10 +72,20 @@ pub struct Thread {
     /// set_tid_address / CLONE_CHILD_CLEARTID: zeroed and futex-woken on exit.
     pub clear_child_tid: u64,
     pub sigmask: u64,
+    /// The mask to restore once a signal handler returns, set by syscalls
+    /// that change the mask while they wait (rt_sigsuspend, ppoll, ...).
+    pub saved_sigmask: Option<u64>,
+    /// Signals sent to this thread (tgkill, faults).
+    pub pending: SigQueue,
+    pub altstack: AltStack,
     pub robust_list: u64,
-    /// Absolute deadline of a blocking I/O call, kept across restarts so a
-    /// restarted call doesn't start its relative timeout over.
+    /// Absolute deadline of a blocking call, kept when the call is rewound to
+    /// re-run (I/O changes, signals) so it doesn't start its relative timeout over.
     pub restart_deadline: Option<u64>,
+    /// The thread was rewound to the `svc` of an unfinished syscall. If a
+    /// signal handler runs before the call re-executes, the call may fail
+    /// with EINTR instead (see `signal::return_to_user`).
+    pub restarting: bool,
 }
 
 impl Thread {
@@ -93,8 +98,12 @@ impl Thread {
             wait: None,
             clear_child_tid: 0,
             sigmask: 0,
+            saved_sigmask: None,
+            pending: SigQueue::default(),
+            altstack: AltStack::default(),
             robust_list: 0,
             restart_deadline: None,
+            restarting: false,
         }
     }
 }
@@ -108,8 +117,8 @@ pub struct Process {
     pub gid: u32,
     pub umask: u32,
     pub sigactions: [SigAction; 65],
-    pub sigpending: u64,
-    pub altstack: [u64; 3],
+    /// Signals sent to the whole process (kill), taken by any thread that doesn't block them.
+    pub shared_pending: SigQueue,
     pub rlimits: [(u64, u64); 16],
     pub name: [u8; 16],
     reported: BTreeSet<(u8, u32, String)>,
@@ -157,8 +166,7 @@ impl Process {
             gid,
             umask: 0o022,
             sigactions: [SigAction::default(); 65],
-            sigpending: 0,
-            altstack: [0, 2, 0], // SS_DISABLE
+            shared_pending: SigQueue::default(),
             rlimits,
             name: [0; 16],
             reported: BTreeSet::new(),
@@ -189,21 +197,22 @@ impl Process {
             Ok(v) => v,
             Err(e) => (-(e.0 as i64)) as u64,
         };
-        self.cur().wait = Some(Wait { on, deadline, timeout_ret });
+        let t = self.cur();
+        t.wait = Some(Wait { on, deadline, timeout_ret });
+        t.restart_deadline = deadline;
         self.timer_dirty = true;
         Err(EBLOCKED)
     }
 
-    /// Deadline for a blocking I/O call with a relative timeout (`None` = forever),
-    /// reusing the original deadline if this is a restarted call.
-    pub fn io_deadline(&mut self, timeout_ns: Option<u64>) -> Option<u64> {
+    /// Deadline for a blocking call with a relative timeout (`None` = forever),
+    /// reusing the original deadline if this is a re-run of a rewound call.
+    pub fn timeout_deadline(&mut self, timeout_ns: Option<u64>) -> Option<u64> {
         let restarted = self.cur().restart_deadline.take();
         restarted.or_else(|| timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns)))
     }
 
     /// Block until I/O state changes (then the syscall reruns) or the deadline passes.
     pub fn block_io(&mut self, deadline: Option<u64>, on_timeout: SysResult) -> SysResult {
-        self.cur().restart_deadline = deadline;
         self.block(WaitOn::Io, deadline, on_timeout)
     }
 
@@ -221,6 +230,7 @@ impl Process {
             t.wait = None;
             // Re-execute the svc: x0..x7 still hold the original arguments.
             t.regs.elr -= 4;
+            t.restarting = true;
             self.runq.push_back(tid);
             self.timer_dirty = true;
         }
@@ -229,10 +239,17 @@ impl Process {
     /// Make a blocked thread runnable; its syscall returns `ret` (or its
     /// timeout value if `None`).
     pub fn wake(&mut self, tid: u32, ret: Option<u64>) {
-        let Some(t) = self.threads.get_mut(&tid) else { return };
-        let Some(w) = t.wait.take() else { return };
+        let Some(w) = self.cancel_wait(tid) else { return };
+        let t = self.threads.get_mut(&tid).unwrap();
         t.regs.x[0] = ret.unwrap_or(w.timeout_ret);
         t.restart_deadline = None;
+        self.runq.push_back(tid);
+        self.timer_dirty = true;
+    }
+
+    /// Stop a thread's wait (leaving its futex queue) without making it runnable.
+    pub fn cancel_wait(&mut self, tid: u32) -> Option<Wait> {
+        let w = self.threads.get_mut(&tid)?.wait.take()?;
         if let WaitOn::Futex(addr) = w.on
             && let Some(q) = self.futexes.get_mut(&addr)
         {
@@ -241,8 +258,8 @@ impl Process {
                 self.futexes.remove(&addr);
             }
         }
-        self.runq.push_back(tid);
         self.timer_dirty = true;
+        Some(w)
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {
@@ -258,7 +275,7 @@ impl Process {
             DenyAction::Errno => Err(EPERM),
             DenyAction::Kill => {
                 let msg = alloc::format!("{syscall} denied (needs capability `{capability}`)");
-                exit_signaled(Signal::Sigsys as u32, 0, 0, &msg)
+                exit_signaled(signal::SIGSYS, 0, 0, &msg)
             }
         }
     }
@@ -300,21 +317,18 @@ pub fn exit_signaled(signal: u32, addr: u64, pc: u64, detail: &str) -> ! {
     console::exit(ExitKind::Signaled, signal as i32)
 }
 
-pub fn terminate(sig: Signal, addr: u64, pc: u64, detail: &str) -> ! {
-    exit_signaled(sig as u32, addr, pc, detail)
-}
-
 /// Demand paging for a user translation fault.
-pub fn user_fault(tf: &TrapFrame, far: u64, access: Access) {
-    let result = {
-        let mut guard = PROCESS.lock();
-        let p = guard.as_mut().expect("fault without a process");
-        p.aspace.fault(far, access)
-    };
-    match result {
+pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
+    let mut guard = PROCESS.lock();
+    let p = guard.as_mut().expect("fault without a process");
+    match p.aspace.fault(far, access) {
         Ok(()) => {}
-        Err(FaultError::Segv) => terminate(Signal::Sigsegv, far, tf.elr, access.describe_violation()),
-        Err(FaultError::OutOfMemory) => terminate(Signal::Sigkill, far, tf.elr, "out of memory"),
+        Err(FaultError::Segv) => {
+            let code = if p.aspace.find(far).is_some() { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
+            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            signal::fault(p, signal::SIGSEGV, code, fault, access.describe_violation())
+        }
+        Err(FaultError::OutOfMemory) => exit_signaled(signal::SIGKILL, far, tf.elr, "out of memory"),
     }
 }
 
@@ -431,6 +445,7 @@ fn exec(p: &mut Process, execfn: &str) -> Result<(u64, u64), (i32, String)> {
     p.aspace.brk_start = exe.end;
     p.aspace.brk = exe.end;
     p.aspace.map(Vma::anon(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW));
+    p.aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
 
     let auxv = [
         (3, exe.phdr),    // AT_PHDR

@@ -2,6 +2,7 @@
 
 use core::arch::{asm, global_asm};
 
+use crate::signal::{self, *};
 use crate::{process, sched, syscall};
 
 pub mod irq;
@@ -77,8 +78,14 @@ const EC_BRK: u64 = 0x3c;
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     match kind {
-        8 => el0_sync(tf),
-        9 => sched::irq(tf),
+        8 => {
+            el0_sync(tf);
+            signal::return_to_user(tf);
+        }
+        9 => {
+            sched::irq(tf);
+            signal::return_to_user(tf);
+        }
         // The kernel runs with IRQs masked, so nothing should arrive here.
         5 => {}
         _ => panic!("unexpected exception: kind={kind} esr={:#x} far={:#x} elr={:#x}", esr(), far(), tf.elr),
@@ -88,9 +95,8 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
 fn el0_sync(tf: &mut TrapFrame) {
     let esr = esr();
     let ec = esr >> 26;
-    use process::Signal::*;
-    match ec {
-        EC_SVC64 => syscall::handle(tf),
+    let (sig, code, addr, esr, why) = match ec {
+        EC_SVC64 => return syscall::handle(tf),
         EC_IABT_LOWER | EC_DABT_LOWER => {
             let far = far();
             let dfsc = esr & 0x3f;
@@ -103,18 +109,21 @@ fn el0_sync(tf: &mut TrapFrame) {
             };
             match dfsc {
                 // Translation fault at any level: demand paging.
-                0b000100..=0b000111 => process::user_fault(tf, far, access),
-                // Alignment fault.
-                0b100001 => process::terminate(Sigbus, far, tf.elr, "alignment fault"),
-                _ => process::terminate(Sigsegv, far, tf.elr, access.describe_violation()),
+                0b000100..=0b000111 => return process::user_fault(tf, far, access, esr),
+                0b100001 => (SIGBUS, BUS_ADRALN, far, Some(esr), "alignment fault"),
+                _ => (SIGSEGV, SEGV_ACCERR, far, Some(esr), access.describe_violation()),
             }
         }
-        EC_UNKNOWN => process::terminate(Sigill, 0, tf.elr, "illegal instruction"),
-        EC_BRK => process::terminate(Sigtrap, 0, tf.elr, "breakpoint (brk)"),
-        EC_PC_ALIGN | EC_SP_ALIGN => process::terminate(Sigbus, far(), tf.elr, "misaligned pc/sp"),
-        EC_FP_EXC => process::terminate(Sigfpe, 0, tf.elr, "floating point exception"),
-        _ => process::terminate(Sigill, 0, tf.elr, "unhandled exception class"),
-    }
+        EC_UNKNOWN => (SIGILL, ILL_ILLOPC, tf.elr, None, "illegal instruction"),
+        EC_BRK => (SIGTRAP, TRAP_BRKPT, tf.elr, None, "breakpoint (brk)"),
+        EC_PC_ALIGN => (SIGBUS, BUS_ADRALN, far(), None, "misaligned pc"),
+        EC_SP_ALIGN => (SIGBUS, BUS_ADRALN, tf.sp_el0, None, "misaligned sp"),
+        EC_FP_EXC => (SIGFPE, FPE_FLTUNK, tf.elr, None, "floating point exception"),
+        _ => (SIGILL, ILL_ILLOPC, tf.elr, None, "unhandled exception class"),
+    };
+    let mut guard = process::PROCESS.lock();
+    let p = guard.as_mut().expect("fault without a process");
+    signal::fault(p, sig, code, signal::Fault { addr, pc: tf.elr, esr }, why);
 }
 
 pub fn esr() -> u64 {

@@ -85,7 +85,7 @@ fn send(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
         Some(tx) => pipe_write(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0),
         None => {
             if flags & MSG_NOSIGNAL == 0 {
-                super::misc::signal_self(p, 13, "SIGPIPE: wrote to a socket that was shut down")?;
+                crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: wrote to a socket that was shut down");
             }
             Err(EPIPE)
         }

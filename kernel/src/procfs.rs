@@ -189,6 +189,8 @@ fn maps(p: &Process, s: &mut String) {
             Backing::File { offset, ino, .. } => (offset, ino as u64 + 1, fs.path_of(ino)),
             Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
             Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
+            // What Linux calls the page holding the signal-return code on arm32.
+            Backing::Sigpage => (0, 0, "[sigpage]".into()),
             Backing::Anon => (0, 0, String::new()),
         };
         let dev = if inode == 0 { "00:00" } else { "00:01" };
@@ -198,7 +200,7 @@ fn maps(p: &Process, s: &mut String) {
 
 fn status(p: &Process, s: &mut String) {
     let (size, rss) = mem_pages(p);
-    let blocked = p.threads.get(&p.current).map_or(0, |t| t.sigmask);
+    let (blocked, pending) = p.threads.get(&p.current).map_or((0, 0), |t| (t.sigmask, t.pending.mask));
     let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
     let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
     let (u, g) = (p.uid, p.gid);
@@ -207,7 +209,7 @@ fn status(p: &Process, s: &mut String) {
         "Name:\t{}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{PID}\nNgid:\t0\nPid:\t{PID}\nPPid:\t0\n\
          TracerPid:\t0\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nFDSize:\t{}\nGroups:\t{g}\n\
          VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/0\n\
-         SigPnd:\t0000000000000000\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
+         SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
          SigCgt:\t{caught:016x}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
          CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\n\
          NoNewPrivs:\t1\nSeccomp:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
@@ -218,7 +220,7 @@ fn status(p: &Process, s: &mut String) {
         size * 4,
         rss * 4,
         p.threads.len(),
-        p.sigpending,
+        p.shared_pending.mask,
     );
 }
 

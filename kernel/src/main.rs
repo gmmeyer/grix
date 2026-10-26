@@ -23,6 +23,7 @@ mod process;
 mod procfs;
 mod rng;
 mod sched;
+mod signal;
 mod syscall;
 mod time;
 mod uaccess;

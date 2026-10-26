@@ -25,19 +25,24 @@ shows progress).
 
 ## Signals
 
-- [ ] Deliver signals to handlers: build an `rt_sigframe` (siginfo +
+- [x] Deliver signals to handlers: build an `rt_sigframe` (siginfo +
       ucontext with FP/SIMD state) on the user stack, then `rt_sigreturn`.
       Go programs die with signal 23 (the runtime preempts goroutines with
       SIGURG). Python `signal.signal` and Node `process.on('SIGUSR1')` die
       with the signal.
-- [ ] `SA_SIGINFO`, `SA_ONSTACK` + `sigaltstack`, `SA_NODEFER`, `SA_RESETHAND`.
-- [ ] Interrupt blocking syscalls: `EINTR`, or restart with `SA_RESTART`.
-- [ ] Per-thread pending signals, `tgkill` aimed at a specific thread,
+- [x] `SA_SIGINFO`, `SA_ONSTACK` + `sigaltstack`, `SA_NODEFER`, `SA_RESETHAND`.
+- [x] Interrupt blocking syscalls: `EINTR`, or restart with `SA_RESTART`.
+- [x] Per-thread pending signals, `tgkill` aimed at a specific thread,
       process signals delivered to any thread that doesn't block them.
-- [ ] Faults (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) delivered to handlers.
+- [x] Faults (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) delivered to handlers.
       Needed by the JVM, Go (nil checks become panics), and crash reporters.
-- [ ] `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd4`.
+- [~] `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd4`.
+      The first two work, and so do `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks. `signalfd4` is still missing.
 - [ ] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
+- [ ] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT). They are ignored today:
+      there is no job control or host to report the stop to.
+- [ ] Restarted `nanosleep`-style calls without a handler (Linux's
+      `restart_syscall`). This only matters once stop signals exist.
 
 ## Timers and clocks
 

@@ -85,10 +85,62 @@ hardware virtualization (HVF) and under emulation (TCG).
 7. **No processes:** fork/exec/wait. This blocks subprocess, child_process
    and shell pipelines.
 
+## Session 2 (2026-10-26): signal delivery
+
+Signals now reach handlers, the way Linux arm64 delivers them
+(`kernel/src/signal.rs`, syscalls in `kernel/src/syscall/signal.rs`):
+
+- **Frames**: the same `rt_sigframe` layout as Linux (siginfo, ucontext,
+  sigcontext, FP/SIMD record, ESR record for faults).
+- **`rt_sigreturn`** validates the frame. It rejects any pstate that isn't
+  EL0 and keeps only NZCV (AGENTS.md invariant 10).
+- **`[sigpage]`**: a trampoline page that handlers return to unless they set
+  `SA_RESTORER`. Go and glibc on arm64 rely on it, since they normally use
+  the vDSO's trampoline.
+- **Per-thread state**: masks, pending queues and sigaltstacks. Real-time
+  signals queue every instance; `kill` goes to the main thread first, as on
+  Linux.
+- **Flags**: `SA_SIGINFO`/`ONSTACK`/`RESTART`/`NODEFER`/`RESETHAND`, and
+  `SS_AUTODISARM` for sigaltstack.
+- **Blocked syscalls** fail with EINTR, or restart after an `SA_RESTART`
+  handler if the call is restartable. The decision is made when the handler
+  is delivered. An interrupted `nanosleep` reports the time left.
+- **Waiting for signals**: `rt_sigsuspend`, `rt_sigtimedwait`,
+  `rt_(tg)sigqueueinfo`, and the sigmask arguments of
+  `ppoll`/`pselect6`/`epoll_pwait(2)`.
+- **Faults** (SIGSEGV/SIGBUS/SIGILL/SIGTRAP/SIGFPE) go to handlers, with
+  `si_code` and `si_addr` set.
+
+Tests:
+- New fixtures:
+  - `fixtures/src/signals.c`, which covers every feature above.
+  - `fixtures/go/signals`, built with the host Go toolchain: goroutine
+    preemption, nil dereference panics, `os/signal`.
+  - `fault sigreturn`, a forged frame asking for EL1.
+- New runtime tests:
+  - Python: handlers, PEP 475 sleep, `signal.pause`, KeyboardInterrupt,
+    `sigwait`.
+  - Node: `process.on('SIGUSR2')`.
+- 43 tests pass under both HVF and TCG. The stress loop
+  (`threads`/`events`/`signals`/`gosignals`, 30× each on both
+  accelerators) had no failures.
+- An independent review found two scheduling bugs, fixed with regression
+  tests:
+  - A signal racing an I/O wakeup didn't interrupt the syscall.
+  - `kill` went to the sender instead of the main thread.
+
+Next, in TODO.md order: the writable tmpfs (`fs_write`); then timers
+(`alarm`/`setitimer`/`timerfd`/POSIX timers, which now just need to call
+`signal::send`), signals from the host, and `signalfd4`; then stdin,
+netlink, networking, and fork/exec.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
-  `/bin/cp -f`, `/bin/rm`, `/usr/bin/make`.
+  `/bin/cp -f`, `/bin/rm`, `/usr/bin/make`. `rm` prompts and hangs a
+  non-interactive command. `cargo` lives in `~/.cargo/bin`, which isn't on
+  the PATH that `make` sees: `export PATH="$HOME/.cargo/bin:$PATH"`.
+- `make fixtures` now also needs Go (cross-compiles `fixtures/go/*`).
 - `make test` builds the kernel and fixtures (it downloads the Alpine
   runtimes, cached in `~/.cache/grix/alpine`) and runs everything.
 - When touching boot, MMU, timer or scheduler code, run the suite under

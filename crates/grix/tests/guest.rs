@@ -135,6 +135,14 @@ fn faults_become_signals() {
         assert_eq!(out.status, ExitStatus::Signaled(sig), "{arg}");
         assert!(matches!(out.events.last(), Some(GuestEvent::Fault { signal, .. }) if *signal == sig as u32));
     }
+    // A signal frame asking to return to a privileged mode is rejected.
+    let out = run(with("fault"), &["/bin/fault", "sigreturn"]);
+    assert_eq!(out.status, ExitStatus::Signaled(11));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Fault { signal: 11, detail, .. }] if detail.contains("rt_sigreturn")),
+        "{:?}",
+        out.events
+    );
 }
 
 #[test]
@@ -279,6 +287,25 @@ fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);
     assert_eq!(out.status, ExitStatus::Signaled(13));
     assert_eq!(out.stdout_str(), "");
+}
+
+// ---------------------------------------------------------------- signals
+
+#[test]
+fn signal_handlers() {
+    let out = run(with("signals").allow(Capability::Threads), &["/bin/signals"]);
+    assert_eq!(out.stdout_str(), "signals ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn go_runtime_signals() {
+    // Async preemption (SIGURG), nil dereference panics (SIGSEGV), os/signal.
+    let out = run(with("gosignals").allow(Capability::Threads), &["/bin/gosignals"]);
+    assert_eq!(out.stdout_str(), "go signals ok true\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 // ---------------------------------------------------------------- Linux surface

@@ -1,9 +1,9 @@
-//! Time, identity, limits, signals, futex and the remaining small syscalls.
+//! Time, identity, limits and the remaining small syscalls.
 
 use super::table::nr;
 use crate::errno::*;
 use crate::mm::frame;
-use crate::process::{self, PID, Process, SigAction};
+use crate::process::{PID, Process};
 use crate::uaccess::*;
 use crate::{rng, time};
 
@@ -125,31 +125,6 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         // glibc probes rseq and libuv probes io_uring; both cope with ENOSYS.
         nr::rseq | nr::io_uring_setup => Err(ENOSYS),
 
-        // signals
-        nr::rt_sigaction => rt_sigaction(p, a[0], a[1], a[2], a[3]),
-        nr::rt_sigprocmask => rt_sigprocmask(p, a[0], a[1], a[2], a[3]),
-        nr::rt_sigpending => write_u64(&mut p.aspace, a[0], p.sigpending).map(|_| 0),
-        nr::sigaltstack => {
-            if a[1] != 0 {
-                let [sp, flags, size] = p.altstack;
-                let mut b = [0u8; 24];
-                b[..8].copy_from_slice(&sp.to_le_bytes());
-                b[8..12].copy_from_slice(&(flags as u32).to_le_bytes());
-                b[16..].copy_from_slice(&size.to_le_bytes());
-                copy_out(&mut p.aspace, a[1], &b)?;
-            }
-            if a[0] != 0 {
-                let sp = read_u64(&mut p.aspace, a[0])?;
-                let flags = read_u32(&mut p.aspace, a[0] + 8)? as u64;
-                let size = read_u64(&mut p.aspace, a[0] + 16)?;
-                p.altstack = [sp, flags, size];
-            }
-            Ok(0)
-        }
-        nr::kill => send_signal(p, a[0] == PID || a[0] == 0 || a[0] as i64 == -1, a[1]),
-        nr::tkill => send_signal(p, p.threads.contains_key(&(a[0] as u32)), a[1]),
-        nr::tgkill => send_signal(p, a[0] == PID && p.threads.contains_key(&(a[1] as u32)), a[2]),
-
         _ => p.unimplemented(n, name, "", ENOSYS),
     }
 }
@@ -262,110 +237,4 @@ fn prlimit(p: &mut Process, pid: u64, res: u64, new: u64, old: u64) -> SysResult
         p.rlimits[i] = (cur, max);
     }
     Ok(0)
-}
-
-// ---------------------------------------------------------------- signals
-
-const SIG_DFL: u64 = 0;
-const SIG_IGN: u64 = 1;
-const SIGKILL: u64 = 9;
-const SIGSTOP: u64 = 19;
-/// Signals whose default action is to do nothing (CHLD, CONT, STOP, TSTP, TTIN, TTOU, URG, WINCH).
-const DEFAULT_IGNORED: u64 = 1 << 17 | 1 << 18 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 22 | 1 << 23 | 1 << 28;
-
-fn bit(sig: u64) -> u64 {
-    1 << (sig - 1)
-}
-
-fn rt_sigaction(p: &mut Process, sig: u64, act: u64, oact: u64, size: u64) -> SysResult {
-    if size != 8 || !(1..=64).contains(&sig) {
-        return Err(EINVAL);
-    }
-    if oact != 0 {
-        let o = p.sigactions[sig as usize];
-        let mut b = [0u8; 32];
-        for (i, v) in [o.handler, o.flags, o.restorer, o.mask].iter().enumerate() {
-            b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        copy_out(&mut p.aspace, oact, &b)?;
-    }
-    if act != 0 {
-        if sig == SIGKILL || sig == SIGSTOP {
-            return Err(EINVAL);
-        }
-        let mut b = [0u8; 32];
-        copy_in(&mut p.aspace, act, &mut b)?;
-        let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-        p.sigactions[sig as usize] = SigAction { handler: w(0), flags: w(1), restorer: w(2), mask: w(3) };
-    }
-    Ok(0)
-}
-
-fn rt_sigprocmask(p: &mut Process, how: u64, set: u64, oset: u64, size: u64) -> SysResult {
-    if size != 8 {
-        return Err(EINVAL);
-    }
-    let mask = p.cur().sigmask;
-    if oset != 0 {
-        write_u64(&mut p.aspace, oset, mask)?;
-    }
-    if set != 0 {
-        let s = read_u64(&mut p.aspace, set)? & !(bit(SIGKILL) | bit(SIGSTOP));
-        let mask = match how {
-            0 => mask | s,
-            1 => mask & !s,
-            2 => s,
-            _ => return Err(EINVAL),
-        };
-        p.cur().sigmask = mask;
-        let deliverable = p.sigpending & !mask;
-        if deliverable != 0 {
-            let sig = deliverable.trailing_zeros() as u64 + 1;
-            p.sigpending &= !bit(sig);
-            return deliver(p, sig, SENT_BY_PROGRAM);
-        }
-    }
-    Ok(0)
-}
-
-/// Signals are process-wide for now; `target_exists` says whether the pid/tid named one of ours.
-fn send_signal(p: &mut Process, target_exists: bool, sig: u64) -> SysResult {
-    if !target_exists {
-        return Err(ESRCH);
-    }
-    if sig > 64 {
-        return Err(EINVAL);
-    }
-    if sig == 0 {
-        return Ok(0);
-    }
-    if p.cur().sigmask & bit(sig) != 0 {
-        p.sigpending |= bit(sig);
-        return Ok(0);
-    }
-    deliver(p, sig, SENT_BY_PROGRAM)
-}
-
-/// The kernel raises a signal at the calling thread (e.g. SIGPIPE).
-pub(super) fn signal_self(p: &mut Process, sig: u64, why: &str) -> SysResult {
-    if p.cur().sigmask & bit(sig) != 0 {
-        p.sigpending |= bit(sig);
-        return Ok(0);
-    }
-    deliver(p, sig, why)
-}
-
-const SENT_BY_PROGRAM: &str = "signal sent by the program itself";
-
-fn deliver(p: &mut Process, sig: u64, why: &str) -> SysResult {
-    let handler = p.sigactions[sig as usize].handler;
-    match handler {
-        SIG_IGN if sig != SIGKILL => Ok(0),
-        SIG_DFL if DEFAULT_IGNORED & bit(sig) != 0 => Ok(0),
-        SIG_DFL | SIG_IGN => process::exit_signaled(sig as u32, 0, 0, why),
-        _ => {
-            let _ = p.unimplemented(nr::rt_sigaction, "rt_sigaction", "delivering signals to handlers", ENOSYS);
-            process::exit_signaled(sig as u32, 0, 0, "signal handlers are not supported yet")
-        }
-    }
 }

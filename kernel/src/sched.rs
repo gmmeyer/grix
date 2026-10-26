@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::console;
-use crate::process::{PROCESS, Process, Signal, WaitOn};
+use crate::process::{PROCESS, Process, WaitOn};
+use crate::signal::SIGKILL;
 use crate::time;
 use grix_abi::wire::Event;
 
@@ -88,12 +89,14 @@ fn deadlock(p: &Process) -> ! {
     let count = |on: fn(WaitOn) -> bool| p.threads.values().filter(|t| t.wait.is_some_and(|w| on(w.on))).count();
     let futex = count(|on| matches!(on, WaitOn::Futex(_)));
     let io = count(|on| on == WaitOn::Io);
+    let sig = count(|on| matches!(on, WaitOn::Signal | WaitOn::SigWait(_)));
     let n = p.threads.len();
     let detail = alloc::format!(
-        "deadlock: all {n} thread(s) are blocked and nothing can wake them ({futex} on futexes, {io} on I/O)"
+        "deadlock: all {n} thread(s) are blocked and nothing can wake them \
+         ({futex} on futexes, {io} on I/O, {sig} waiting for signals)"
     );
-    console::event(&Event::Fault { signal: Signal::Sigkill as u32, addr: 0, pc: 0, detail: &detail });
-    console::exit(grix_abi::wire::ExitKind::Signaled, Signal::Sigkill as i32)
+    console::event(&Event::Fault { signal: SIGKILL, addr: 0, pc: 0, detail: &detail });
+    console::exit(grix_abi::wire::ExitKind::Signaled, SIGKILL as i32)
 }
 
 /// Program the timer for the next thing that needs the CPU's attention: the

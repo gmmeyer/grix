@@ -4,6 +4,7 @@ mod file;
 mod mem;
 mod misc;
 mod net;
+mod signal;
 pub mod table;
 mod thread;
 
@@ -24,23 +25,27 @@ pub fn handle(tf: &mut TrapFrame) {
         Ok(n) => dispatch(p, tf, n, a),
         Err(_) => p.unimplemented(u32::MAX, "unknown", "", ENOSYS),
     };
-    match result {
+    if result == Err(EBLOCKED) && !crate::signal::interrupt_self(p, tf) {
         // The thread blocked or exited: its return value is set when it wakes.
         // (schedule() saves its registers before waking any I/O waiters.)
-        Err(EBLOCKED) => sched::schedule(p, tf),
-        r => {
-            p.cur().restart_deadline = None;
-            tf.x[0] = match r {
-                Ok(v) => v,
-                Err(e) => (-(e.0 as i64)) as u64,
-            };
-            p.wake_io_waiters();
-            if p.resched {
-                sched::schedule(p, tf);
-            } else {
-                sched::update_timer(p);
-            }
-        }
+        sched::schedule(p, tf);
+        return;
+    }
+    // (If it was about to block for a deliverable signal, interrupt_self
+    // already set x0 or rewound to the svc.)
+    if result != Err(EBLOCKED) {
+        p.cur().restart_deadline = None;
+        tf.x[0] = match result {
+            Ok(v) => v,
+            Err(e) => (-(e.0 as i64)) as u64,
+        };
+        crate::signal::syscall_done(p, result == Err(EINTR));
+    }
+    p.wake_io_waiters();
+    if p.resched {
+        sched::schedule(p, tf);
+    } else {
+        sched::update_timer(p);
     }
 }
 
@@ -53,7 +58,7 @@ pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) ->
     p.deny(n, name, cap.name(), detail).map(|_| ())
 }
 
-fn dispatch(p: &mut Process, tf: &TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
+fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
     let (name, gate) = table::info(n);
     match gate {
         Gate::Core => {}
@@ -90,14 +95,26 @@ fn dispatch(p: &mut Process, tf: &TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
         nr::dup3 => file::dup3(p, a[0], a[1], a[2]),
         nr::fcntl => file::fcntl(p, a[0], a[1], a[2]),
         nr::ioctl => file::ioctl(p, a[0], a[1], a[2]),
-        nr::ppoll => file::ppoll(p, a[0], a[1], a[2]),
-        nr::pselect6 => file::pselect6(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::ppoll => {
+            signal::wait_mask(p, a[3], a[4])?;
+            file::ppoll(p, a[0], a[1], a[2])
+        }
+        nr::pselect6 => {
+            signal::pselect_mask(p, a[5])?;
+            file::pselect6(p, a[0], a[1], a[2], a[3], a[4])
+        }
         nr::pipe2 => file::pipe2(p, a[0], a[1]),
         nr::eventfd2 => file::eventfd2(p, a[0], a[1]),
         nr::epoll_create1 => file::epoll_create1(p, a[0]),
         nr::epoll_ctl => file::epoll_ctl(p, a[0], a[1], a[2], a[3]),
-        nr::epoll_pwait => file::epoll_wait(p, a[0], a[1], a[2], file::ms_timeout(a[3])),
-        nr::epoll_pwait2 => file::epoll_pwait2(p, a[0], a[1], a[2], a[3]),
+        nr::epoll_pwait => {
+            signal::wait_mask(p, a[4], a[5])?;
+            file::epoll_wait(p, a[0], a[1], a[2], file::ms_timeout(a[3]))
+        }
+        nr::epoll_pwait2 => {
+            signal::wait_mask(p, a[4], a[5])?;
+            file::epoll_pwait2(p, a[0], a[1], a[2], a[3])
+        }
         nr::close_range => file::close_range(p, a[0], a[1], a[2]),
         nr::statfs => file::statfs(p, a[0], a[1]),
         nr::fstatfs => file::fstatfs(p, a[0], a[1]),
@@ -146,6 +163,20 @@ fn dispatch(p: &mut Process, tf: &TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
         nr::sched_yield => thread::sched_yield(p),
         nr::nanosleep => thread::nanosleep(p, a[0]),
         nr::clock_nanosleep => thread::clock_nanosleep(p, a[0], a[1], a[2]),
+
+        // signals
+        nr::rt_sigaction => signal::rt_sigaction(p, a[0], a[1], a[2], a[3]),
+        nr::rt_sigprocmask => signal::rt_sigprocmask(p, a[0], a[1], a[2], a[3]),
+        nr::rt_sigpending => signal::rt_sigpending(p, a[0], a[1]),
+        nr::rt_sigsuspend => signal::rt_sigsuspend(p, a[0], a[1]),
+        nr::rt_sigtimedwait => signal::rt_sigtimedwait(p, a[0], a[1], a[2], a[3]),
+        nr::rt_sigqueueinfo => signal::rt_sigqueueinfo(p, a[0], None, a[1], a[2]),
+        nr::rt_tgsigqueueinfo => signal::rt_sigqueueinfo(p, a[0], Some(a[1]), a[2], a[3]),
+        nr::rt_sigreturn => crate::signal::sigreturn(p, tf),
+        nr::sigaltstack => signal::sigaltstack(p, tf.sp_el0, a[0], a[1]),
+        nr::kill => signal::kill(p, a[0], a[1]),
+        nr::tkill => signal::tgkill(p, None, a[0], a[1]),
+        nr::tgkill => signal::tgkill(p, Some(a[0]), a[1], a[2]),
 
         // everything else
         _ => misc::dispatch(p, n, name, a),

@@ -143,6 +143,7 @@ syscalls! {
     135 rt_sigprocmask Core;
     136 rt_sigpending Core;
     137 rt_sigtimedwait Core;
+    138 rt_sigqueueinfo Core;
     139 rt_sigreturn Core;
     140 setpriority Core;
     141 getpriority Core;
@@ -216,6 +217,7 @@ syscalls! {
     231 munlockall Core;
     232 mincore Core;
     233 madvise Core;
+    240 rt_tgsigqueueinfo Core;
     241 perf_event_open Privileged;
     242 accept4 Cap(Net);
     243 recvmmsg Cap(Net);

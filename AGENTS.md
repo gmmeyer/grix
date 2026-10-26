@@ -8,7 +8,7 @@ what the project is and how to use it, see [README.md](README.md).
 ```sh
 make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 make host        # host CLI      -> target/release/grix
-make fixtures    # C test programs (zig) + Alpine busybox, python3, nodejs (network, cached)
+make fixtures    # C (zig) and Go test programs + Alpine busybox, python3, nodejs (network, cached)
 make test        # everything; end-to-end tests boot the kernel in QEMU
 make check       # clippy for host and kernel
 ```
@@ -25,7 +25,8 @@ make check       # clippy for host and kernel
   with `GRIX_ACCEL=tcg` when touching boot, MMU, cache, page-table, timer or
   scheduler code. Emulation and real hardware catch different mistakes, and
   timing-dependent bugs show up differently on each. Concurrency changes
-  deserve a stress loop (run the `threads`/`events` fixtures 30× each).
+  deserve a stress loop (run the `threads`/`events`/`signals`/`gosignals`
+  fixtures 30× each).
 - Debugging a guest: `grix run -v ...` prints the kernel log, and `--json`
   shows status, output and events together. A kernel panic message ends up in
   `RunOutput::kernel_log`.
@@ -50,6 +51,20 @@ returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when
 `ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
+
+Signals (`signal.rs`): actions are per process; masks, pending queues and
+sigaltstacks are per thread. `kill` picks a receiver like Linux (the main
+thread first, then any thread that doesn't block the signal) and queues it
+there. If every thread blocks it, it waits on the process. Delivery happens
+on every return to EL0 (`signal::return_to_user`, called from
+`trap_handler`): the kernel pushes a Linux-layout `rt_sigframe` (with the
+FP/SIMD record) and points the thread at the handler. Handlers return
+through the `[sigpage]` trampoline unless they set `SA_RESTORER`, as Go and
+glibc on arm64 don't. `signal::send` rewinds a blocked receiver to its `svc`
+and sets `Thread::restarting`. I/O wakeups do the same. When a handler is
+then delivered, the call fails with EINTR unless the handler has
+`SA_RESTART` and the call is restartable. With no handler it simply re-runs,
+keeping its deadline (`restart_deadline`).
 
 ## Invariants: don't break these
 
@@ -86,6 +101,11 @@ from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
+10. **User register state never reaches EL1.** `rt_sigreturn` loads every
+    register from user memory. It must reject a frame whose pstate names
+    another exception level, AArch32 or masked interrupts, and keep only
+    NZCV (`signal::read_frame`). Anything else that loads a user-supplied
+    context needs the same check.
 
 ## Adding a syscall
 
@@ -94,8 +114,8 @@ from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
    flags (e.g. `O_DIRECTORY = 0o40000` on arm64) all differ.
 2. Add or adjust its entry in `table.rs` (with the right gate) and implement it
    in `syscall/file.rs`, `mem.rs` or `misc.rs`. Return `Err(errno)` like Linux.
-3. Add a C fixture in `fixtures/src/` (built automatically by
-   `fixtures/build.sh`) or use busybox, plus an end-to-end test in
+3. Add a C fixture in `fixtures/src/` or a Go one in `fixtures/go/<name>/`
+   (built automatically by `fixtures/build.sh`) or use busybox, plus an end-to-end test in
    `crates/grix/tests/guest.rs` that checks the program's output, its
    exit status, **and** `events`.
 4. Run `make test`, plus `GRIX_ACCEL=hvf cargo test -p grix --test guest` on Apple Silicon.

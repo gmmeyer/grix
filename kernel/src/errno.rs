@@ -8,6 +8,7 @@ pub type SysResult = Result<u64, Errno>;
 pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
 pub const ESRCH: Errno = Errno(3);
+pub const EINTR: Errno = Errno(4);
 pub const EBADF: Errno = Errno(9);
 pub const EAGAIN: Errno = Errno(11);
 pub const ENOMEM: Errno = Errno(12);

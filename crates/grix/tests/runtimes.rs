@@ -116,6 +116,55 @@ fn node() {
     assert_no_surprises(&out);
 }
 
+const PYTHON_SIGNALS: &str = r#"
+import os, signal, threading, time
+got = []
+signal.signal(signal.SIGUSR1, lambda sig, frame: got.append(sig))
+os.kill(os.getpid(), signal.SIGUSR1)
+print("handler", got)
+# A signal interrupts the main thread's sleep; Python runs the handler and
+# sleeps for the rest of the time (PEP 475).
+main = threading.main_thread().ident
+threading.Timer(0.05, signal.pthread_kill, (main, signal.SIGUSR1)).start()
+t0 = time.monotonic()
+time.sleep(0.2)
+print("sleep", time.monotonic() - t0 >= 0.2, len(got))
+# os.kill from another thread interrupts the main thread's pause().
+threading.Timer(0.05, os.kill, (os.getpid(), signal.SIGUSR1)).start()
+signal.pause()
+print("pause", len(got))
+try:
+    os.kill(os.getpid(), signal.SIGINT)
+    time.sleep(1)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt")
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+os.kill(os.getpid(), signal.SIGUSR2)
+print("sigwait", int(signal.sigwait({signal.SIGUSR2})))
+"#;
+
+#[test]
+fn python_signals() {
+    let b = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").file("/data/test.py", PYTHON_SIGNALS, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/python3", "/data/test.py"]);
+    assert_eq!(out.stdout_str(), "handler [10]\nsleep True 2\npause 3\nKeyboardInterrupt\nsigwait 12\n");
+    assert_no_surprises(&out);
+}
+
+const NODE_SIGNALS: &str = r#"
+const timeout = setTimeout(() => { console.log('no signal'); process.exit(1); }, 5000);
+process.on('SIGUSR2', (name) => { console.log('got', name); clearTimeout(timeout); });
+process.kill(process.pid, 'SIGUSR2');
+"#;
+
+#[test]
+fn node_signals() {
+    let b = sandbox("node").file("/data/test.js", NODE_SIGNALS, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/node", "/data/test.js"]);
+    assert_eq!(out.stdout_str(), "got SIGUSR2\n");
+    assert_no_surprises(&out);
+}
+
 #[test]
 fn node_needs_threads() {
     let b = Sandbox::builder().timeout(Duration::from_secs(120)).memory_mb(1024).import(runtime("node"), "/").unwrap();
