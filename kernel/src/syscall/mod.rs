@@ -4,12 +4,14 @@ mod file;
 mod mem;
 mod misc;
 pub mod table;
+mod thread;
 
 use grix_abi::policy::Capability;
 
 use crate::arch::TrapFrame;
 use crate::errno::*;
 use crate::process::{PROCESS, Process};
+use crate::sched;
 use table::{Gate, nr};
 
 pub fn handle(tf: &mut TrapFrame) {
@@ -18,13 +20,27 @@ pub fn handle(tf: &mut TrapFrame) {
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("syscall without a process");
     let result = match u32::try_from(n) {
-        Ok(n) => dispatch(p, n, a),
+        Ok(n) => dispatch(p, tf, n, a),
         Err(_) => p.unimplemented(u32::MAX, "unknown", "", ENOSYS),
     };
-    tf.x[0] = match result {
-        Ok(v) => v,
-        Err(e) => (-(e.0 as i64)) as u64,
-    };
+    match result {
+        // The thread blocked or exited: its return value is set when it wakes.
+        // (schedule() saves its registers before waking any I/O waiters.)
+        Err(EBLOCKED) => sched::schedule(p, tf),
+        r => {
+            p.cur().restart_deadline = None;
+            tf.x[0] = match r {
+                Ok(v) => v,
+                Err(e) => (-(e.0 as i64)) as u64,
+            };
+            p.wake_io_waiters();
+            if p.resched {
+                sched::schedule(p, tf);
+            } else {
+                sched::update_timer(p);
+            }
+        }
+    }
 }
 
 /// Check a capability needed for a specific use of a syscall (e.g. clone flags).
@@ -36,7 +52,7 @@ pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) ->
     p.deny(n, name, cap.name(), detail).map(|_| ())
 }
 
-fn dispatch(p: &mut Process, n: u32, a: [u64; 6]) -> SysResult {
+fn dispatch(p: &mut Process, tf: &TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
     let (name, gate) = table::info(n);
     match gate {
         Gate::Core => {}
@@ -74,6 +90,13 @@ fn dispatch(p: &mut Process, n: u32, a: [u64; 6]) -> SysResult {
         nr::fcntl => file::fcntl(p, a[0], a[1], a[2]),
         nr::ioctl => file::ioctl(p, a[0], a[1], a[2]),
         nr::ppoll => file::ppoll(p, a[0], a[1], a[2]),
+        nr::pselect6 => file::pselect6(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::pipe2 => file::pipe2(p, a[0], a[1]),
+        nr::eventfd2 => file::eventfd2(p, a[0], a[1]),
+        nr::epoll_create1 => file::epoll_create1(p, a[0]),
+        nr::epoll_ctl => file::epoll_ctl(p, a[0], a[1], a[2], a[3]),
+        nr::epoll_pwait => file::epoll_wait(p, a[0], a[1], a[2], file::ms_timeout(a[3])),
+        nr::epoll_pwait2 => file::epoll_pwait2(p, a[0], a[1], a[2], a[3]),
         nr::close_range => file::close_range(p, a[0], a[1], a[2]),
         nr::fsync | nr::fdatasync => p.fds.get(a[0]).map(|_| 0),
         nr::sync => Ok(0),
@@ -89,15 +112,23 @@ fn dispatch(p: &mut Process, n: u32, a: [u64; 6]) -> SysResult {
         nr::madvise => mem::madvise(p, a[0], a[1], a[2]),
         nr::msync | nr::mlock | nr::munlock | nr::mlock2 | nr::mlockall | nr::munlockall => Ok(0),
 
-        // processes and threads (not implemented yet, but gated)
-        nr::clone => misc::clone(p, n, a[0]),
-        nr::clone3 => {
-            let flags = crate::uaccess::read_u64(&mut p.aspace, a[0])?;
-            misc::clone(p, n, flags)
+        // threads (processes are gated in clone, not implemented yet)
+        nr::clone => thread::clone(p, tf, a),
+        nr::clone3 => thread::clone3(p, tf, a[0], a[1]),
+        nr::exit => thread::exit_thread(p, (a[0] & 0xff) as i32),
+        nr::exit_group => crate::process::exit((a[0] & 0xff) as i32),
+        nr::futex => thread::futex(p, a),
+        nr::set_tid_address => thread::set_tid_address(p, a[0]),
+        nr::set_robust_list => {
+            p.cur().robust_list = a[0];
+            Ok(0)
         }
+        nr::gettid => Ok(p.current as u64),
+        nr::sched_yield => thread::sched_yield(p),
+        nr::nanosleep => thread::nanosleep(p, a[0]),
+        nr::clock_nanosleep => thread::clock_nanosleep(p, a[0], a[1], a[2]),
 
         // everything else
-        nr::exit | nr::exit_group => crate::process::exit((a[0] & 0xff) as i32),
         _ => misc::dispatch(p, n, name, a),
     }
 }

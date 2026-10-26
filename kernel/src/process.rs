@@ -1,7 +1,7 @@
-//! The single process this kernel runs: exec, faults, termination, and
-//! reporting of denied/unimplemented operations.
+//! The single process this kernel runs: its threads, exec, faults,
+//! termination, and reporting of denied/unimplemented operations.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use grix_abi::image::Image;
@@ -9,7 +9,7 @@ use grix_abi::policy::{DenyAction, Policy};
 use grix_abi::wire::{Event, ExitKind};
 use spin::Mutex;
 
-use crate::arch::{self, TrapFrame};
+use crate::arch::{self, FpState, TrapFrame};
 use crate::console::{self, klog};
 use crate::elf;
 use crate::errno::*;
@@ -22,6 +22,8 @@ use crate::rng;
 use crate::uaccess::copy_out;
 
 pub const PID: u64 = 1;
+/// Linux defaults to a much higher limit; this bounds kernel memory per sandbox.
+pub const MAX_THREADS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -43,6 +45,60 @@ pub struct SigAction {
     pub mask: u64,
 }
 
+/// What a blocked thread is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOn {
+    /// A futex word (user virtual address).
+    Futex(u64),
+    /// Only the deadline (nanosleep, poll timeouts).
+    Sleep,
+    /// I/O readiness (pipes, eventfds, epoll). The syscall is restarted from
+    /// scratch whenever I/O state changes anywhere.
+    Io,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Wait {
+    pub on: WaitOn,
+    /// Monotonic ns.
+    pub deadline: Option<u64>,
+    /// x0 to return if the deadline passes.
+    pub timeout_ret: u64,
+}
+
+pub struct Thread {
+    pub tid: u32,
+    /// User registers, valid while the thread is not running.
+    pub regs: TrapFrame,
+    pub tpidr: u64,
+    pub fp: FpState,
+    /// `Some` while blocked.
+    pub wait: Option<Wait>,
+    /// set_tid_address / CLONE_CHILD_CLEARTID: zeroed and futex-woken on exit.
+    pub clear_child_tid: u64,
+    pub sigmask: u64,
+    pub robust_list: u64,
+    /// Absolute deadline of a blocking I/O call, kept across restarts so a
+    /// restarted call doesn't start its relative timeout over.
+    pub restart_deadline: Option<u64>,
+}
+
+impl Thread {
+    pub fn new(tid: u32) -> Self {
+        Thread {
+            tid,
+            regs: TrapFrame::default(),
+            tpidr: 0,
+            fp: FpState::default(),
+            wait: None,
+            clear_child_tid: 0,
+            sigmask: 0,
+            robust_list: 0,
+            restart_deadline: None,
+        }
+    }
+}
+
 pub struct Process {
     pub aspace: AddressSpace,
     pub fds: FdTable,
@@ -52,12 +108,29 @@ pub struct Process {
     pub gid: u32,
     pub umask: u32,
     pub sigactions: [SigAction; 65],
-    pub sigmask: u64,
     pub sigpending: u64,
     pub altstack: [u64; 3],
     pub rlimits: [(u64, u64); 16],
     pub name: [u8; 16],
     reported: BTreeSet<(u8, u32, String)>,
+
+    // Threads and scheduling (see sched.rs).
+    pub threads: BTreeMap<u32, Thread>,
+    /// The running thread. Its live state is in the CPU, not in `threads`.
+    pub current: u32,
+    /// Runnable threads other than `current`, in round-robin order.
+    pub runq: VecDeque<u32>,
+    /// Futex wait queues: address -> (tid, bitset) in FIFO order.
+    pub futexes: BTreeMap<u64, VecDeque<(u32, u32)>>,
+    pub next_tid: u32,
+    /// When the current thread's time slice started (monotonic ns).
+    pub slice_start: u64,
+    /// Switch threads before returning to user space.
+    pub resched: bool,
+    /// The timer needs reprogramming (runnable set or deadlines changed).
+    pub timer_dirty: bool,
+    /// `ipc::generation()` when I/O waiters were last woken.
+    pub io_seen: u64,
 }
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
@@ -80,13 +153,89 @@ impl Process {
             gid,
             umask: 0o022,
             sigactions: [SigAction::default(); 65],
-            sigmask: 0,
             sigpending: 0,
             altstack: [0, 2, 0], // SS_DISABLE
             rlimits,
             name: [0; 16],
             reported: BTreeSet::new(),
+            threads: BTreeMap::from([(PID as u32, Thread::new(PID as u32))]),
+            current: PID as u32,
+            runq: VecDeque::new(),
+            futexes: BTreeMap::new(),
+            next_tid: PID as u32 + 1,
+            slice_start: 0,
+            resched: false,
+            timer_dirty: true,
+            io_seen: 0,
         }
+    }
+
+    pub fn cur(&mut self) -> &mut Thread {
+        self.threads.get_mut(&self.current).expect("current thread missing")
+    }
+
+    /// Block the calling thread. The syscall handler returns the result of
+    /// this (EBLOCKED) and the scheduler runs something else; whoever wakes the
+    /// thread decides its syscall's return value.
+    pub fn block(&mut self, on: WaitOn, deadline: Option<u64>, on_timeout: SysResult) -> SysResult {
+        let timeout_ret = match on_timeout {
+            Ok(v) => v,
+            Err(e) => (-(e.0 as i64)) as u64,
+        };
+        self.cur().wait = Some(Wait { on, deadline, timeout_ret });
+        self.timer_dirty = true;
+        Err(EBLOCKED)
+    }
+
+    /// Deadline for a blocking I/O call with a relative timeout (`None` = forever),
+    /// reusing the original deadline if this is a restarted call.
+    pub fn io_deadline(&mut self, timeout_ns: Option<u64>) -> Option<u64> {
+        let restarted = self.cur().restart_deadline.take();
+        restarted.or_else(|| timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns)))
+    }
+
+    /// Block until I/O state changes (then the syscall reruns) or the deadline passes.
+    pub fn block_io(&mut self, deadline: Option<u64>, on_timeout: SysResult) -> SysResult {
+        self.cur().restart_deadline = deadline;
+        self.block(WaitOn::Io, deadline, on_timeout)
+    }
+
+    /// If any I/O state changed, restart every thread blocked on I/O.
+    pub fn wake_io_waiters(&mut self) {
+        let version = crate::ipc::generation();
+        if version == self.io_seen {
+            return;
+        }
+        self.io_seen = version;
+        let waiting: Vec<u32> =
+            self.threads.values().filter(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io)).map(|t| t.tid).collect();
+        for tid in waiting {
+            let t = self.threads.get_mut(&tid).unwrap();
+            t.wait = None;
+            // Re-execute the svc: x0..x7 still hold the original arguments.
+            t.regs.elr -= 4;
+            self.runq.push_back(tid);
+            self.timer_dirty = true;
+        }
+    }
+
+    /// Make a blocked thread runnable; its syscall returns `ret` (or its
+    /// timeout value if `None`).
+    pub fn wake(&mut self, tid: u32, ret: Option<u64>) {
+        let Some(t) = self.threads.get_mut(&tid) else { return };
+        let Some(w) = t.wait.take() else { return };
+        t.regs.x[0] = ret.unwrap_or(w.timeout_ret);
+        t.restart_deadline = None;
+        if let WaitOn::Futex(addr) = w.on
+            && let Some(q) = self.futexes.get_mut(&addr)
+        {
+            q.retain(|&(t, _)| t != tid);
+            if q.is_empty() {
+                self.futexes.remove(&addr);
+            }
+        }
+        self.runq.push_back(tid);
+        self.timer_dirty = true;
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {
@@ -169,7 +318,9 @@ pub fn start(img: Image<'static>) -> ! {
     p.aspace.activate();
     match exec(&mut p, &img) {
         Ok((entry, sp)) => {
+            p.slice_start = crate::time::monotonic_ns();
             *PROCESS.lock() = Some(p);
+            arch::irq::init();
             arch::enter_user(entry, sp)
         }
         Err((code, reason)) => {

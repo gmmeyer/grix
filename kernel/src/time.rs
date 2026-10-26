@@ -32,13 +32,14 @@ pub fn realtime_ns() -> u64 {
     clock().boot_time_ns + monotonic_ns()
 }
 
-/// Busy-wait. (No timer interrupts yet.)
-pub fn sleep_until_monotonic(deadline_ns: u64) {
-    while monotonic_ns() < deadline_ns {
-        core::hint::spin_loop();
-    }
+/// The counter value at monotonic time `ns` (for programming the timer).
+pub fn counter_at(ns: u64) -> u64 {
+    let c = clock();
+    let ticks = (ns as u128 * c.freq as u128 / 1_000_000_000).min(u64::MAX as u128) as u64;
+    c.counter0.saturating_add(ticks)
 }
 
-pub fn sleep_ns(ns: u64) {
-    sleep_until_monotonic(monotonic_ns().saturating_add(ns));
+/// Convert an absolute CLOCK_REALTIME time to monotonic time.
+pub fn realtime_to_monotonic(ns: u64) -> u64 {
+    ns.saturating_sub(clock().boot_time_ns)
 }

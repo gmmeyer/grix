@@ -84,7 +84,7 @@ pub(crate) fn run(
     // Under emulation use QEMU's richest CPU model; with hardware virtualization, the host CPU.
     let cpu = if cfg.accel == "tcg" { "max,pauth-impdef=on" } else { "host" };
     let mut cmd = Command::new(&cfg.qemu);
-    cmd.args(["-machine", "virt", "-cpu", cpu, "-smp", "1"])
+    cmd.args(["-machine", "virt,gic-version=3", "-cpu", cpu, "-smp", "1"])
         .args(["-m", &format!("{}M", cfg.memory_mb)])
         .args(["-accel", &cfg.accel])
         .args(["-nodefaults", "-no-user-config", "-display", "none", "-no-reboot"])

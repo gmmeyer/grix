@@ -8,7 +8,6 @@ pub type SysResult = Result<u64, Errno>;
 pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
 pub const ESRCH: Errno = Errno(3);
-pub const EINTR: Errno = Errno(4);
 pub const EBADF: Errno = Errno(9);
 pub const EAGAIN: Errno = Errno(11);
 pub const ENOMEM: Errno = Errno(12);
@@ -23,9 +22,14 @@ pub const EMFILE: Errno = Errno(24);
 pub const ENOTTY: Errno = Errno(25);
 pub const ESPIPE: Errno = Errno(29);
 pub const EROFS: Errno = Errno(30);
+pub const EPIPE: Errno = Errno(32);
 pub const ERANGE: Errno = Errno(34);
 pub const ENAMETOOLONG: Errno = Errno(36);
 pub const ENOSYS: Errno = Errno(38);
 pub const ELOOP: Errno = Errno(40);
 pub const E2BIG: Errno = Errno(7);
 pub const ETIMEDOUT: Errno = Errno(110);
+
+/// Internal: the syscall blocked the calling thread (or it exited); the
+/// scheduler decides what runs next. Never returned to user space.
+pub const EBLOCKED: Errno = Errno(u32::MAX);

@@ -232,3 +232,49 @@ fn shell_running_a_program_needs_process_capability() {
     assert_ne!(out.status, ExitStatus::Exited(0));
     assert_eq!(out.missing_capabilities(), ["process"]);
 }
+
+// ---------------------------------------------------------------- threads
+
+#[test]
+fn threads_need_the_threads_capability() {
+    let out = run(with("spawn"), &["/bin/spawn"]);
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    assert_eq!(out.stdout_str(), "pthread_create: Resource temporarily unavailable\n");
+    assert_eq!(out.missing_capabilities(), ["threads"]);
+}
+
+#[test]
+fn pthreads() {
+    let out = run(with("threads").allow(Capability::Threads), &["/bin/threads"]);
+    assert_eq!(out.stdout_str(), "threads ok counter=160000\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn deadlocks_are_reported_instead_of_hanging() {
+    let out = run(with("deadlock").allow(Capability::Threads), &["/bin/deadlock"]);
+    assert_eq!(out.status, ExitStatus::Signaled(9));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Fault { signal: 9, detail, .. }] if detail.starts_with("deadlock")),
+        "{:?}",
+        out.events
+    );
+}
+
+// ---------------------------------------------------------------- pipes, eventfd, epoll
+
+#[test]
+fn pipes_eventfd_epoll_poll_select() {
+    let out = run(with("events").allow(Capability::Threads), &["/bin/events"]);
+    assert_eq!(out.stdout_str(), "events ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn sigpipe_kills_by_default() {
+    let out = run(with("sigpipe"), &["/bin/sigpipe"]);
+    assert_eq!(out.status, ExitStatus::Signaled(13));
+    assert_eq!(out.stdout_str(), "");
+}

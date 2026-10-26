@@ -8,12 +8,17 @@ use grix_abi::wire::Channel;
 use super::{require, table::nr};
 use crate::console;
 use crate::errno::*;
-use crate::fd::{FdEntry, FileKind, O_ACCMODE, O_RDONLY, O_WRONLY, OpenFile, new_file};
+use crate::fd::{
+    Epoll, FdEntry, FileKind, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile, Registration, new_file,
+};
 use crate::fs::{self, Dev, Ino, Kind, ROOT, S_IFIFO, StatInfo};
+use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF};
 use crate::process::Process;
 use crate::rng;
 use crate::time;
 use crate::uaccess::*;
+use alloc::sync::Arc;
+use spin::Mutex;
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -64,12 +69,14 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         return Ok(fs::get().stat(p.cwd));
     }
     let f = p.fds.get(fd)?;
-    let kind = f.lock().kind;
-    Ok(match kind {
-        FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => {
-            StatInfo { ino: 0x1000_0000 + fd, mode: S_IFIFO | 0o600, nlink: 1, size: 0, rdev: 0 }
-        }
-        FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::get().stat(ino),
+    let f = f.lock();
+    let anon = |ino: u64, mode: u32| StatInfo { ino, mode, nlink: 1, size: 0, rdev: 0 };
+    Ok(match &f.kind {
+        FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600),
+        FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::get().stat(*ino),
+        FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600),
+        // anon_inode files have no type bits on Linux.
+        FileKind::EventFd(_) | FileKind::Epoll(_) => anon(0x2000_0000 + fd, 0o600),
     })
 }
 
@@ -166,9 +173,46 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         return Err(EBADF);
     }
     let count = count.min(MAX_RW);
-    match f.kind {
+    let nonblock = f.nonblocking();
+    match &f.kind {
         FileKind::Stdin => Ok(0),
-        FileKind::Stdout | FileKind::Stderr => Err(EBADF),
+        FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
+        FileKind::Pipe(end) => {
+            if end.write {
+                return Err(EBADF);
+            }
+            let mut pipe = end.pipe.lock();
+            if pipe.buf.is_empty() {
+                if pipe.writers == 0 {
+                    return Ok(0);
+                }
+                drop(pipe);
+                return would_block(p, nonblock);
+            }
+            let n = (count as usize).min(pipe.buf.len());
+            let (a, b) = pipe.buf.as_slices();
+            let first = n.min(a.len());
+            copy_out(&mut p.aspace, buf, &a[..first])?;
+            copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
+            pipe.buf.drain(..n);
+            pipe.touch();
+            Ok(n as u64)
+        }
+        FileKind::EventFd(e) => {
+            if count < 8 {
+                return Err(EINVAL);
+            }
+            let mut ev = e.lock();
+            if ev.count == 0 {
+                drop(ev);
+                return would_block(p, nonblock);
+            }
+            let v = if ev.semaphore { 1 } else { ev.count };
+            copy_out(&mut p.aspace, buf, &v.to_le_bytes())?;
+            ev.count -= v;
+            ev.touch();
+            Ok(8)
+        }
         FileKind::Dev(Dev::Null, _) => Ok(0),
         FileKind::Dev(Dev::Zero, _) => zero_out(&mut p.aspace, buf, count).map(|_| count),
         FileKind::Dev(Dev::Random, _) => {
@@ -182,7 +226,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             }
             Ok(count)
         }
-        FileKind::Node(ino) => match fs::get().node(ino).kind {
+        FileKind::Node(ino) => match fs::get().node(*ino).kind {
             Kind::File(data) => {
                 let off = at.unwrap_or(f.offset);
                 let len = data.len() as u64;
@@ -207,11 +251,57 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
         return Err(EBADF);
     }
     let count = count.min(MAX_RW);
-    let ch = match f.kind {
+    let nonblock = f.nonblocking();
+    let ch = match &f.kind {
         FileKind::Stdout => Channel::Stdout,
         FileKind::Stderr => Channel::Stderr,
         FileKind::Dev(..) => return Ok(count),
-        FileKind::Stdin | FileKind::Node(_) => return Err(EBADF),
+        FileKind::Stdin | FileKind::Node(_) | FileKind::Epoll(_) => return Err(EBADF),
+        FileKind::Pipe(end) => {
+            if !end.write {
+                return Err(EBADF);
+            }
+            if count == 0 {
+                return Ok(0);
+            }
+            let mut pipe = end.pipe.lock();
+            if pipe.readers == 0 {
+                drop(pipe);
+                super::misc::signal_self(p, 13, "SIGPIPE: wrote to a pipe with no readers")?;
+                return Err(EPIPE);
+            }
+            // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
+            let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
+            if pipe.space() < need {
+                drop(pipe);
+                return would_block(p, nonblock);
+            }
+            let n = (count as usize).min(pipe.space());
+            let mut tmp = alloc::vec![0u8; n];
+            copy_in(&mut p.aspace, buf, &mut tmp)?;
+            pipe.buf.extend(tmp);
+            pipe.touch();
+            return Ok(n as u64);
+        }
+        FileKind::EventFd(e) => {
+            if count < 8 {
+                return Err(EINVAL);
+            }
+            let v = read_u64(&mut p.aspace, buf)?;
+            if v == u64::MAX {
+                return Err(EINVAL);
+            }
+            let mut ev = e.lock();
+            if ev.count.checked_add(v).is_none_or(|s| s > EVENTFD_MAX) {
+                drop(ev);
+                return would_block(p, nonblock);
+            }
+            ev.count += v;
+            if v > 0 {
+                ev.touch();
+            }
+            return Ok(8);
+        }
     };
     let mut chunk = [0u8; CHUNK];
     let mut done = 0u64;
@@ -226,6 +316,15 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
     Ok(count)
 }
 
+/// EAGAIN for non-blocking files, otherwise block until I/O state changes.
+fn would_block(p: &mut Process, nonblock: bool) -> SysResult {
+    if nonblock {
+        return Err(EAGAIN);
+    }
+    let deadline = p.io_deadline(None);
+    p.block_io(deadline, Ok(0))
+}
+
 pub fn read(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
@@ -236,6 +335,7 @@ pub fn pread(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRes
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
     match f.kind {
+        FileKind::Node(_) if (off as i64) < 0 => Err(EINVAL),
         FileKind::Node(_) => read_into(p, &mut f, buf, count, Some(off)),
         FileKind::Dev(..) => read_into(p, &mut f, buf, count, None),
         _ => Err(ESPIPE),
@@ -520,13 +620,28 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
 }
 
-pub fn ioctl(p: &mut Process, fd: u64, req: u64, _arg: u64) -> SysResult {
+pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
+    const FIONREAD: u64 = 0x541b;
     const FIONBIO: u64 = 0x5421;
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     let entry = p.fds.entry_mut(fd)?;
     match req {
-        FIONBIO => Ok(0),
+        FIONREAD => {
+            let avail = match &entry.file.lock().kind {
+                FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
+                FileKind::Stdin => 0,
+                _ => return Err(ENOTTY),
+            };
+            write_u32(&mut p.aspace, arg, avail).map(|_| 0)
+        }
+        FIONBIO => {
+            let on = read_u32(&mut p.aspace, arg)? != 0;
+            let file = p.fds.get(fd)?;
+            let mut f = file.lock();
+            f.flags = if on { f.flags | O_NONBLOCK } else { f.flags & !O_NONBLOCK };
+            Ok(0)
+        }
         FIOCLEX | FIONCLEX => {
             entry.cloexec = req == FIOCLEX;
             Ok(0)
@@ -536,13 +651,30 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, _arg: u64) -> SysResult {
     }
 }
 
+// ---------------------------------------------------------------- polling
+
+const POLLIN: u16 = 0x1;
+const POLLOUT: u16 = 0x4;
+const POLLERR: u16 = 0x8;
+const POLLHUP: u16 = 0x10;
+const POLLNVAL: u16 = 0x20;
+const POLLRDNORM: u16 = 0x40;
+const POLLWRNORM: u16 = 0x100;
+
+fn readiness(p: &Process, fd: u64) -> Result<u32, Errno> {
+    Ok(p.fds.get(fd)?.lock().kind.poll().0)
+}
+
+/// Relative timeout from a timespec pointer (NULL = forever).
+fn timespec_timeout(p: &mut Process, ts: u64) -> Result<Option<u64>, Errno> {
+    if ts == 0 { Ok(None) } else { read_timespec_ns(&mut p.aspace, ts).map(Some) }
+}
+
 pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
-    const POLLIN: u16 = 0x1;
-    const POLLOUT: u16 = 0x4;
-    const POLLNVAL: u16 = 0x20;
     if nfds > 1024 {
         return Err(EINVAL);
     }
+    let timeout = timespec_timeout(p, timeout)?;
     let mut raw = alloc::vec![0u8; nfds as usize * 8];
     copy_in(&mut p.aspace, fds, &mut raw)?;
     let mut ready = 0;
@@ -552,16 +684,17 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
         let revents = if fd < 0 {
             0
         } else {
-            match p.fds.get(fd as u64) {
+            match readiness(p, fd as u64) {
                 Err(_) => POLLNVAL,
-                // Every file we have is always ready: stdin is at EOF, output never blocks.
-                Ok(f) => {
-                    let possible = match f.lock().kind {
-                        FileKind::Stdin => POLLIN,
-                        FileKind::Stdout | FileKind::Stderr => POLLOUT,
-                        _ => POLLIN | POLLOUT,
-                    };
-                    possible & events
+                Ok(mask) => {
+                    let mut r = mask as u16 & (events | POLLERR | POLLHUP);
+                    if mask as u16 & POLLIN != 0 && events & POLLRDNORM != 0 {
+                        r |= POLLRDNORM;
+                    }
+                    if mask as u16 & POLLOUT != 0 && events & POLLWRNORM != 0 {
+                        r |= POLLWRNORM;
+                    }
+                    r
                 }
             }
         };
@@ -570,14 +703,223 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
             ready += 1;
         }
     }
-    copy_out(&mut p.aspace, fds, &raw)?;
-    if ready == 0 {
-        if timeout == 0 {
-            // No timeout and nothing can ever become ready: Linux would block forever.
-            return p.unimplemented(nr::ppoll, "ppoll", "blocking forever (nothing can become ready)", EINTR);
-        }
-        let ns = read_timespec_ns(&mut p.aspace, timeout)?;
-        time::sleep_ns(ns);
+    if ready > 0 || timeout == Some(0) {
+        copy_out(&mut p.aspace, fds, &raw)?;
+        return Ok(ready);
     }
-    Ok(ready)
+    let deadline = p.io_deadline(timeout);
+    p.block_io(deadline, Ok(0))
+}
+
+pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, timeout: u64) -> SysResult {
+    if nfds > 1024 {
+        return Err(EINVAL);
+    }
+    let timeout = timespec_timeout(p, timeout)?;
+    let words = (nfds as usize).div_ceil(64);
+    let mut sets = [alloc::vec![0u64; words], alloc::vec![0u64; words], alloc::vec![0u64; words]];
+    for (set, ptr) in sets.iter_mut().zip([rfds, wfds, efds]) {
+        if ptr != 0 {
+            let mut b = alloc::vec![0u8; words * 8];
+            copy_in(&mut p.aspace, ptr, &mut b)?;
+            for (w, c) in set.iter_mut().zip(b.chunks(8)) {
+                *w = u64::from_le_bytes(c.try_into().unwrap());
+            }
+        }
+    }
+    let mut out = [alloc::vec![0u64; words], alloc::vec![0u64; words], alloc::vec![0u64; words]];
+    let mut count = 0;
+    for fd in 0..nfds as usize {
+        let (w, bit) = (fd / 64, 1u64 << (fd % 64));
+        let wanted = [0, 1, 2].map(|i| sets[i][w] & bit != 0);
+        if !wanted.contains(&true) {
+            continue;
+        }
+        let mask = readiness(p, fd as u64)?;
+        let hits = [mask & (EPOLLIN | EPOLLHUP | EPOLLERR) != 0, mask & (EPOLLOUT | EPOLLERR) != 0, false];
+        for i in 0..3 {
+            if wanted[i] && hits[i] {
+                out[i][w] |= bit;
+                count += 1;
+            }
+        }
+    }
+    if count > 0 || timeout == Some(0) {
+        for (set, ptr) in out.iter().zip([rfds, wfds, efds]) {
+            if ptr != 0 {
+                let b: Vec<u8> = set.iter().flat_map(|w| w.to_le_bytes()).collect();
+                copy_out(&mut p.aspace, ptr, &b)?;
+            }
+        }
+        return Ok(count);
+    }
+    let deadline = p.io_deadline(timeout);
+    p.block_io(deadline, Ok(0))
+}
+
+// ---------------------------------------------------------------- pipes, eventfd, epoll
+
+const O_DIRECT: u32 = 0o200000;
+
+pub fn pipe2(p: &mut Process, fdsp: u64, flags: u64) -> SysResult {
+    let flags = flags as u32;
+    if flags & !(O_CLOEXEC | O_NONBLOCK | O_DIRECT) != 0 {
+        return Err(EINVAL);
+    }
+    let (r, w) = ipc::pipe();
+    let status = flags & O_NONBLOCK;
+    let cloexec = flags & O_CLOEXEC != 0;
+    let rfd = p.fds.alloc(FdEntry { file: new_file(FileKind::Pipe(r), O_RDONLY | status), cloexec }, 0)?;
+    let wfd = match p.fds.alloc(FdEntry { file: new_file(FileKind::Pipe(w), O_WRONLY | status), cloexec }, 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = p.fds.close(rfd);
+            return Err(e);
+        }
+    };
+    let mut b = [0u8; 8];
+    b[..4].copy_from_slice(&(rfd as i32).to_le_bytes());
+    b[4..].copy_from_slice(&(wfd as i32).to_le_bytes());
+    if let Err(e) = copy_out(&mut p.aspace, fdsp, &b) {
+        let _ = p.fds.close(rfd);
+        let _ = p.fds.close(wfd);
+        return Err(e);
+    }
+    Ok(0)
+}
+
+pub fn eventfd2(p: &mut Process, initval: u64, flags: u64) -> SysResult {
+    const EFD_SEMAPHORE: u32 = 1;
+    let flags = flags as u32;
+    if flags & !(EFD_SEMAPHORE | O_CLOEXEC | O_NONBLOCK) != 0 {
+        return Err(EINVAL);
+    }
+    let ev = EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0);
+    let file = new_file(FileKind::EventFd(ev), O_RDWR | (flags & O_NONBLOCK));
+    p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
+}
+
+pub fn epoll_create1(p: &mut Process, flags: u64) -> SysResult {
+    if flags as u32 & !O_CLOEXEC != 0 {
+        return Err(EINVAL);
+    }
+    let file = new_file(FileKind::Epoll(Arc::new(Mutex::new(Epoll::default()))), O_RDWR);
+    p.fds.alloc(FdEntry { file, cloexec: flags as u32 & O_CLOEXEC != 0 }, 0)
+}
+
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
+
+fn epoll_of(p: &Process, epfd: u64) -> Result<Arc<Mutex<Epoll>>, Errno> {
+    match &p.fds.get(epfd)?.lock().kind {
+        FileKind::Epoll(e) => Ok(e.clone()),
+        _ => Err(EINVAL),
+    }
+}
+
+pub fn epoll_ctl(p: &mut Process, epfd: u64, op: u64, fd: u64, eventp: u64) -> SysResult {
+    const ADD: u64 = 1;
+    const DEL: u64 = 2;
+    const MOD: u64 = 3;
+    let ep = epoll_of(p, epfd)?;
+    let target = p.fds.get(fd)?;
+    if fd as i32 == epfd as i32 {
+        return Err(EINVAL);
+    }
+    match &target.lock().kind {
+        // Like Linux: regular files and directories can't be polled.
+        FileKind::Node(_) => return Err(EPERM),
+        FileKind::Epoll(_) => return p.unimplemented(nr::epoll_ctl, "epoll_ctl", "nested epoll", EINVAL),
+        _ => {}
+    }
+    let (events, data) = if op == DEL {
+        (0, 0)
+    } else {
+        let mut b = [0u8; 16]; // arm64 struct epoll_event is not packed: u32 events, pad, u64 data
+        copy_in(&mut p.aspace, eventp, &mut b)?;
+        (u32::from_le_bytes(b[..4].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()))
+    };
+    let mut e = ep.lock();
+    let key = fd as i32 as u64;
+    let live = e.interest.get(&key).is_some_and(|r| r.file.ptr_eq(&Arc::downgrade(&target)));
+    match op {
+        ADD if live => return Err(EEXIST),
+        ADD => {
+            e.interest
+                .insert(key, Registration { file: Arc::downgrade(&target), events, data, reported_version: None });
+        }
+        DEL if live => {
+            e.interest.remove(&key);
+        }
+        MOD if live => {
+            let r = e.interest.get_mut(&key).unwrap();
+            r.events = events;
+            r.data = data;
+            r.reported_version = None;
+        }
+        DEL | MOD => return Err(ENOENT),
+        _ => return Err(EINVAL),
+    }
+    ipc::changed();
+    Ok(0)
+}
+
+/// epoll_pwait / epoll_pwait2. `timeout`: None = forever.
+pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Option<u64>) -> SysResult {
+    let max = max as i32;
+    if max <= 0 || max > 1 << 20 {
+        return Err(EINVAL);
+    }
+    let ep = epoll_of(p, epfd)?;
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut e = ep.lock();
+        let mut dead = Vec::new();
+        for (fd, reg) in e.interest.iter_mut() {
+            if out.len() / 16 >= max as usize {
+                break;
+            }
+            let Some(file) = reg.file.upgrade() else {
+                dead.push(*fd);
+                continue;
+            };
+            let (mask, version) = file.lock().kind.poll();
+            let ready = mask & (reg.events | EPOLLERR | EPOLLHUP);
+            if ready == 0 || reg.events & !(EPOLLET | EPOLLONESHOT) == 0 {
+                continue;
+            }
+            if reg.events & EPOLLET != 0 {
+                if reg.reported_version == Some(version) {
+                    continue;
+                }
+                reg.reported_version = Some(version);
+            }
+            if reg.events & EPOLLONESHOT != 0 {
+                reg.events &= EPOLLET | EPOLLONESHOT; // disabled until EPOLL_CTL_MOD
+            }
+            out.extend_from_slice(&ready.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&reg.data.to_le_bytes());
+        }
+        for fd in dead {
+            e.interest.remove(&fd);
+        }
+    }
+    if !out.is_empty() || timeout == Some(0) {
+        copy_out(&mut p.aspace, evp, &out)?;
+        return Ok(out.len() as u64 / 16);
+    }
+    let deadline = p.io_deadline(timeout);
+    p.block_io(deadline, Ok(0))
+}
+
+/// epoll_pwait's millisecond timeout: negative means forever.
+pub fn ms_timeout(ms: u64) -> Option<u64> {
+    let ms = ms as i32;
+    (ms >= 0).then(|| ms as u64 * 1_000_000)
+}
+
+pub fn epoll_pwait2(p: &mut Process, epfd: u64, evp: u64, max: u64, ts: u64) -> SysResult {
+    let timeout = timespec_timeout(p, ts)?;
+    epoll_wait(p, epfd, evp, max, timeout)
 }

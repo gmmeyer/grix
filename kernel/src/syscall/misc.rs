@@ -1,33 +1,15 @@
 //! Time, identity, limits, signals, futex and the remaining small syscalls.
 
-use grix_abi::policy::Capability;
-
-use super::{require, table::nr};
+use super::table::nr;
 use crate::errno::*;
 use crate::mm::frame;
 use crate::process::{self, PID, Process, SigAction};
 use crate::uaccess::*;
 use crate::{rng, time};
 
-const CLONE_THREAD: u64 = 0x10000;
-
-/// Threads and processes are gated now and implemented later.
-pub fn clone(p: &mut Process, n: u32, flags: u64) -> SysResult {
-    let (cap, what) = if flags & CLONE_THREAD != 0 {
-        (Capability::Threads, "threads")
-    } else {
-        (Capability::Process, "child processes")
-    };
-    require(p, n, cap, "")?;
-    let (name, _) = super::table::info(n);
-    p.unimplemented(n, name, what, ENOSYS)
-}
-
 #[allow(non_upper_case_globals)]
 pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
     match n {
-        nr::set_tid_address => Ok(PID),
-        nr::set_robust_list => Ok(0),
         nr::uname => uname(p, a[0]),
         nr::clock_gettime => clock_gettime(p, a[0], a[1]),
         nr::clock_getres => {
@@ -49,22 +31,6 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
-        nr::nanosleep => {
-            let ns = read_timespec_ns(&mut p.aspace, a[0])?;
-            time::sleep_ns(ns);
-            Ok(0)
-        }
-        nr::clock_nanosleep => {
-            const TIMER_ABSTIME: u64 = 1;
-            let ns = read_timespec_ns(&mut p.aspace, a[2])?;
-            if a[1] & TIMER_ABSTIME != 0 {
-                let now = clock_now(a[0]).ok_or(EINVAL)?;
-                time::sleep_ns(ns.saturating_sub(now));
-            } else {
-                time::sleep_ns(ns);
-            }
-            Ok(0)
-        }
         nr::getrandom => {
             let len = a[1].min(32 << 20);
             let mut chunk = [0u8; 256];
@@ -77,7 +43,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(len)
         }
-        nr::getpid | nr::gettid | nr::getpgid | nr::getsid => Ok(PID),
+        nr::getpid | nr::getpgid | nr::getsid => Ok(PID),
         nr::getppid => Ok(0),
         nr::getuid | nr::geteuid => Ok(p.uid as u64),
         nr::getgid | nr::getegid => Ok(p.gid as u64),
@@ -125,7 +91,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             write_u64(&mut p.aspace, a[2], 1)?;
             Ok(8)
         }
-        nr::sched_setaffinity | nr::sched_yield | nr::sched_setparam | nr::sched_setscheduler => Ok(0),
+        nr::sched_setaffinity | nr::sched_setparam | nr::sched_setscheduler => Ok(0),
         nr::sched_getscheduler => Ok(0),
         nr::sched_getparam => write_u32(&mut p.aspace, a[1], 0).map(|_| 0),
         nr::getpriority => Ok(20),
@@ -152,8 +118,8 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
                 Err(EINVAL)
             }
         }
-        // glibc probes rseq and copes with ENOSYS; not worth reporting.
-        nr::rseq => Err(ENOSYS),
+        // glibc probes rseq and libuv probes io_uring; both cope with ENOSYS.
+        nr::rseq | nr::io_uring_setup => Err(ENOSYS),
 
         // signals
         nr::rt_sigaction => rt_sigaction(p, a[0], a[1], a[2], a[3]),
@@ -176,10 +142,9 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
-        nr::kill | nr::tkill => send_signal(p, a[0], a[1]),
-        nr::tgkill => send_signal(p, a[1], a[2]),
-
-        nr::futex => futex(p, a),
+        nr::kill => send_signal(p, a[0] == PID || a[0] == 0 || a[0] as i64 == -1, a[1]),
+        nr::tkill => send_signal(p, p.threads.contains_key(&(a[0] as u32)), a[1]),
+        nr::tgkill => send_signal(p, a[0] == PID && p.threads.contains_key(&(a[1] as u32)), a[2]),
 
         _ => p.unimplemented(n, name, "", ENOSYS),
     }
@@ -335,29 +300,32 @@ fn rt_sigprocmask(p: &mut Process, how: u64, set: u64, oset: u64, size: u64) -> 
     if size != 8 {
         return Err(EINVAL);
     }
+    let mask = p.cur().sigmask;
     if oset != 0 {
-        write_u64(&mut p.aspace, oset, p.sigmask)?;
+        write_u64(&mut p.aspace, oset, mask)?;
     }
     if set != 0 {
         let s = read_u64(&mut p.aspace, set)? & !(bit(SIGKILL) | bit(SIGSTOP));
-        p.sigmask = match how {
-            0 => p.sigmask | s,
-            1 => p.sigmask & !s,
+        let mask = match how {
+            0 => mask | s,
+            1 => mask & !s,
             2 => s,
             _ => return Err(EINVAL),
         };
-        let deliverable = p.sigpending & !p.sigmask;
+        p.cur().sigmask = mask;
+        let deliverable = p.sigpending & !mask;
         if deliverable != 0 {
             let sig = deliverable.trailing_zeros() as u64 + 1;
             p.sigpending &= !bit(sig);
-            return deliver(p, sig);
+            return deliver(p, sig, SENT_BY_PROGRAM);
         }
     }
     Ok(0)
 }
 
-fn send_signal(p: &mut Process, target: u64, sig: u64) -> SysResult {
-    if target != PID && target != 0 && target as i64 != -1 {
+/// Signals are process-wide for now; `target_exists` says whether the pid/tid named one of ours.
+fn send_signal(p: &mut Process, target_exists: bool, sig: u64) -> SysResult {
+    if !target_exists {
         return Err(ESRCH);
     }
     if sig > 64 {
@@ -366,54 +334,33 @@ fn send_signal(p: &mut Process, target: u64, sig: u64) -> SysResult {
     if sig == 0 {
         return Ok(0);
     }
-    if p.sigmask & bit(sig) != 0 {
+    if p.cur().sigmask & bit(sig) != 0 {
         p.sigpending |= bit(sig);
         return Ok(0);
     }
-    deliver(p, sig)
+    deliver(p, sig, SENT_BY_PROGRAM)
 }
 
-fn deliver(p: &mut Process, sig: u64) -> SysResult {
+/// The kernel raises a signal at the calling thread (e.g. SIGPIPE).
+pub(super) fn signal_self(p: &mut Process, sig: u64, why: &str) -> SysResult {
+    if p.cur().sigmask & bit(sig) != 0 {
+        p.sigpending |= bit(sig);
+        return Ok(0);
+    }
+    deliver(p, sig, why)
+}
+
+const SENT_BY_PROGRAM: &str = "signal sent by the program itself";
+
+fn deliver(p: &mut Process, sig: u64, why: &str) -> SysResult {
     let handler = p.sigactions[sig as usize].handler;
     match handler {
         SIG_IGN if sig != SIGKILL => Ok(0),
         SIG_DFL if DEFAULT_IGNORED & bit(sig) != 0 => Ok(0),
-        SIG_DFL | SIG_IGN => process::exit_signaled(sig as u32, 0, 0, "signal sent by the program itself"),
+        SIG_DFL | SIG_IGN => process::exit_signaled(sig as u32, 0, 0, why),
         _ => {
             let _ = p.unimplemented(nr::rt_sigaction, "rt_sigaction", "delivering signals to handlers", ENOSYS);
             process::exit_signaled(sig as u32, 0, 0, "signal handlers are not supported yet")
         }
-    }
-}
-
-// ---------------------------------------------------------------- futex
-
-fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
-    const WAIT: u64 = 0;
-    const WAKE: u64 = 1;
-    const REQUEUE: u64 = 3;
-    const CMP_REQUEUE: u64 = 4;
-    const WAIT_BITSET: u64 = 9;
-    const WAKE_BITSET: u64 = 10;
-    let [uaddr, op, val, timeout, ..] = a;
-    match op & 127 {
-        WAIT | WAIT_BITSET => {
-            if read_u32(&mut p.aspace, uaddr)? != val as u32 {
-                return Err(EAGAIN);
-            }
-            // Only one thread exists, so nobody can wake us.
-            if timeout == 0 {
-                return p.unimplemented(nr::futex, "futex", "waiting forever (single thread)", EINTR);
-            }
-            let ns = read_timespec_ns(&mut p.aspace, timeout)?;
-            if op & 127 == WAIT_BITSET {
-                time::sleep_until_monotonic(ns); // absolute
-            } else {
-                time::sleep_ns(ns);
-            }
-            Err(ETIMEDOUT)
-        }
-        WAKE | WAKE_BITSET | REQUEUE | CMP_REQUEUE => Ok(0),
-        _ => p.unimplemented(nr::futex, "futex", "operation", ENOSYS),
     }
 }

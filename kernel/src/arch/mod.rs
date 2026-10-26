@@ -2,14 +2,17 @@
 
 use core::arch::{asm, global_asm};
 
-use crate::{process, syscall};
+use crate::{process, sched, syscall};
+
+pub mod irq;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
+global_asm!(include_str!("fpsimd.S"));
 
 /// Register state saved on every exception. Layout must match vectors.S.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TrapFrame {
     pub x: [u64; 31],
     pub sp_el0: u64,
@@ -19,9 +22,39 @@ pub struct TrapFrame {
 
 const _: () = assert!(core::mem::size_of::<TrapFrame>() == 272);
 
+/// User FP/SIMD registers. Layout must match fpsimd.S.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+pub struct FpState {
+    pub q: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+
 unsafe extern "C" {
     fn enter_user_asm(entry: u64, sp: u64, kernel_stack_top: u64) -> !;
+    fn fpsimd_save(state: *mut FpState);
+    fn fpsimd_restore(state: *const FpState);
     static __stack_top: u8;
+}
+
+pub fn save_fp(state: &mut FpState) {
+    unsafe { fpsimd_save(state) };
+}
+
+pub fn restore_fp(state: &FpState) {
+    unsafe { fpsimd_restore(state) };
+}
+
+/// The user thread pointer (TLS base).
+pub fn tpidr() -> u64 {
+    let v;
+    unsafe { asm!("mrs {}, tpidr_el0", out(reg) v) };
+    v
+}
+
+pub fn set_tpidr(v: u64) {
+    unsafe { asm!("msr tpidr_el0, {}", in(reg) v) };
 }
 
 /// Drop to EL0 at `entry` with stack pointer `sp`. Never returns: from here on
@@ -45,8 +78,9 @@ const EC_BRK: u64 = 0x3c;
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     match kind {
         8 => el0_sync(tf),
-        // No interrupt sources are enabled yet.
-        9 | 5 => {}
+        9 => sched::irq(tf),
+        // The kernel runs with IRQs masked, so nothing should arrive here.
+        5 => {}
         _ => panic!("unexpected exception: kind={kind} esr={:#x} far={:#x} elr={:#x}", esr(), far(), tf.elr),
     }
 }
