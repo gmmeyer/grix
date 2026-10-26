@@ -1,0 +1,31 @@
+//! Run Linux programs inside a capability-scoped Rust unikernel.
+//!
+//! ```no_run
+//! use agentbox::{Capability, Sandbox};
+//!
+//! let sandbox = Sandbox::builder()
+//!     .import("./build/hello", "/bin/hello")?
+//!     .env("GREETING", "hi")
+//!     .build()?;
+//! let out = sandbox.run(&["/bin/hello", "world"])?;
+//! println!("{}", String::from_utf8_lossy(&out.stdout));
+//! for event in &out.events {
+//!     eprintln!("{event}");
+//! }
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+//!
+//! The program sees only the files you import, and can only use the
+//! capabilities you grant ([`Capability`]). Anything it tries beyond that is
+//! denied and reported in [`RunOutput::events`].
+
+mod event;
+mod image;
+mod manifest;
+mod sandbox;
+mod vmm;
+
+pub use agentbox_abi::policy::{Capability, DenyAction};
+pub use event::GuestEvent;
+pub use manifest::Manifest;
+pub use sandbox::{ExitStatus, RunOutput, Sandbox, SandboxBuilder, Stream};

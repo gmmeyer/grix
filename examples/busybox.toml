@@ -1,0 +1,20 @@
+# Run Alpine's static busybox with one data file and nothing else.
+#   make fixtures && cargo run -p agentbox -- run -m examples/busybox.toml
+#   cargo run -p agentbox -- run -m examples/busybox.toml -- /bin/busybox wc -l /data/hello.c
+
+command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
+capabilities = []        # fs_write, threads, process, net
+on_deny = "errno"        # or "kill"
+memory_mb = 256
+timeout_secs = 30
+
+[env]
+LANG = "C"
+
+[[import]]
+host = "../fixtures/build/alpine/busybox.static"
+guest = "/bin/busybox"
+
+[[import]]
+host = "../fixtures/src/hello.c"
+guest = "/data/hello.c"

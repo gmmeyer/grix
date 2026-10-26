@@ -1,0 +1,21 @@
+[package]
+name = "agentbox"
+description = "Run Linux programs in a capability-scoped Rust unikernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentbox"
+path = "src/main.rs"
+
+[dependencies]
+agentbox-abi = { path = "../abi" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_json = "1"

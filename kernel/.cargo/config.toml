@@ -1,0 +1,7 @@
+[build]
+# softfloat: the kernel never touches FP/SIMD registers, so user FP state
+# survives syscalls and faults without being saved.
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = ["-C", "relocation-model=static", "-C", "force-frame-pointers=yes"]

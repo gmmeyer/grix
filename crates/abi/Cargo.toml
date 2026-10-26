@@ -1,0 +1,8 @@
+[package]
+name = "agentbox-abi"
+description = "Shared host/guest definitions for agentbox: image format, capability policy, wire protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
