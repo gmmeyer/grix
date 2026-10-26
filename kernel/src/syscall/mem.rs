@@ -66,7 +66,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
                     if shared && prot.write {
                         return Err(EACCES);
                     }
-                    Backing::File { data, offset: off, filesz: (data.len() as u64).saturating_sub(off) }
+                    Backing::File { data, offset: off, filesz: (data.len() as u64).saturating_sub(off), ino }
                 }
                 _ => return Err(ENODEV),
             },

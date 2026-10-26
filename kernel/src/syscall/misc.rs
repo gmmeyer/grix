@@ -54,7 +54,11 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
-        nr::getgroups => Ok(0),
+        // The primary group, as after a normal login (initgroups).
+        nr::getgroups => match a[0] {
+            0 => Ok(1),
+            _ => write_u32(&mut p.aspace, a[1], p.gid).map(|_| 1),
+        },
         nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
         nr::umask => {
             let old = p.umask;
@@ -166,7 +170,8 @@ fn clock_gettime(p: &mut Process, clock: u64, tp: u64) -> SysResult {
 
 fn uname(p: &mut Process, buf: u64) -> SysResult {
     let mut b = [0u8; 65 * 6];
-    let fields = ["Linux", "grix", "6.1.0-grix", "#1 SMP grix", "aarch64", "(none)"];
+    use crate::procfs::{HOSTNAME, RELEASE, VERSION};
+    let fields = ["Linux", HOSTNAME, RELEASE, VERSION, "aarch64", "(none)"];
     for (i, f) in fields.iter().enumerate() {
         b[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
     }

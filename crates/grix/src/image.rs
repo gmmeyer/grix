@@ -16,7 +16,7 @@ pub(crate) enum Node {
 }
 
 /// Paths the guest kernel provides itself.
-const RESERVED: &[&str] = &["/dev", "/proc"];
+const RESERVED: &[&str] = &["/dev", "/proc", "/sys"];
 
 /// Check and normalize an absolute guest path.
 pub(crate) fn guest_path(p: &str) -> Result<String> {

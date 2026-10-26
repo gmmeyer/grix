@@ -10,8 +10,9 @@ shows progress).
 
 ## Processes and exec
 
-- [ ] `#!` scripts for the initial exec and `execve`. `pip3` fails today
+- [~] `#!` scripts for the initial exec and `execve`. `pip3` fails today
       with "not an ELF file".
+      Done for the initial program, including nested interpreters; `execve` comes with processes.
 - [ ] `fork`/`vfork`/`clone` without `CLONE_THREAD`: separate address spaces
       with copy-on-write. Python `subprocess`, Node `child_process`,
       busybox `sh -c 'a | b'` ("can't fork"), make, compilers.
@@ -61,12 +62,13 @@ shows progress).
       their own tree.
 - [ ] Hand writable directories back to the host after a run (the agent's results).
 - [ ] Read-write host directory mounts, gated by policy.
-- [ ] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
-- [ ] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
-- [ ] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
+- [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
+- [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
+- [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
       Coreutils `ls -la` currently hits an "unknown" syscall.
-- [ ] `inotify`. Node `fs.watch`, webpack, watchdog. Imports never change,
+- [~] `inotify`. Node `fs.watch`, webpack, watchdog. Imports never change,
       so a watch that never fires is correct until writes exist.
+      Watches can be added and removed, and never fire. Real events come with the writable filesystem.
 - [ ] `flock` and `fcntl` record locks with real semantics (sqlite) once there
       are writers.
 - [ ] Real file timestamps from the host (make, build caches). Everything
@@ -81,16 +83,16 @@ shows progress).
 
 ## /proc, /sys, /dev
 
-- [ ] `/proc/self/maps` (glibc `pthread_getattr_np`, so Rust std stack guards
+- [x] `/proc/self/maps` (glibc `pthread_getattr_np`, so Rust std stack guards
       on glibc, the JVM, sanitizers).
-- [ ] `/proc/self/fd/N`, `/dev/fd`, `/dev/stdin|stdout|stderr`.
-- [ ] `/proc/self/{status,stat,statm,cmdline,environ,cgroup,limits,auxv}`.
+- [x] `/proc/self/fd/N`, `/dev/fd`, `/dev/stdin|stdout|stderr`.
+- [x] `/proc/self/{status,stat,statm,cmdline,environ,cgroup,limits,auxv}`.
       Go reads `/proc/self/cgroup`.
-- [ ] `/proc/{cpuinfo,stat,meminfo,uptime,loadavg,version}`. Node
+- [x] `/proc/{cpuinfo,stat,meminfo,uptime,loadavg,version}`. Node
       `os.cpus()` returns `[]`; busybox `free` fails.
-- [ ] `/proc/sys/kernel/{hostname,osrelease,ostype,pid_max,random/uuid}`,
+- [x] `/proc/sys/kernel/{hostname,osrelease,ostype,pid_max,random/uuid}`,
       `/proc/sys/vm/overcommit_memory`.
-- [ ] `/sys/devices/system/cpu/{online,possible}` (glibc `get_nprocs`),
+- [x] `/sys/devices/system/cpu/{online,possible}` (glibc `get_nprocs`),
       `/sys/kernel/mm/transparent_hugepage/*` (Go probes it),
       `/sys/fs/cgroup/*` (cgroup v2 limits for Go/Java/Node).
 - [ ] `/dev/tty`, `/dev/pts`, pseudo-terminals (`openpty`, termios,
@@ -98,7 +100,7 @@ shows progress).
 
 ## Users, environment, host config
 
-- [ ] Synthesize `/etc/passwd` and `/etc/group` with the sandbox user (unless
+- [x] Synthesize `/etc/passwd` and `/etc/group` with the sandbox user (unless
       imported). Python `getpass.getuser()` raises; Node `os.userInfo()` and
       `os.homedir()` throw; `ls -l` and `id` show numbers.
 - [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
@@ -144,7 +146,7 @@ shows progress).
 
 ## Binary compatibility
 
-- [ ] Report the syscall number for unknown syscalls. Today the event says
+- [x] Report the syscall number for unknown syscalls. Today the event says
       only "unsupported unknown".
 - [ ] glibc dynamic executables (Debian/Ubuntu arm64). Most prebuilt Linux
       tools are glibc-linked; untested so far.

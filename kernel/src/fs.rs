@@ -1,6 +1,7 @@
 //! The filesystem the program sees: exactly the files the host imported,
-//! plus a few synthetic nodes (/dev/null, /dev/zero, /dev/urandom,
-//! /proc/self/exe). File contents are referenced in place from the boot image.
+//! plus synthetic nodes: /dev, /proc and /sys (see procfs.rs), and
+//! /etc/passwd + /etc/group describing the sandbox user unless imported.
+//! File contents are referenced in place from the boot image.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -10,6 +11,7 @@ use grix_abi::image::{Entry, EntryKind};
 use spin::Once;
 
 use crate::errno::*;
+use crate::procfs::{self, ProcFile};
 
 pub type Ino = usize;
 pub const ROOT: Ino = 0;
@@ -33,6 +35,8 @@ pub enum Kind {
     Dir(BTreeMap<String, Ino>),
     Symlink(String),
     Dev(Dev),
+    /// Generated when opened.
+    Proc(ProcFile),
 }
 
 pub struct Node {
@@ -52,12 +56,19 @@ pub struct StatInfo {
 
 pub struct Fs {
     nodes: Vec<Node>,
+    /// `/proc/1/fd`, whose entries are the live descriptors.
+    pub fd_dir: Ino,
 }
 
 static FS: Once<Fs> = Once::new();
 
-pub fn init(entries: &[Entry<'static>], exe: &str) {
-    FS.call_once(|| Fs::build(entries, exe));
+/// Make `fs` the filesystem. Done once, after exec resolved the program.
+pub fn install(fs: Fs) {
+    FS.call_once(|| fs);
+}
+
+fn leak(s: String) -> &'static [u8] {
+    alloc::boxed::Box::leak(s.into_boxed_str()).as_bytes()
 }
 
 pub fn get() -> &'static Fs {
@@ -65,9 +76,9 @@ pub fn get() -> &'static Fs {
 }
 
 impl Fs {
-    fn build(entries: &[Entry<'static>], exe: &str) -> Fs {
+    pub fn build(entries: &[Entry<'static>], uid: u32, gid: u32) -> Fs {
         let root = Node { kind: Kind::Dir(BTreeMap::new()), perm: 0o755, parent: ROOT, name: String::new() };
-        let mut fs = Fs { nodes: vec![root] };
+        let mut fs = Fs { nodes: vec![root], fd_dir: ROOT };
         for e in entries {
             let path = e.path.trim_end_matches('/');
             let Some(slash) = path.rfind('/') else { continue };
@@ -88,10 +99,56 @@ impl Fs {
         fs.insert(dev, "zero", Kind::Dev(Dev::Zero), 0o666);
         fs.insert(dev, "random", Kind::Dev(Dev::Random), 0o666);
         fs.insert(dev, "urandom", Kind::Dev(Dev::Random), 0o666);
-        let proc_self = fs.mkdir_p("/proc/self");
-        fs.insert(proc_self, "exe", Kind::Symlink(exe.into()), 0o777);
+        fs.insert(dev, "fd", Kind::Symlink("/proc/self/fd".into()), 0o777);
+        for (i, name) in ["stdin", "stdout", "stderr"].iter().enumerate() {
+            fs.insert(dev, name, Kind::Symlink(alloc::format!("/proc/self/fd/{i}")), 0o777);
+        }
+        fs.mkdir_p("/dev/shm");
+
+        let pid_dir = fs.mkdir_p("/proc/1");
+        fs.fd_dir = fs.insert(pid_dir, "fd", Kind::Dir(BTreeMap::new()), 0o500);
+        let proc = fs.mkdir_p("/proc");
+        fs.insert(proc, "self", Kind::Symlink("1".into()), 0o777);
+        fs.insert(proc, "thread-self", Kind::Symlink("1".into()), 0o777);
+        fs.insert(proc, "mounts", Kind::Symlink("self/mounts".into()), 0o777);
+        for &(path, file) in procfs::FILES {
+            let (dir, name) = path.rsplit_once('/').unwrap();
+            let parent = fs.mkdir_p(dir);
+            fs.insert(parent, name, Kind::Proc(file), 0o444);
+        }
+
+        // Describe the sandbox user unless the host imported its own files.
+        if fs.lookup(ROOT, "/etc/passwd", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            let passwd = alloc::format!(
+                "root:x:0:0:root:/root:/sbin/nologin\ngrix:x:{uid}:{gid}:grix:/home/grix:/bin/sh\n\
+                 nobody:x:65534:65534:nobody:/:/sbin/nologin\n"
+            );
+            fs.insert(etc, "passwd", Kind::File(leak(passwd)), 0o644);
+            fs.mkdir_p("/home/grix");
+        }
+        if fs.lookup(ROOT, "/etc/group", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            let group = alloc::format!("root:x:0:\ngrix:x:{gid}:\nnobody:x:65534:\n");
+            fs.insert(etc, "group", Kind::File(leak(group)), 0o644);
+        }
+        if fs.lookup(ROOT, "/etc/mtab", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            fs.insert(etc, "mtab", Kind::Symlink("/proc/self/mounts".into()), 0o777);
+        }
         fs.mkdir_p("/tmp");
         fs
+    }
+
+    /// `/proc/self/exe` points at the program actually running (the
+    /// interpreter, for `#!` scripts).
+    pub fn set_exe(&mut self, path: &str) {
+        let pid_dir = self.mkdir_p("/proc/1");
+        self.insert(pid_dir, "exe", Kind::Symlink(path.into()), 0o777);
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     fn child(&self, dir: Ino, name: &str) -> Option<Ino> {
@@ -208,6 +265,7 @@ impl Fs {
                 };
                 (S_IFCHR, 0, 1, (1 << 8) | minor)
             }
+            Kind::Proc(_) => (S_IFREG, 0, 1, 0),
         };
         StatInfo { ino: ino as u64 + 1, mode: ty | n.perm, nlink, size, rdev }
     }
@@ -225,7 +283,7 @@ impl Fs {
     /// Linux d_type for a node.
     pub fn d_type(&self, ino: Ino) -> u8 {
         match self.nodes[ino].kind {
-            Kind::File(_) => 8,
+            Kind::File(_) | Kind::Proc(_) => 8,
             Kind::Dir(_) => 4,
             Kind::Symlink(_) => 10,
             Kind::Dev(_) => 2,

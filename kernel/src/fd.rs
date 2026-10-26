@@ -29,6 +29,16 @@ pub enum FileKind {
     Socket(SocketEnd),
     EventFd(Arc<Mutex<EventFd>>),
     Epoll(Arc<Mutex<Epoll>>),
+    /// A /proc or /sys file: contents generated at open.
+    Generated(Vec<u8>),
+    Inotify(Inotify),
+}
+
+/// Imports are read-only, so watches never fire (yet): the fd is never readable.
+#[derive(Default)]
+pub struct Inotify {
+    pub watches: BTreeMap<i32, Ino>,
+    pub next_wd: i32,
 }
 
 impl FileKind {
@@ -39,7 +49,8 @@ impl FileKind {
             // stdin is at EOF and output never blocks.
             FileKind::Stdin => (EPOLLIN, 0),
             FileKind::Stdout | FileKind::Stderr => (EPOLLOUT, 0),
-            FileKind::Node(_) | FileKind::Dev(..) => (EPOLLIN | EPOLLOUT, 0),
+            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
+            FileKind::Inotify(_) => (0, 0),
             FileKind::Pipe(end) => end.poll(),
             FileKind::Socket(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),

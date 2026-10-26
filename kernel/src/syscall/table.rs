@@ -32,6 +32,18 @@ macro_rules! syscalls {
 }
 
 syscalls! {
+    5 setxattr Cap(FsWrite);
+    6 lsetxattr Cap(FsWrite);
+    7 fsetxattr Cap(FsWrite);
+    8 getxattr Core;
+    9 lgetxattr Core;
+    10 fgetxattr Core;
+    11 listxattr Core;
+    12 llistxattr Core;
+    13 flistxattr Core;
+    14 removexattr Cap(FsWrite);
+    15 lremovexattr Cap(FsWrite);
+    16 fremovexattr Cap(FsWrite);
     17 getcwd Core;
     19 eventfd2 Core;
     20 epoll_create1 Core;
@@ -41,6 +53,8 @@ syscalls! {
     24 dup3 Core;
     25 fcntl Core;
     26 inotify_init1 Core;
+    27 inotify_add_watch Core;
+    28 inotify_rm_watch Core;
     29 ioctl Core;
     32 flock Core;
     33 mknodat Cap(FsWrite);

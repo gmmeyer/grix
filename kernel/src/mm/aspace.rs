@@ -8,6 +8,7 @@ use super::paging::{ADDR_MASK, PageTable, Prot};
 use super::{PAGE_SIZE, frame, p2v, page_down};
 use crate::arch;
 use crate::errno::*;
+use crate::fs::Ino;
 
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = 1 << 48;
@@ -39,8 +40,8 @@ pub enum Backing {
     /// Zero-filled on first touch.
     Anon,
     /// Private file mapping. Byte `o` of the VMA is `data[offset + o]` while
-    /// `o < filesz`, and zero after that (ELF .bss).
-    File { data: &'static [u8], offset: u64, filesz: u64 },
+    /// `o < filesz`, and zero after that (ELF .bss). `ino` names the file.
+    File { data: &'static [u8], offset: u64, filesz: u64, ino: Ino },
 }
 
 #[derive(Clone, Debug)]
@@ -62,8 +63,8 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
-            Backing::File { data, offset, filesz } => {
-                Backing::File { data, offset: offset + skip, filesz: filesz.saturating_sub(skip) }
+            Backing::File { data, offset, filesz, ino } => {
+                Backing::File { data, offset: offset + skip, filesz: filesz.saturating_sub(skip), ino }
             }
         };
         Vma { start: s, end: e, prot: self.prot, backing }
@@ -99,6 +100,10 @@ impl AddressSpace {
 
     pub fn activate(&self) {
         arch::set_user_page_table(self.pt.root);
+    }
+
+    pub fn vmas(&self) -> impl Iterator<Item = &Vma> {
+        self.vmas.values()
     }
 
     pub fn find(&self, va: u64) -> Option<&Vma> {
@@ -239,7 +244,7 @@ impl AddressSpace {
             return Err(FaultError::Segv);
         }
         let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
-        if let Backing::File { data, offset, filesz } = vma.backing {
+        if let Backing::File { data, offset, filesz, .. } = vma.backing {
             let o = page - vma.start;
             if o < filesz {
                 let n = (filesz - o).min(PAGE_SIZE);

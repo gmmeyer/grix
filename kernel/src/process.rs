@@ -113,6 +113,10 @@ pub struct Process {
     pub rlimits: [(u64, u64); 16],
     pub name: [u8; 16],
     reported: BTreeSet<(u8, u32, String)>,
+    /// The running program (after `#!` resolution), its argv and environment.
+    pub exe: String,
+    pub argv: Vec<String>,
+    pub envp: Vec<String>,
 
     // Threads and scheduling (see sched.rs).
     pub threads: BTreeMap<u32, Thread>,
@@ -158,6 +162,9 @@ impl Process {
             rlimits,
             name: [0; 16],
             reported: BTreeSet::new(),
+            exe: String::new(),
+            argv: Vec::new(),
+            envp: Vec::new(),
             threads: BTreeMap::from([(PID as u32, Thread::new(PID as u32))]),
             current: PID as u32,
             runq: VecDeque::new(),
@@ -313,50 +320,108 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access) {
 
 /// Load the image's program and jump to it.
 pub fn start(img: Image<'static>) -> ! {
-    fs::init(&img.entries, img.exe);
+    let fail = |code: i32, reason: &str| -> ! {
+        console::event(&Event::ExecFailed { path: img.exe, reason });
+        klog!("exec {}: {}\n", img.exe, reason);
+        exit(code)
+    };
+    let mut fs = fs::Fs::build(&img.entries, img.uid, img.gid);
+    let cwd = match fs.lookup(ROOT, img.cwd, true) {
+        Ok(ino) if fs.is_dir(ino) => ino,
+        _ => fail(127, &alloc::format!("working directory {} does not exist", img.cwd)),
+    };
+    let argv = img.argv.iter().map(|s| String::from(*s)).collect();
+    let (exe, argv) = match resolve_interpreters(&fs, cwd, img.exe, argv) {
+        Ok(r) => r,
+        Err((code, reason)) => fail(code, &reason),
+    };
+    fs.set_exe(&exe);
+    fs::install(fs);
+
     let mut p = Process::new(img.policy, img.uid, img.gid);
+    p.cwd = cwd;
+    p.argv = argv;
+    p.envp = img.envp.iter().map(|s| String::from(*s)).collect();
+    p.exe = exe;
     p.aspace.activate();
-    match exec(&mut p, &img) {
+    match exec(&mut p, img.exe) {
         Ok((entry, sp)) => {
             p.slice_start = crate::time::monotonic_ns();
             *PROCESS.lock() = Some(p);
             arch::irq::init();
             arch::enter_user(entry, sp)
         }
-        Err((code, reason)) => {
-            console::event(&Event::ExecFailed { path: img.exe, reason: &reason });
-            klog!("exec {}: {}\n", img.exe, reason);
-            exit(code)
-        }
+        Err((code, reason)) => fail(code, &reason),
     }
 }
 
-fn exec(p: &mut Process, img: &Image<'static>) -> Result<(u64, u64), (i32, String)> {
+/// Follow `#!` lines like Linux's binfmt_script: `#!interp [arg]` runs
+/// `interp [arg] script args...`. Returns the ELF to load and the final argv.
+fn resolve_interpreters(
+    fs: &fs::Fs,
+    cwd: Ino,
+    path: &str,
+    mut argv: Vec<String>,
+) -> Result<(String, Vec<String>), (i32, String)> {
+    let mut path = String::from(path);
+    for _ in 0..5 {
+        let what = if argv.first().is_some_and(|a| *a == path) || argv.is_empty() { "program" } else { "interpreter" };
+        let ino = fs
+            .lookup(cwd, &path, true)
+            .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
+        let node = fs.node(ino);
+        let data = match node.kind {
+            Kind::File(data) if node.perm & 0o111 != 0 => data,
+            Kind::File(_) => return Err((126, alloc::format!("{what} {path} is not executable"))),
+            _ => return Err((126, alloc::format!("{what} {path} is not a regular file"))),
+        };
+        let Some(rest) = data.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), argv)) };
+        // Linux reads at most this much of the #! line.
+        let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
+        let line = core::str::from_utf8(&line[..line.len().min(254)])
+            .map_err(|_| (126, alloc::format!("{path}: invalid #! line")))?
+            .trim();
+        let (interp, arg) = match line.split_once([' ', '\t']) {
+            Some((i, a)) => (i, Some(a.trim()).filter(|a| !a.is_empty())),
+            None => (line, None),
+        };
+        if interp.is_empty() {
+            return Err((126, alloc::format!("{path}: empty #! line")));
+        }
+        let mut next = alloc::vec![String::from(interp)];
+        next.extend(arg.map(String::from));
+        next.push(path.clone());
+        next.extend(argv.into_iter().skip(1));
+        argv = next;
+        path = String::from(interp);
+    }
+    Err((126, alloc::format!("{path}: too many levels of #! interpreters")))
+}
+
+/// Load `p.exe` (already resolved by `resolve_interpreters`) and build the
+/// initial stack. `execfn` is the path originally asked for (AT_EXECFN).
+fn exec(p: &mut Process, execfn: &str) -> Result<(u64, u64), (i32, String)> {
     let fs = fs::get();
-    p.cwd = match fs.lookup(ROOT, img.cwd, true) {
-        Ok(ino) if fs.is_dir(ino) => ino,
-        _ => return Err((127, alloc::format!("working directory {} does not exist", img.cwd))),
-    };
-    let file = |path: &str, what: &str| -> Result<&'static [u8], (i32, String)> {
+    let file = |path: &str, what: &str| -> Result<(&'static [u8], Ino), (i32, String)> {
         let ino = fs
             .lookup(p.cwd, path, true)
             .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        let node = fs.node(ino);
-        match node.kind {
-            Kind::File(data) if node.perm & 0o111 != 0 || what == "interpreter" => Ok(data),
-            Kind::File(_) => Err((126, alloc::format!("{what} {path} is not executable"))),
+        match fs.node(ino).kind {
+            Kind::File(data) => Ok((data, ino)),
             _ => Err((126, alloc::format!("{what} {path} is not a regular file"))),
         }
     };
 
-    let data = file(img.exe, "program")?;
-    let exe = elf::load(&mut p.aspace, data, Some(elf::DYN_BASE)).map_err(|e| (126, e.into()))?;
+    let (data, ino) = file(&p.exe, "program")?;
+    let exe = elf::load(&mut p.aspace, data, ino, Some(elf::DYN_BASE))
+        .map_err(|e| (126, alloc::format!("{}: {e}", p.exe)))?;
     let (entry, interp_base) = match exe.interp {
         Some(path) => {
-            let idata = file(path, "interpreter")?;
-            let interp = elf::load(&mut p.aspace, idata, None).map_err(|e| (126, alloc::format!("{path}: {e}")))?;
+            let (idata, iino) = file(path, "ELF interpreter")?;
+            let interp =
+                elf::load(&mut p.aspace, idata, iino, None).map_err(|e| (126, alloc::format!("{path}: {e}")))?;
             if interp.interp.is_some() {
-                return Err((126, "interpreter requests its own interpreter".into()));
+                return Err((126, "ELF interpreter requests its own interpreter".into()));
             }
             (interp.entry, interp.base)
         }
@@ -384,7 +449,9 @@ fn exec(p: &mut Process, img: &Image<'static>) -> Result<(u64, u64), (i32, Strin
         (23, 0),             // AT_SECURE
         (26, 0),             // AT_HWCAP2
     ];
-    let sp = build_stack(&mut p.aspace, &img.argv, &img.envp, img.exe, &auxv)
+    let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
+    let envp: Vec<&str> = p.envp.iter().map(String::as_str).collect();
+    let sp = build_stack(&mut p.aspace, &argv, &envp, execfn, &auxv)
         .map_err(|e| (126, alloc::format!("could not build initial stack (errno {})", e.0)))?;
     Ok((entry, sp))
 }

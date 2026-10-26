@@ -20,6 +20,7 @@ mod fs;
 mod ipc;
 mod mm;
 mod process;
+mod procfs;
 mod rng;
 mod sched;
 mod syscall;

@@ -135,6 +135,13 @@ pub fn counter() -> u64 {
     v
 }
 
+/// Main ID register: implementer, part number, revision.
+pub fn midr() -> u64 {
+    let v;
+    unsafe { asm!("mrs {}, midr_el1", out(reg) v) };
+    v
+}
+
 pub fn counter_freq() -> u64 {
     let v;
     unsafe { asm!("mrs {}, cntfrq_el0", out(reg) v) };

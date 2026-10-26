@@ -53,11 +53,11 @@ fn static_pie_executable() {
 #[test]
 fn reads_imported_files_only() {
     let b = with("cat").file("/data/in.txt", "secret data\n", 0o644).unwrap();
-    let out = run(b, &["/bin/cat", "/data/in.txt", "/etc/passwd"]);
+    let out = run(b, &["/bin/cat", "/data/in.txt", "/etc/shadow"]);
     assert_eq!(out.status, ExitStatus::Exited(1));
     assert_eq!(out.stdout_str(), "secret data\n");
-    assert_eq!(out.stderr_str(), "cat: /etc/passwd: No such file or directory\n");
-    assert_eq!(out.events, [GuestEvent::MissingPath { path: "/etc/passwd".into() }]);
+    assert_eq!(out.stderr_str(), "cat: /etc/shadow: No such file or directory\n");
+    assert_eq!(out.events, [GuestEvent::MissingPath { path: "/etc/shadow".into() }]);
 }
 
 #[test]
@@ -83,7 +83,8 @@ fn root_contains_only_imports_and_synthetic_dirs() {
     let out = run(with("ls"), &["/bin/ls", "/"]);
     let listing = out.stdout_str();
     let names: Vec<&str> = listing.lines().skip(1).filter_map(|l| l.split(' ').nth(1)).collect();
-    assert_eq!(names, ["bin", "dev", "proc", "tmp"]);
+    // /etc/passwd + /etc/group and /home/grix describe the sandbox user.
+    assert_eq!(names, ["bin", "dev", "etc", "home", "proc", "sys", "tmp"]);
 }
 
 #[test]
@@ -278,4 +279,47 @@ fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);
     assert_eq!(out.status, ExitStatus::Signaled(13));
     assert_eq!(out.stdout_str(), "");
+}
+
+// ---------------------------------------------------------------- Linux surface
+
+#[test]
+fn users_proc_dev_statfs_xattr_inotify() {
+    let out = run(with("compat"), &["/bin/compat"]);
+    assert_eq!(out.stdout_str(), "via /dev/stdout\ncompat ok \n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(out.events, [GuestEvent::MissingPath { path: "/nope".into() }]);
+}
+
+#[test]
+fn shebang_scripts() {
+    let b = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .file("/bin/greet", "#!/bin/busybox sh\necho \"hi $1 from $0\"\n", 0o755)
+        .unwrap()
+        .file("/bin/nested", "#!/bin/greet\n", 0o755)
+        .unwrap()
+        .file("/bin/missing", "#!/bin/nope\n", 0o755)
+        .unwrap();
+    let sb = b.build().unwrap();
+    let out = sb.run(&["/bin/greet", "there"]).unwrap();
+    assert_eq!(out.stdout_str(), "hi there from /bin/greet\n");
+    // A script whose interpreter is itself a script.
+    let out = sb.run(&["/bin/nested", "x"]).unwrap();
+    assert_eq!(out.stdout_str(), "hi /bin/nested from /bin/greet\n");
+    let out = sb.run(&["/bin/missing"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(127));
+    assert!(matches!(&out.events[..], [GuestEvent::ExecFailed { reason, .. }] if reason.contains("/bin/nope")));
+}
+
+#[test]
+fn busybox_sees_user_and_system_info() {
+    let sb = busybox_sandbox();
+    assert_eq!(busybox(&sb, &["id"]).stdout_str(), "uid=1000(grix) gid=1000(grix) groups=1000(grix)\n");
+    assert_eq!(busybox(&sb, &["whoami"]).stdout_str(), "grix\n");
+    assert!(busybox(&sb, &["ps"]).stdout_str().contains("1 grix"));
+    assert!(busybox(&sb, &["free"]).stdout_str().contains("Mem:"));
+    assert!(busybox(&sb, &["df", "/"]).stdout_str().contains("grix"));
+    assert_eq!(busybox(&sb, &["ls", "/proc/self/fd"]).stdout_str(), "0\n1\n2\n3\n");
 }

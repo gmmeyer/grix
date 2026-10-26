@@ -12,6 +12,7 @@ use crate::fd::{
     Epoll, FdEntry, FileKind, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile, Registration, new_file,
 };
 use crate::fs::{self, Dev, Ino, Kind, ROOT, S_IFIFO, StatInfo};
+use crate::procfs;
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
@@ -78,8 +79,11 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::get().stat(*ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600),
         FileKind::Socket(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777),
+        FileKind::Generated(data) => {
+            StatInfo { ino: 0x4000_0000 + fd, mode: fs::S_IFREG | 0o444, nlink: 1, size: data.len() as u64, rdev: 0 }
+        }
         // anon_inode files have no type bits on Linux.
-        FileKind::EventFd(_) | FileKind::Epoll(_) => anon(0x2000_0000 + fd, 0o600),
+        FileKind::EventFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) => anon(0x2000_0000 + fd, 0o600),
     })
 }
 
@@ -90,6 +94,9 @@ fn path_stat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Stat
             return fd_stat(p, dirfd);
         }
         return Err(ENOENT);
+    }
+    if let Some(fd) = procfs::fd_path(&path) {
+        return fd_stat(p, fd);
     }
     let ino = resolve(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
     Ok(fs::get().stat(ino))
@@ -103,6 +110,11 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult 
     let acc = flags & O_ACCMODE;
     let writes = acc != O_RDONLY || flags & O_TRUNC != 0 || flags & O_TMPFILE == O_TMPFILE;
     let fs = fs::get();
+    // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file.
+    if let Some(fd) = procfs::fd_path(&path) {
+        let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+        return p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0);
+    }
     let base = if path.starts_with('/') { ROOT } else { dir_base(p, dirfd)? };
     let found = fs.lookup(base, &path, flags & O_NOFOLLOW == 0);
 
@@ -135,6 +147,8 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult 
         Kind::File(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
         Kind::File(_) if writes => return no_writes(p, &path),
         Kind::File(_) => FileKind::Node(ino),
+        Kind::Proc(_) if writes => return Err(EACCES),
+        Kind::Proc(f) => FileKind::Generated(procfs::generate(p, f)),
     };
     let file = new_file(kind, flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
     p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
@@ -180,6 +194,16 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
     match &f.kind {
         FileKind::Stdin => Ok(0),
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
+        FileKind::Inotify(_) => would_block(p, nonblock),
+        FileKind::Generated(data) => {
+            let off = at.unwrap_or(f.offset) as usize;
+            let n = (count as usize).min(data.len().saturating_sub(off));
+            copy_out(&mut p.aspace, buf, &data[off..off + n])?;
+            if at.is_none() {
+                f.offset += n as u64;
+            }
+            Ok(n as u64)
+        }
         FileKind::Pipe(end) if end.write => Err(EBADF),
         FileKind::Pipe(end) => pipe_read(p, end, buf, count, nonblock, false),
         FileKind::Socket(s) => match &s.rx {
@@ -244,7 +268,9 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64) -> SysRes
         FileKind::Stdout => Channel::Stdout,
         FileKind::Stderr => Channel::Stderr,
         FileKind::Dev(..) => return Ok(count),
-        FileKind::Stdin | FileKind::Node(_) | FileKind::Epoll(_) => return Err(EBADF),
+        FileKind::Stdin | FileKind::Node(_) | FileKind::Epoll(_) | FileKind::Generated(_) | FileKind::Inotify(_) => {
+            return Err(EBADF);
+        }
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
         FileKind::Socket(s) => {
@@ -364,8 +390,8 @@ pub fn pread(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRes
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
     match f.kind {
-        FileKind::Node(_) if (off as i64) < 0 => Err(EINVAL),
-        FileKind::Node(_) => read_into(p, &mut f, buf, count, Some(off)),
+        FileKind::Node(_) | FileKind::Generated(_) if (off as i64) < 0 => Err(EINVAL),
+        FileKind::Node(_) | FileKind::Generated(_) => read_into(p, &mut f, buf, count, Some(off)),
         FileKind::Dev(..) => read_into(p, &mut f, buf, count, None),
         _ => Err(ESPIPE),
     }
@@ -435,6 +461,7 @@ pub fn lseek(p: &mut Process, fd: u64, off: u64, whence: u64) -> SysResult {
             Kind::File(d) => d.len() as i64,
             _ => 0,
         },
+        FileKind::Generated(ref data) => data.len() as i64,
         FileKind::Dev(..) => return Ok(0),
         _ => return Err(ESPIPE),
     };
@@ -532,8 +559,17 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
         return Err(EINVAL);
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
-    let ino = resolve(p, dirfd, &path, false)?;
-    let Kind::Symlink(target) = &fs::get().node(ino).kind else { return Err(EINVAL) };
+    let target = match procfs::fd_path(&path) {
+        Some(fd) if path.contains("/fd/") => {
+            let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+            procfs::fd_link(&file.lock().kind, fd)
+        }
+        _ => {
+            let ino = resolve(p, dirfd, &path, false)?;
+            let Kind::Symlink(target) = &fs::get().node(ino).kind else { return Err(EINVAL) };
+            target.clone()
+        }
+    };
     let n = (target.len() as u64).min(size) as usize;
     copy_out(&mut p.aspace, buf, &target.as_bytes()[..n]).map(|_| n as u64)
 }
@@ -548,7 +584,19 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     }
     let mut out: Vec<u8> = Vec::new();
     let mut pos = f.offset;
-    while let Some((name, ino)) = fs.dir_entry(dir, pos) {
+    // /proc/self/fd lists the live descriptors as symlinks.
+    let fd_names: Vec<String> = if dir == fs.fd_dir {
+        (0..p.fds.len() as u64).filter(|&fd| p.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
+    } else {
+        Vec::new()
+    };
+    let entry = |pos: u64| -> Option<(&str, Ino, u8)> {
+        if dir == fs.fd_dir && pos >= 2 {
+            return fd_names.get(pos as usize - 2).map(|n| (n.as_str(), dir, 10));
+        }
+        fs.dir_entry(dir, pos).map(|(n, ino)| (n, ino, fs.d_type(ino)))
+    };
+    while let Some((name, ino, d_type)) = entry(pos) {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > count as usize {
             if out.is_empty() {
@@ -560,7 +608,7 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
         out.extend_from_slice(&(ino as u64 + 1).to_le_bytes());
         out.extend_from_slice(&(pos as i64 + 1).to_le_bytes());
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push(fs.d_type(ino));
+        out.push(d_type);
         out.extend_from_slice(name.as_bytes());
         out.resize(start + reclen, 0);
         pos += 1;
@@ -952,4 +1000,91 @@ pub fn ms_timeout(ms: u64) -> Option<u64> {
 pub fn epoll_pwait2(p: &mut Process, epfd: u64, evp: u64, max: u64, ts: u64) -> SysResult {
     let timeout = timespec_timeout(p, ts)?;
     epoll_wait(p, epfd, evp, max, timeout)
+}
+
+// ---------------------------------------------------------------- statfs, xattrs, inotify
+
+/// struct statfs (arm64): everything lives on one read-only in-memory filesystem.
+fn statfs_bytes() -> [u8; 120] {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const ST_RDONLY: u64 = 1;
+    let (total, used) = crate::mm::frame::stats();
+    let fields = [
+        TMPFS_MAGIC,                   // f_type
+        4096,                          // f_bsize
+        total,                         // f_blocks
+        total - used,                  // f_bfree
+        0,                             // f_bavail: read-only
+        fs::get().node_count() as u64, // f_files
+        0,                             // f_ffree
+        0,                             // f_fsid
+        255,                           // f_namelen
+        4096,                          // f_frsize
+        ST_RDONLY,                     // f_flags
+    ];
+    let mut b = [0u8; 120];
+    for (i, v) in fields.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+pub fn statfs(p: &mut Process, pathp: u64, buf: u64) -> SysResult {
+    let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    resolve(p, AT_FDCWD as u64, &path, true)?;
+    copy_out(&mut p.aspace, buf, &statfs_bytes()).map(|_| 0)
+}
+
+pub fn fstatfs(p: &mut Process, fd: u64, buf: u64) -> SysResult {
+    p.fds.get(fd)?;
+    copy_out(&mut p.aspace, buf, &statfs_bytes()).map(|_| 0)
+}
+
+const ENODATA: Errno = Errno(61);
+
+/// getxattr/lgetxattr/fgetxattr and listxattr/llistxattr/flistxattr: files
+/// exist but carry no extended attributes.
+pub fn xattr_query(p: &mut Process, n: u32, target: u64, list: bool) -> SysResult {
+    match n {
+        nr::fgetxattr | nr::flistxattr => {
+            p.fds.get(target)?;
+        }
+        _ => {
+            let path = read_cstr(&mut p.aspace, target, PATH_MAX)?;
+            let follow = !matches!(n, nr::lgetxattr | nr::llistxattr);
+            resolve(p, AT_FDCWD as u64, &path, follow)?;
+        }
+    }
+    if list { Ok(0) } else { Err(ENODATA) }
+}
+
+pub fn inotify_init1(p: &mut Process, flags: u64) -> SysResult {
+    let flags = flags as u32;
+    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+        return Err(EINVAL);
+    }
+    let file = new_file(FileKind::Inotify(crate::fd::Inotify::default()), O_RDONLY | (flags & O_NONBLOCK));
+    p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
+}
+
+pub fn inotify_add_watch(p: &mut Process, fd: u64, pathp: u64, mask: u64) -> SysResult {
+    const IN_DONT_FOLLOW: u64 = 0x0200_0000;
+    let file = p.fds.get(fd)?;
+    let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    let ino = resolve(p, AT_FDCWD as u64, &path, mask & IN_DONT_FOLLOW == 0)?;
+    let mut f = file.lock();
+    let FileKind::Inotify(n) = &mut f.kind else { return Err(EINVAL) };
+    if let Some((&wd, _)) = n.watches.iter().find(|(_, w)| **w == ino) {
+        return Ok(wd as u64);
+    }
+    n.next_wd += 1;
+    n.watches.insert(n.next_wd, ino);
+    Ok(n.next_wd as u64)
+}
+
+pub fn inotify_rm_watch(p: &mut Process, fd: u64, wd: u64) -> SysResult {
+    let file = p.fds.get(fd)?;
+    let mut f = file.lock();
+    let FileKind::Inotify(n) = &mut f.kind else { return Err(EINVAL) };
+    n.watches.remove(&(wd as i32)).map(|_| 0).ok_or(EINVAL)
 }

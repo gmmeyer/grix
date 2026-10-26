@@ -1,6 +1,7 @@
 //! ELF64 (AArch64) loader. Segments become file-backed VMAs that are paged in
 //! on demand straight from the boot image.
 
+use crate::fs::Ino;
 use crate::mm::aspace::{AddressSpace, Backing, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_down, page_up};
@@ -50,7 +51,12 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, &'static str> {
 
 /// Load `data` into `aspace`. For ET_DYN, `base` picks the load address
 /// (None = let the address space choose).
-pub fn load(aspace: &mut AddressSpace, data: &'static [u8], base: Option<u64>) -> Result<Loaded, &'static str> {
+pub fn load(
+    aspace: &mut AddressSpace,
+    data: &'static [u8],
+    ino: Ino,
+    base: Option<u64>,
+) -> Result<Loaded, &'static str> {
     if data.get(..4) != Some(b"\x7fELF") {
         return Err("not an ELF file");
     }
@@ -122,7 +128,7 @@ pub fn load(aspace: &mut AddressSpace, data: &'static [u8], base: Option<u64>) -
             start,
             end: vend,
             prot: Prot::from_elf(p.flags),
-            backing: Backing::File { data, offset: p.offset - skew, filesz: p.filesz + skew },
+            backing: Backing::File { data, offset: p.offset - skew, filesz: p.filesz + skew, ino },
         });
         end = end.max(vend);
     }

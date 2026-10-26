@@ -8,7 +8,7 @@ pub enum GuestEvent {
     /// A syscall needed a capability that was not granted.
     Denied { syscall: String, capability: String, detail: String },
     /// The program needed kernel functionality that is not implemented yet.
-    Unimplemented { syscall: String, detail: String },
+    Unimplemented { nr: u32, syscall: String, detail: String },
     /// The program looked for a path that was not imported.
     MissingPath { path: String },
     /// The program was killed by a fault or signal.
@@ -23,8 +23,8 @@ impl From<Event<'_>> for GuestEvent {
             Event::Denied { syscall, capability, detail, .. } => {
                 GuestEvent::Denied { syscall: syscall.into(), capability: capability.into(), detail: detail.into() }
             }
-            Event::Unimplemented { syscall, detail, .. } => {
-                GuestEvent::Unimplemented { syscall: syscall.into(), detail: detail.into() }
+            Event::Unimplemented { nr, syscall, detail } => {
+                GuestEvent::Unimplemented { nr, syscall: syscall.into(), detail: detail.into() }
             }
             Event::MissingPath { path } => GuestEvent::MissingPath { path: path.into() },
             Event::Fault { signal, addr, pc, detail } => GuestEvent::Fault { signal, addr, pc, detail: detail.into() },
@@ -47,8 +47,12 @@ impl fmt::Display for GuestEvent {
                     write!(f, ": needs capability `{capability}`")
                 }
             }
-            GuestEvent::Unimplemented { syscall, detail } => {
-                write!(f, "unsupported {syscall}")?;
+            GuestEvent::Unimplemented { nr, syscall, detail } => {
+                if syscall == "unknown" {
+                    write!(f, "unsupported syscall {nr}")?;
+                } else {
+                    write!(f, "unsupported {syscall}")?;
+                }
                 if !detail.is_empty() {
                     write!(f, " ({detail})")?;
                 }
