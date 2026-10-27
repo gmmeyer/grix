@@ -96,6 +96,17 @@ fn network_is_denied_by_default() {
 }
 
 #[test]
+fn network_interfaces_without_net() {
+    // getifaddrs, if_nameindex and netlink describe lo; nothing else exists.
+    let out = run(with("netif"), &["/bin/netif"]);
+    assert_eq!(out.stdout_str(), "netif ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The fixture checks that AF_INET sockets are still denied.
+    assert_eq!(out.missing_capabilities(), ["net"]);
+    assert_eq!(out.events.len(), 1, "{:?}", out.events);
+}
+
+#[test]
 fn kill_on_deny() {
     let out = run(with("net").on_deny(DenyAction::Kill), &["/bin/net"]);
     assert_eq!(out.status, ExitStatus::Signaled(31));

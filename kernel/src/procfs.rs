@@ -80,6 +80,16 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/fs/file-max", ProcFile::Text("1024\n")),
     ("/proc/sys/fs/nr_open", ProcFile::Text("1024\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),
+    // The only interface is lo (see netlink.rs).
+    (
+        "/proc/net/dev",
+        ProcFile::Text(
+            "Inter-|   Receive                                                |  Transmit\n \
+             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    \
+             lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
+        ),
+    ),
+    ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
     ("/sys/devices/system/cpu/online", ProcFile::Text("0\n")),
     ("/sys/devices/system/cpu/possible", ProcFile::Text("0\n")),
     ("/sys/devices/system/cpu/present", ProcFile::Text("0\n")),
@@ -331,6 +341,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
         FileKind::Inotify(_) => String::from("anon_inode:inotify"),
         FileKind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
+        FileKind::Netlink(_) | FileKind::UnixUnbound(_) => alloc::format!("socket:[{}]", 0x3000_0000 + fd),
     }
 }
 

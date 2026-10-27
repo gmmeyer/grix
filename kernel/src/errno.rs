@@ -36,6 +36,8 @@ pub const ENOTEMPTY: Errno = Errno(39);
 pub const ELOOP: Errno = Errno(40);
 pub const ENODATA: Errno = Errno(61);
 pub const EOPNOTSUPP: Errno = Errno(95);
+pub const ENOBUFS: Errno = Errno(105);
+pub const ENOTCONN: Errno = Errno(107);
 pub const E2BIG: Errno = Errno(7);
 pub const ETIMEDOUT: Errno = Errno(110);
 

@@ -191,6 +191,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 |---|---|
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Network sockets (`net`), stdin from the host |
+| Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | `signalfd`; CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
@@ -206,7 +207,7 @@ and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
 Alpine's **python3** (threads, asyncio, hashlib, json, signal handlers,
 KeyboardInterrupt, tempfile, shutil, an on-disk sqlite database) and
 **nodejs** (timers, crypto, fs reads and writes, worker_threads,
-`process.on('SIG…')`); static Go binaries (goroutine preemption, nil
+`process.on('SIG…')`, `os.networkInterfaces()`); static Go binaries (goroutine preemption, nil
 dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
 `dd`, `find`.
 
@@ -238,6 +239,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart
   src/timer.rs     setitimer, POSIX timers and timerfds, fired by the scheduler
+  src/netlink.rs   NETLINK_ROUTE answers and interface ioctls: the only interface is lo
   src/fs.rs        the filesystem: imports plus copy-on-write pages, permissions, size limits
   src/ipc.rs       pipes, eventfds, socket pairs
   src/syscall/     Linux syscall table (+ capability gates) and implementations

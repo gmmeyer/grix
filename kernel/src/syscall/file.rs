@@ -136,7 +136,9 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600, 0),
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
-        FileKind::Socket(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
+        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) => {
+            anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0)
+        }
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::TimerFd(_) => {
@@ -328,6 +330,11 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Stdin => Ok(0),
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
         FileKind::Inotify(_) => would_block(p, nonblock),
+        FileKind::UnixUnbound(_) => Err(ENOTCONN),
+        FileKind::Netlink(_) => {
+            let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
+            super::net::netlink_recv(p, nl, &[(buf, count)], 0, nonblock).map(|(n, _)| n)
+        }
         FileKind::TimerFd(t) => {
             if count < 8 {
                 return Err(EINVAL);
@@ -487,6 +494,11 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             return Err(EBADF);
         }
         FileKind::TimerFd(_) => return Err(EINVAL),
+        FileKind::UnixUnbound(_) => return Err(ENOTCONN),
+        FileKind::Netlink(_) => {
+            let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
+            return super::net::netlink_request(p, nl, &[(buf, count)]);
+        }
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
         FileKind::Socket(s) => {
@@ -1369,6 +1381,30 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     const FIONBIO: u64 = 0x5421;
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
+    const SIOCGIFCONF: u64 = 0x8912;
+    let entry = p.fds.entry_mut(fd)?;
+    let socket =
+        matches!(entry.file.lock().kind, FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_));
+    if socket && req == SIOCGIFCONF {
+        // struct ifconf { int ifc_len; char *ifc_buf; }: one entry, for lo.
+        let len = read_u32(&mut p.aspace, arg)? as usize;
+        let buf = read_u64(&mut p.aspace, arg + 8)?;
+        let entry = crate::netlink::ifconf_entry();
+        // With no buffer, report the size needed.
+        let n = if buf == 0 || len >= entry.len() { entry.len() } else { 0 };
+        if buf != 0 && n > 0 {
+            copy_out(&mut p.aspace, buf, &entry)?;
+        }
+        return write_u32(&mut p.aspace, arg, n as u32).map(|_| 0);
+    }
+    if socket && (0x8900..=0x89ff).contains(&req) {
+        let mut ifr = [0u8; 40];
+        copy_in(&mut p.aspace, arg, &mut ifr)?;
+        return match crate::netlink::ifreq_ioctl(req, &mut ifr) {
+            Some(r) => r.and_then(|_| copy_out(&mut p.aspace, arg, &ifr)).map(|_| 0),
+            None => p.unimplemented(nr::ioctl, "ioctl", &alloc::format!("socket ioctl {req:#x}"), EOPNOTSUPP),
+        };
+    }
     let entry = p.fds.entry_mut(fd)?;
     match req {
         FIONREAD => {

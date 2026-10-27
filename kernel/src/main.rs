@@ -19,6 +19,7 @@ mod fd;
 mod fs;
 mod ipc;
 mod mm;
+mod netlink;
 mod process;
 mod procfs;
 mod rng;

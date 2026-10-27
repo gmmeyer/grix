@@ -161,7 +161,13 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::getsockopt => net::getsockopt(p, a[0], a[1], a[2], a[3], a[4]),
         nr::setsockopt => net::setsockopt(p, a[0], a[1], a[2]),
         nr::shutdown => net::shutdown(p, a[0], a[1]),
-        nr::getsockname | nr::getpeername => net::getname(p, a[0], a[1], a[2]),
+        nr::getsockname => net::getname(p, a[0], a[1], a[2], false),
+        nr::getpeername => net::getname(p, a[0], a[1], a[2], true),
+        nr::socket => net::socket(p, a[0], a[1], a[2]),
+        nr::bind => net::bind(p, a[0], a[1], a[2]),
+        nr::connect => net::connect(p, a[0]),
+        nr::listen => net::listen(p, a[0]),
+        nr::accept | nr::accept4 => net::accept(p, a[0]),
 
         // memory
         nr::brk => mem::brk(p, a[0]),

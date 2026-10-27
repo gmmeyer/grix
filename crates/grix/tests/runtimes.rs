@@ -262,6 +262,21 @@ fn node_files() {
 }
 
 #[test]
+fn node_network_interfaces() {
+    let b = sandbox("node");
+    let out = run(
+        b,
+        &[
+            "/usr/bin/node",
+            "-e",
+            "const n = require('os').networkInterfaces(); console.log(Object.keys(n), n.lo.map(a => a.cidr))",
+        ],
+    );
+    assert_eq!(out.stdout_str(), "[ 'lo' ] [ '127.0.0.1/8', '::1/128' ]\n");
+    assert_no_surprises(&out);
+}
+
+#[test]
 fn node_needs_threads() {
     let b = Sandbox::builder().timeout(Duration::from_secs(120)).memory_mb(1024).import(runtime("node"), "/").unwrap();
     let out = b.build().unwrap().run(&["/usr/bin/node", "-e", "1"]).unwrap();

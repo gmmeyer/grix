@@ -34,6 +34,11 @@ pub enum FileKind {
     Generated(Vec<u8>),
     Inotify(Inotify),
     TimerFd(Arc<Mutex<crate::timer::TimerFd>>),
+    /// A NETLINK_ROUTE socket (netlink.rs).
+    Netlink(crate::netlink::Netlink),
+    /// An AF_UNIX socket of this type that isn't bound or connected (binding
+    /// to paths isn't implemented yet). Good for interface ioctls.
+    UnixUnbound(u64),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -59,6 +64,8 @@ impl FileKind {
                 (if t.expirations > 0 { EPOLLIN } else { 0 }, t.version)
             }
             FileKind::Pipe(end) => end.poll(),
+            FileKind::Netlink(nl) => nl.poll(),
+            FileKind::UnixUnbound(_) => (EPOLLOUT | crate::ipc::EPOLLHUP, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).

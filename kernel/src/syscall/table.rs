@@ -190,12 +190,12 @@ syscalls! {
     177 getegid Core;
     178 gettid Core;
     179 sysinfo Core;
-    198 socket Cap(Net);
+    198 socket Core; // gated by family: netlink route sockets only know `lo`; see net.rs
     199 socketpair Core; // AF_UNIX pairs are local IPC; others need `net`
-    200 bind Cap(Net);
-    201 listen Cap(Net);
-    202 accept Cap(Net);
-    203 connect Cap(Net);
+    200 bind Core; // acts on existing sockets (netlink port ids); see net.rs
+    201 listen Core; // acts on existing sockets; see net.rs
+    202 accept Core; // acts on existing sockets; see net.rs
+    203 connect Core; // acts on existing sockets; see net.rs
     204 getsockname Core; // acts on existing sockets; see net.rs
     205 getpeername Core; // acts on existing sockets; see net.rs
     206 sendto Core; // acts on existing sockets; see net.rs
@@ -227,7 +227,7 @@ syscalls! {
     233 madvise Core;
     240 rt_tgsigqueueinfo Core;
     241 perf_event_open Privileged;
-    242 accept4 Cap(Net);
+    242 accept4 Core; // acts on existing sockets; see net.rs
     243 recvmmsg Cap(Net);
     260 wait4 Cap(Process);
     261 prlimit64 Core;

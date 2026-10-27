@@ -15,8 +15,7 @@ support too, then the big ones. Re-probed 2026-10-26: Python (tempfile,
 pip, sqlite), Node (fs), `git init` and Go now pass.
 
 1. ~~**Timers**~~: done (see below).
-2. **Network interface listing**: an `AF_NETLINK` route socket that
-   reports only `lo`. Node `os.networkInterfaces()` is denied a socket today.
+2. ~~**Network interface listing**~~: done (see Networking).
 3. **Small Linux gaps**:
    - `memfd_create`
    - CPU-time clocks
@@ -153,10 +152,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] DNS through a host resolver.
 - [ ] Loopback (127.0.0.1) inside the sandbox, so a server and its client in
       the same sandbox work without the host.
-- [ ] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
+- [x] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
       `os.networkInterfaces()` throws today.
+      No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
 - [ ] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
       datagram and seqpacket pairs, `SCM_RIGHTS` fd passing.
+      `socket(AF_UNIX)` works for ioctls. bind, connect and listen on it are reported as unimplemented.
 - [ ] A fast host transport (virtio-vsock or virtio-console). The UART takes
       one VM exit per byte.
 
