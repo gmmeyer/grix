@@ -73,13 +73,16 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
     #[allow(non_upper_case_globals)]
     match n {
         // files
-        nr::openat => file::openat(p, a[0], a[1], a[2]),
+        nr::openat => file::openat(p, a[0], a[1], a[2], a[3]),
         nr::close => file::close(p, a[0]),
         nr::read => file::read(p, a[0], a[1], a[2]),
         nr::write => file::write(p, a[0], a[1], a[2]),
         nr::readv => file::readv(p, a[0], a[1], a[2]),
         nr::writev => file::writev(p, a[0], a[1], a[2]),
         nr::pread64 => file::pread(p, a[0], a[1], a[2], a[3]),
+        nr::pwrite64 => file::pwrite(p, a[0], a[1], a[2], a[3]),
+        nr::preadv => file::preadv(p, a[0], a[1], a[2], a[3], false),
+        nr::pwritev => file::preadv(p, a[0], a[1], a[2], a[3], true),
         nr::lseek => file::lseek(p, a[0], a[1], a[2]),
         nr::fstat => file::fstat(p, a[0], a[1]),
         nr::newfstatat => file::newfstatat(p, a[0], a[1], a[2], a[3]),
@@ -124,6 +127,26 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::inotify_add_watch => file::inotify_add_watch(p, a[0], a[1], a[2]),
         nr::inotify_rm_watch => file::inotify_rm_watch(p, a[0], a[1]),
         nr::fsync | nr::fdatasync => p.fds.get(a[0]).map(|_| 0),
+        // changing the tree (gated by fs_write in the table)
+        nr::mkdirat => file::mkdirat(p, a[0], a[1], a[2]),
+        nr::unlinkat => file::unlinkat(p, a[0], a[1], a[2]),
+        nr::renameat => file::renameat2(p, a[0], a[1], a[2], a[3], 0),
+        nr::renameat2 => file::renameat2(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::linkat => file::linkat(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::symlinkat => file::symlinkat(p, a[0], a[1], a[2]),
+        nr::truncate => file::truncate(p, a[0], a[1]),
+        nr::ftruncate => file::ftruncate(p, a[0], a[1]),
+        nr::fallocate => file::fallocate(p, a[0], a[1], a[2], a[3]),
+        nr::fchmod => file::fchmod(p, a[0], a[1]),
+        nr::fchmodat => file::fchmodat(p, a[0], a[1], a[2]),
+        nr::fchown => file::fchown(p, a[0], a[1], a[2]),
+        nr::fchownat => file::fchownat(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::utimensat => file::utimensat(p, a[0], a[1], a[2], a[3]),
+        nr::setxattr | nr::lsetxattr | nr::fsetxattr | nr::removexattr | nr::lremovexattr | nr::fremovexattr => {
+            p.unimplemented(n, name, "extended attributes", EOPNOTSUPP)
+        }
+        nr::sendfile => file::sendfile(p, a[0], a[1], a[2], a[3]),
+        nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sync => Ok(0),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),
         nr::flock => p.fds.get(a[0]).map(|_| 0),

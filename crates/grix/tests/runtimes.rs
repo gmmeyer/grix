@@ -80,6 +80,49 @@ fn python() {
     assert_no_surprises(&out);
 }
 
+const PYTHON_FILES: &str = r#"
+import json, os, pathlib, shutil, sqlite3, tempfile
+d = tempfile.mkdtemp()
+p = pathlib.Path(d, "a", "b")
+p.mkdir(parents=True)
+(p / "x.json").write_text(json.dumps({"k": [1, 2]}))
+shutil.copy(p / "x.json", p / "y.json")
+os.replace(p / "y.json", p / "z.json")
+db = sqlite3.connect(os.path.join(d, "t.db"))
+db.execute("create table t (v)")
+db.executemany("insert into t values (?)", [(i,) for i in range(1000)])
+db.commit()
+print("sqlite", db.execute("select count(*), sum(v) from t").fetchone())
+db.close()
+with tempfile.TemporaryFile() as f:
+    f.write(b"scratch")
+    f.seek(0)
+    print("tempfile", f.read())
+print("tree", sorted(str(q.relative_to(d)) for q in pathlib.Path(d).rglob("*")))
+print("json", json.loads((p / "z.json").read_text()))
+shutil.rmtree(d)
+print("removed", not os.path.exists(d))
+"#;
+
+#[test]
+fn python_files() {
+    let b = sandbox("python")
+        .allow(Capability::FsWrite)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .file("/data/test.py", PYTHON_FILES, 0o644)
+        .unwrap();
+    let out = run(b, &["/usr/bin/python3", "/data/test.py"]);
+    assert_eq!(
+        out.stdout_str(),
+        "sqlite (1000, 499500)\n\
+         tempfile b'scratch'\n\
+         tree ['a', 'a/b', 'a/b/x.json', 'a/b/z.json', 't.db']\n\
+         json {'k': [1, 2]}\n\
+         removed True\n"
+    );
+    assert_no_surprises(&out);
+}
+
 const NODE: &str = r#"
 const crypto = require('crypto');
 const fs = require('fs');
@@ -162,6 +205,35 @@ fn node_signals() {
     let b = sandbox("node").file("/data/test.js", NODE_SIGNALS, 0o644).unwrap();
     let out = run(b, &["/usr/bin/node", "/data/test.js"]);
     assert_eq!(out.stdout_str(), "got SIGUSR2\n");
+    assert_no_surprises(&out);
+}
+
+const NODE_FILES: &str = r#"
+const fs = require('fs'), path = require('path'), os = require('os');
+const d = fs.mkdtempSync(path.join(os.tmpdir(), 'n-'));
+fs.mkdirSync(path.join(d, 'a/b'), { recursive: true });
+fs.writeFileSync(path.join(d, 'a/b/f.txt'), 'node wrote this');
+fs.appendFileSync(path.join(d, 'a/b/f.txt'), '!');
+fs.renameSync(path.join(d, 'a/b/f.txt'), path.join(d, 'g.txt'));
+fs.copyFileSync(path.join(d, 'g.txt'), path.join(d, 'h.txt'));
+console.log('read', fs.readFileSync(path.join(d, 'h.txt'), 'utf8'), fs.statSync(path.join(d, 'h.txt')).size);
+console.log('list', JSON.stringify(fs.readdirSync(d).sort()));
+(async () => {
+  await fs.promises.writeFile(path.join(d, 'p.txt'), 'promise');
+  console.log('promise', await fs.promises.readFile(path.join(d, 'p.txt'), 'utf8'));
+  fs.rmSync(d, { recursive: true });
+  console.log('exists', fs.existsSync(d));
+})();
+"#;
+
+#[test]
+fn node_files() {
+    let b = sandbox("node").allow(Capability::FsWrite).file("/data/test.js", NODE_FILES, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/node", "/data/test.js"]);
+    assert_eq!(
+        out.stdout_str(),
+        "read node wrote this! 16\nlist [\"a\",\"g.txt\",\"h.txt\"]\npromise promise\nexists false\n"
+    );
     assert_no_surprises(&out);
 }
 

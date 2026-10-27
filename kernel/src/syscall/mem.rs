@@ -1,12 +1,12 @@
 //! Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise.
 
 use crate::errno::*;
-use crate::fd::{FileKind, O_ACCMODE, O_WRONLY};
-use crate::fs::{self, Kind};
+use crate::fd::{FileKind, O_ACCMODE, O_RDWR, O_WRONLY};
 use crate::mm::aspace::{Backing, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_up};
 use crate::process::Process;
+use crate::syscall::table::nr;
 
 const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
@@ -59,18 +59,34 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         if f.flags & O_ACCMODE == O_WRONLY {
             return Err(EACCES);
         }
-        match f.kind {
-            FileKind::Node(ino) => match fs::get().node(ino).kind {
-                Kind::File(data) => {
-                    // Files are read-only, so a shared writable mapping is impossible.
-                    if shared && prot.write {
+        match (&f.kind, &f.content) {
+            (FileKind::Node(ino), Some(c)) => {
+                let ino = *ino;
+                if shared && prot.write {
+                    if f.flags & O_ACCMODE != O_RDWR {
                         return Err(EACCES);
                     }
-                    Backing::File { data, offset: off, filesz: (data.len() as u64).saturating_sub(off), ino }
+                    // Writes through the mapping would have to reach the file.
+                    return p.unimplemented(nr::mmap, "mmap", "shared writable file mappings", ENODEV);
                 }
-                _ => return Err(ENODEV),
-            },
-            FileKind::Dev(..) => Backing::Anon, // /dev/zero
+                // Unmodified imports map straight from the boot image; written
+                // files are copied page by page as they fault in. Either way
+                // the mapping holds a copy, so a shared one is registered with
+                // the file: changing the file later is reported.
+                let mut data = c.lock();
+                let shared = shared.then(|| data.map_shared());
+                match data.image() {
+                    Some(bytes) => Backing::File {
+                        data: bytes,
+                        offset: off,
+                        filesz: (bytes.len() as u64).saturating_sub(off),
+                        ino,
+                        shared,
+                    },
+                    None => Backing::Data { data: c.clone(), offset: off, ino, shared },
+                }
+            }
+            (FileKind::Dev(..), _) => Backing::Anon, // /dev/zero
             _ => return Err(ENODEV),
         }
     };
@@ -114,7 +130,12 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
         return Ok(0);
     }
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(ENOMEM)?;
-    p.aspace.protect(addr, end, Prot::from_linux(prot)).map(|_| 0)
+    let prot = Prot::from_linux(prot);
+    if prot.write && p.aspace.has_shared_file(addr, end) {
+        // Writes through it would have to reach the file.
+        return p.unimplemented(nr::mprotect, "mprotect", "shared writable file mappings", EACCES);
+    }
+    p.aspace.protect(addr, end, prot).map(|_| 0)
 }
 
 pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64) -> SysResult {

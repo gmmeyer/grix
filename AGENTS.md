@@ -38,7 +38,8 @@ into a boot image (`crates/abi/src/image.rs`). QEMU loads the image at
 physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`kernel/src`) enables the MMU in `arch/boot.S`, runs in the high half
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
-the image (`fs.rs`), loads the ELF (`elf.rs`, `process.rs`), and drops to EL0.
+the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
+(`elf.rs`, `process.rs`), and drops to EL0.
 After that, every bit of kernel work happens in an exception handler
 (`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames on the
@@ -101,7 +102,17 @@ keeping its deadline (`restart_deadline`).
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
-10. **User register state never reaches EL1.** `rt_sigreturn` loads every
+10. **The kernel heap is small (32 MiB) and running out of it panics.**
+    Anything a program can make the kernel allocate needs a budget that
+    fails with an errno first: file data counts pages (`fs::set_limit`),
+    and nodes and names count against `META_LIMIT` (ENOSPC).
+11. **`fs::lock()` is not re-entrant**; it panics if the lock is already
+    held. Drop the guard before calling anything that takes it
+    (`Process::missing_path`, `procfs::generate`, …). Lock order:
+    `OpenFile` → filesystem → `FileData`. Never hold a `FileData` lock
+    across `copy_in`/`copy_out`, because a fault may read the same file
+    through a mapping (file.rs uses bounce buffers).
+12. **User register state never reaches EL1.** `rt_sigreturn` loads every
     register from user memory. It must reject a frame whose pstate names
     another exception level, AArch32 or masked interrupts, and keep only
     NZCV (`signal::read_frame`). Anything else that loads a user-supplied

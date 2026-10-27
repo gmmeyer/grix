@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::errno::*;
-use crate::fs::{Dev, Ino};
+use crate::fs::{Content, Dev, Ino};
 use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd, SocketEnd};
 
 pub const MAX_FDS: usize = 1024;
@@ -15,6 +15,7 @@ pub const O_ACCMODE: u32 = 0o3;
 pub const O_RDONLY: u32 = 0o0;
 pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
+pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
 
 pub enum FileKind {
@@ -34,7 +35,7 @@ pub enum FileKind {
     Inotify(Inotify),
 }
 
-/// Imports are read-only, so watches never fire (yet): the fd is never readable.
+/// Watches are recorded but never fire (yet): the fd is never readable.
 #[derive(Default)]
 pub struct Inotify {
     pub watches: BTreeMap<i32, Ino>,
@@ -67,6 +68,12 @@ pub struct OpenFile {
     pub flags: u32,
     /// Opened with O_PATH: only usable as a dirfd / for fstat.
     pub path_only: bool,
+    /// A regular file's contents, held so they outlive an unlink.
+    pub content: Option<Content>,
+    /// Keeps the node's slot from being reused while this is open (`fs::Fs::pin`).
+    pub pin: Option<Arc<()>>,
+    /// getdents: the last directory entry returned.
+    pub dir_pos: Option<alloc::string::String>,
 }
 
 impl OpenFile {
@@ -103,7 +110,7 @@ pub struct FdTable {
 }
 
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
-    Arc::new(Mutex::new(OpenFile { kind, offset: 0, flags, path_only: false }))
+    Arc::new(Mutex::new(OpenFile { kind, offset: 0, flags, path_only: false, content: None, pin: None, dir_pos: None }))
 }
 
 impl FdTable {
@@ -164,5 +171,10 @@ impl FdTable {
 
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Is there a free descriptor (so open can fail with EMFILE before it creates anything)?
+    pub fn has_room(&self) -> bool {
+        self.slots.len() < MAX_FDS || self.slots.iter().any(Option::is_none)
     }
 }

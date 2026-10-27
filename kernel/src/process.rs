@@ -112,6 +112,8 @@ pub struct Process {
     pub aspace: AddressSpace,
     pub fds: FdTable,
     pub cwd: Ino,
+    /// Keeps the working directory's slot from being reused if it's removed.
+    pub cwd_pin: Option<alloc::sync::Arc<()>>,
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
@@ -161,6 +163,7 @@ impl Process {
             aspace: AddressSpace::new().expect("out of memory"),
             fds: FdTable::with_stdio(),
             cwd: ROOT,
+            cwd_pin: None,
             policy,
             uid,
             gid,
@@ -290,10 +293,13 @@ impl Process {
 
     /// The program looked for a path that was not imported.
     pub fn missing_path(&mut self, base: Ino, path: &str) {
+        if !fs::lock().missing_is_import_gap(base, path) {
+            return;
+        }
         let abs = if path.starts_with('/') {
             String::from(path)
         } else {
-            let mut s = fs::get().path_of(base);
+            let mut s = fs::lock().path_of(base);
             if !s.ends_with('/') {
                 s.push('/');
             }
@@ -351,9 +357,12 @@ pub fn start(img: Image<'static>) -> ! {
     };
     fs.set_exe(&exe);
     fs::install(fs);
+    // Like tmpfs's default size: half of RAM for written file data.
+    fs::set_limit(crate::mm::frame::stats().0 / 2);
 
     let mut p = Process::new(img.policy, img.uid, img.gid);
     p.cwd = cwd;
+    p.cwd_pin = Some(fs::lock().pin(cwd));
     p.argv = argv;
     p.envp = img.envp.iter().map(|s| String::from(*s)).collect();
     p.exe = exe;
@@ -384,8 +393,8 @@ fn resolve_interpreters(
             .lookup(cwd, &path, true)
             .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
         let node = fs.node(ino);
-        let data = match node.kind {
-            Kind::File(data) if node.perm & 0o111 != 0 => data,
+        let data = match &node.kind {
+            Kind::File(c) if node.perm & 0o111 != 0 => image_of(c, path.as_str())?,
             Kind::File(_) => return Err((126, alloc::format!("{what} {path} is not executable"))),
             _ => return Err((126, alloc::format!("{what} {path} is not a regular file"))),
         };
@@ -412,16 +421,22 @@ fn resolve_interpreters(
     Err((126, alloc::format!("{path}: too many levels of #! interpreters")))
 }
 
+/// The bytes of a file to execute. Programs run straight from the boot
+/// image; a file the program wrote can't be executed yet (that comes with execve).
+fn image_of(c: &fs::Content, path: &str) -> Result<&'static [u8], (i32, String)> {
+    c.lock().image().ok_or_else(|| (126, alloc::format!("{path} was modified in the sandbox and can't be executed")))
+}
+
 /// Load `p.exe` (already resolved by `resolve_interpreters`) and build the
 /// initial stack. `execfn` is the path originally asked for (AT_EXECFN).
 fn exec(p: &mut Process, execfn: &str) -> Result<(u64, u64), (i32, String)> {
-    let fs = fs::get();
+    let fs = fs::lock();
     let file = |path: &str, what: &str| -> Result<(&'static [u8], Ino), (i32, String)> {
         let ino = fs
             .lookup(p.cwd, path, true)
             .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        match fs.node(ino).kind {
-            Kind::File(data) => Ok((data, ino)),
+        match &fs.node(ino).kind {
+            Kind::File(c) => Ok((image_of(c, path)?, ino)),
             _ => Err((126, alloc::format!("{what} {path} is not a regular file"))),
         }
     };

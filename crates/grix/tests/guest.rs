@@ -122,6 +122,49 @@ fn file_writes_need_fs_write() {
 }
 
 #[test]
+fn writable_filesystem() {
+    let b = with("files").allow(Capability::FsWrite).file("/data/in.txt", "imported text\n", 0o644).unwrap();
+    let out = run(b, &["/bin/files"]);
+    assert_eq!(out.stdout_str(), "files ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn filesystem_size_limit() {
+    // Written data is limited to half of guest memory, like tmpfs.
+    let out = run(with("files").allow(Capability::FsWrite), &["/bin/files", "fill"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stdout_str());
+    let mib: u64 =
+        out.stdout_str().trim().strip_prefix("filled ").unwrap().strip_suffix(" MiB").unwrap().parse().unwrap();
+    assert!((150..=256).contains(&mib), "{mib} MiB");
+}
+
+#[test]
+fn filesystem_metadata_limit() {
+    // Names and nodes are bounded too: ENOSPC instead of exhausting kernel memory.
+    let out = run(with("files").allow(Capability::FsWrite), &["/bin/files", "meta"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stdout_str());
+    assert!(out.stdout_str().starts_with("meta "), "{}", out.stdout_str());
+}
+
+#[test]
+fn shared_file_mappings_are_reported() {
+    let out = run(with("files").allow(Capability::FsWrite), &["/bin/files", "shared"]);
+    assert_eq!(out.stdout_str(), "shared ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let unimplemented: Vec<&str> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            GuestEvent::Unimplemented { syscall, .. } => Some(syscall.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unimplemented, ["mprotect", "write"], "{:?}", out.events);
+}
+
+#[test]
 fn memory_management() {
     let out = run(with("mem"), &["/bin/mem"]);
     assert_eq!(out.stdout_str(), "mem ok\n");

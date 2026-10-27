@@ -21,8 +21,9 @@ grix: missing /etc/passwd: not imported
 > **Status: early prototype.** It runs unmodified **Python 3.12**,
 > **Node 22** (Alpine's builds), **Go** programs, busybox, and static,
 > static-PIE or dynamically linked musl programs, with threads, signal
-> handlers, pipes, eventfd and epoll. Processes (fork/exec), writable files
-> and networking are gated by capabilities but **not implemented yet**. See
+> handlers, pipes, eventfd, epoll and (with `fs_write`) a writable in-memory
+> filesystem. Processes (fork/exec) and networking are gated by capabilities
+> but **not implemented yet**. See
 > [Compatibility](#compatibility) and [Roadmap](#roadmap).
 
 ## Quick start
@@ -123,7 +124,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 | Environment | Empty | `env` |
 | Memory, time, randomness, stdout/stderr | Always available | `memory_mb`, `timeout` limit them |
 | Local IPC: pipes, eventfd, epoll, AF_UNIX socket pairs | Always available | — |
-| `fs_write` | Denied | `allow(Capability::FsWrite)` |
+| `fs_write` | Denied: the filesystem is read-only | `allow(Capability::FsWrite)`: the whole tree becomes writable in guest memory (copy-on-write over the imports, up to half of RAM). The host's files never change. |
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
 | `net` | Denied, and the VM has no network device | `allow(Capability::Net)` |
@@ -193,7 +194,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | Timers that raise signals (`alarm`, `setitimer`, POSIX timers), `signalfd` |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
-| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Writable filesystem (`fs_write`) |
+| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Getting written files back to the host; host directory mounts |
+| With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
 | Clocks, blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR) | x86_64 guests |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | Linux/KVM hosts are untested |
@@ -201,17 +203,20 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
 and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
 Alpine's **python3** (threads, asyncio, hashlib, json, signal handlers,
-KeyboardInterrupt) and **nodejs** (timers, crypto, fs, worker_threads,
+KeyboardInterrupt, tempfile, shutil, an on-disk sqlite database) and
+**nodejs** (timers, crypto, fs reads and writes, worker_threads,
 `process.on('SIG…')`); static Go binaries (goroutine preemption, nil
-dereference panics, `os/signal`).
+dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
+`dd`, `find`.
 
 ## Roadmap
 
 1. **Networking** (`net`), so web servers can run: socket syscalls in the
    guest, proxied to the host, which enforces allow-lists for outbound
    connections and forwards listening ports. The guest needs no TCP/IP stack.
-2. **Writable filesystem**: tmpfs with a size limit (`fs_write`), optionally
-   exported back to the host, and stdin from the host.
+2. **Results back to the host**: export directories the program wrote (the
+   agent's outputs), read-write host mounts gated by policy, and stdin from
+   the host.
 3. **Timers** (`alarm`, `setitimer`, `timerfd`, POSIX timers) and signals
    from the host.
 4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
@@ -232,6 +237,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/mm/          frame allocator, page tables, address spaces / VMAs
   src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart
+  src/fs.rs        the filesystem: imports plus copy-on-write pages, permissions, size limits
   src/ipc.rs       pipes, eventfds, socket pairs
   src/syscall/     Linux syscall table (+ capability gates) and implementations
 fixtures/          C (src/, built with zig) and Go (go/) test programs; build/ also gets Alpine runtimes

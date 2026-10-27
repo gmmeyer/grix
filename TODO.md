@@ -58,12 +58,13 @@ shows progress).
 
 ## Filesystem
 
-- [ ] Writable tmpfs at `/tmp` (and anywhere `fs_write` allows), with a size
+- [x] Writable tmpfs at `/tmp` (and anywhere `fs_write` allows), with a size
       limit. Python `tempfile`, `pip install`, `git init`, compilers,
       `__pycache__`, Node `fs.writeFileSync`.
-- [ ] mkdir/unlink/rmdir/rename(2)/link/symlink/truncate/fallocate/chmod/chown/utimensat.
-- [ ] `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_EXCL`/`O_TMPFILE`, `pwrite64`/`pwritev`.
-- [ ] Copy-on-write overlay over imported files, for programs that modify
+      With `fs_write` the whole tree is writable in guest memory. File data is limited to half of RAM, and nodes and names to a metadata budget.
+- [x] mkdir/unlink/rmdir/rename(2)/link/symlink/truncate/fallocate/chmod/chown/utimensat.
+- [x] `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_EXCL`/`O_TMPFILE`, `pwrite64`/`pwritev`.
+- [x] Copy-on-write overlay over imported files, for programs that modify
       their own tree.
 - [ ] Hand writable directories back to the host after a run (the agent's results).
 - [ ] Read-write host directory mounts, gated by policy.
@@ -71,18 +72,22 @@ shows progress).
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
       Coreutils `ls -la` currently hits an "unknown" syscall.
-- [~] `inotify`. Node `fs.watch`, webpack, watchdog. Imports never change,
-      so a watch that never fires is correct until writes exist.
-      Watches can be added and removed, and never fire. Real events come with the writable filesystem.
+- [~] `inotify`. Node `fs.watch`, webpack, watchdog.
+      Watches can be added and removed but never fire, even now that files change.
 - [ ] `flock` and `fcntl` record locks with real semantics (sqlite) once there
       are writers.
-- [ ] Real file timestamps from the host (make, build caches). Everything
+- [~] Real file timestamps from the host (make, build caches). Everything
       shows boot time today.
-- [ ] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
+      Files the program changes get real atime/mtime/ctime. Imports still show boot time.
+- [~] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
+      `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice` and `tee` are missing.
 - [ ] `openat2`, `name_to_handle_at` (newer tools).
-- [ ] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
+- [~] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
+      `/dev/shm` is a writable 1777 directory. `memfd_create` is missing.
 - [ ] `MAP_SHARED` mappings of writable files, `msync`.
+      Shared mappings hold a copy taken at fault time. Changing the file, or making the mapping writable, is reported as unimplemented.
+- [ ] Executing files the program wrote (needs execve).
 - [ ] Large imports without copying everything into RAM: read-only
       virtio-blk/virtio-fs, loaded lazily (big runtimes, datasets).
 
@@ -167,4 +172,4 @@ shows progress).
 - [ ] SMP: more than one vCPU.
 - [ ] Our own VMM instead of QEMU (boot time, attack surface).
 - [ ] Snapshots of booted runtimes for instant start.
-- [ ] `getdents64` is O(n²) on large directories.
+- [x] `getdents64` is O(n²) on large directories.

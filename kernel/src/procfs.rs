@@ -115,11 +115,19 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             let _ = writeln!(s, "{}", comm(p));
         }
         ProcFile::Limits => limits(p, &mut s),
-        ProcFile::Mountinfo => s.push_str(
-            "1 0 0:1 / / ro,relatime - tmpfs grix ro\n2 1 0:2 / /proc rw,relatime - proc proc rw\n\
-             3 1 0:3 / /dev rw,relatime - devtmpfs dev rw\n",
-        ),
-        ProcFile::Mounts => s.push_str("grix / tmpfs ro 0 0\nproc /proc proc rw 0 0\ndev /dev devtmpfs rw 0 0\n"),
+        // The root is read-only without fs_write.
+        ProcFile::Mountinfo => {
+            let m = root_mode(p);
+            let _ = write!(
+                s,
+                "1 0 0:1 / / {m},relatime - tmpfs grix {m}\n2 1 0:2 / /proc rw,relatime - proc proc rw\n\
+                 3 1 0:3 / /dev rw,relatime - devtmpfs dev rw\n"
+            );
+        }
+        ProcFile::Mounts => {
+            let m = root_mode(p);
+            let _ = write!(s, "grix / tmpfs {m} 0 0\nproc /proc proc rw 0 0\ndev /dev devtmpfs rw 0 0\n");
+        }
         ProcFile::Cpuinfo => cpuinfo(&mut s),
         ProcFile::ProcStat => {
             let ticks = time::monotonic_ns() / 10_000_000;
@@ -176,8 +184,12 @@ fn mem_pages(p: &Process) -> (u64, u64) {
     (size, used)
 }
 
+fn root_mode(p: &Process) -> &'static str {
+    if p.policy.allows(grix_abi::policy::Capability::FsWrite) { "rw" } else { "ro" }
+}
+
 fn maps(p: &Process, s: &mut String) {
-    let fs = fs::get();
+    let fs = fs::lock();
     for v in p.aspace.vmas() {
         let perms = [(v.prot.read || v.prot.write || v.prot.exec, 'r'), (v.prot.write, 'w'), (v.prot.exec, 'x')];
         let mut flags = String::new();
@@ -186,7 +198,9 @@ fn maps(p: &Process, s: &mut String) {
         }
         flags.push('p');
         let (offset, inode, name) = match v.backing {
-            Backing::File { offset, ino, .. } => (offset, ino as u64 + 1, fs.path_of(ino)),
+            Backing::File { offset, ino, .. } | Backing::Data { offset, ino, .. } => {
+                (offset, ino as u64 + 1, fs.path_of(ino))
+            }
             Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
             Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
             // What Linux calls the page holding the signal-return code on arm32.
@@ -309,7 +323,7 @@ fn uuid(s: &mut String, seed: Option<[u8; 16]>) {
 pub fn fd_link(kind: &FileKind, fd: u64) -> String {
     match kind {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => format!("pipe:[{}]", 0x1000_0000 + fd),
-        FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::get().path_of(*ino),
+        FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().path_of(*ino),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
         FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),

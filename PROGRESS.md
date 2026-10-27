@@ -93,7 +93,7 @@ Signals now reach handlers, the way Linux arm64 delivers them
 - **Frames**: the same `rt_sigframe` layout as Linux (siginfo, ucontext,
   sigcontext, FP/SIMD record, ESR record for faults).
 - **`rt_sigreturn`** validates the frame. It rejects any pstate that isn't
-  EL0 and keeps only NZCV (AGENTS.md invariant 10).
+  EL0 and keeps only NZCV (AGENTS.md invariant 12).
 - **`[sigpage]`**: a trampoline page that handlers return to unless they set
   `SA_RESTORER`. Go and glibc on arm64 rely on it, since they normally use
   the vDSO's trampoline.
@@ -129,10 +129,48 @@ Tests:
   - A signal racing an I/O wakeup didn't interrupt the syscall.
   - `kill` went to the sender instead of the main thread.
 
-Next, in TODO.md order: the writable tmpfs (`fs_write`); then timers
-(`alarm`/`setitimer`/`timerfd`/POSIX timers, which now just need to call
-`signal::send`), signals from the host, and `signalfd4`; then stdin,
-netlink, networking, and fork/exec.
+### Writable filesystem (`fs_write`)
+
+With `fs_write` the whole tree is writable in guest memory
+(`kernel/src/fs.rs`):
+
+- **Storage**: file contents are the imported bytes plus copy-on-write page
+  frames. Written data is limited to half of RAM (ENOSPC, like tmpfs).
+  Nodes and names count against a 12 MiB metadata budget, so a program
+  can't exhaust the 32 MiB kernel heap (AGENTS.md invariant 10).
+- **Ownership**: Unix owners, modes, the sticky bit and real timestamps.
+  The sandbox user owns `/` and the imports. `/dev`, `/proc` and `/sys` are
+  fixed. `/tmp` and `/dev/shm` are 1777.
+- **Syscalls**:
+  - open flags O_CREAT/EXCL/TRUNC/APPEND/TMPFILE, pwrite/preadv/pwritev
+  - mkdir/unlink/rmdir/rename(2) with NOREPLACE and EXCHANGE, link/symlink
+  - truncate/fallocate, chmod/chown/utimensat
+  - sendfile and copy_file_range, SEEK_DATA/SEEK_HOLE
+- **Unlinked files**: unlinked-but-open files stay usable, and slots are
+  reused once nothing refers to them.
+- **getdents** uses a name cursor, so `rm -rf` works while it deletes.
+- **mmap** of written files works. MAP_SHARED mappings hold a copy, so
+  changing the file, or making the mapping writable, is reported as
+  unimplemented.
+- **Missing-path events** are no longer reported for directories the
+  program changed, or for /tmp.
+
+Tests:
+- `fixtures/src/files.c` covers all of the above, plus hostile inputs: a
+  doubling symlink chain (ELOOP after 40 links), reads far past /proc
+  files, a symlink flood (ENOSPC instead of a kernel panic), and 100k
+  mkdir/rmdir rounds.
+- Python: tempfile, shutil, an on-disk sqlite database, rmtree. Node: fs
+  writes and renames, fs.promises, rmSync.
+- 49 tests pass under HVF and TCG, and the stress loop was clean.
+- A review found the heap, symlink and /proc problems above before they
+  shipped.
+
+Next, in TODO.md order:
+1. Give written files back to the host (the agent's results), and stdin.
+2. Timers (`alarm`/`setitimer`/`timerfd`/POSIX timers, which now just need
+   to call `signal::send`), signals from the host, `signalfd4`.
+3. netlink, networking, fork/exec.
 
 ### Notes for the next session
 

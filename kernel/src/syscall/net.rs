@@ -24,7 +24,6 @@ const SOL_SOCKET: u64 = 1;
 const ENOTSOCK: Errno = Errno(88);
 const ENOPROTOOPT: Errno = Errno(92);
 const EPROTONOSUPPORT: Errno = Errno(93);
-const EOPNOTSUPP: Errno = Errno(95);
 const EISCONN: Errno = Errno(106);
 
 pub fn socketpair(p: &mut Process, domain: u64, ty: u64, _proto: u64, sv: u64) -> SysResult {

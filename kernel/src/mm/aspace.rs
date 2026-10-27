@@ -2,13 +2,14 @@
 //! page faults, plus the page table that realises them.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::paging::{ADDR_MASK, PageTable, Prot};
 use super::{PAGE_SIZE, frame, p2v, page_down};
 use crate::arch;
 use crate::errno::*;
-use crate::fs::Ino;
+use crate::fs::{Content, Ino};
 
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = 1 << 48;
@@ -43,7 +44,10 @@ pub enum Backing {
     Anon,
     /// Private file mapping. Byte `o` of the VMA is `data[offset + o]` while
     /// `o < filesz`, and zero after that (ELF .bss). `ino` names the file.
-    File { data: &'static [u8], offset: u64, filesz: u64, ino: Ino },
+    File { data: &'static [u8], offset: u64, filesz: u64, ino: Ino, shared: Option<Arc<()>> },
+    /// Private copy of a file written in the sandbox: each page is copied
+    /// from byte `offset + o` of the file when it faults in.
+    Data { data: Content, offset: u64, ino: Ino, shared: Option<Arc<()>> },
     /// Each page starts with the signal-return trampoline (`signal::TRAMPOLINE`).
     Sigpage,
 }
@@ -67,12 +71,24 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
-            Backing::Sigpage => Backing::Sigpage,
-            Backing::File { data, offset, filesz, ino } => {
-                Backing::File { data, offset: offset + skip, filesz: filesz.saturating_sub(skip), ino }
+            Backing::Data { ref data, offset, ino, ref shared } => {
+                Backing::Data { data: data.clone(), offset: offset + skip, ino, shared: shared.clone() }
             }
+            Backing::Sigpage => Backing::Sigpage,
+            Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
+                data,
+                offset: offset + skip,
+                filesz: filesz.saturating_sub(skip),
+                ino,
+                shared: shared.clone(),
+            },
         };
         Vma { start: s, end: e, prot: self.prot, backing }
+    }
+
+    /// A MAP_SHARED file mapping (which only holds a copy of the file).
+    pub fn is_shared_file(&self) -> bool {
+        matches!(self.backing, Backing::File { shared: Some(_), .. } | Backing::Data { shared: Some(_), .. })
     }
 
     pub fn allows(&self, access: Access) -> bool {
@@ -175,6 +191,11 @@ impl AddressSpace {
         }
     }
 
+    /// Does `[start, end)` overlap a MAP_SHARED file mapping?
+    pub fn has_shared_file(&self, start: u64, end: u64) -> bool {
+        self.vmas.range(..end).any(|(_, v)| v.end > start && v.is_shared_file())
+    }
+
     /// mprotect. Fails with ENOMEM if any part of the range is unmapped.
     pub fn protect(&mut self, start: u64, end: u64, prot: Prot) -> Result<(), Errno> {
         let mut expected = start;
@@ -251,6 +272,12 @@ impl AddressSpace {
         let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
         let src: &[u8] = match vma.backing {
             Backing::Anon => &[],
+            Backing::Data { ref data, offset, .. } => {
+                // SAFETY: `pa` is the frame just allocated, mapped linearly.
+                let dst = unsafe { core::slice::from_raw_parts_mut(p2v(pa) as *mut u8, PAGE_SIZE as usize) };
+                data.lock().read(offset + (page - vma.start), dst);
+                &[]
+            }
             Backing::Sigpage => &crate::signal::TRAMPOLINE,
             Backing::File { data, offset, filesz, .. } => {
                 let o = page - vma.start;

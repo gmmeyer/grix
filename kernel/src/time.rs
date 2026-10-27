@@ -32,6 +32,11 @@ pub fn realtime_ns() -> u64 {
     clock().boot_time_ns + monotonic_ns()
 }
 
+/// Boot time in nanoseconds since the Unix epoch.
+pub fn boot_realtime_ns() -> u64 {
+    clock().boot_time_ns
+}
+
 /// Boot time in seconds since the Unix epoch.
 pub fn realtime_to_boot_secs() -> u64 {
     clock().boot_time_ns / 1_000_000_000

@@ -128,7 +128,7 @@ pub fn load(
             start,
             end: vend,
             prot: Prot::from_elf(p.flags),
-            backing: Backing::File { data, offset: p.offset - skew, filesz: p.filesz + skew, ino },
+            backing: Backing::File { data, offset: p.offset - skew, filesz: p.filesz + skew, ino, shared: None },
         });
         end = end.max(vend);
     }
