@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grix::{
-    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, RunOutput, Sandbox, SandboxBuilder,
-    Stream,
+    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, RunControl, RunOutput, Sandbox,
+    SandboxBuilder, Stream,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -436,6 +436,137 @@ fn timeout() {
     // `sleep` via clock: ask for far less time than the program needs.
     let out = with("clock").timeout(Duration::from_millis(1)).build().unwrap().run(&["/bin/clock"]).unwrap();
     assert_eq!(out.status, ExitStatus::Timeout);
+}
+
+// ---------------------------------------------------------------- signals from the host
+
+fn hostsig() -> SandboxBuilder {
+    with("hostsig").allow(Capability::Process).allow(Capability::FsWrite).export("/out").unwrap()
+}
+
+#[test]
+fn signals_from_the_host() {
+    // SIGINT reaches the program and its child (its process group); SIGTERM
+    // makes it clean up, and its exports come back.
+    let control = RunControl::new();
+    let sb = hostsig().control(&control).build().unwrap();
+    let c = control.clone();
+    let (mut seen, mut int_sent, mut term_sent) = (String::new(), false, false);
+    let out = sb
+        .run_streaming(&["/bin/hostsig"], |stream, data| {
+            if stream != Stream::Stdout {
+                return;
+            }
+            seen.push_str(&String::from_utf8_lossy(data));
+            if !int_sent && seen.contains("ready\n") {
+                int_sent = c.signal(2);
+            }
+            if !term_sent && seen.contains("parent got SIGINT\n") && seen.contains("child got SIGINT\n") {
+                term_sent = c.signal(15);
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    let stdout = out.stdout_str();
+    for line in ["ready", "parent got SIGINT", "child got SIGINT", "got SIGTERM"] {
+        assert!(stdout.lines().any(|l| l == line), "{line:?} in {stdout:?}");
+    }
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let ex = out.export("/out").unwrap();
+    assert_eq!(ex.state, ExportState::Complete);
+    assert_eq!(ex.entries[0].content, ExportContent::File(b"cleaned up\n".to_vec()));
+    // Nothing is running now.
+    assert!(!control.signal(15) && !control.stop());
+}
+
+#[test]
+fn a_timeout_sends_sigterm_first() {
+    // Out of time: SIGTERM, and the program's exports come back if it ends
+    // within the grace period. Without one, it's stopped at once.
+    let out = hostsig().timeout(Duration::from_secs(2)).build().unwrap().run(&["/bin/hostsig"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Timeout, "{:?} {}", out.events, out.kernel_log);
+    assert!(out.stdout_str().ends_with("got SIGTERM\n"), "{}", out.stdout_str());
+    let ex = out.export("/out").unwrap();
+    assert_eq!((ex.state, ex.entries.len()), (ExportState::Complete, 1));
+
+    let sb = hostsig().timeout(Duration::from_secs(3)).grace(Duration::ZERO).build().unwrap();
+    let out = sb.run(&["/bin/hostsig"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Timeout);
+    assert_eq!(out.stdout_str(), "ready\n");
+    assert_eq!(out.export("/out").unwrap().state, ExportState::Incomplete);
+}
+
+#[test]
+fn waiting_for_a_host_signal_is_not_a_deadlock() {
+    // With a control attached, a program that only waits for a signal may
+    // get one; without handlers, SIGTERM ends it. stop() ends a run outright.
+    let control = RunControl::new();
+    let sb = with("hostsig").control(&control).build().unwrap();
+    let c = control.clone();
+    let out = sb
+        .run_streaming(&["/bin/hostsig", "plain"], |_, data| {
+            if data.starts_with(b"ready") {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    c.signal(15);
+                });
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Signaled(15), "{:?} {}", out.events, out.kernel_log);
+    assert_eq!(out.stdout_str(), "ready\n");
+    assert!(!out.events.iter().any(|e| e.to_string().contains("deadlock")), "{:?}", out.events);
+
+    // The same, after a child that was the last to run has exited (the
+    // scheduler once spun there, never reading the host's signal).
+    let sb2 = with("hostsig").allow(Capability::Process).control(&control).build().unwrap();
+    let c = control.clone();
+    let out = sb2
+        .run_streaming(&["/bin/hostsig", "child"], |_, data| {
+            if data.starts_with(b"ready") {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(600));
+                    c.signal(15);
+                });
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Signaled(15), "{:?} {}", out.events, out.kernel_log);
+
+    let c = control.clone();
+    let out = sb
+        .run_streaming(&["/bin/hostsig", "plain"], |_, data| {
+            if data.starts_with(b"ready") {
+                c.stop();
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Stopped);
+    assert_eq!(out.status.code(), 137);
+
+    // Output doesn't keep a run going: stop() and the time limit end one
+    // that writes all the time too.
+    let c = control.clone();
+    let started = std::time::Instant::now();
+    let out = sb
+        .run_streaming(&["/bin/hostsig", "chatty"], |_, data| {
+            if data.starts_with(b"ready") {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    c.stop();
+                });
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Stopped);
+    assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+    let sb = with("hostsig").timeout(Duration::from_secs(2)).grace(Duration::from_secs(1)).build().unwrap();
+    let out = sb.run(&["/bin/hostsig", "chatty"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Timeout);
+    assert!(out.stdout_str().contains("still here"));
 }
 
 // ---------------------------------------------------------------- real-world binaries (Alpine)

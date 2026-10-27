@@ -281,7 +281,16 @@ Next, in TODO.md order:
   kernel heap allocator (talc), because `linked_list_allocator` went
   quadratic with tens of thousands of small objects.
 
-Next: signals from the host.
+- **Signals from the host**: `RunControl` (`signal`, `stop`) and the
+  CLI's Ctrl-C/SIGTERM/SIGHUP/SIGQUIT reach the program's process group as
+  `Input::Signal` frames. A timeout now sends SIGTERM and waits `grace` (5
+  s), so a program that cleans up still sends its exports. Threads waiting
+  only for a signal are no longer a deadlock. That includes musl's
+  `pause()`, which on arm64 is a `ppoll` with nothing to watch. This
+  exposed an old scheduler bug: when the process that ran last had just
+  ended, `idle` compared the I/O generation with that dead process's, never
+  settled, and spun with interrupts masked. It now compares with what
+  `poll` last settled on.
 
 ### Notes for the next session
 

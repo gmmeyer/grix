@@ -9,6 +9,7 @@ use grix_abi::policy::{Capability, DenyAction, Policy};
 use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
 
+use crate::control::RunControl;
 use crate::event::GuestEvent;
 use crate::export::{Collector, Export};
 use crate::hostfs::LiveMount;
@@ -25,6 +26,8 @@ const MIN_FREE: u64 = 64 << 20;
 const DEFAULT_MAX_OUTPUT: usize = 64 << 20;
 /// Exported bytes kept unless `max_export` says otherwise.
 const DEFAULT_MAX_EXPORT: usize = 256 << 20;
+/// How long a program has to end after the SIGTERM a timeout sends.
+const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,8 +43,12 @@ pub enum ExitStatus {
     Exited(i32),
     /// The program was killed by this signal.
     Signaled(i32),
-    /// The program ran past the time limit and was stopped.
+    /// The program ran past the time limit. It got SIGTERM and the grace
+    /// period ([`SandboxBuilder::grace`]) to end, and was stopped if it
+    /// didn't; if it did, its exports came back.
     Timeout,
+    /// [`RunControl::stop`](crate::RunControl::stop) ended the run.
+    Stopped,
     /// The guest kernel crashed (a bug in grix, see `kernel_log`).
     KernelPanic,
     /// The VM ended without reporting a status.
@@ -53,12 +60,14 @@ impl ExitStatus {
         *self == ExitStatus::Exited(0)
     }
 
-    /// Shell-style exit code: status, 128+signal, 124 on timeout, 125 on sandbox failure.
+    /// Shell-style exit code: status, 128+signal, 124 on timeout, 137 when
+    /// stopped (as for SIGKILL), 125 on sandbox failure.
     pub fn code(&self) -> i32 {
         match self {
             ExitStatus::Exited(c) => *c,
             ExitStatus::Signaled(s) => 128 + s,
             ExitStatus::Timeout => 124,
+            ExitStatus::Stopped => 137,
             ExitStatus::KernelPanic | ExitStatus::VmFailed(_) => 125,
         }
     }
@@ -177,6 +186,8 @@ pub struct SandboxBuilder {
     mounts: Vec<Mount>,
     live: Vec<LiveMount>,
     net: NetPolicy,
+    control: Option<RunControl>,
+    grace: Duration,
     uid: u32,
     gid: u32,
     kernel: PathBuf,
@@ -200,6 +211,8 @@ impl Default for SandboxBuilder {
             mounts: Vec::new(),
             live: Vec::new(),
             net: NetPolicy::default(),
+            control: None,
+            grace: DEFAULT_GRACE,
             uid: 1000,
             gid: 1000,
             kernel: env_path(
@@ -384,6 +397,23 @@ impl SandboxBuilder {
     fn mount_points(&self) -> impl Iterator<Item = (&str, &Path)> {
         let on_exit = self.mounts.iter().map(|m| (m.guest.as_str(), m.host.as_path()));
         on_exit.chain(self.live.iter().map(|m| (m.guest.as_str(), m.host.as_path())))
+    }
+
+    /// Send the program signals while it runs, or stop it, with `control`
+    /// (see [`RunControl`]). It reaches whichever runs of this sandbox are
+    /// in progress.
+    pub fn control(mut self, control: &RunControl) -> Self {
+        self.control = Some(control.clone());
+        self
+    }
+
+    /// When the time limit is reached, the program gets SIGTERM, and this
+    /// long to end (5 seconds by default; zero to stop it at once). If it
+    /// ends in time, its exports and `mount_on_exit` changes come back as
+    /// usual. The status is [`ExitStatus::Timeout`] either way.
+    pub fn grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
     }
 
     /// Send at most this many bytes of exports in all (256 MiB by default,
@@ -610,6 +640,8 @@ impl Sandbox {
 
         let vm = VmConfig {
             net: cfg.net.clone(),
+            control: cfg.control.clone(),
+            grace: cfg.grace,
             live: cfg.live.clone(),
             qemu: cfg.qemu.clone(),
             kernel: cfg.kernel.clone(),
@@ -655,16 +687,23 @@ impl Sandbox {
             Channel::Exit | Channel::Link | Channel::Fs => {}
         })?;
         out.events.extend(run.events);
+        let run_timed_out = run.timed_out;
         let end = run.end;
         let (exported, changes) = exports.finish();
         out.exports = exported;
         out.mount_changes = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
         out.duration = started.elapsed();
         out.status = match end {
+            // Out of time, even if the program then ended on the SIGTERM;
+            // a kernel panic or a lost VM still says so.
+            VmEnd::Exited { kind: ExitKind::Exited | ExitKind::Signaled, .. } | VmEnd::Stopped if run_timed_out => {
+                ExitStatus::Timeout
+            }
             VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),
             VmEnd::Exited { kind: ExitKind::Signaled, code } => ExitStatus::Signaled(code),
             VmEnd::Exited { kind: ExitKind::Panic, .. } => ExitStatus::KernelPanic,
             VmEnd::Timeout => ExitStatus::Timeout,
+            VmEnd::Stopped => ExitStatus::Stopped,
             VmEnd::Lost { qemu_status, qemu_stderr } => ExitStatus::VmFailed(format!(
                 "qemu exited ({qemu_status:?}) without a guest status: {}",
                 qemu_stderr.trim()

@@ -1,11 +1,15 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grix::{Capability, DenyAction, Export, ExportState, Manifest, MountMode, MountState, RunOutput, Sandbox, Stream};
+use grix::{
+    Capability, DenyAction, Export, ExportState, Manifest, MountMode, MountState, RunControl, RunOutput, Sandbox,
+    Stream,
+};
 
 #[derive(Parser)]
 #[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
@@ -61,6 +65,10 @@ struct RunArgs {
     /// Guest memory in MiB.
     #[arg(long)]
     mem: Option<u64>,
+    /// After the time limit, how many seconds the program has to end after
+    /// SIGTERM before it's stopped (default 5).
+    #[arg(long, value_name = "SECS")]
+    grace: Option<u64>,
     /// Time limit in seconds.
     #[arg(long)]
     timeout: Option<u64>,
@@ -190,6 +198,9 @@ fn run(args: RunArgs) -> Result<i32> {
     if let Some(mb) = args.mem {
         b = b.memory_mb(mb);
     }
+    if let Some(s) = args.grace {
+        b = b.grace(Duration::from_secs(s));
+    }
     if let Some(s) = args.timeout {
         b = b.timeout(Duration::from_secs(s));
     }
@@ -207,7 +218,9 @@ fn run(args: RunArgs) -> Result<i32> {
         bail!("no command given (pass it after `--` or set `command` in the manifest)");
     }
 
-    let sandbox = b.build()?;
+    let control = RunControl::new();
+    let sandbox = b.control(&control).build()?;
+    forward_signals(control, args.quiet);
     // Piped or redirected input goes to the program; a terminal doesn't
     // (there's no interactive mode yet), so the program sees end-of-file.
     let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
@@ -256,6 +269,7 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     match &out.status {
         grix::ExitStatus::Timeout => eprintln!("grix: timed out"),
+        grix::ExitStatus::Stopped => eprintln!("grix: stopped"),
         grix::ExitStatus::KernelPanic => eprintln!("grix: guest kernel panic:\n{}", out.kernel_log),
         grix::ExitStatus::VmFailed(why) => eprintln!("grix: {why}"),
         _ => {}
@@ -336,4 +350,56 @@ fn write_exports(out: &RunOutput, exports: &[(String, PathBuf)], quiet: bool) ->
         }
     }
     ok
+}
+
+/// Host signals caught and not forwarded yet, as a bit per signal number.
+static CAUGHT: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn caught(sig: libc::c_int) {
+    CAUGHT.fetch_or(1 << sig, Ordering::SeqCst);
+}
+
+/// Pass Ctrl-C, SIGTERM, SIGHUP and SIGQUIT on to the program, as a
+/// terminal would. The third Ctrl-C stops the sandbox, for a program that
+/// doesn't end. What arrives before the run has started waits for it.
+fn forward_signals(control: RunControl, quiet: bool) {
+    // The host's numbers for these, and Linux's.
+    let forwarded = [(libc::SIGINT, 2), (libc::SIGTERM, 15), (libc::SIGHUP, 1), (libc::SIGQUIT, 3)];
+    for (sig, _) in forwarded {
+        // SAFETY: the handler only sets an atomic, which is async-signal-safe.
+        unsafe { libc::signal(sig, caught as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+    std::thread::spawn(move || {
+        let (mut interrupts, mut pending, mut stop) = (0, Vec::new(), false);
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let bits = CAUGHT.swap(0, Ordering::SeqCst);
+            for (sig, linux) in forwarded {
+                if bits & (1 << sig) == 0 {
+                    continue;
+                }
+                if sig == libc::SIGINT {
+                    interrupts += 1;
+                    if interrupts >= 3 {
+                        if !stop && !quiet {
+                            eprintln!("grix: stopping the sandbox");
+                        }
+                        stop = true;
+                        continue;
+                    }
+                    if interrupts == 2 && !quiet {
+                        eprintln!("grix: press Ctrl-C again to stop the sandbox");
+                    }
+                }
+                if !pending.contains(&linux) {
+                    pending.push(linux);
+                }
+            }
+            // Until the run starts, they wait.
+            if stop && control.stop() {
+                stop = false;
+            }
+            pending.retain(|&sig| !control.signal(sig));
+        }
+    });
 }

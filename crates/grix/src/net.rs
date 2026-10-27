@@ -321,6 +321,15 @@ impl Outbox {
         self.ready.notify_one();
     }
 
+    /// Queue a signal for the guest whatever room there is (they're tiny,
+    /// and the agent sends them).
+    pub fn signal(&self, frame: Vec<u8>) {
+        let q = self.q.lock().unwrap();
+        if !q.closed {
+            self.push(q, frame);
+        }
+    }
+
     /// Queue a frame if there's room, or drop it.
     fn offer(&self, frame: Vec<u8>) {
         let q = self.q.lock().unwrap();

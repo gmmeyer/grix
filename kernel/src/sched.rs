@@ -7,6 +7,7 @@
 //! the address space in TTBR0.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::console;
@@ -87,12 +88,42 @@ fn pick(p: &Process, procs: &Procs) -> Option<u32> {
 /// deadlines. Returns whether anything woke.
 fn poll(p: &mut Process, procs: &mut Procs) -> bool {
     let mut woke = false;
-    for q in procs.all(p) {
-        woke |= crate::timer::fire(q);
-        woke |= q.wake_io_waiters();
-        woke |= wake_expired(q);
+    for sig in console::take_host_signals() {
+        woke |= from_host(p, procs, sig);
     }
-    woke
+    // Until I/O state stops changing (a timer can fire a timerfd), so every
+    // waiter has seen the generation `idle` compares against.
+    loop {
+        let generation = crate::ipc::generation();
+        for q in procs.all(p) {
+            woke |= crate::timer::fire(q);
+            woke |= q.wake_io_waiters();
+            woke |= wake_expired(q);
+        }
+        if crate::ipc::generation() == generation {
+            POLLED.store(generation, Ordering::Relaxed);
+            return woke;
+        }
+    }
+}
+
+/// The I/O generation the last `poll` left everyone at.
+static POLLED: AtomicU64 = AtomicU64::new(0);
+
+/// A signal from the host: to the program's process group, as a terminal
+/// sends Ctrl-C to its foreground group. Unlike other senders, nothing
+/// shields init (the program) from it.
+fn from_host(p: &mut Process, procs: &mut Procs, sig: u32) -> bool {
+    let Some(group) = procs.all(p).find(|q| q.pid == crate::process::INIT).map(|q| q.pgid) else { return false };
+    let mut sent = false;
+    for q in procs.all(p) {
+        if q.pgid == group {
+            let info = crate::signal::SigInfo::sent(sig, crate::signal::SI_USER, 0, 0, "a signal from the host");
+            sent |= crate::signal::send(q, crate::signal::Target::Process, info).is_ok();
+        }
+    }
+    p.timer_dirty = true;
+    sent
 }
 
 /// After a syscall: if I/O state changed, wake waiters in every process,
@@ -130,13 +161,16 @@ fn wake_expired(p: &mut Process) -> bool {
 fn idle(p: &mut Process, procs: &mut Procs) {
     match earliest_deadline(p, procs) {
         Some(deadline) => irq::timer_at(deadline),
-        // The host can still wake whoever waits for I/O.
-        None if waiting_for_input(p, procs) => irq::timer_off(),
+        // The host can still wake whoever waits for I/O, and a thread
+        // waiting for a signal may get one: a RunControl's, or the SIGTERM
+        // the time limit sends.
+        None if waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
         None => deadlock(p, procs),
     }
     p.timer_dirty = true;
-    // Checking on the host may itself have freed room for a writer.
-    if crate::ipc::generation() != p.io_seen {
+    // Checking on the host may itself have freed room for a writer. (Not
+    // `p.io_seen`: `p` may have just ended, and nothing updates that.)
+    if crate::ipc::generation() != POLLED.load(Ordering::Relaxed) {
         return;
     }
     if let Some(id) = irq::wait_for_interrupt() {
@@ -149,6 +183,13 @@ fn idle(p: &mut Process, procs: &mut Procs) {
 fn waiting_for_input(p: &mut Process, procs: &mut Procs) -> bool {
     let io = procs.all(p).any(|q| q.threads.values().any(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io)));
     io && console::host_pending()
+}
+
+/// A thread waits for a signal (pause, sigsuspend, sigwait).
+fn waiting_for_signal(p: &mut Process, procs: &mut Procs) -> bool {
+    procs.all(p).any(|q| {
+        q.threads.values().any(|t| t.wait.is_some_and(|w| matches!(w.on, WaitOn::Signal | WaitOn::SigWait(_))))
+    })
 }
 
 /// Handle an acknowledged interrupt and signal its end.

@@ -6,6 +6,7 @@
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
 //! timeout_secs = 30
+//! grace_secs = 5             # after the time limit: SIGTERM, then this long to end
 //! max_export_mb = 256
 //!
 //! [env]
@@ -54,6 +55,8 @@ pub struct Manifest {
     pub cwd: Option<String>,
     pub memory_mb: Option<u64>,
     pub timeout_secs: Option<u64>,
+    /// After the time limit, seconds to end after SIGTERM.
+    pub grace_secs: Option<u64>,
     pub max_export_mb: Option<usize>,
     #[serde(default)]
     pub allow_hosts: Vec<String>,
@@ -149,6 +152,9 @@ impl Manifest {
         }
         if let Some(mb) = self.memory_mb {
             b = b.memory_mb(mb);
+        }
+        if let Some(s) = self.grace_secs {
+            b = b.grace(Duration::from_secs(s));
         }
         if let Some(s) = self.timeout_secs {
             b = b.timeout(Duration::from_secs(s));

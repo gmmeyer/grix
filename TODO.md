@@ -66,7 +66,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Needed by the JVM, Go (nil checks become panics), and crash reporters.
 - [x] `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd4`.
       `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks work too.
-- [ ] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
+- [x] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
+      `RunControl::signal` / `stop`, the CLI's Ctrl-C (and SIGTERM, SIGHUP, SIGQUIT), to the program's process group. A timeout sends SIGTERM and waits `grace` (5 s). Threads waiting for a signal (including musl's ppoll-based `pause()`) aren't a deadlock.
+- [ ] Job control from the host (SIGTSTP/SIGCONT stopping and continuing the program).
 - [ ] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT). They are ignored today:
       there is no job control or host to report the stop to.
 - [ ] Restarted `nanosleep`-style calls without a handler (Linux's
@@ -102,7 +104,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       `SandboxBuilder::export` / `--export GUEST:HOST` / `[[export]]`. Sent when the program ends (exit, crash, deadlock), into `RunOutput::exports`, under a `max_export` budget. `Export::write_to` recreates it on the host without following links.
 - [x] Export only what changed in an imported tree (an overlay's upper layer, with deletions), instead of all of it.
       Mounts do this: the kernel compares each node with what was imported and sends new and changed entries and the topmost removed paths.
-- [ ] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
+- [x] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
+      A timeout sends SIGTERM first; a program that ends within the grace period sends its exports.
 - [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
 - [x] Read-write host directory mounts, gated by policy.
       Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.

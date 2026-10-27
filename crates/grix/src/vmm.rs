@@ -9,6 +9,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,9 @@ use crate::net::{NetPolicy, Outbox, Proxy, StdinGate};
 
 pub(crate) struct VmConfig {
     pub net: NetPolicy,
+    pub control: Option<crate::control::RunControl>,
+    /// How long the program has to end after the SIGTERM a timeout sends.
+    pub grace: Duration,
     pub live: Vec<crate::hostfs::LiveMount>,
     pub qemu: PathBuf,
     pub kernel: PathBuf,
@@ -38,6 +42,8 @@ pub(crate) enum VmEnd {
         code: i32,
     },
     Timeout,
+    /// `RunControl::stop`.
+    Stopped,
     /// QEMU exited without the guest reporting a status.
     Lost {
         qemu_status: Option<i32>,
@@ -162,7 +168,14 @@ fn feed_stdin(to_guest: Arc<Outbox>, gate: StdinGate, mut input: Box<dyn Read + 
 pub(crate) struct VmRun {
     pub end: VmEnd,
     pub events: Vec<GuestEvent>,
+    /// The time ran out (the program may have ended on the SIGTERM sent
+    /// then).
+    pub timed_out: bool,
 }
+
+/// How often a run with a `RunControl` looks for `stop`.
+const STOP_POLL: Duration = Duration::from_millis(50);
+const SIGTERM: u8 = 15;
 
 pub(crate) fn run(
     cfg: &VmConfig,
@@ -212,7 +225,19 @@ pub(crate) fn run(
         // stdin ends, and then discards what the guest writes.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Its own process group: a terminal's Ctrl-C is for the program,
+        // which grix passes on; it mustn't end the VM.
+        .process_group(0);
+    // Still, it goes when grix goes, however that happens.
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl is async-signal-safe, as pre_exec requires.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
     let child = cmd.spawn().with_context(|| format!("starting {}", cfg.qemu.display()))?;
     let mut child = ChildGuard(child);
     let uart = accept_uart(&listener, &mut child.0)?;
@@ -260,23 +285,42 @@ pub(crate) fn run(
         String::from_utf8_lossy(&s).into_owned()
     });
 
+    let live = cfg.control.as_ref().map(|c| c.attach(to_guest.clone()));
     let mut deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     let mut decoder = FrameDecoder::new();
     let mut exit = None;
     loop {
+        // Checked every time round, not just when the program is quiet: a
+        // chatty one must stop or time out too.
+        let stopped = live.as_ref().is_some_and(|l| l.stopped());
+        if stopped || Instant::now() >= deadline {
+            // Out of time while the program runs: ask it to end, as a
+            // container runtime does, and give it a little longer.
+            if !stopped && exit.is_none() && !timed_out && !cfg.grace.is_zero() {
+                timed_out = true;
+                let mut f = wire::input_header(Input::Signal, 1).to_vec();
+                f.push(SIGTERM);
+                to_guest.signal(f);
+                deadline = Instant::now() + cfg.grace;
+                continue;
+            }
+            // If the program had ended, that's its status (and the exports
+            // are incomplete); otherwise it timed out, or was stopped.
+            let end = match exit {
+                Some((kind, code)) => VmEnd::Exited { kind, code },
+                None if stopped => VmEnd::Stopped,
+                None => VmEnd::Timeout,
+            };
+            timed_out |= matches!(end, VmEnd::Timeout);
+            return Ok(VmRun { end, events: proxy.stop(), timed_out });
+        }
         let left = deadline.saturating_duration_since(Instant::now());
-        let chunk = match rx.recv_timeout(left) {
+        let wait = if live.is_some() { left.min(STOP_POLL) } else { left };
+        let chunk = match rx.recv_timeout(wait) {
             Ok(chunk) => chunk,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            // Out of time. If the program had ended, that's its status (and
-            // the exports are incomplete); otherwise it timed out.
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let end = match exit {
-                    Some((kind, code)) => VmEnd::Exited { kind, code },
-                    None => VmEnd::Timeout,
-                };
-                return Ok(VmRun { end, events: proxy.stop() });
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
         };
         decoder.push(&chunk, |ch, payload| match ch {
             Channel::Exit if exit.is_none() => {
@@ -304,5 +348,5 @@ pub(crate) fn run(
         Some((kind, code)) => VmEnd::Exited { kind, code },
         None => VmEnd::Lost { qemu_status: status.code(), qemu_stderr },
     };
-    Ok(VmRun { end, events })
+    Ok(VmRun { end, events, timed_out })
 }

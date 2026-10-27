@@ -128,7 +128,10 @@ then delivered, the call fails with EINTR unless the handler has
 keeping its deadline (`restart_deadline`). A woken call always re-runs once
 before signals are delivered (`Thread::recheck`), so one that can now
 complete does, as on Linux; it stays `restarting` until the svc actually
-runs again.
+runs again. Signals from the host (`wire::Input::Signal`, from `RunControl`
+or a timeout's SIGTERM) are queued by the console and sent to init's
+process group from `sched::poll`; a thread waiting for a signal is never
+treated as deadlocked.
 
 ## Invariants: don't break these
 

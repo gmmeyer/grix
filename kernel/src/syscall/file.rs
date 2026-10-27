@@ -19,7 +19,7 @@ use crate::procfs;
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
-use crate::process::Process;
+use crate::process::{Process, WaitOn};
 use crate::rng;
 use crate::time;
 use crate::uaccess::*;
@@ -1769,6 +1769,12 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
         copy_out(&mut p.aspace, fds, &raw)?;
         return Ok(ready);
     }
+    // Nothing to watch and no time limit: musl's pause() on arm64. Only a
+    // signal can end it, so say so (it isn't a deadlock: the host may send
+    // one).
+    if timeout.is_none() && raw.chunks(8).all(|c| i32::from_le_bytes(c[..4].try_into().unwrap()) < 0) {
+        return p.block(WaitOn::Signal, None, Ok(0));
+    }
     let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))
 }
@@ -1814,6 +1820,9 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
             }
         }
         return Ok(count);
+    }
+    if timeout.is_none() && sets.iter().all(|set| set.iter().all(|&w| w == 0)) {
+        return p.block(WaitOn::Signal, None, Ok(0));
     }
     let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))

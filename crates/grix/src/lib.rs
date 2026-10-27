@@ -19,6 +19,7 @@
 //! capabilities you grant ([`Capability`]). Anything it tries beyond that is
 //! denied and reported in [`RunOutput::events`].
 
+mod control;
 mod dns;
 mod event;
 mod export;
@@ -30,6 +31,7 @@ mod net;
 mod sandbox;
 mod vmm;
 
+pub use control::RunControl;
 pub use event::GuestEvent;
 pub use export::{Export, ExportContent, ExportEntry, ExportState};
 pub use grix_abi::policy::{Capability, DenyAction};

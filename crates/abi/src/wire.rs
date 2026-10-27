@@ -69,6 +69,8 @@ pub enum Input {
     Link = 3,
     /// Live mounts: `hostfs::Reply`s, a frame of a message each.
     Fs = 4,
+    /// A signal for the program's process group: one byte, 1-64.
+    Signal = 5,
 }
 
 impl Input {
@@ -78,6 +80,7 @@ impl Input {
             2 => Some(Self::StdinEof),
             3 => Some(Self::Link),
             4 => Some(Self::Fs),
+            5 => Some(Self::Signal),
             _ => None,
         }
     }

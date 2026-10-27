@@ -93,6 +93,37 @@ let results = out.export("/out").unwrap();  // entries in memory (state says if 
 results.write_to("./results")?;             // or recreate it on the host
 ```
 
+### Signals and timeouts
+
+A `RunControl` sends the program signals while it runs, as a terminal
+would: to its whole process group, so a shell's children get Ctrl-C too.
+
+```rust
+use grix::RunControl;
+
+let control = RunControl::new();
+let sandbox = Sandbox::builder().import("./server", "/bin/server")?.control(&control).build()?;
+let c = control.clone();
+std::thread::spawn(move || {
+    // ... later, from anywhere:
+    c.signal(2);   // SIGINT: what Ctrl-C would send
+    c.signal(15);  // SIGTERM: shut down
+    c.stop();      // or just end the run (ExitStatus::Stopped)
+});
+let out = sandbox.run(&["/bin/server"])?;
+```
+
+- When the time limit runs out, the program gets SIGTERM and a grace
+  period (`grace`, 5 seconds by default) to end. If it does, its exports
+  and `mount_on_exit` changes come back. The status is `Timeout` either way.
+- A program whose threads are all blocked is ended at once and reported as
+  a deadlock, unless one waits for a signal (`pause`, `sigsuspend`,
+  `sigwait`): one may yet come, from a control or the time limit.
+- The CLI passes on Ctrl-C, SIGTERM, SIGHUP and SIGQUIT (QEMU runs in its
+  own process group, so a terminal's Ctrl-C is the program's alone). The
+  third Ctrl-C stops the sandbox. `--grace SECS` and the manifest's
+  `grace_secs` set the grace period.
+
 ### Working on a host directory
 
 `mount` makes a host directory live in the sandbox, like a bind mount:
@@ -151,8 +182,8 @@ The CLI has `--mount HOST:GUEST[:rw|ro|on-exit]`, and manifests `[[mount]]`
 tables with `host`, `guest` and `mode` (`"rw"`, `"ro"` or `"on_exit"`).
 
 An exported directory comes back whenever the program ends (exit, crash,
-deadlock), but not if it times out. If nothing is imported there, it starts
-out empty. The program's status is reported first, and the export then has
+deadlock, or a timeout it ends within the grace period of; see below). If
+nothing is imported there, it starts out empty. The program's status is reported first, and the export then has
 30 seconds. The guest leaves out entries over the budget (`max_export`, 256
 MiB by default) or nested deeper than 4096 bytes of path, and `state` says
 when anything is missing. `write_to` builds the tree beside its target and
@@ -350,8 +381,9 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec` | Job control (stopping and continuing) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
-| Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
-| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | Exports and `mount_on_exit` changes after a timeout |
+| Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Job control signals from the host (SIGTSTP/SIGCONT) |
+| Signals from the host: `RunControl::signal` and the CLI's Ctrl-C reach the program's process group; a timeout sends SIGTERM and a grace period first, so exports still come back | |
+| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | |
 | Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`) | inotify events for host changes |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files. Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
@@ -376,7 +408,8 @@ subshells.
    enforces the allow-list and forwards ports. The guest has no TCP/IP stack.
 2. ~~**Host directories**~~: done. Live mounts (read-write or read-only,
    any size) and mounts whose changes are applied when the program ends.
-3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
+3. ~~**Signals from the host**~~: done (`RunControl`, Ctrl-C in the CLI,
+   SIGTERM and a grace period on timeout).
 4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
    crate with no external dependencies.

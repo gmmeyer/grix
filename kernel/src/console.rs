@@ -91,6 +91,18 @@ struct Console {
     /// Networking messages that arrived while waiting for an answer, for
     /// the next `dispatch`.
     deferred: Vec<Vec<u8>>,
+    /// Signals from the host, for the scheduler to deliver.
+    signals: Vec<u32>,
+}
+
+/// Signals queued from the host at most (more are dropped, as a pending
+/// standard signal would merge anyway).
+const MAX_HOST_SIGNALS: usize = 32;
+
+/// The signals the host sent since last asked.
+pub fn take_host_signals() -> Vec<u32> {
+    let mut guard = CONSOLE.lock();
+    guard.as_mut().map_or_else(Vec::new, |c| core::mem::take(&mut c.signals))
 }
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
@@ -99,8 +111,15 @@ static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 pub fn init_virtio() {
     let dev = virtio::Console::probe().expect("no virtio console (QEMU must be started with one)");
     let stdin = Stdin { buf: VecDeque::new(), eof: true, decoder: Box::default(), version: 0, owed: 0 };
-    *CONSOLE.lock() =
-        Some(Console { dev, stdin, out_version: 0, fs: Assembler::default(), fs_reply: None, deferred: Vec::new() });
+    *CONSOLE.lock() = Some(Console {
+        dev,
+        stdin,
+        out_version: 0,
+        fs: Assembler::default(),
+        fs_reply: None,
+        deferred: Vec::new(),
+        signals: Vec::new(),
+    });
 }
 
 pub fn write(ch: Channel, data: &[u8]) {
@@ -231,7 +250,7 @@ pub fn interrupt(id: u32) -> bool {
 /// out, for `dispatch` once the console lock is released (handling them may
 /// send replies).
 fn drain(c: &mut Console) -> Vec<Vec<u8>> {
-    let Console { dev, stdin, fs, fs_reply, deferred, .. } = c;
+    let Console { dev, stdin, fs, fs_reply, deferred, signals, .. } = c;
     let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
     let mut link = core::mem::take(deferred);
@@ -239,6 +258,9 @@ fn drain(c: &mut Console) -> Vec<Vec<u8>> {
         for &b in bytes {
             match decoder.push(b) {
                 Some((Input::Link, msg)) => link.push(msg.to_vec()),
+                Some((Input::Signal, &[sig])) if (1..=64).contains(&sig) && signals.len() < MAX_HOST_SIGNALS => {
+                    signals.push(sig as u32);
+                }
                 // Garbled answers are dropped; the request then gets none.
                 Some((Input::Fs, msg)) => {
                     if let Some(Ok(reply)) = fs.push(msg) {
