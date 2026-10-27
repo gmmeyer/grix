@@ -44,6 +44,10 @@ make test       # unit tests + end-to-end tests that boot the kernel in QEMU
 # stdin is passed through when it isn't a terminal (--no-stdin turns that off).
 echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox wc -w
 
+# Results: the program fills /out, and it's copied to ./results when it ends.
+./target/release/grix run -a fs_write -x /out:./results \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox cp /etc/passwd /out/
+
 # Language runtimes: import a whole root filesystem and allow threads.
 ./target/release/grix run -a threads -i fixtures/build/python:/ -- /usr/bin/python3 -c 'print(6*7)'
 ./target/release/grix run -a threads -i fixtures/build/node:/ -- /usr/bin/node -e 'console.log(6*7)'
@@ -65,16 +69,29 @@ let sandbox = Sandbox::builder()
     .env("LANG", "C")
     .memory_mb(256)
     .timeout(std::time::Duration::from_secs(10))
-    // .allow(Capability::Net)                            // grant only what's needed
+    .allow(Capability::FsWrite)                          // grant only what's needed
+    .export("/out")?                                     // sent back when the program ends
     .build()?;
 
-let out = sandbox.run(&["/bin/busybox", "wc", "-l", "/data/input.csv"])?;
+let out = sandbox.run(&["/bin/busybox", "sort", "-o", "/out/sorted.csv", "/data/input.csv"])?;
 println!("{}", out.stdout_str());           // also: stderr, status, kernel_log, duration
 for event in &out.events {
     eprintln!("{event}");                   // denied / missing / unsupported / faults
 }
 let needed = out.missing_capabilities();    // e.g. ["net"] -> ask the user, then re-run
+let results = out.export("/out").unwrap();  // entries in memory (state says if it's all there)
+results.write_to("./results")?;             // or recreate it on the host
 ```
+
+An exported directory comes back whenever the program ends (exit, crash,
+deadlock), but not if it times out. If nothing is imported there, it starts
+out empty. The program's status is reported first, and the export then has
+30 seconds. The guest leaves out entries over the budget (`max_export`, 256
+MiB by default) or nested deeper than 4096 bytes of path, and `state` says
+when anything is missing. `write_to` builds the tree beside its target and
+renames it into place. It never writes through a symlink, drops
+setuid/setgid and group/other write, and leaves nothing behind if it fails.
+The CLI checks `-x` destinations before the run.
 
 Every `run` boots a new VM from the same configuration, so runs don't share
 state. `run_streaming` delivers stdout/stderr as they arrive.
@@ -96,6 +113,10 @@ LANG = "C"
 [[import]]
 host = "../fixtures/build/alpine/bin/busybox.static"   # relative to the manifest
 guest = "/bin/busybox"
+
+[[export]]               # copied out when the program ends (needs fs_write to fill it)
+guest = "/out"
+host = "results"         # relative to the manifest; must not exist yet, or be empty
 ```
 
 ## What you can import
@@ -201,8 +222,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
-| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Getting written files back to the host; host directory mounts |
-| With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
+| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Host directory mounts; exports after a timeout |
+| With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files. Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
 | Clocks (including per-thread and per-process CPU time), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | x86_64 guests |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | Linux/KVM hosts are untested |
@@ -221,9 +242,8 @@ dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
 1. **Networking** (`net`), so web servers can run: socket syscalls in the
    guest, proxied to the host, which enforces allow-lists for outbound
    connections and forwards listening ports. The guest needs no TCP/IP stack.
-2. **Results back to the host**: export directories the program wrote (the
-   agent's outputs), and read-write host mounts gated by policy, over the
-   virtio console.
+2. **Host directories**: read-write host mounts gated by policy, and
+   exporting only what changed. Exporting whole directories works today.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
 4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace

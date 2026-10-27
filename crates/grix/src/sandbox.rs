@@ -10,6 +10,7 @@ use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
 
 use crate::event::GuestEvent;
+use crate::export::{Collector, Export};
 use crate::image::{self, Node};
 use crate::vmm::{self, VmConfig, VmEnd};
 
@@ -19,6 +20,8 @@ const RESERVED_LOW: u64 = IMAGE_BASE - RAM_BASE;
 const MIN_FREE: u64 = 64 << 20;
 /// Output kept per stream unless `max_output` says otherwise.
 const DEFAULT_MAX_OUTPUT: usize = 64 << 20;
+/// Exported bytes kept unless `max_export` says otherwise.
+const DEFAULT_MAX_EXPORT: usize = 256 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +73,9 @@ pub struct RunOutput {
     pub stderr_truncated: bool,
     #[serde(serialize_with = "display_all")]
     pub events: Vec<GuestEvent>,
+    /// The directories given to [`SandboxBuilder::export`], in that order,
+    /// as the program left them.
+    pub exports: Vec<Export>,
     pub kernel_log: String,
     #[serde(serialize_with = "millis")]
     pub duration: Duration,
@@ -94,6 +100,13 @@ impl RunOutput {
 
     pub fn stderr_str(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
+    /// The export of guest directory `dir` (as given to
+    /// [`SandboxBuilder::export`]).
+    pub fn export(&self, dir: &str) -> Option<&Export> {
+        let dir = image::guest_path(dir).ok()?;
+        self.exports.iter().find(|e| e.dir == dir)
     }
 
     /// Capabilities the program asked for but did not have.
@@ -136,6 +149,8 @@ pub struct SandboxBuilder {
     memory_mb: u64,
     timeout: Duration,
     max_output: usize,
+    exports: Vec<String>,
+    max_export: usize,
     uid: u32,
     gid: u32,
     kernel: PathBuf,
@@ -154,6 +169,8 @@ impl Default for SandboxBuilder {
             memory_mb: 512,
             timeout: Duration::from_secs(60),
             max_output: DEFAULT_MAX_OUTPUT,
+            exports: Vec::new(),
+            max_export: DEFAULT_MAX_EXPORT,
             uid: 1000,
             gid: 1000,
             kernel: env_path(
@@ -228,6 +245,31 @@ impl SandboxBuilder {
         self
     }
 
+    /// Send directory `guest` back when the program ends, however it ends
+    /// (except a timeout or kernel panic), into [`RunOutput::exports`]: the
+    /// program's results. Write one to the host with [`Export::write_to`].
+    /// The program's status comes first; the export then has 30 seconds
+    /// (or what's left of the timeout, if longer).
+    /// If nothing is imported there, it starts out as an empty directory for
+    /// the program to fill (writable with [`Capability::FsWrite`]), so a
+    /// program that makes it itself needs `mkdir -p` or the like.
+    pub fn export(mut self, guest: &str) -> Result<Self> {
+        let path = image::guest_path(guest)?;
+        if !self.exports.contains(&path) {
+            self.exports.push(path);
+        }
+        Ok(self)
+    }
+
+    /// Send at most this many bytes of exports in all (256 MiB by default,
+    /// counting paths and a little per entry). Entries that don't fit are
+    /// left out, and [`ExportState::Truncated`](crate::ExportState::Truncated)
+    /// says so.
+    pub fn max_export(mut self, bytes: usize) -> Self {
+        self.max_export = bytes;
+        self
+    }
+
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = path.into();
         self
@@ -245,7 +287,19 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Sandbox> {
+    pub fn build(mut self) -> Result<Sandbox> {
+        for dir in &self.exports {
+            let inside = format!("{dir}/");
+            let exists = self.files.keys().any(|p| p == dir || p.starts_with(&inside));
+            // Not under an imported file or link: that would replace it.
+            let room = self
+                .files
+                .iter()
+                .all(|(p, n)| matches!(n, Node::Dir { .. }) || !(p == "/" || dir.starts_with(&format!("{p}/"))));
+            if !exists && room {
+                self.files.insert(dir.clone(), Node::Dir { mode: 0o755 });
+            }
+        }
         if !self.cwd.starts_with('/') {
             bail!("working directory {:?} must be absolute", self.cwd);
         }
@@ -333,8 +387,11 @@ impl Sandbox {
             argv: argv.clone(),
             envp: env.iter().map(String::as_str).collect(),
             entries: image::entries(&cfg.files),
+            exports: cfg.exports.iter().map(String::as_str).collect(),
+            export_budget: cfg.max_export as u64,
         }
         .encode();
+        let mut exports = Collector::new(&cfg.exports, cfg.max_export as u64);
 
         let vm = VmConfig {
             qemu: cfg.qemu.clone(),
@@ -349,6 +406,7 @@ impl Sandbox {
             stdout_truncated: false,
             stderr_truncated: false,
             events: Vec::new(),
+            exports: Vec::new(),
             kernel_log: String::new(),
             duration: Duration::ZERO,
         };
@@ -375,8 +433,10 @@ impl Sandbox {
                 Ok(e) => out.events.push(e.into()),
                 Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
+            Channel::Export => exports.push(payload),
             Channel::Exit => {}
         })?;
+        out.exports = exports.finish();
         out.duration = started.elapsed();
         out.status = match end {
             VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),

@@ -75,6 +75,10 @@ fn write_temp(ext: &str, contents: &[u8]) -> Result<TempFile> {
     Ok(guard)
 }
 
+/// How long the guest gets, after the program ends, to send its exports
+/// (on top of what's left of the timeout).
+const EXPORT_GRACE: Duration = Duration::from_secs(30);
+
 /// The most of the serial port's output we keep: the kernel only writes
 /// there before the virtio console is up and when it panics.
 const MAX_UART: usize = 1 << 20;
@@ -223,22 +227,33 @@ pub(crate) fn run(
         String::from_utf8_lossy(&s).into_owned()
     });
 
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let mut decoder = FrameDecoder::new();
     let mut exit = None;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Ok(VmEnd::Timeout);
-        }
-        match rx.recv_timeout(left) {
-            Ok(chunk) => decoder.push(&chunk, |ch, payload| match ch {
-                Channel::Exit => exit = exit.or(wire::decode_exit(payload)),
-                _ => on_frame(ch, payload),
-            }),
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(VmEnd::Timeout),
+        let chunk = match rx.recv_timeout(left) {
+            Ok(chunk) => chunk,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+            // Out of time. If the program had ended, that's its status (and
+            // the exports are incomplete); otherwise it timed out.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Ok(match exit {
+                    Some((kind, code)) => VmEnd::Exited { kind, code },
+                    None => VmEnd::Timeout,
+                });
+            }
+        };
+        decoder.push(&chunk, |ch, payload| match ch {
+            Channel::Exit if exit.is_none() => {
+                exit = wire::decode_exit(payload);
+                if exit.is_some() {
+                    deadline = deadline.max(Instant::now() + EXPORT_GRACE);
+                }
+            }
+            Channel::Exit => {}
+            _ => on_frame(ch, payload),
+        });
     }
     let status = child.0.wait()?;
     drop(qemu_in);

@@ -20,12 +20,14 @@
 //! denied and reported in [`RunOutput::events`].
 
 mod event;
+mod export;
 mod image;
 mod manifest;
 mod sandbox;
 mod vmm;
 
 pub use event::GuestEvent;
+pub use export::{Export, ExportContent, ExportEntry, ExportState};
 pub use grix_abi::policy::{Capability, DenyAction};
-pub use manifest::Manifest;
+pub use manifest::{ExportTo, Manifest};
 pub use sandbox::{ExitStatus, RunOutput, Sandbox, SandboxBuilder, Stream};

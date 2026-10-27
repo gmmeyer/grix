@@ -50,7 +50,9 @@ reads slowly, program writes to stdout/stderr block like pipe writes (woken
 by the device's interrupt; `Thread::io_done` lets a re-run continue after
 what it already sent) or fail with EAGAIN; the kernel's own messages spin
 until there's room. Before the virtio console is up, and for panics, frames
-go to the PL011 UART, on a Unix socket the host reads (bounded).
+go to the PL011 UART, on a Unix socket the host reads (bounded). When the
+program ends (`process::finish`), `export.rs` sends the directories listed
+in `Image::exports` before the exit status (`wire::ExportMsg`).
 
 Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use grix::{Capability, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
+use grix::{Capability, ExitStatus, ExportContent, ExportState, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
 
 fn runtime(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
@@ -282,6 +282,27 @@ fn node_network_interfaces() {
     );
     assert_eq!(out.stdout_str(), "[ 'lo' ] [ '127.0.0.1/8', '::1/128' ]\n");
     assert_no_surprises(&out);
+}
+
+#[test]
+fn results_from_python_and_node() {
+    // The programs write into the exported /out; the host gets it back.
+    let py = "import json, sqlite3; json.dump({'ok': True}, open('/out/report.json', 'w')); \
+              db = sqlite3.connect('/out/r.db'); db.execute('create table t(x)'); db.commit()";
+    let b = sandbox("python").allow(Capability::FsWrite).env("PYTHONDONTWRITEBYTECODE", "1").export("/out").unwrap();
+    let out = run(b, &["/usr/bin/python3", "-c", py]);
+    let ex = out.export("/out").unwrap();
+    assert_eq!(ex.state, ExportState::Complete);
+    let report = ex.entries.iter().find(|e| e.path == "report.json").unwrap();
+    assert_eq!(report.content, ExportContent::File(br#"{"ok": true}"#.to_vec()));
+    let db = ex.entries.iter().find(|e| e.path == "r.db").unwrap();
+    assert!(matches!(&db.content, ExportContent::File(d) if d.starts_with(b"SQLite format 3\0")));
+
+    let js = "const fs = require('fs'); fs.mkdirSync('/out/js'); fs.writeFileSync('/out/js/out.txt', 'from node')";
+    let b = sandbox("node").allow(Capability::FsWrite).export("/out").unwrap();
+    let out = run(b, &["/usr/bin/node", "-e", js]);
+    let paths: Vec<_> = out.exports[0].entries.iter().map(|e| (e.path.as_str(), e.content.clone())).collect();
+    assert_eq!(paths, [("js", ExportContent::Dir), ("js/out.txt", ExportContent::File(b"from node".to_vec()))]);
 }
 
 #[test]

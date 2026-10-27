@@ -57,6 +57,11 @@ pub struct Image<'a> {
     pub argv: Vec<&'a str>,
     pub envp: Vec<&'a str>,
     pub entries: Vec<Entry<'a>>,
+    /// Directories to send back to the host when the program ends (see
+    /// `wire::ExportMsg`), and the most they may cost in all
+    /// (`wire::export_cost`).
+    pub exports: Vec<&'a str>,
+    pub export_budget: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +107,8 @@ impl<'a> Image<'a> {
             w.u32(e.mode);
             w.bytes(e.data);
         }
+        w.strs(&self.exports);
+        w.u64(self.export_budget);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -142,6 +149,8 @@ impl<'a> Image<'a> {
             let data = r.bytes()?;
             entries.push(Entry { path, kind, mode, data });
         }
+        let exports = r.strs()?;
+        let export_budget = r.u64()?;
         Ok(Image {
             ram_size: header.ram_size,
             boot_time_ns,
@@ -155,6 +164,8 @@ impl<'a> Image<'a> {
             argv,
             envp,
             entries,
+            exports,
+            export_budget,
         })
     }
 }
@@ -183,6 +194,8 @@ mod tests {
                 Entry { path: "/bin/hello", kind: EntryKind::File, mode: 0o755, data: b"\x7fELF" },
                 Entry { path: "/bin/hi", kind: EntryKind::Symlink, mode: 0o777, data: b"hello" },
             ],
+            exports: vec!["/out", "/tmp/results"],
+            export_budget: 1 << 20,
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -206,6 +219,8 @@ mod tests {
             argv: vec![],
             envp: vec![],
             entries: vec![],
+            exports: vec![],
+            export_budget: 0,
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

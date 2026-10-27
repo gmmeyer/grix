@@ -294,9 +294,13 @@ pub fn host_pending() -> bool {
     !c.stdin.eof || c.dev.in_flight()
 }
 
-/// Report final status and power off.
-pub fn exit(kind: ExitKind, code: i32) -> ! {
+/// Report the program's final status. (Exports may follow.)
+pub fn report_exit(kind: ExitKind, code: i32) {
     write(Channel::Exit, &wire::encode_exit(kind, code));
+}
+
+/// Power off once everything sent has reached the host.
+pub fn power_off() -> ! {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.dev.flush(|| false);
     }

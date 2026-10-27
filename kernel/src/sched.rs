@@ -131,7 +131,7 @@ fn deadlock(p: &Process) -> ! {
          ({futex} on futexes, {io} on I/O, {sig} waiting for signals)"
     );
     console::event(&Event::Fault { signal: SIGKILL, addr: 0, pc: 0, detail: &detail });
-    console::exit(grix_abi::wire::ExitKind::Signaled, SIGKILL as i32)
+    crate::process::finish(grix_abi::wire::ExitKind::Signaled, SIGKILL as i32)
 }
 
 /// Program the timer for the next thing that needs the CPU's attention: the

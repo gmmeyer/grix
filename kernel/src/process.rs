@@ -348,15 +348,23 @@ impl Process {
     }
 }
 
+/// The program has ended: report its status, then send the exported
+/// directories. Status first, so a slow export can't cost the host it.
+pub fn finish(kind: ExitKind, code: i32) -> ! {
+    console::report_exit(kind, code);
+    crate::export::send();
+    console::power_off()
+}
+
 /// Exit the program normally.
 pub fn exit(code: i32) -> ! {
-    console::exit(ExitKind::Exited, code)
+    finish(ExitKind::Exited, code)
 }
 
 /// Terminate the program with a signal and report why.
 pub fn exit_signaled(signal: u32, addr: u64, pc: u64, detail: &str) -> ! {
     console::event(&Event::Fault { signal, addr, pc, detail });
-    console::exit(ExitKind::Signaled, signal as i32)
+    finish(ExitKind::Signaled, signal as i32)
 }
 
 /// Demand paging for a user translation fault.
@@ -376,6 +384,7 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
 
 /// Load the image's program and jump to it.
 pub fn start(img: Image<'static>) -> ! {
+    crate::export::init(img.exports.clone(), img.export_budget);
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);

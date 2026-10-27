@@ -214,6 +214,26 @@ Next, in TODO.md order:
 3. fork/exec/wait.
 4. Networking through the host.
 
+### stdin, a fast transport, and exports
+
+- **stdin from the host** and **output limits** (`550b1bb`): `run_with_stdin`,
+  the CLI passes a non-terminal stdin through, and `max_output` caps what's
+  kept of stdout/stderr.
+- **virtio-console** (`52aa085`): the framed channel moved off the PL011 to
+  port 1 of a virtio-serial device (`kernel/src/virtio.rs`). About 50 MB/s
+  out and 30 MB/s in with HVF, up from 100 KB/s and 25 KB/s. When the host
+  reads slowly, only the writing thread waits (or gets EAGAIN); a blocking
+  write still returns its full count. A review found a single-threaded
+  writer killed as "deadlocked" before it shipped.
+- **Exports**: `SandboxBuilder::export("/out")` (CLI `-x /out:./results`,
+  manifest `[[export]]`). When the program ends, however it ends short of a
+  timeout or kernel panic, the kernel sends the directory's entries (mode,
+  mtime, contents, symlink targets) before the exit status. The host
+  checks every path and size (`max_export`, 256 MiB), and `write_to`
+  recreates the tree without following links.
+
+Next, in TODO.md order: fork/exec/wait, then networking through the host.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

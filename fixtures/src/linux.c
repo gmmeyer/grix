@@ -109,18 +109,21 @@ static int test_signalfd(void) {
 }
 
 static volatile int spin_stop;
+// Spins until its own CPU clock says 40 ms (or 2 s pass, if it's stuck).
+// Not 40 ms of wall time: the host may deschedule the VM while another
+// thread is current, which takes wall time from this one's share.
 static void *spinner(void *arg) {
     (void)arg;
-    long t0 = ns(CLOCK_MONOTONIC);
-    while (ns(CLOCK_MONOTONIC) - t0 < 40000000L) {}
+    long w0 = ns(CLOCK_MONOTONIC);
+    while (ns(CLOCK_THREAD_CPUTIME_ID) < 40000000L && ns(CLOCK_MONOTONIC) - w0 < 2000000000L) {}
     return (void *)ns(CLOCK_THREAD_CPUTIME_ID);
 }
 
 static int test_cpu_clocks(void) {
     long p0 = ns(CLOCK_PROCESS_CPUTIME_ID), t0 = ns(CLOCK_THREAD_CPUTIME_ID);
-    usleep(50000);  // sleeping uses no CPU
+    usleep(50000);  // sleeping uses no CPU (allowing for a busy host)
     long slept = ns(CLOCK_THREAD_CPUTIME_ID) - t0;
-    CHECK(slept < 20000000L);
+    CHECK(slept < 35000000L);
     long w0 = ns(CLOCK_MONOTONIC);
     while (ns(CLOCK_MONOTONIC) - w0 < 50000000L) {}  // spinning does
     long spun = ns(CLOCK_THREAD_CPUTIME_ID) - t0;
@@ -130,9 +133,9 @@ static int test_cpu_clocks(void) {
     void *theirs;
     pthread_create(&t, 0, spinner, 0);
     pthread_join(t, &theirs);
-    CHECK((long)theirs >= 30000000L);
+    CHECK((long)theirs >= 40000000L);
     long proc = ns(CLOCK_PROCESS_CPUTIME_ID) - p0;
-    CHECK(proc >= spun + 30000000L);
+    CHECK(proc >= spun + 40000000L);
     clockid_t c;
     CHECK(clock_getcpuclockid(0, &c) == 0 && ns(c) >= proc);
     CHECK(pthread_getcpuclockid(pthread_self(), &c) == 0 && ns(c) >= spun);

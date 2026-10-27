@@ -416,6 +416,12 @@ impl core::ops::DerefMut for FsGuard {
     }
 }
 
+/// The filesystem, unless it isn't built yet or is held further up the call
+/// stack (for code that may run in the middle of a filesystem operation).
+pub fn try_lock() -> Option<FsGuard> {
+    FS.try_lock().filter(|g| g.is_some()).map(FsGuard)
+}
+
 /// The filesystem. One CPU and no preemption in the kernel, so the lock is
 /// never contended: failing to take it means it is already held further up
 /// the call stack, a kernel bug that would otherwise hang.

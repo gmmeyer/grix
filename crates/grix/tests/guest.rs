@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use grix::{Capability, DenyAction, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder, Stream};
+use grix::{
+    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, RunOutput, Sandbox, SandboxBuilder,
+    Stream,
+};
 
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
@@ -139,6 +142,106 @@ fn writable_filesystem() {
     assert_eq!(out.stdout_str(), "files ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn exported_directories() {
+    // What the program leaves in /out comes back when it ends, even by a
+    // crash: with modes, times and links, and the imported file that was
+    // there. An export that isn't a directory is reported missing.
+    let sb = with("export")
+        .allow(Capability::FsWrite)
+        .file("/out/imported.txt", "from the host\n", 0o600)
+        .unwrap()
+        .export("/out")
+        .unwrap()
+        .export("/out/imported.txt")
+        .unwrap()
+        .build()
+        .unwrap();
+    for (args, status) in
+        [(&["/bin/export"][..], ExitStatus::Exited(0)), (&["/bin/export", "crash"], ExitStatus::Signaled(11))]
+    {
+        let out = sb.run(args).unwrap();
+        assert_eq!(out.stdout_str(), "export ok\n");
+        assert_eq!(out.status, status, "{}", out.kernel_log);
+        let faults = out.events.iter().filter(|e| matches!(e, GuestEvent::Fault { .. })).count();
+        assert_eq!(out.events.len(), faults, "{:?}", out.events);
+        assert_eq!(faults, if status == ExitStatus::Exited(0) { 0 } else { 1 });
+        let ex = out.export("/out").unwrap();
+        assert_eq!(ex.state, ExportState::Complete, "{}", out.kernel_log);
+        let paths: Vec<&str> = ex.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "a",
+                "a/b",
+                "a/b/c.txt",
+                "big.bin",
+                "empty",
+                "imported.txt",
+                "link",
+                "new",
+                "run.sh",
+                "sub",
+                "sub/hard",
+                "sub/hello.txt"
+            ]
+        );
+        let get = |p: &str| ex.entries.iter().find(|e| e.path == p).unwrap();
+        let hello = get("sub/hello.txt");
+        assert_eq!(hello.content, ExportContent::File(b"hello\n".to_vec()));
+        assert_eq!(hello.mode, 0o640);
+        assert_eq!(hello.mtime, UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+        assert_eq!(get("sub/hard").content, hello.content);
+        assert_eq!((get("sub").mode, get("sub").content.clone()), (0o750, ExportContent::Dir));
+        assert_eq!(get("link").content, ExportContent::Symlink("sub/hello.txt".into()));
+        assert_eq!(get("empty").content, ExportContent::File(vec![]));
+        assert_eq!(get("run.sh").mode, 0o755);
+        assert_eq!(
+            (get("imported.txt").mode, get("new").content.clone()),
+            (0o600, ExportContent::File(b"renamed\n".to_vec()))
+        );
+        let big: Vec<u8> = (0..3usize << 20).map(|i| (i % 251) as u8).collect();
+        assert!(get("big.bin").content == ExportContent::File(big));
+        assert_eq!(out.export("/out/imported.txt").unwrap().state, ExportState::Missing);
+    }
+
+    // On the host: the same tree, links left as links.
+    let out = sb.run(&["/bin/export"]).unwrap();
+    let dest = std::env::temp_dir().join(format!("grix-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dest);
+    out.export("/out").unwrap().write_to(&dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("a/b/c.txt")).unwrap(), b"deep\n");
+    assert_eq!(std::fs::read_link(dest.join("link")).unwrap(), PathBuf::from("sub/hello.txt"));
+    assert_eq!(std::fs::read(dest.join("link")).unwrap(), b"hello\n");
+    std::fs::remove_dir_all(&dest).unwrap();
+
+    // Past the export limit: what came before it, and a note that it's cut off.
+    // (No import at /out: the export makes it an empty directory.)
+    let out =
+        run(with("export").allow(Capability::FsWrite).export("/out").unwrap().max_export(1 << 20), &["/bin/export"]);
+    let ex = out.export("/out").unwrap();
+    assert_eq!(ex.state, ExportState::Truncated);
+    let paths: Vec<&str> = ex.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths[..3], ["a", "a/b", "a/b/c.txt"]);
+    assert!(!paths.contains(&"big.bin"));
+    // Entries that don't fit are left out and smaller ones after them still
+    // come: the 3 MiB file, not the next ones.
+    assert!(paths.contains(&"sub/hello.txt") && paths.contains(&"run.sh"));
+
+    // Deeper than an export path may go (4096 bytes), and a 100 GiB sparse
+    // file: both left out, quickly, and the program's status is intact.
+    let started = std::time::Instant::now();
+    let out = run(with("export").allow(Capability::FsWrite).export("/out").unwrap(), &["/bin/export", "deep"]);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let ex = out.export("/out").unwrap();
+    assert_eq!(ex.state, ExportState::Truncated);
+    let paths: Vec<&str> = ex.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths.len(), 34, "33 levels fit, plus top.txt");
+    assert!(paths.iter().all(|p| p.len() <= 4096) && paths.contains(&"top.txt"));
+    assert!(!paths.iter().any(|p| p.ends_with("bottom.txt") || *p == "sparse.img"));
 }
 
 #[test]

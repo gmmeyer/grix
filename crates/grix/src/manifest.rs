@@ -6,6 +6,7 @@
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
 //! timeout_secs = 30
+//! max_export_mb = 256
 //!
 //! [env]
 //! GREETING = "hi"
@@ -13,6 +14,10 @@
 //! [[import]]
 //! host = "build/hello"       # relative to this manifest
 //! guest = "/bin/hello"
+//!
+//! [[export]]                 # copied out when the program ends (CLI)
+//! guest = "/out"
+//! host = "results"           # relative to this manifest; must not exist yet
 //! ```
 
 use std::collections::BTreeMap;
@@ -38,8 +43,11 @@ pub struct Manifest {
     pub cwd: Option<String>,
     pub memory_mb: Option<u64>,
     pub timeout_secs: Option<u64>,
+    pub max_export_mb: Option<usize>,
     #[serde(default, rename = "import")]
     pub imports: Vec<Import>,
+    #[serde(default, rename = "export")]
+    pub exports: Vec<ExportTo>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -47,6 +55,14 @@ pub struct Manifest {
 pub struct Import {
     pub host: PathBuf,
     pub guest: String,
+}
+
+/// A guest directory to export, and where on the host to write it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportTo {
+    pub guest: String,
+    pub host: PathBuf,
 }
 
 impl Manifest {
@@ -62,6 +78,11 @@ impl Manifest {
         for imp in &mut m.imports {
             if imp.host.is_relative() {
                 imp.host = dir.join(&imp.host);
+            }
+        }
+        for exp in &mut m.exports {
+            if exp.host.is_relative() {
+                exp.host = dir.join(&exp.host);
             }
         }
         Ok(m)
@@ -92,8 +113,14 @@ impl Manifest {
         if let Some(s) = self.timeout_secs {
             b = b.timeout(Duration::from_secs(s));
         }
+        if let Some(mb) = self.max_export_mb {
+            b = b.max_export(mb << 20);
+        }
         for imp in &self.imports {
             b = b.import(&imp.host, &imp.guest)?;
+        }
+        for exp in &self.exports {
+            b = b.export(&exp.guest)?;
         }
         Ok(b)
     }
@@ -116,11 +143,15 @@ mod tests {
             [[import]]
             host = "x"
             guest = "/bin/x"
+            [[export]]
+            guest = "/out"
+            host = "results"
             "#,
         )
         .unwrap();
         assert_eq!(m.command, ["/bin/x", "a"]);
         assert_eq!(m.imports[0].guest, "/bin/x");
+        assert_eq!(m.exports[0].host, Path::new("results"));
         assert_eq!(m.env["A"], "1");
     }
 

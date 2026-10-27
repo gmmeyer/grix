@@ -28,6 +28,8 @@ pub enum Channel {
     Event = 4,
     /// Final status; see [`encode_exit`].
     Exit = 5,
+    /// Exported directories, after the final status; see [`ExportMsg`].
+    Export = 6,
 }
 
 impl Channel {
@@ -38,6 +40,7 @@ impl Channel {
             3 => Some(Self::Log),
             4 => Some(Self::Event),
             5 => Some(Self::Exit),
+            6 => Some(Self::Export),
             _ => None,
         }
     }
@@ -194,6 +197,115 @@ pub fn decode_exit(buf: &[u8]) -> Option<(ExitKind, i32)> {
     Some((kind, i32::from_le_bytes([a, b, c, d])))
 }
 
+/// What an exported entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExportKind {
+    Dir = 0,
+    File = 1,
+    Symlink = 2,
+}
+
+/// The longest path an export entry may have (relative to its directory).
+/// Deeper entries are left out, and the export is marked truncated.
+pub const MAX_EXPORT_PATH: usize = 4096;
+
+/// What an entry counts against `Image::export_budget`: its path, its
+/// contents, and a little for the host's bookkeeping. Both sides use this,
+/// so the guest leaves out exactly what the host wouldn't take.
+pub fn export_cost(path_len: usize, data_len: u64) -> u64 {
+    (path_len as u64).saturating_add(data_len).saturating_add(256)
+}
+
+/// [`Channel::Export`] messages: the directories the host asked for
+/// (`Image::exports`), sent when the program ends, after its status. For
+/// each directory in order, `Root`, then an `Entry` for everything under it
+/// (parents before children). Each `Entry` is followed by `Data` messages
+/// carrying exactly its path (relative to the directory, `/`-separated) and
+/// then its contents (file bytes or link target). `Done` ends the export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportMsg<'a> {
+    /// Directory `index` of `Image::exports`; `found` if it exists and is a
+    /// directory.
+    Root {
+        index: u32,
+        found: bool,
+    },
+    Entry {
+        kind: ExportKind,
+        mode: u32,
+        mtime_ns: u64,
+        path_len: u32,
+        data_len: u64,
+    },
+    Data(&'a [u8]),
+    /// Something in the current directory was left out: over the budget or
+    /// `MAX_EXPORT_PATH`.
+    Truncated,
+    /// Something in the current directory couldn't be read (the program
+    /// ended in the middle of changing it).
+    Skipped,
+    Done,
+}
+
+impl<'a> ExportMsg<'a> {
+    /// The first byte of a `Data` message, followed by the bytes themselves
+    /// (so the guest can build one in place).
+    pub const DATA_TAG: u8 = 2;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match *self {
+            ExportMsg::Root { index, found } => {
+                w.u8(0);
+                w.u32(index);
+                w.u8(found as u8);
+            }
+            ExportMsg::Entry { kind, mode, mtime_ns, path_len, data_len } => {
+                w.u8(1);
+                w.u8(kind as u8);
+                w.u32(mode);
+                w.u64(mtime_ns);
+                w.u32(path_len);
+                w.u64(data_len);
+            }
+            ExportMsg::Data(bytes) => {
+                w.u8(Self::DATA_TAG);
+                w.raw(bytes);
+            }
+            ExportMsg::Done => w.u8(3),
+            ExportMsg::Truncated => w.u8(4),
+            ExportMsg::Skipped => w.u8(5),
+        }
+        w.buf
+    }
+
+    pub fn decode(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(buf);
+        let msg = match r.u8()? {
+            0 => ExportMsg::Root { index: r.u32()?, found: r.u8()? != 0 },
+            1 => {
+                let kind = match r.u8()? {
+                    0 => ExportKind::Dir,
+                    1 => ExportKind::File,
+                    2 => ExportKind::Symlink,
+                    _ => return Err(DecodeError),
+                };
+                ExportMsg::Entry { kind, mode: r.u32()?, mtime_ns: r.u64()?, path_len: r.u32()?, data_len: r.u64()? }
+            }
+            Self::DATA_TAG => return Ok(ExportMsg::Data(&buf[1..])),
+            3 => ExportMsg::Done,
+            4 => ExportMsg::Truncated,
+            5 => ExportMsg::Skipped,
+            _ => return Err(DecodeError),
+        };
+        if r.remaining() != 0 {
+            return Err(DecodeError);
+        }
+        Ok(msg)
+    }
+}
+
 /// Things the guest kernel reports so the caller can see what a program tried to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
@@ -269,6 +381,28 @@ mod tests {
         let mut v = frame_header(ch, data.len()).to_vec();
         v.extend_from_slice(data);
         v
+    }
+
+    #[test]
+    fn export_messages_roundtrip_and_reject_garbage() {
+        let msgs = [
+            ExportMsg::Root { index: 3, found: true },
+            ExportMsg::Entry { kind: ExportKind::Symlink, mode: 0o777, mtime_ns: 5, path_len: 4, data_len: 9 },
+            ExportMsg::Data(b"a/b/c"),
+            ExportMsg::Data(b""),
+            ExportMsg::Truncated,
+            ExportMsg::Skipped,
+            ExportMsg::Done,
+        ];
+        for m in msgs {
+            assert_eq!(ExportMsg::decode(&m.encode()), Ok(m));
+        }
+        assert!(ExportMsg::decode(&[]).is_err());
+        assert!(ExportMsg::decode(&[9]).is_err());
+        assert!(ExportMsg::decode(&[1, 7, 0, 0, 0, 0]).is_err()); // bad kind, short
+        let mut long = ExportMsg::Done.encode();
+        long.push(0);
+        assert!(ExportMsg::decode(&long).is_err());
     }
 
     #[test]

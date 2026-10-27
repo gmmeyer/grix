@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grix::{Capability, DenyAction, Manifest, Sandbox, Stream};
+use grix::{Capability, DenyAction, Export, ExportState, Manifest, RunOutput, Sandbox, Stream};
 
 #[derive(Parser)]
 #[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
@@ -17,7 +17,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run a program in a fresh sandbox.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// List the capabilities a sandbox can be granted.
     Caps,
 }
@@ -30,6 +30,10 @@ struct RunArgs {
     /// Import HOST[:GUEST] (GUEST defaults to /<file name>). Repeatable.
     #[arg(short, long = "import", value_name = "HOST[:GUEST]")]
     imports: Vec<String>,
+    /// When the program ends, copy guest directory GUEST to HOST (which must
+    /// not exist yet, or be empty). Repeatable.
+    #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
+    exports: Vec<String>,
     /// Grant a capability (fs_write, threads, process, net). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
@@ -48,6 +52,9 @@ struct RunArgs {
     /// Keep at most this many MiB of each of stdout and stderr.
     #[arg(long, value_name = "MIB")]
     max_output: Option<usize>,
+    /// Export at most this many MiB in all (default 256).
+    #[arg(long, value_name = "MIB")]
+    max_export: Option<usize>,
     /// Don't pass our stdin to the program (it's passed when it isn't a terminal).
     #[arg(long)]
     no_stdin: bool,
@@ -77,7 +84,7 @@ fn main() -> ExitCode {
             }
             Ok(0)
         }
-        Cmd::Run(args) => run(args),
+        Cmd::Run(args) => run(*args),
     };
     match result {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -105,6 +112,20 @@ fn run(args: RunArgs) -> Result<i32> {
         };
         b = b.import(&host, &guest)?;
     }
+    let mut exports: Vec<(String, PathBuf)> =
+        manifest.exports.iter().map(|e| (e.guest.clone(), e.host.clone())).collect();
+    for spec in &args.exports {
+        let (guest, host) = spec.split_once(':').with_context(|| format!("--export {spec:?} must be GUEST:HOST"))?;
+        b = b.export(guest)?;
+        exports.push((guest.to_string(), PathBuf::from(host)));
+    }
+    // Before the run, so its results have somewhere to go.
+    for (i, (_, host)) in exports.iter().enumerate() {
+        Export::check_destination(host).context("export destination")?;
+        if exports[..i].iter().any(|(_, h)| h == host) {
+            bail!("{} is the destination of two exports", host.display());
+        }
+    }
     for name in &args.allow {
         b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);
     }
@@ -127,6 +148,9 @@ fn run(args: RunArgs) -> Result<i32> {
     if let Some(mb) = args.max_output {
         b = b.max_output(mb << 20);
     }
+    if let Some(mb) = args.max_export {
+        b = b.max_export(mb << 20);
+    }
     let command = if args.command.is_empty() { manifest.command.clone() } else { args.command.clone() };
     if command.is_empty() {
         bail!("no command given (pass it after `--` or set `command` in the manifest)");
@@ -146,7 +170,8 @@ fn run(args: RunArgs) -> Result<i32> {
     if args.json {
         let out = run(&mut |_, _| {})?;
         println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(out.status.code());
+        let wrote = write_exports(&out, &exports, args.quiet);
+        return Ok(if wrote { out.status.code() } else { 125 });
     }
 
     let out = run(&mut |stream, data| {
@@ -183,5 +208,42 @@ fn run(args: RunArgs) -> Result<i32> {
         grix::ExitStatus::VmFailed(why) => eprintln!("grix: {why}"),
         _ => {}
     }
-    Ok(out.status.code())
+    let wrote = write_exports(&out, &exports, args.quiet);
+    Ok(if wrote { out.status.code() } else { 125 })
+}
+
+/// Write each exported directory to its host path, saying what happened.
+/// Partial exports are written too, with a warning. False if any couldn't
+/// be written.
+fn write_exports(out: &RunOutput, exports: &[(String, PathBuf)], quiet: bool) -> bool {
+    let mut ok = true;
+    for (guest, host) in exports {
+        let Some(export) = out.export(guest) else { continue };
+        let note = match export.state {
+            ExportState::Complete => "",
+            ExportState::Missing => {
+                eprintln!("grix: {guest} didn't exist when the program ended; nothing exported");
+                continue;
+            }
+            ExportState::Truncated => " (cut off at the export limit)",
+            ExportState::Incomplete => " (incomplete: the run ended before all of it arrived)",
+        };
+        if export.entries.is_empty() && !note.is_empty() {
+            eprintln!("grix: nothing of {guest} was exported{note}");
+            continue;
+        }
+        match export.write_to(host) {
+            Ok(()) if quiet && note.is_empty() => {}
+            Ok(()) => {
+                let n = export.entries.len();
+                let s = if n == 1 { "entry" } else { "entries" };
+                eprintln!("grix: exported {guest} to {} ({n} {s}){note}", host.display())
+            }
+            Err(e) => {
+                eprintln!("grix: exporting {guest} to {}: {e:#}", host.display());
+                ok = false;
+            }
+        }
+    }
+    ok
 }

@@ -22,7 +22,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 5. ~~**A fast host transport**~~: done. stdio, events and stdin travel on a
    virtio console: about 50 MB/s out and 30 MB/s in with HVF, up from
    100 KB/s and 25 KB/s on the UART.
-6. **Getting written files back to the host** (the agent's results).
+6. ~~**Getting written files back to the host**~~: done. `export` /
+   `--export` / `[[export]]` send directories back when the program ends.
 7. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
    pipelines and `git commit` (run through `sh`) all stop here.
 8. **Networking through the host** (`net`).
@@ -88,7 +89,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_EXCL`/`O_TMPFILE`, `pwrite64`/`pwritev`.
 - [x] Copy-on-write overlay over imported files, for programs that modify
       their own tree.
-- [ ] Hand writable directories back to the host after a run (the agent's results).
+- [x] Hand writable directories back to the host after a run (the agent's results).
+      `SandboxBuilder::export` / `--export GUEST:HOST` / `[[export]]`. Sent when the program ends (exit, crash, deadlock), into `RunOutput::exports`, under a `max_export` budget. `Export::write_to` recreates it on the host without following links.
+- [ ] Export only what changed in an imported tree (an overlay's upper layer, with deletions), instead of all of it.
+- [ ] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
+- [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
 - [ ] Read-write host directory mounts, gated by policy.
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).

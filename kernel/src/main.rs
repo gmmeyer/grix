@@ -15,6 +15,7 @@ mod arch;
 mod console;
 mod elf;
 mod errno;
+mod export;
 mod fd;
 mod fs;
 mod ipc;
