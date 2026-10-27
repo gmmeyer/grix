@@ -7,6 +7,7 @@ mod net;
 mod signal;
 pub mod table;
 mod thread;
+mod timer;
 
 use grix_abi::policy::Capability;
 
@@ -186,6 +187,18 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::sched_yield => thread::sched_yield(p),
         nr::nanosleep => thread::nanosleep(p, a[0]),
         nr::clock_nanosleep => thread::clock_nanosleep(p, a[0], a[1], a[2]),
+
+        // timers
+        nr::getitimer => timer::getitimer(p, a[0], a[1]),
+        nr::setitimer => timer::setitimer(p, a[0], a[1], a[2]),
+        nr::timer_create => timer::timer_create(p, a[0], a[1], a[2]),
+        nr::timer_settime => timer::timer_settime(p, a[0], a[1], a[2], a[3]),
+        nr::timer_gettime => timer::timer_gettime(p, a[0], a[1]),
+        nr::timer_getoverrun => timer::timer_getoverrun(p, a[0]),
+        nr::timer_delete => timer::timer_delete(p, a[0]),
+        nr::timerfd_create => timer::timerfd_create(p, a[0], a[1]),
+        nr::timerfd_settime => timer::timerfd_settime(p, a[0], a[1], a[2], a[3]),
+        nr::timerfd_gettime => timer::timerfd_gettime(p, a[0], a[1]),
 
         // signals
         nr::rt_sigaction => signal::rt_sigaction(p, a[0], a[1], a[2], a[3]),

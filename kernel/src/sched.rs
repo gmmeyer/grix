@@ -31,6 +31,7 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
         None => false,
     };
     let next = loop {
+        crate::timer::fire(p);
         p.wake_io_waiters();
         wake_expired(p);
         if let Some(next) = p.runq.pop_front() {
@@ -81,8 +82,10 @@ fn idle(p: &mut Process) {
     p.timer_dirty = true;
 }
 
+/// The next time something needs the CPU: a sleeping thread's deadline or a timer.
 fn earliest_deadline(p: &Process) -> Option<u64> {
-    p.threads.values().filter_map(|t| t.wait?.deadline).min()
+    let sleepers = p.threads.values().filter_map(|t| t.wait?.deadline);
+    sleepers.chain(p.timers.next_deadline()).min()
 }
 
 fn deadlock(p: &Process) -> ! {
@@ -123,7 +126,9 @@ pub fn irq(tf: &mut TrapFrame) {
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("interrupt without a process");
     p.timer_dirty = true;
-    let woke = wake_expired(p);
+    let fired = crate::timer::fire(p);
+    p.wake_io_waiters();
+    let woke = wake_expired(p) || fired;
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
     if !p.runq.is_empty() && (slice_over || woke) {
         schedule(p, tf);

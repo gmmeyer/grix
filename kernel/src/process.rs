@@ -146,6 +146,8 @@ pub struct Process {
     pub timer_dirty: bool,
     /// `ipc::generation()` when I/O waiters were last woken.
     pub io_seen: u64,
+    /// setitimer, POSIX timers and timerfds (see timer.rs).
+    pub timers: crate::timer::Timers,
 }
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
@@ -185,6 +187,7 @@ impl Process {
             resched: false,
             timer_dirty: true,
             io_seen: 0,
+            timers: crate::timer::Timers::default(),
         }
     }
 

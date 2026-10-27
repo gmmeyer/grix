@@ -194,6 +194,30 @@ fn python_signals() {
     assert_no_surprises(&out);
 }
 
+const PYTHON_TIMERS: &str = r#"
+import signal, time
+hits = []
+signal.signal(signal.SIGALRM, lambda sig, frame: hits.append(sig))
+signal.setitimer(signal.ITIMER_REAL, 0.05)
+t0 = time.monotonic()
+time.sleep(0.2)
+print("one-shot", hits, time.monotonic() - t0 >= 0.2)
+signal.setitimer(signal.ITIMER_REAL, 0.01, 0.01)
+while len(hits) < 6:
+    signal.pause()
+signal.setitimer(signal.ITIMER_REAL, 0)
+print("periodic", len(hits) >= 6, signal.getitimer(signal.ITIMER_REAL))
+print("alarm", signal.alarm(3), signal.alarm(0))
+"#;
+
+#[test]
+fn python_timers() {
+    let b = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").file("/data/test.py", PYTHON_TIMERS, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/python3", "/data/test.py"]);
+    assert_eq!(out.stdout_str(), "one-shot [14] True\nperiodic True (0.0, 0.0)\nalarm 0 3\n");
+    assert_no_surprises(&out);
+}
+
 const NODE_SIGNALS: &str = r#"
 const timeout = setTimeout(() => { console.log('no signal'); process.exit(1); }, 5000);
 process.on('SIGUSR2', (name) => { console.log('got', name); clearTimeout(timeout); });

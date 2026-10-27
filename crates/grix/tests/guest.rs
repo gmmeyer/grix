@@ -326,6 +326,22 @@ fn pipes_eventfd_epoll_poll_select() {
 }
 
 #[test]
+fn timers() {
+    let out = run(with("timers").allow(Capability::Threads), &["/bin/timers"]);
+    assert_eq!(out.stdout_str(), "timers ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The fixture checks that CPU-time interval timers are reported as missing.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { syscall, .. }] if syscall == "setitimer"),
+        "{:?}",
+        out.events
+    );
+    // SIGALRM's default action ends the program.
+    let out = run(with("timers"), &["/bin/timers", "alarm"]);
+    assert_eq!(out.status, ExitStatus::Signaled(14));
+}
+
+#[test]
 fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);
     assert_eq!(out.status, ExitStatus::Signaled(13));

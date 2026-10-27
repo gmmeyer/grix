@@ -87,6 +87,8 @@ pub struct SigInfo {
     /// (faults), pid, uid and value (sigqueue).
     pub fields: [u64; 4],
     pub fault: Option<Fault>,
+    /// The POSIX timer that sent it, so later expiries count as overruns.
+    pub timer: Option<u32>,
     /// Why the signal was raised, reported if it ends the program.
     pub why: &'static str,
 }
@@ -94,7 +96,7 @@ pub struct SigInfo {
 impl SigInfo {
     /// Sent by this process: kill, tgkill, or the kernel on its behalf (SIGPIPE).
     pub fn sent(signo: u32, code: i32, uid: u32, why: &'static str) -> Self {
-        SigInfo { signo, code, fields: [PID | (uid as u64) << 32, 0, 0, 0], fault: None, why }
+        SigInfo { signo, code, fields: [PID | (uid as u64) << 32, 0, 0, 0], fault: None, timer: None, why }
     }
 
     pub fn bytes(&self) -> [u8; 128] {
@@ -137,6 +139,10 @@ impl SigQueue {
             self.mask &= !bit(sig);
         }
         info
+    }
+
+    fn timer_entry(&mut self, id: u32) -> Option<&mut SigInfo> {
+        self.items.iter_mut().find(|s| s.timer == Some(id))
     }
 
     fn discard(&mut self, sig: u32) {
@@ -228,6 +234,14 @@ fn in_order(mask: u64) -> impl Iterator<Item = u32> {
     [sync, mask & !sync].into_iter().flat_map(|m| (0..64).filter(move |i| m & (1 << i) != 0).map(|i| i + 1))
 }
 
+/// The not-yet-delivered signal from POSIX timer `id`, wherever it is queued.
+pub fn queued_timer_signal(p: &mut Process, id: u32) -> Option<&mut SigInfo> {
+    if p.shared_pending.timer_entry(id).is_some() {
+        return p.shared_pending.timer_entry(id);
+    }
+    p.threads.values_mut().find_map(|t| t.pending.timer_entry(id))
+}
+
 /// Discard pending instances of `sig` everywhere (its disposition became "ignore").
 pub fn discard(p: &mut Process, sig: u32) {
     p.shared_pending.discard(sig);
@@ -302,7 +316,7 @@ pub fn fault(p: &mut Process, sig: u32, code: i32, fault: Fault, why: &'static s
     if act.handler == SIG_DFL || act.handler == SIG_IGN || t.sigmask & bit(sig) != 0 {
         process::exit_signaled(sig, fault.addr, fault.pc, why);
     }
-    let info = SigInfo { signo: sig, code, fields: [fault.addr, 0, 0, 0], fault: Some(fault), why };
+    let info = SigInfo { signo: sig, code, fields: [fault.addr, 0, 0, 0], fault: Some(fault), timer: None, why };
     t.pending.push(info).expect("standard signals always queue");
 }
 
@@ -455,6 +469,7 @@ pub fn return_to_user(tf: &mut TrapFrame) {
             }
             break;
         };
+        crate::timer::delivered(&mut p.timers, &info);
         let act = p.sigactions[info.signo as usize];
         if is_ignored(&act, info.signo) {
             continue;
@@ -645,11 +660,12 @@ fn read_frame(a: &mut AddressSpace, frame: u64) -> Result<(alloc::vec::Vec<u8>, 
 /// rt_sigtimedwait: take a pending signal in `set` (thread-directed first).
 pub fn dequeue(p: &mut Process, set: u64) -> Option<SigInfo> {
     let t = p.cur();
-    if let Some(sig) = in_order(t.pending.mask & set).next() {
-        return t.pending.take(sig);
-    }
-    let sig = in_order(p.shared_pending.mask & set).next()?;
-    p.shared_pending.take(sig)
+    let info = match in_order(t.pending.mask & set).next() {
+        Some(sig) => t.pending.take(sig),
+        None => in_order(p.shared_pending.mask & set).next().and_then(|sig| p.shared_pending.take(sig)),
+    }?;
+    crate::timer::delivered(&mut p.timers, &info);
+    Some(info)
 }
 
 /// Use `mask` until the current syscall finishes or a handler it was

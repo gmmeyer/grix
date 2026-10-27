@@ -33,6 +33,7 @@ pub enum FileKind {
     /// A /proc or /sys file: contents generated at open.
     Generated(Vec<u8>),
     Inotify(Inotify),
+    TimerFd(Arc<Mutex<crate::timer::TimerFd>>),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -52,6 +53,11 @@ impl FileKind {
             FileKind::Stdout | FileKind::Stderr => (EPOLLOUT, 0),
             FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Inotify(_) => (0, 0),
+            FileKind::TimerFd(t) => {
+                let mut t = t.lock();
+                t.update(crate::time::monotonic_ns());
+                (if t.expirations > 0 { EPOLLIN } else { 0 }, t.version)
+            }
             FileKind::Pipe(end) => end.poll(),
             FileKind::Socket(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),

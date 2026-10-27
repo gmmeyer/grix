@@ -330,6 +330,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::EventFd(_) => String::from("anon_inode:[eventfd]"),
         FileKind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
         FileKind::Inotify(_) => String::from("anon_inode:inotify"),
+        FileKind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
     }
 }
 

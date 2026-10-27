@@ -8,11 +8,31 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
+## Next up
+
+Order: small kernel-only items first, then the ones that need host
+support too, then the big ones. Re-probed 2026-10-26: Python (tempfile,
+pip, sqlite), Node (fs), `git init` and Go now pass.
+
+1. ~~**Timers**~~: done (see below).
+2. **Network interface listing**: an `AF_NETLINK` route socket that
+   reports only `lo`. Node `os.networkInterfaces()` is denied a socket today.
+3. **Small Linux gaps**:
+   - `memfd_create`
+   - CPU-time clocks
+   - `membarrier`, `mincore`, more `prctl` options
+   - `signalfd4`
+   - `/etc/localtime`
+4. **stdin from the host**, and output size limits.
+5. **Getting written files back to the host** (the agent's results).
+6. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
+   pipelines and `git commit` (run through `sh`) all stop here.
+7. **Networking through the host** (`net`).
+
 ## Processes and exec
 
-- [~] `#!` scripts for the initial exec and `execve`. `pip3` fails today
-      with "not an ELF file".
-      Done for the initial program, including nested interpreters; `execve` comes with processes.
+- [~] `#!` scripts for the initial exec and `execve`.
+      Done for the initial program, including nested interpreters (`pip3` runs). `execve` comes with processes.
 - [ ] `fork`/`vfork`/`clone` without `CLONE_THREAD`: separate address spaces
       with copy-on-write. Python `subprocess`, Node `child_process`,
       busybox `sh -c 'a | b'` ("can't fork"), make, compilers.
@@ -46,10 +66,12 @@ shows progress).
 
 ## Timers and clocks
 
-- [ ] `alarm`/`setitimer`/`getitimer` (SIGALRM). Python `signal.alarm`
+- [x] `alarm`/`setitimer`/`getitimer` (SIGALRM). Python `signal.alarm`
       reports "unsupported setitimer" today.
-- [ ] POSIX timers: `timer_create`/`timer_settime`/`timer_gettime`/`timer_delete`.
-- [ ] `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (event loops,
+      ITIMER_REAL works. ITIMER_VIRTUAL/PROF count CPU time and are reported as unimplemented.
+- [x] POSIX timers: `timer_create`/`timer_settime`/`timer_gettime`/`timer_delete`.
+      Signals with values, overruns, SIGEV_THREAD_ID, SIGEV_NONE and absolute times all work. CPU-time clocks are reported as unimplemented.
+- [x] `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (event loops,
       systemd-style services).
 - [ ] Real CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`,
       `getrusage`, `times`). These report wall time today.

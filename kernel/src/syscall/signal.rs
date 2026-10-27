@@ -206,7 +206,7 @@ pub fn rt_sigqueueinfo(p: &mut Process, tgid: u64, tid: Option<u64>, sig: u64, u
     for (i, f) in fields.iter_mut().enumerate() {
         *f = u64::from_le_bytes(b[16 + i * 8..24 + i * 8].try_into().unwrap());
     }
-    let info = SigInfo { signo: sig, code, fields, fault: None, why: SENT_BY_PROGRAM };
+    let info = SigInfo { signo: sig, code, fields, fault: None, timer: None, why: SENT_BY_PROGRAM };
     let target = tid.map_or(Target::Process, |t| Target::Thread(t as u32));
     signal::send(p, target, info).map(|_| 0)
 }

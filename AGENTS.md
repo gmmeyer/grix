@@ -52,6 +52,9 @@ returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when
 `ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
+Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
+the scheduler programs the CPU timer for the earliest one and calls
+`timer::fire` from the timer interrupt and the idle loop.
 
 Signals (`signal.rs`): actions are per process; masks, pending queues and
 sigaltstacks are per thread. `kill` picks a receiver like Linux (the main

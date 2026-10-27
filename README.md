@@ -192,7 +192,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Network sockets (`net`), stdin from the host |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
-| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | Timers that raise signals (`alarm`, `setitimer`, POSIX timers), `signalfd` |
+| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | `signalfd`; CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
+| Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
 | `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Getting written files back to the host; host directory mounts |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
@@ -217,8 +218,7 @@ dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
 2. **Results back to the host**: export directories the program wrote (the
    agent's outputs), read-write host mounts gated by policy, and stdin from
    the host.
-3. **Timers** (`alarm`, `setitimer`, `timerfd`, POSIX timers) and signals
-   from the host.
+3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
 4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
@@ -237,6 +237,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/mm/          frame allocator, page tables, address spaces / VMAs
   src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart
+  src/timer.rs     setitimer, POSIX timers and timerfds, fired by the scheduler
   src/fs.rs        the filesystem: imports plus copy-on-write pages, permissions, size limits
   src/ipc.rs       pipes, eventfds, socket pairs
   src/syscall/     Linux syscall table (+ capability gates) and implementations

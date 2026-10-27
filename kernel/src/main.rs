@@ -26,6 +26,7 @@ mod sched;
 mod signal;
 mod syscall;
 mod time;
+mod timer;
 mod uaccess;
 
 use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};

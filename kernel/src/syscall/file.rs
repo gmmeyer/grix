@@ -139,7 +139,9 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Socket(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         // anon_inode files have no type bits on Linux.
-        FileKind::EventFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) => anon(0x2000_0000 + fd, 0o600, 0),
+        FileKind::EventFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::TimerFd(_) => {
+            anon(0x2000_0000 + fd, 0o600, 0)
+        }
     })
 }
 
@@ -326,6 +328,20 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Stdin => Ok(0),
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
         FileKind::Inotify(_) => would_block(p, nonblock),
+        FileKind::TimerFd(t) => {
+            if count < 8 {
+                return Err(EINVAL);
+            }
+            let ticks = {
+                let mut t = t.lock();
+                t.update(time::monotonic_ns());
+                core::mem::take(&mut t.expirations)
+            };
+            if ticks == 0 {
+                return would_block(p, nonblock);
+            }
+            copy_out(&mut p.aspace, buf, &ticks.to_le_bytes()).map(|_| 8)
+        }
         FileKind::Generated(data) => {
             let off = (at.unwrap_or(f.offset) as usize).min(data.len());
             let n = (count as usize).min(data.len().saturating_sub(off));
@@ -470,6 +486,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         FileKind::Stdin | FileKind::Epoll(_) | FileKind::Generated(_) | FileKind::Inotify(_) => {
             return Err(EBADF);
         }
+        FileKind::TimerFd(_) => return Err(EINVAL),
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
         FileKind::Socket(s) => {
