@@ -81,10 +81,31 @@ fn wake_expired(p: &mut Process) -> bool {
 /// Nothing is runnable: sleep until the next deadline, or give up if no
 /// thread can ever wake.
 fn idle(p: &mut Process) {
-    let Some(deadline) = earliest_deadline(p) else { deadlock(p) };
-    irq::timer_at(deadline);
-    irq::wait_for_interrupt();
+    match earliest_deadline(p) {
+        Some(deadline) => irq::timer_at(deadline),
+        // Input from the host can still wake whoever waits for it.
+        None if waiting_for_input(p) => irq::timer_off(),
+        None => deadlock(p),
+    }
+    if let Some(id) = irq::wait_for_interrupt() {
+        handle_interrupt(id);
+    }
     p.timer_dirty = true;
+}
+
+/// A thread is blocked on I/O while the host may still send stdin.
+fn waiting_for_input(p: &Process) -> bool {
+    console::stdin_open() && p.threads.values().any(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io))
+}
+
+/// Handle an acknowledged interrupt and signal its end.
+fn handle_interrupt(id: u32) {
+    match id {
+        irq::TIMER_INTID => irq::timer_off(),
+        irq::UART_INTID => console::rx_interrupt(),
+        _ => {}
+    }
+    irq::eoi(id);
 }
 
 /// The next time something needs the CPU: a sleeping thread's deadline or a timer.
@@ -124,10 +145,7 @@ pub fn update_timer(p: &mut Process) {
 /// Timer interrupt while user code was running.
 pub fn irq(tf: &mut TrapFrame) {
     let Some(id) = irq::ack() else { return };
-    if id == irq::TIMER_INTID {
-        irq::timer_off();
-    }
-    irq::eoi(id);
+    handle_interrupt(id);
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("interrupt without a process");
     p.timer_dirty = true;

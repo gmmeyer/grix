@@ -1,9 +1,12 @@
-//! Guest -> host protocol over the serial console.
+//! Host <-> guest protocol over the serial console.
 //!
 //! Every byte the guest sends is part of a frame:
 //! `[FRAME_MAGIC, channel, len_lo, len_hi, payload...]` with `len <= MAX_FRAME`.
 //! The host must treat this stream as untrusted: a compromised guest can send
 //! anything, so the decoder resynchronizes on garbage and bounds every length.
+//!
+//! The host sends frames of the same shape into the console's input
+//! ([`Input`]): the program's stdin, then its end.
 
 use alloc::vec::Vec;
 
@@ -24,6 +27,9 @@ pub enum Channel {
     Event = 4,
     /// Final status; see [`encode_exit`].
     Exit = 5,
+    /// The guest is ready for stdin (see [`Input`]): the host must not send
+    /// any before this, since the guest resets the UART's receiver to get here.
+    Ready = 6,
 }
 
 impl Channel {
@@ -34,6 +40,7 @@ impl Channel {
             3 => Some(Self::Log),
             4 => Some(Self::Event),
             5 => Some(Self::Exit),
+            6 => Some(Self::Ready),
             _ => None,
         }
     }
@@ -42,6 +49,84 @@ impl Channel {
 pub fn frame_header(ch: Channel, len: usize) -> [u8; FRAME_HEADER] {
     debug_assert!(len <= MAX_FRAME);
     [FRAME_MAGIC, ch as u8, len as u8, (len >> 8) as u8]
+}
+
+/// Host -> guest frame kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Input {
+    /// Bytes for the program's stdin.
+    Stdin = 1,
+    /// stdin has ended: reads return 0 once the data is used up.
+    StdinEof = 2,
+}
+
+impl Input {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::Stdin),
+            2 => Some(Self::StdinEof),
+            _ => None,
+        }
+    }
+}
+
+pub fn input_header(kind: Input, len: usize) -> [u8; FRAME_HEADER] {
+    debug_assert!(len <= MAX_FRAME);
+    [FRAME_MAGIC, kind as u8, len as u8, (len >> 8) as u8]
+}
+
+/// Byte-at-a-time decoder for host -> guest frames (guest side, no heap
+/// beyond its fixed buffer). Bytes that don't form a frame are skipped.
+pub struct InputDecoder {
+    header: [u8; FRAME_HEADER],
+    have: usize,
+    payload: [u8; MAX_FRAME],
+    len: usize,
+}
+
+impl Default for InputDecoder {
+    fn default() -> Self {
+        InputDecoder { header: [0; FRAME_HEADER], have: 0, payload: [0; MAX_FRAME], len: 0 }
+    }
+}
+
+impl InputDecoder {
+    /// Feed one byte. Returns a complete frame when this byte ends one.
+    pub fn push(&mut self, b: u8) -> Option<(Input, &[u8])> {
+        if self.have < FRAME_HEADER {
+            if self.have == 0 && b != FRAME_MAGIC {
+                return None;
+            }
+            self.header[self.have] = b;
+            self.have += 1;
+            if self.have < FRAME_HEADER {
+                return None;
+            }
+            let len = self.header[2] as usize | (self.header[3] as usize) << 8;
+            if Input::from_u8(self.header[1]).is_none() || len > MAX_FRAME {
+                self.have = 0;
+                return None;
+            }
+            self.len = len;
+            if len > 0 {
+                return None;
+            }
+        } else {
+            self.payload[self.have - FRAME_HEADER] = b;
+            self.have += 1;
+            if self.have - FRAME_HEADER < self.len {
+                return None;
+            }
+        }
+        self.have = 0;
+        Some((Input::from_u8(self.header[1]).unwrap(), &self.payload[..self.len]))
+    }
+
+    /// Is a frame partly received?
+    pub fn partial(&self) -> bool {
+        self.have > 0
+    }
 }
 
 /// Incremental frame decoder (host side).
@@ -203,6 +288,23 @@ mod tests {
         assert_eq!(got[0], (Channel::Stdout, b"hello".to_vec()));
         assert_eq!(decode_exit(&got[1].1), Some((ExitKind::Exited, 3)));
         assert!(d.garbage >= 2);
+    }
+
+    #[test]
+    fn decodes_input_frames() {
+        let mut stream = vec![0x42, FRAME_MAGIC, 9, 0, 0]; // garbage and a bad kind
+        stream.extend(input_header(Input::Stdin, 3));
+        stream.extend(b"abc");
+        stream.extend(input_header(Input::StdinEof, 0));
+        let mut d = InputDecoder::default();
+        let mut got = vec![];
+        for b in stream {
+            if let Some((k, p)) = d.push(b) {
+                got.push((k, p.to_vec()));
+            }
+        }
+        assert_eq!(got, [(Input::Stdin, b"abc".to_vec()), (Input::StdinEof, vec![])]);
+        assert!(!d.partial());
     }
 
     #[test]

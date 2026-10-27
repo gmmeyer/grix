@@ -16,6 +16,8 @@ const GICR_SGI: u64 = GICR + 0x1_0000;
 
 /// Virtual timer PPI.
 pub const TIMER_INTID: u32 = 27;
+/// The PL011 UART: SPI 1 on QEMU `virt`.
+pub const UART_INTID: u32 = 33;
 const SPURIOUS: u32 = 1023;
 
 fn reg32(addr: u64) -> *mut u32 {
@@ -46,6 +48,19 @@ pub fn init() {
     timer_off();
 }
 
+/// Route the UART's interrupt to this CPU (group 1, mid priority, level).
+pub fn enable_uart() {
+    let n = UART_INTID as u64;
+    // SAFETY: GIC distributor registers, mapped at GICD.
+    unsafe {
+        let igroupr = reg32(GICD + 0x80 + (n / 32) * 4);
+        igroupr.write_volatile(igroupr.read_volatile() | (1 << (n % 32)));
+        ((GICD + 0x400 + n) as *mut u8).write_volatile(0x80); // GICD_IPRIORITYR
+        ((GICD + 0x6000 + n * 8) as *mut u64).write_volatile(0); // GICD_IROUTER: affinity 0.0.0.0
+        reg32(GICD + 0x100 + (n / 32) * 4).write_volatile(1 << (n % 32)); // GICD_ISENABLER
+    }
+}
+
 /// Acknowledge the highest-priority pending interrupt, if any.
 pub fn ack() -> Option<u32> {
     let id: u64;
@@ -68,13 +83,9 @@ pub fn timer_off() {
     unsafe { asm!("msr cntv_ctl_el0, {}", "isb", in(reg) 0u64) };
 }
 
-/// Sleep until an interrupt is pending, then acknowledge it. IRQs stay masked.
-pub fn wait_for_interrupt() {
+/// Sleep until an interrupt is pending and acknowledge it (the caller
+/// handles it and signals EOI). IRQs stay masked.
+pub fn wait_for_interrupt() -> Option<u32> {
     unsafe { asm!("dsb sy", "wfi") };
-    if let Some(id) = ack() {
-        if id == TIMER_INTID {
-            timer_off();
-        }
-        eoi(id);
-    }
+    ack()
 }

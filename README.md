@@ -41,6 +41,9 @@ make test       # unit tests + end-to-end tests that boot the kernel in QEMU
 ./target/release/grix run --json -m examples/busybox.toml     # machine-readable result
 ./target/release/grix caps                                    # list capabilities
 
+# stdin is passed through when it isn't a terminal (--no-stdin turns that off).
+echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox wc -w
+
 # Language runtimes: import a whole root filesystem and allow threads.
 ./target/release/grix run -a threads -i fixtures/build/python:/ -- /usr/bin/python3 -c 'print(6*7)'
 ./target/release/grix run -a threads -i fixtures/build/node:/ -- /usr/bin/node -e 'console.log(6*7)'
@@ -190,7 +193,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Works today | Not yet |
 |---|---|
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Network sockets (`net`), stdin from the host |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`) | Network sockets (`net`); fast stdio (the serial port moves about 100 KB/s out and 25 KB/s in) |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
@@ -217,8 +220,8 @@ dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
    guest, proxied to the host, which enforces allow-lists for outbound
    connections and forwards listening ports. The guest needs no TCP/IP stack.
 2. **Results back to the host**: export directories the program wrote (the
-   agent's outputs), read-write host mounts gated by policy, and stdin from
-   the host.
+   agent's outputs), and read-write host mounts gated by policy. This needs a
+   faster channel than the serial port first.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
 4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace

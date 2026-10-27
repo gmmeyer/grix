@@ -285,6 +285,19 @@ fn node_network_interfaces() {
 }
 
 #[test]
+fn stdin_for_python_and_node() {
+    let py = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").build().unwrap();
+    let out = py
+        .run_with_stdin(&["/usr/bin/python3", "-c", "import sys; print(sorted(sys.stdin.read().split()))"], "b a c\n")
+        .unwrap();
+    assert_eq!(out.stdout_str(), "['a', 'b', 'c']\n");
+    let node = sandbox("node").build().unwrap();
+    let js = "let s = ''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => console.log(s.trim().toUpperCase()))";
+    let out = node.run_with_stdin(&["/usr/bin/node", "-e", js], "from the host\n").unwrap();
+    assert_eq!(out.stdout_str(), "FROM THE HOST\n");
+}
+
+#[test]
 fn node_needs_threads() {
     let b = Sandbox::builder().timeout(Duration::from_secs(120)).memory_mb(1024).import(runtime("node"), "/").unwrap();
     let out = b.build().unwrap().run(&["/usr/bin/node", "-e", "1"]).unwrap();

@@ -43,7 +43,9 @@ the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
 After that, every bit of kernel work happens in an exception handler
 (`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames on the
-PL011 UART (`console.rs`, format in `crates/abi/src/wire.rs`).
+PL011 UART (`console.rs`, format in `crates/abi/src/wire.rs`). stdin comes
+back the same way, as `wire::Input` frames. The host sends none before the
+guest's `Ready` frame, because the guest resets the UART FIFOs at boot.
 
 Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must

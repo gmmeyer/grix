@@ -391,6 +391,7 @@ pub fn start(img: Image<'static>) -> ! {
     // Like tmpfs's default size: half of RAM for written file data.
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
+    let stdin = img.stdin;
     let mut p = Process::new(img.policy, img.uid, img.gid);
     p.cwd = cwd;
     p.cwd_pin = Some(fs::lock().pin(cwd));
@@ -403,6 +404,7 @@ pub fn start(img: Image<'static>) -> ! {
             p.slice_start = crate::time::monotonic_ns();
             *PROCESS.lock() = Some(p);
             arch::irq::init();
+            console::init_stdin(stdin);
             arch::enter_user(entry, sp)
         }
         Err((code, reason)) => fail(code, &reason),

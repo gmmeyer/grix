@@ -332,7 +332,18 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
     let count = count.min(MAX_RW);
     let nonblock = f.nonblocking();
     match &f.kind {
-        FileKind::Stdin => Ok(0),
+        FileKind::Stdin => {
+            if count == 0 {
+                return Ok(0);
+            }
+            let mut chunk = [0u8; CHUNK];
+            let want = (count as usize).min(CHUNK);
+            match console::stdin_read(&mut chunk[..want]) {
+                console::StdinRead::Data(n) => copy_out(&mut p.aspace, buf, &chunk[..n]).map(|_| n as u64),
+                console::StdinRead::Eof => Ok(0),
+                console::StdinRead::Empty => would_block(p, nonblock),
+            }
+        }
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
         FileKind::Inotify(_) => would_block(p, nonblock),
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
@@ -1522,7 +1533,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             let avail = match &entry.file.lock().kind {
                 FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
                 FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
-                FileKind::Stdin => 0,
+                FileKind::Stdin => console::stdin_state().0 as u32,
                 _ => return Err(ENOTTY),
             };
             write_u32(&mut p.aspace, arg, avail).map(|_| 0)

@@ -375,6 +375,62 @@ fn kernel_memory_is_bounded() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+// ---------------------------------------------------------------- stdin and output
+
+/// Deterministic bytes, and their FNV-1a hash as the stdin fixture prints it.
+fn sample(n: usize) -> (Vec<u8>, String) {
+    let mut x: u32 = 12345;
+    let data: Vec<u8> = (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            (x >> 16) as u8
+        })
+        .collect();
+    let hash = data.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    (data, format!("bytes={n} fnv={hash:016x} fionread=1\n"))
+}
+
+#[test]
+fn stdin_from_the_host() {
+    let sb = with("stdin").build().unwrap();
+    // More than the guest's 64 KiB stdin buffer, so it has to push back.
+    let (data, want) = sample(100_000);
+    let out = sb.run_with_stdin(&["/bin/stdin"], data).unwrap();
+    assert_eq!(out.stdout_str(), want);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Empty input, and no input at all: end-of-file either way.
+    assert_eq!(
+        sb.run_with_stdin(&["/bin/stdin"], b"".to_vec()).unwrap().stdout_str(),
+        "bytes=0 fnv=cbf29ce484222325 fionread=1\n"
+    );
+    assert_eq!(sb.run(&["/bin/stdin"]).unwrap().stdout_str(), "bytes=0 fnv=cbf29ce484222325 fionread=1\n");
+}
+
+#[test]
+fn stdin_through_busybox() {
+    let sb = busybox_sandbox();
+    let (data, _) = sample(20_000);
+    let out = sb.run_with_stdin(&["/bin/busybox", "cat"], data.clone()).unwrap();
+    assert_eq!(out.stdout, data);
+    let out = sb.run_with_stdin(&["/bin/busybox", "wc", "-l"], b"a\nb\nc\n".to_vec()).unwrap();
+    assert_eq!(out.stdout_str().trim(), "3");
+}
+
+#[test]
+fn output_limit() {
+    let sb = Sandbox::builder()
+        .max_output(1000)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .build()
+        .unwrap();
+    let out = sb.run(&["/bin/busybox", "head", "-c", "5000", "/dev/zero"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(out.stdout.len(), 1000);
+    assert!(out.stdout_truncated && !out.stderr_truncated);
+}
+
 #[test]
 fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);

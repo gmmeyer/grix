@@ -1,8 +1,9 @@
 //! VM backend: QEMU `virt` machine.
 //!
-//! The VM gets exactly: RAM, one serial port (the framed channel back to us),
-//! the kernel, and the boot image. No network card, no disks, no semihosting
-//! (which would expose the host filesystem) and no QEMU monitor.
+//! The VM gets exactly: RAM, one serial port (the framed channel back to us,
+//! and stdin to it), the kernel, and the boot image. No network card, no
+//! disks, no semihosting (which would expose the host filesystem) and no
+//! QEMU monitor.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use grix_abi::image::IMAGE_BASE;
-use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder};
+use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder, Input};
 
 pub(crate) struct VmConfig {
     pub qemu: PathBuf,
@@ -68,10 +69,36 @@ fn write_temp(image: &[u8]) -> Result<TempFile> {
     Ok(guard)
 }
 
+/// Feed `input` to the guest's stdin as frames, then end it, once the guest
+/// says it's ready. The guest stops draining the console when its stdin
+/// buffer is full, so writes here block: that's the backpressure. They fail
+/// once QEMU is gone.
+fn feed_stdin(mut qemu_in: impl Write, mut input: Box<dyn Read + Send>, ready: mpsc::Receiver<()>) {
+    if ready.recv().is_err() {
+        return; // the VM ended first
+    }
+    let mut buf = vec![0u8; wire::MAX_FRAME];
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // An unreadable input ends stdin, like a closed pipe.
+            Err(_) => break,
+        };
+        if qemu_in.write_all(&wire::input_header(Input::Stdin, n)).and_then(|_| qemu_in.write_all(&buf[..n])).is_err() {
+            return;
+        }
+    }
+    let _ = qemu_in.write_all(&wire::input_header(Input::StdinEof, 0));
+    let _ = qemu_in.flush();
+}
+
 pub(crate) fn run(
     cfg: &VmConfig,
     image: &[u8],
     timeout: Duration,
+    stdin: Option<Box<dyn Read + Send>>,
     mut on_frame: impl FnMut(Channel, &[u8]),
 ) -> Result<VmEnd> {
     if !cfg.kernel.exists() {
@@ -93,11 +120,16 @@ pub(crate) fn run(
         .arg(&cfg.kernel)
         .arg("-device")
         .arg(format!("loader,file={},addr={IMAGE_BASE:#x},force-raw=on", img.0.display()))
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().with_context(|| format!("starting {}", cfg.qemu.display()))?;
     let mut child = ChildGuard(child);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    if let (Some(input), Some(qemu_in)) = (stdin, child.0.stdin.take()) {
+        // Detached: it may be blocked reading `input` when the VM ends.
+        thread::spawn(move || feed_stdin(qemu_in, input, ready_rx));
+    }
 
     let mut stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -130,12 +162,12 @@ pub(crate) fn run(
             return Ok(VmEnd::Timeout);
         }
         match rx.recv_timeout(left) {
-            Ok(chunk) => decoder.push(&chunk, |ch, payload| {
-                if ch == Channel::Exit {
-                    exit = exit.or(wire::decode_exit(payload));
-                } else {
-                    on_frame(ch, payload);
+            Ok(chunk) => decoder.push(&chunk, |ch, payload| match ch {
+                Channel::Exit => exit = exit.or(wire::decode_exit(payload)),
+                Channel::Ready => {
+                    let _ = ready_tx.send(());
                 }
+                _ => on_frame(ch, payload),
             }),
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(VmEnd::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

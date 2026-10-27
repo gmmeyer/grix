@@ -66,8 +66,11 @@ impl FileKind {
     /// the readiness might have (for edge-triggered epoll).
     pub fn poll(&self) -> (u32, u64) {
         match self {
-            // stdin is at EOF and output never blocks.
-            FileKind::Stdin => (EPOLLIN, 0),
+            // stdin is readable with data or at end-of-file; output never blocks.
+            FileKind::Stdin => {
+                let (_, readable, version) = crate::console::stdin_state();
+                (if readable { EPOLLIN } else { 0 }, version)
+            }
             FileKind::Stdout | FileKind::Stderr => (EPOLLOUT, 0),
             FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Inotify(_) => (0, 0),

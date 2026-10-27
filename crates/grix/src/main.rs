@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -45,6 +45,12 @@ struct RunArgs {
     /// Time limit in seconds.
     #[arg(long)]
     timeout: Option<u64>,
+    /// Keep at most this many MiB of each of stdout and stderr.
+    #[arg(long, value_name = "MIB")]
+    max_output: Option<usize>,
+    /// Don't pass our stdin to the program (it's passed when it isn't a terminal).
+    #[arg(long)]
+    no_stdin: bool,
     /// Kill the program (SIGSYS) instead of returning EPERM when it uses a capability it lacks.
     #[arg(long)]
     kill_on_deny: bool,
@@ -118,19 +124,32 @@ fn run(args: RunArgs) -> Result<i32> {
     if args.kill_on_deny {
         b = b.on_deny(DenyAction::Kill);
     }
+    if let Some(mb) = args.max_output {
+        b = b.max_output(mb << 20);
+    }
     let command = if args.command.is_empty() { manifest.command.clone() } else { args.command.clone() };
     if command.is_empty() {
         bail!("no command given (pass it after `--` or set `command` in the manifest)");
     }
 
     let sandbox = b.build()?;
+    // Piped or redirected input goes to the program; a terminal doesn't
+    // (there's no interactive mode yet), so the program sees end-of-file.
+    let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
+    let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
+        if stdin {
+            sandbox.run_streaming_with_stdin(&command, std::io::stdin(), on_output)
+        } else {
+            sandbox.run_streaming(&command, on_output)
+        }
+    };
     if args.json {
-        let out = sandbox.run(&command)?;
+        let out = run(&mut |_, _| {})?;
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(out.status.code());
     }
 
-    let out = sandbox.run_streaming(&command, |stream, data| {
+    let out = run(&mut |stream, data| {
         let _ = match stream {
             Stream::Stdout => std::io::stdout().write_all(data),
             Stream::Stderr => std::io::stderr().write_all(data),
@@ -151,6 +170,11 @@ fn run(args: RunArgs) -> Result<i32> {
         }
         if missing > 0 {
             eprintln!("grix: {missing} path(s) were looked up but not imported (-v lists them)");
+        }
+    }
+    for (truncated, name) in [(out.stdout_truncated, "stdout"), (out.stderr_truncated, "stderr")] {
+        if truncated {
+            eprintln!("grix: {name} was cut off at the output limit (--max-output)");
         }
     }
     match &out.status {

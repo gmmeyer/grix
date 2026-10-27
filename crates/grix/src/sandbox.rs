@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,8 @@ use crate::vmm::{self, VmConfig, VmEnd};
 const RESERVED_LOW: u64 = IMAGE_BASE - RAM_BASE;
 /// Minimum RAM left for the program above the boot image.
 const MIN_FREE: u64 = 64 << 20;
+/// Output kept per stream unless `max_output` says otherwise.
+const DEFAULT_MAX_OUTPUT: usize = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +65,9 @@ pub struct RunOutput {
     pub stdout: Vec<u8>,
     #[serde(serialize_with = "lossy")]
     pub stderr: Vec<u8>,
+    /// The program wrote more than `max_output` to stdout; the rest was dropped.
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     #[serde(serialize_with = "display_all")]
     pub events: Vec<GuestEvent>,
     pub kernel_log: String,
@@ -129,6 +135,7 @@ pub struct SandboxBuilder {
     cwd: String,
     memory_mb: u64,
     timeout: Duration,
+    max_output: usize,
     uid: u32,
     gid: u32,
     kernel: PathBuf,
@@ -146,6 +153,7 @@ impl Default for SandboxBuilder {
             cwd: "/".into(),
             memory_mb: 512,
             timeout: Duration::from_secs(60),
+            max_output: DEFAULT_MAX_OUTPUT,
             uid: 1000,
             gid: 1000,
             kernel: env_path(
@@ -212,6 +220,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Keep at most this many bytes of each of stdout and stderr (64 MiB by
+    /// default). The program keeps running; the rest is dropped and
+    /// [`RunOutput::stdout_truncated`] / `stderr_truncated` say so.
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.max_output = bytes;
+        self
+    }
+
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
         self.kernel = path.into();
         self
@@ -262,14 +278,37 @@ impl Sandbox {
     }
 
     /// Run `argv[0]` (a path inside the sandbox) and collect its output.
+    /// stdin is at end-of-file.
     pub fn run<S: AsRef<str>>(&self, argv: &[S]) -> Result<RunOutput> {
-        self.run_streaming(argv, |_, _| {})
+        self.run_inner(argv, None, |_, _| {})
+    }
+
+    /// Like [`run`](Sandbox::run), with `input` as the program's stdin.
+    pub fn run_with_stdin<S: AsRef<str>>(&self, argv: &[S], input: impl Into<Vec<u8>>) -> Result<RunOutput> {
+        self.run_inner(argv, Some(Box::new(std::io::Cursor::new(input.into()))), |_, _| {})
     }
 
     /// Like [`run`](Sandbox::run), also passing output to `on_output` as it arrives.
-    pub fn run_streaming<S: AsRef<str>>(
+    pub fn run_streaming<S: AsRef<str>>(&self, argv: &[S], on_output: impl FnMut(Stream, &[u8])) -> Result<RunOutput> {
+        self.run_inner(argv, None, on_output)
+    }
+
+    /// Like [`run_streaming`](Sandbox::run_streaming), reading the program's
+    /// stdin from `stdin` as it asks for it. The reader is used on another
+    /// thread, which may still be blocked in it after the run ends.
+    pub fn run_streaming_with_stdin<S: AsRef<str>>(
         &self,
         argv: &[S],
+        stdin: impl Read + Send + 'static,
+        on_output: impl FnMut(Stream, &[u8]),
+    ) -> Result<RunOutput> {
+        self.run_inner(argv, Some(Box::new(stdin)), on_output)
+    }
+
+    fn run_inner<S: AsRef<str>>(
+        &self,
+        argv: &[S],
+        stdin: Option<Box<dyn Read + Send>>,
         mut on_output: impl FnMut(Stream, &[u8]),
     ) -> Result<RunOutput> {
         let cfg = &self.cfg;
@@ -289,6 +328,7 @@ impl Sandbox {
             uid: cfg.uid,
             gid: cfg.gid,
             cwd: &cfg.cwd,
+            stdin: stdin.is_some(),
             exe,
             argv: argv.clone(),
             envp: env.iter().map(String::as_str).collect(),
@@ -306,26 +346,36 @@ impl Sandbox {
             status: ExitStatus::Timeout,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             events: Vec::new(),
             kernel_log: String::new(),
             duration: Duration::ZERO,
         };
         let started = Instant::now();
-        let end = vmm::run(&vm, &bytes, cfg.timeout, |ch, payload| match ch {
+        let max = cfg.max_output;
+        // Keep up to `max` bytes; mark the stream once anything is dropped.
+        let keep = |buf: &mut Vec<u8>, truncated: &mut bool, payload: &[u8]| -> usize {
+            let room = max.saturating_sub(buf.len()).min(payload.len());
+            buf.extend_from_slice(&payload[..room]);
+            *truncated |= room < payload.len();
+            room
+        };
+        let end = vmm::run(&vm, &bytes, cfg.timeout, stdin, |ch, payload| match ch {
             Channel::Stdout => {
-                out.stdout.extend_from_slice(payload);
-                on_output(Stream::Stdout, payload);
+                let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
+                on_output(Stream::Stdout, &payload[..n]);
             }
             Channel::Stderr => {
-                out.stderr.extend_from_slice(payload);
-                on_output(Stream::Stderr, payload);
+                let n = keep(&mut out.stderr, &mut out.stderr_truncated, payload);
+                on_output(Stream::Stderr, &payload[..n]);
             }
             Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
             Channel::Event => match Event::decode(payload) {
                 Ok(e) => out.events.push(e.into()),
                 Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
-            Channel::Exit => {}
+            Channel::Exit | Channel::Ready => {}
         })?;
         out.duration = started.elapsed();
         out.status = match end {

@@ -37,6 +37,7 @@ use console::klog;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
+    console::init();
     let header_bytes = unsafe { core::slice::from_raw_parts(mm::p2v(IMAGE_BASE) as *const u8, HEADER_LEN) };
     let header = image::parse_header(header_bytes).unwrap_or_else(|_| panic!("no boot image at {IMAGE_BASE:#x}"));
     mm::init(header.ram_size, IMAGE_BASE, header.total_len);

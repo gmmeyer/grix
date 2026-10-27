@@ -18,7 +18,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 2. ~~**Network interface listing**~~: done (see Networking).
 3. ~~**Small Linux gaps**~~: done. `memfd_create`, CPU-time clocks,
    `membarrier`, `mincore`, `prctl`, `signalfd4` and `/etc/localtime` all work.
-4. **stdin from the host**, and output size limits.
+4. ~~**stdin from the host**, and output size limits~~: done. Both
+   directions are slow over the serial port (about 100 KB/s out, 25 KB/s
+   in), so a faster transport comes next.
 5. **Getting written files back to the host** (the agent's results).
 6. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
    pipelines and `git commit` (run through `sh`) all stop here.
@@ -162,9 +164,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 ## stdio and host interaction
 
-- [ ] stdin from the host (pipes, interactive sessions). stdin is always EOF today.
+- [x] stdin from the host (pipes, interactive sessions). stdin is always EOF today.
+      Piped, from the library or the CLI, with backpressure. Interactive sessions come with TTY mode.
 - [ ] Faster output path (same UART problem as networking).
-- [ ] Output size limits with truncation reported.
+      The PL011 costs a VM exit per byte. FIFO batching gets about 100 KB/s out and 25 KB/s in. virtio-console would move data through shared memory.
+- [x] Output size limits with truncation reported.
+      `max_output` (64 MiB per stream by default): the program keeps running, and the rest is dropped and reported.
 - [ ] Interactive TTY mode (`grix run -t`).
 
 ## Memory

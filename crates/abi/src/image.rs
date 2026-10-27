@@ -49,6 +49,9 @@ pub struct Image<'a> {
     pub uid: u32,
     pub gid: u32,
     pub cwd: &'a str,
+    /// The host sends stdin over the console (see `wire::Input`). Without
+    /// it, stdin reads return end-of-file at once.
+    pub stdin: bool,
     /// Path of the program to execute.
     pub exe: &'a str,
     pub argv: Vec<&'a str>,
@@ -88,6 +91,7 @@ impl<'a> Image<'a> {
         w.u32(self.uid);
         w.u32(self.gid);
         w.str(self.cwd);
+        w.u8(self.stdin as u8);
         w.str(self.exe);
         w.strs(&self.argv);
         w.strs(&self.envp);
@@ -117,6 +121,7 @@ impl<'a> Image<'a> {
         let uid = r.u32()?;
         let gid = r.u32()?;
         let cwd = r.str()?;
+        let stdin = r.u8()? != 0;
         let exe = r.str()?;
         let argv = r.strs()?;
         let envp = r.strs()?;
@@ -145,6 +150,7 @@ impl<'a> Image<'a> {
             uid,
             gid,
             cwd,
+            stdin,
             exe,
             argv,
             envp,
@@ -168,6 +174,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             cwd: "/",
+            stdin: true,
             exe: "/bin/hello",
             argv: vec!["hello", "world"],
             envp: vec!["A=1"],
@@ -194,6 +201,7 @@ mod tests {
             uid: 0,
             gid: 0,
             cwd: "/",
+            stdin: false,
             exe: "/x",
             argv: vec![],
             envp: vec![],
