@@ -30,7 +30,9 @@ pub const PIPE_CAPACITY: usize = 64 * 1024;
 pub const PIPE_BUF: usize = 4096;
 
 pub struct Pipe {
+    /// Its heap allocation is charged to the kernel memory budget (`charge`).
     pub buf: VecDeque<u8>,
+    charge: crate::kmem::Charge,
     pub readers: usize,
     pub writers: usize,
     /// Bumped on every state change (for edge-triggered epoll).
@@ -40,6 +42,37 @@ pub struct Pipe {
 impl Pipe {
     pub fn space(&self) -> usize {
         PIPE_CAPACITY - self.buf.len()
+    }
+
+    /// Could a write add anything now? (Room in the pipe, and in memory.)
+    pub fn writable(&self) -> bool {
+        self.space() > 0 && (self.buf.capacity() > self.buf.len() || crate::kmem::available() > 0)
+    }
+
+    /// Make room for up to `n` more bytes and return how many fit: limited by
+    /// the pipe's capacity and by the kernel memory budget.
+    pub fn reserve(&mut self, n: usize) -> usize {
+        let n = n.min(self.space());
+        let spare = self.buf.capacity() - self.buf.len();
+        if n <= spare {
+            return n;
+        }
+        let want = self.buf.len() + n;
+        if self.charge.resize(want as u64).is_err() {
+            return spare;
+        }
+        self.buf.reserve_exact(n);
+        // reserve_exact may round up; charge what was really allocated if we can.
+        let _ = self.charge.resize(self.buf.capacity().max(want) as u64);
+        n
+    }
+
+    /// Give the buffer's memory back once it has been read empty.
+    pub fn drained(&mut self) {
+        if self.buf.is_empty() && self.buf.capacity() > 0 {
+            self.buf = VecDeque::new();
+            let _ = self.charge.resize(0);
+        }
     }
 
     pub fn touch(&mut self) {
@@ -55,7 +88,13 @@ pub struct PipeEnd {
 }
 
 pub fn pipe() -> (PipeEnd, PipeEnd) {
-    let p = Arc::new(Mutex::new(Pipe { buf: VecDeque::new(), readers: 1, writers: 1, version: 0 }));
+    let p = Arc::new(Mutex::new(Pipe {
+        buf: VecDeque::new(),
+        charge: crate::kmem::Charge::default(),
+        readers: 1,
+        writers: 1,
+        version: 0,
+    }));
     (PipeEnd { pipe: p.clone(), write: false }, PipeEnd { pipe: p, write: true })
 }
 
@@ -63,7 +102,7 @@ impl PipeEnd {
     pub fn poll(&self) -> (u32, u64) {
         let p = self.pipe.lock();
         let mask = if self.write {
-            (if p.space() > 0 { EPOLLOUT } else { 0 }) | if p.readers == 0 { EPOLLERR } else { 0 }
+            (if p.writable() { EPOLLOUT } else { 0 }) | if p.readers == 0 { EPOLLERR } else { 0 }
         } else {
             (if p.buf.is_empty() { 0 } else { EPOLLIN }) | if p.writers == 0 { EPOLLHUP } else { 0 }
         };

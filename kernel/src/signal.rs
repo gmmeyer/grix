@@ -69,8 +69,10 @@ const SYNCHRONOUS: u64 = bit(SIGSEGV) | bit(SIGBUS) | bit(SIGILL) | bit(SIGTRAP)
 /// Signals whose default action is to do nothing: CHLD, URG, WINCH, and also
 /// CONT and the stop signals, since there is no job control to stop for.
 const DEFAULT_IGNORED: u64 = bit(17) | bit(18) | bit(19) | bit(20) | bit(21) | bit(22) | bit(23) | bit(28);
-/// Real-time signals queue every instance; this bounds kernel memory per queue.
-const MAX_QUEUED: usize = 1024;
+/// Real-time signals queue every instance. Like Linux's RLIMIT_SIGPENDING,
+/// one limit covers all queues (it bounds kernel memory).
+const MAX_QUEUED_RT: u64 = 4096;
+static QUEUED_RT: AtomicU64 = AtomicU64::new(0);
 
 /// A synchronous fault: what the frame's `fault_address` and ESR record say.
 #[derive(Clone, Copy, Debug)]
@@ -125,8 +127,11 @@ impl SigQueue {
         if info.signo < SIGRTMIN && self.mask & b != 0 {
             return Ok(());
         }
-        if info.signo >= SIGRTMIN && self.items.len() >= MAX_QUEUED {
-            return Err(EAGAIN);
+        if info.signo >= SIGRTMIN {
+            if QUEUED_RT.load(Ordering::Relaxed) >= MAX_QUEUED_RT {
+                return Err(EAGAIN);
+            }
+            QUEUED_RT.fetch_add(1, Ordering::Relaxed);
         }
         self.mask |= b;
         self.items.push_back(info);
@@ -136,6 +141,9 @@ impl SigQueue {
     fn take(&mut self, sig: u32) -> Option<SigInfo> {
         let i = self.items.iter().position(|s| s.signo == sig)?;
         let info = self.items.remove(i);
+        if sig >= SIGRTMIN {
+            QUEUED_RT.fetch_sub(1, Ordering::Relaxed);
+        }
         if !self.items.iter().any(|s| s.signo == sig) {
             self.mask &= !bit(sig);
         }
@@ -147,8 +155,19 @@ impl SigQueue {
     }
 
     fn discard(&mut self, sig: u32) {
+        let before = self.items.len();
         self.items.retain(|s| s.signo != sig);
+        if sig >= SIGRTMIN {
+            QUEUED_RT.fetch_sub((before - self.items.len()) as u64, Ordering::Relaxed);
+        }
         self.mask &= !bit(sig);
+    }
+}
+
+impl Drop for SigQueue {
+    fn drop(&mut self) {
+        let rt = self.items.iter().filter(|s| s.signo >= SIGRTMIN).count();
+        QUEUED_RT.fetch_sub(rt as u64, Ordering::Relaxed);
     }
 }
 
@@ -285,6 +304,7 @@ pub fn discard(p: &mut Process, sig: u32) {
     for t in p.threads.values_mut() {
         t.pending.discard(sig);
     }
+    crate::timer::resync(p);
 }
 
 /// Where a signal goes.
@@ -502,7 +522,7 @@ pub fn return_to_user(tf: &mut TrapFrame) {
             Some(sig) => t.pending.take(sig),
             None => in_order(p.shared_pending.mask & !blocked).next().and_then(|sig| p.shared_pending.take(sig)),
         };
-        let Some(info) = info else {
+        let Some(mut info) = info else {
             // A mask-changing wait ended without running a handler: restore
             // the mask (unless the wait is being re-run) and look again.
             if !t.restarting
@@ -513,7 +533,9 @@ pub fn return_to_user(tf: &mut TrapFrame) {
             }
             break;
         };
-        crate::timer::delivered(&mut p.timers, &info);
+        if crate::timer::delivered(&mut p.timers, &mut info) {
+            p.timer_dirty = true;
+        }
         let act = p.sigactions[info.signo as usize];
         if is_ignored(&act, info.signo) {
             continue;
@@ -536,6 +558,8 @@ pub fn return_to_user(tf: &mut TrapFrame) {
     if let Some(t) = p.threads.get_mut(&tid) {
         t.restarting = false;
     }
+    // A timer whose signal was just taken re-arms.
+    crate::sched::update_timer(p);
 }
 
 fn put_u32(b: &mut [u8], off: usize, v: u32) {
@@ -708,7 +732,10 @@ pub fn dequeue(p: &mut Process, set: u64) -> Option<SigInfo> {
         Some(sig) => t.pending.take(sig),
         None => in_order(p.shared_pending.mask & set).next().and_then(|sig| p.shared_pending.take(sig)),
     }?;
-    crate::timer::delivered(&mut p.timers, &info);
+    let mut info = info;
+    if crate::timer::delivered(&mut p.timers, &mut info) {
+        p.timer_dirty = true;
+    }
     Some(info)
 }
 

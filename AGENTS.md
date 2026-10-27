@@ -107,8 +107,15 @@ keeping its deadline (`restart_deadline`).
    stay masked in the kernel; don't unmask them.
 10. **The kernel heap is small (32 MiB) and running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
-    fails with an errno first: file data counts pages (`fs::set_limit`),
-    and nodes and names count against `META_LIMIT` (ENOSPC).
+    fails with an errno first:
+    - File data counts pages (`fs::set_limit`), and nodes and names count
+      against `META_LIMIT` (ENOSPC).
+    - Buffers held for a program (pipes, netlink replies, generated /proc
+      files) take a `kmem::Charge`.
+    - Counts are capped: mappings (`MAX_VMAS`), queued real-time signals,
+      inotify watches, POSIX timers, threads, descriptors.
+
+    Limits must be global, not per object: a program can open many objects.
 11. **`fs::lock()` is not re-entrant**; it panics if the lock is already
     held. Drop the guard before calling anything that takes it
     (`Process::missing_path`, `procfs::generate`, …). Lock order:

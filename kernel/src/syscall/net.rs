@@ -218,7 +218,7 @@ pub(super) fn netlink_recv(
     flags: u64,
     nonblock: bool,
 ) -> Result<(u64, u64), Errno> {
-    let Some(dgram) = nl.rx.front() else {
+    let Some((dgram, _)) = nl.rx.front() else {
         return super::file::would_block(p, nonblock).map(|_| (0, 0));
     };
     let mut done = 0usize;

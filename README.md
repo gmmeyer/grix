@@ -240,6 +240,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart
   src/timer.rs     setitimer, POSIX timers and timerfds, fired by the scheduler
   src/netlink.rs   NETLINK_ROUTE answers and interface ioctls: the only interface is lo
+  src/kmem.rs      the budget for kernel memory programs can make the kernel hold
   src/fs.rs        the filesystem: imports plus copy-on-write pages, permissions, size limits
   src/ipc.rs       pipes, eventfds, socket pairs
   src/syscall/     Linux syscall table (+ capability gates) and implementations

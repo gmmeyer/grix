@@ -176,6 +176,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [~] `mincore`; accept the remaining `madvise` advice values.
       `mincore` works.
 - [ ] Free empty page-table pages on munmap.
+- [x] Bound kernel memory a program can tie up. Pipe buffers, netlink
+      replies, /proc contents, queued RT signals, mappings and inotify
+      watches all hit an errno before the heap runs out (kmem.rs).
+- [ ] `find_free` (mmap without a hint) is O(n) in the number of mappings.
 
 ## Binary compatibility
 

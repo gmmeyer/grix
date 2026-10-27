@@ -18,6 +18,7 @@ mod errno;
 mod fd;
 mod fs;
 mod ipc;
+mod kmem;
 mod mm;
 mod netlink;
 mod process;

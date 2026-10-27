@@ -17,6 +17,9 @@ pub const STACK_TOP: u64 = 0x0000_ffff_fffe_0000;
 pub const STACK_SIZE: u64 = 8 << 20;
 /// The signal-return trampoline page, above the stack.
 pub const SIGPAGE: u64 = STACK_TOP + 0x1_0000;
+/// At most this many mappings (Linux's vm.max_map_count is 65530): each
+/// takes kernel heap, so a program mapping page after page gets ENOMEM.
+pub const MAX_VMAS: usize = 32768;
 /// mmap allocates top-down from here, leaving a gap below the stack.
 pub const MMAP_TOP: u64 = STACK_TOP - STACK_SIZE - (128 << 20);
 pub const MMAP_BOTTOM: u64 = 1 << 32;
@@ -127,6 +130,41 @@ impl AddressSpace {
         self.vmas.values()
     }
 
+    /// The mappings overlapping `[start, end)`, last first. They're sorted and
+    /// disjoint, so walking back from `end` stops at the first one that ends
+    /// before `start`: O(log n + k), not a scan of everything below `end`.
+    fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = &Vma> {
+        self.vmas.range(..end).rev().map(|(_, v)| v).take_while(move |v| v.end > start)
+    }
+
+    /// Room for `more` mappings (an operation that may split some)?
+    pub fn has_room(&self, more: usize) -> Result<(), Errno> {
+        if self.vmas.len() + more > MAX_VMAS { Err(ENOMEM) } else { Ok(()) }
+    }
+
+    /// Would changing `[start, end)` stay within MAX_VMAS? The mappings it
+    /// overlaps are cut at its edges; with `keep` (mprotect) their middle
+    /// parts stay as mappings, otherwise (munmap, MAP_FIXED) they go, and
+    /// `added` new ones are mapped.
+    pub fn room_for(&self, start: u64, end: u64, keep: bool, added: usize) -> Result<(), Errno> {
+        let overlapping: Vec<&Vma> = self.overlapping(start, end).collect();
+        let edges =
+            overlapping.iter().filter(|v| v.start < start).count() + overlapping.iter().filter(|v| v.end > end).count();
+        let after = self.vmas.len() - overlapping.len() + edges + if keep { overlapping.len() } else { 0 } + added;
+        if after > MAX_VMAS && after > self.vmas.len() { Err(ENOMEM) } else { Ok(()) }
+    }
+
+    /// Grow the anonymous mapping that ends at `end` up to `new_end`, if
+    /// there is one with this protection (brk). Returns whether it did.
+    pub fn extend_anon(&mut self, end: u64, new_end: u64, prot: Prot) -> bool {
+        let Some((_, v)) = self.vmas.range_mut(..end).next_back() else { return false };
+        if v.end != end || v.prot != prot || !matches!(v.backing, Backing::Anon) {
+            return false;
+        }
+        v.end = new_end;
+        true
+    }
+
     pub fn find(&self, va: u64) -> Option<&Vma> {
         self.vmas.range(..=va).next_back().map(|(_, v)| v).filter(|v| va < v.end)
     }
@@ -193,17 +231,19 @@ impl AddressSpace {
 
     /// Does `[start, end)` overlap a MAP_SHARED file mapping?
     pub fn has_shared_file(&self, start: u64, end: u64) -> bool {
-        self.vmas.range(..end).any(|(_, v)| v.end > start && v.is_shared_file())
+        self.overlapping(start, end).any(Vma::is_shared_file)
     }
 
     /// mprotect. Fails with ENOMEM if any part of the range is unmapped.
     pub fn protect(&mut self, start: u64, end: u64, prot: Prot) -> Result<(), Errno> {
+        let mut pieces: Vec<(u64, u64)> = self.overlapping(start, end).map(|v| (v.start, v.end)).collect();
+        pieces.reverse();
         let mut expected = start;
-        for (_, v) in self.vmas.range(..end).filter(|(_, v)| v.end > start) {
-            if v.start > expected {
+        for (s, e) in pieces {
+            if s > expected {
                 return Err(ENOMEM);
             }
-            expected = v.end;
+            expected = e;
         }
         if expected < end {
             return Err(ENOMEM);

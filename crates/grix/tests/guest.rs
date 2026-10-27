@@ -366,6 +366,16 @@ fn memfd_signalfd_cpu_clocks_and_more() {
 }
 
 #[test]
+fn kernel_memory_is_bounded() {
+    // Netlink replies, pipe buffers, queued signals, mappings, inotify
+    // watches and /proc contents run into errnos, not a kernel panic.
+    let out = run(with("limits"), &["/bin/limits"]);
+    assert_eq!(out.stdout_str(), "limits ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);
     assert_eq!(out.status, ExitStatus::Signaled(13));

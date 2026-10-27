@@ -148,7 +148,7 @@ pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResu
     };
     write_u32(&mut p.aspace, idp, id)?;
     p.timers.next_id = id.wrapping_add(1);
-    p.timers.posix.insert(id, PosixTimer { timing: Interval::default(), notify, overrun: 0, clock });
+    p.timers.posix.insert(id, PosixTimer { timing: Interval::default(), notify, overrun: 0, clock, pending: false });
     Ok(0)
 }
 

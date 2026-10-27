@@ -28,7 +28,13 @@ pub fn brk(p: &mut Process, addr: u64) -> SysResult {
         if !a.is_free(old_end, new_end) {
             return Ok(a.brk);
         }
-        a.map(Vma::anon(old_end, new_end, Prot::RW));
+        // One mapping for the whole heap, however many times it grows.
+        if !a.extend_anon(old_end, new_end, Prot::RW) {
+            if a.has_room(1).is_err() {
+                return Ok(a.brk);
+            }
+            a.map(Vma::anon(old_end, new_end, Prot::RW));
+        }
     } else if new_end < old_end {
         a.unmap(new_end, old_end);
     }
@@ -107,6 +113,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
     } else {
         a.find_free(len).ok_or(ENOMEM)?
     };
+    a.room_for(start, start + len, false, 1)?;
     a.map(Vma { start, end: start + len, prot, backing });
     Ok(start)
 }
@@ -117,6 +124,7 @@ pub fn munmap(p: &mut Process, addr: u64, len: u64) -> SysResult {
     if !aligned(addr) {
         return Err(EINVAL);
     }
+    p.aspace.room_for(addr, end, false, 0)?;
     p.aspace.unmap(addr, end);
     Ok(0)
 }
@@ -131,6 +139,7 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
     }
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(ENOMEM)?;
     let prot = Prot::from_linux(prot);
+    p.aspace.room_for(addr, end, true, 0)?;
     if prot.write && p.aspace.has_shared_file(addr, end) {
         // Writes through it would have to reach the file.
         return p.unimplemented(nr::mprotect, "mprotect", "shared writable file mappings", EACCES);
@@ -152,6 +161,7 @@ pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64)
     if old_len == 0 {
         return Err(EINVAL); // duplicating shared mappings is not supported
     }
+    p.aspace.has_room(2)?;
     p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0)
 }
 

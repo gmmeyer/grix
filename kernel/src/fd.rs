@@ -50,6 +50,17 @@ pub struct Inotify {
     pub next_wd: i32,
 }
 
+/// Watches across all inotify instances (Linux's max_user_watches): they
+/// take kernel memory.
+pub const MAX_WATCHES: u64 = 8192;
+pub static WATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        WATCHES.fetch_sub(self.watches.len() as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl FileKind {
     /// Current readiness (EPOLL* bits) and a counter that changes whenever
     /// the readiness might have (for edge-triggered epoll).
@@ -91,6 +102,8 @@ pub struct OpenFile {
     pub pin: Option<Arc<()>>,
     /// getdents: the last directory entry returned.
     pub dir_pos: Option<alloc::string::String>,
+    /// Kernel memory this file holds (generated /proc contents).
+    pub held: Option<crate::kmem::Charge>,
 }
 
 impl OpenFile {
@@ -127,7 +140,16 @@ pub struct FdTable {
 }
 
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
-    Arc::new(Mutex::new(OpenFile { kind, offset: 0, flags, path_only: false, content: None, pin: None, dir_pos: None }))
+    Arc::new(Mutex::new(OpenFile {
+        kind,
+        offset: 0,
+        flags,
+        path_only: false,
+        content: None,
+        pin: None,
+        dir_pos: None,
+        held: None,
+    }))
 }
 
 impl FdTable {

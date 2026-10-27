@@ -166,11 +166,52 @@ Tests:
 - A review found the heap, symlink and /proc problems above before they
   shipped.
 
+### Timers, interface listing, small gaps, kernel memory budget
+
+- **Timers** (`kernel/src/timer.rs`):
+  - ITIMER_REAL / `alarm`.
+  - POSIX timers: signal values, overruns, SIGEV_THREAD_ID, SIGEV_NONE,
+    absolute times.
+  - timerfd: blocking, non-blocking, epoll.
+
+  As on Linux, a timer re-arms only once its last expiry is consumed, so a
+  1 ns interval can't starve the program. The scheduler fires timers from
+  the timer interrupt and the idle loop.
+- **Interface listing** without `net` (`kernel/src/netlink.rs`). NETLINK_ROUTE
+  dumps, interface ioctls and `/proc/net/dev` report just `lo`; changing
+  interfaces gets EPERM.
+  - Node `os.networkInterfaces()`, Python `if_nameindex` and busybox
+    `ip addr` work.
+  - Socket creation is now gated by address family, and
+    connect/listen/accept "act on existing sockets".
+- **Small gaps**:
+  - `memfd_create`, with seals.
+  - `signalfd4`.
+  - Real per-thread and per-process CPU time (clocks, getrusage, times,
+    /proc stat).
+  - `membarrier`, `mincore`, more `prctl` options (unknown ones are now
+    reported).
+  - A generated UTC `/etc/localtime`.
+- **Kernel memory budget** (`kernel/src/kmem.rs`, AGENTS.md invariant 10).
+  Pipe buffers, netlink replies, generated /proc files, queued RT signals,
+  mappings and inotify watches all fail with an errno before the 32 MiB
+  heap runs out. A review found the netlink path; the others were older.
+  `brk` growth now merges into one mapping, and mapping lookups are
+  O(log n + k).
+
+Tests:
+- New fixtures: `timers.c`, `netif.c`, `linux.c` and `limits.c`.
+- New runtime tests: Python timers and CPU time, Node interfaces.
+- 55 tests pass under HVF and TCG. The stress loops were clean, including
+  a parallel-load run (8 VMs at once).
+- That parallel run is what exposed a race in a test, and some
+  timing-dependent tests that are now load-independent.
+
 Next, in TODO.md order:
-1. Give written files back to the host (the agent's results), and stdin.
-2. Timers (`alarm`/`setitimer`/`timerfd`/POSIX timers, which now just need
-   to call `signal::send`), signals from the host, `signalfd4`.
-3. netlink, networking, fork/exec.
+1. stdin from the host, and output limits.
+2. Give written files back to the host (the agent's results).
+3. fork/exec/wait.
+4. Networking through the host.
 
 ### Notes for the next session
 

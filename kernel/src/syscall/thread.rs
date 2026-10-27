@@ -110,6 +110,8 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
 pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     p.exited_cpu_ns += p.thread_cpu_ns(p.current).unwrap_or(0);
     let t = p.threads.remove(&p.current).expect("current thread missing");
+    // Its queued signals went with it, perhaps a timer's.
+    crate::timer::resync(p);
     if p.threads.is_empty() {
         process::exit(code);
     }

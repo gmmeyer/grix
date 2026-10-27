@@ -79,6 +79,19 @@ int main(void) {
     CHECK(h->nlmsg_type == RTM_NEWADDR && h->nlmsg_seq == 7);
     h = NLMSG_NEXT(h, full);
     CHECK(NLMSG_OK(h, full) && h->nlmsg_type == NLMSG_DONE);
+    // Looking a link up by name: lo exists, eth0 doesn't.
+    struct { struct nlmsghdr h; struct ifinfomsg i; struct rtattr a; char name[8]; } byname = {
+        .h = {.nlmsg_len = sizeof byname, .nlmsg_type = RTM_GETLINK, .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 9},
+        .a = {.rta_len = RTA_LENGTH(5), .rta_type = IFLA_IFNAME},
+        .name = "eth0",
+    };
+    CHECK(send(nl, &byname, sizeof byname, 0) == sizeof byname && recv(nl, buf, sizeof buf, 0) > 0);
+    h = (void *)buf;
+    CHECK(h->nlmsg_type == NLMSG_ERROR && ((struct nlmsgerr *)NLMSG_DATA(h))->error == -ENODEV);
+    strcpy(byname.name, "lo");
+    byname.a.rta_len = RTA_LENGTH(3);
+    CHECK(send(nl, &byname, sizeof byname, 0) == sizeof byname && recv(nl, buf, sizeof buf, 0) > 0);
+    CHECK(h->nlmsg_type == RTM_NEWLINK && ((struct ifinfomsg *)NLMSG_DATA(h))->ifi_index == 1);
     // Changing an address is refused like it is for any unprivileged user.
     req.h.nlmsg_type = RTM_NEWADDR;
     req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;

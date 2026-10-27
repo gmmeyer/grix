@@ -34,10 +34,11 @@ const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_CAPPED: u16 = 0x100;
 
 const HDR: usize = 16;
-/// Reply bytes waiting to be read, and per reply datagram. Every request is
-/// answered from a few hundred bytes, but a datagram can hold thousands of
-/// requests: this keeps a program from filling the kernel heap.
-const MAX_QUEUED_BYTES: usize = 256 * 1024;
+/// Reply bytes waiting to be read on one socket, and per reply datagram.
+/// Every request is answered from a few hundred bytes, but a datagram can
+/// hold thousands of requests. Replies are also charged to the kernel
+/// memory budget, which covers all sockets together.
+const MAX_QUEUED_BYTES: usize = 64 * 1024;
 const MAX_REPLY: usize = 32 * 1024;
 /// The largest request accepted (Linux's default socket buffer is similar).
 pub const MAX_REQUEST: usize = 64 * 1024;
@@ -50,8 +51,8 @@ const LO_FLAGS: u32 = 0x1 | 0x8 | 0x40 | 0x1_0000;
 pub struct Netlink {
     /// Our port id (nl_pid).
     pub port: u32,
-    /// Reply datagrams, oldest first.
-    pub rx: VecDeque<Vec<u8>>,
+    /// Reply datagrams, oldest first, with the kernel memory they hold.
+    pub rx: VecDeque<(Vec<u8>, crate::kmem::Charge)>,
     /// Bumped whenever replies are queued (for edge-triggered epoll).
     pub version: u64,
 }
@@ -68,7 +69,7 @@ impl Netlink {
     /// Handle one sent datagram, which may hold several requests, and queue
     /// one reply datagram for it.
     pub fn request(&mut self, data: &[u8]) -> Result<(), Errno> {
-        if self.rx.iter().map(Vec::len).sum::<usize>() >= MAX_QUEUED_BYTES {
+        if self.rx.iter().map(|(r, _)| r.capacity()).sum::<usize>() >= MAX_QUEUED_BYTES {
             return Err(ENOBUFS);
         }
         let mut reply = Vec::new();
@@ -84,7 +85,9 @@ impl Netlink {
             off += len.next_multiple_of(4).min(data.len() - off);
         }
         if !reply.is_empty() {
-            self.rx.push_back(reply);
+            reply.shrink_to_fit();
+            let charge = crate::kmem::Charge::new(reply.capacity() as u64).map_err(|_| ENOBUFS)?;
+            self.rx.push_back((reply, charge));
             self.version += 1;
         }
         Ok(())
@@ -97,7 +100,8 @@ impl Netlink {
         }
         // rtgenmsg/ifinfomsg/ifaddrmsg all start with the address family.
         let family = msg.get(HDR).copied().unwrap_or(0);
-        let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+        // Either half of NLM_F_DUMP (ROOT or MATCH) asks for a dump, as on Linux.
+        let dump = flags & NLM_F_DUMP != 0;
         let result = match ty {
             RTM_GETLINK if dump => {
                 self.link(out, seq, NLM_F_MULTI);
@@ -105,14 +109,21 @@ impl Netlink {
                 Ok(())
             }
             RTM_GETLINK => {
-                // ifinfomsg.ifi_index: 0 means "by name", which can only be lo.
+                // ifinfomsg.ifi_index, or (with index 0) IFLA_IFNAME/IFLA_ALT_IFNAME.
                 let index = msg.get(HDR + 4..HDR + 8).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-                if index == 0 || index == LO_INDEX {
-                    self.link(out, seq, 0);
-                    Ok(())
-                } else {
-                    Err(ENODEV)
-                }
+                let found = match (index, link_name(msg)) {
+                    (0, None) => Err(EINVAL),
+                    (0, Some(name)) => {
+                        if name == b"lo" {
+                            Ok(())
+                        } else {
+                            Err(ENODEV)
+                        }
+                    }
+                    (LO_INDEX, _) => Ok(()),
+                    _ => Err(ENODEV),
+                };
+                found.map(|_| self.link(out, seq, 0))
             }
             RTM_GETADDR if dump => {
                 if family == 0 || family == AF_INET {
@@ -196,6 +207,26 @@ impl Netlink {
         b.extend_from_slice(&request[..HDR]);
         self.message(out, NLMSG_ERROR, NLM_F_CAPPED, u32_at(request, 8), &b);
     }
+}
+
+/// The interface name in an RTM_GETLINK request's attributes (after the
+/// 16-byte ifinfomsg), without its NUL.
+fn link_name(msg: &[u8]) -> Option<&[u8]> {
+    const IFLA_IFNAME: u16 = 3;
+    const IFLA_ALT_IFNAME: u16 = 53;
+    let mut off = HDR + 16;
+    while msg.len().saturating_sub(off) >= 4 {
+        let (len, ty) = (u16_at(msg, off) as usize, u16_at(msg, off + 2));
+        if len < 4 || len > msg.len() - off {
+            return None;
+        }
+        if ty == IFLA_IFNAME || ty == IFLA_ALT_IFNAME {
+            let name = &msg[off + 4..off + len];
+            return Some(name.split(|&b| b == 0).next().unwrap_or(name));
+        }
+        off += len.next_multiple_of(4);
+    }
+    None
 }
 
 /// struct rtattr: length, type, data (padded to 4 bytes).

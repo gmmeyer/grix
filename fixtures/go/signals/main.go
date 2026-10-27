@@ -20,20 +20,23 @@ func fail(format string, args ...any) {
 }
 
 func main() {
-	// With one P, the sleeping main goroutine only gets to run again if
-	// the spinning goroutine (no function calls, so no cooperative
-	// preemption points) is preempted asynchronously.
+	// With one P, main yields until the spinner has started. The spinner
+	// never yields (no function calls, so no cooperative preemption
+	// points), so main only runs again if it is preempted asynchronously.
 	runtime.GOMAXPROCS(1)
-	var stop atomic.Bool
+	var started, stop atomic.Bool
 	var spins uint64
 	done := make(chan struct{})
 	go func() {
 		for !stop.Load() {
 			spins++
+			started.Store(true)
 		}
 		close(done)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	for !started.Load() {
+		runtime.Gosched()
+	}
 	stop.Store(true)
 	<-done
 

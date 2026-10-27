@@ -249,7 +249,10 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         }
     };
     if let Some(f) = proc {
-        let file = new_file(FileKind::Generated(procfs::generate(p, f)), flags & !(O_CLOEXEC | O_CREAT | O_EXCL));
+        let data = procfs::generate(p, f);
+        let held = crate::kmem::Charge::new(data.capacity() as u64)?;
+        let file = new_file(FileKind::Generated(data), flags & !(O_CLOEXEC | O_CREAT | O_EXCL));
+        file.lock().held = Some(held);
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     if let Some(c) = &content
@@ -366,6 +369,8 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             if ticks == 0 {
                 return would_block(p, nonblock);
             }
+            // Consumed: the timer re-arms (see timer.rs).
+            p.timer_dirty = true;
             copy_out(&mut p.aspace, buf, &ticks.to_le_bytes()).map(|_| 8)
         }
         FileKind::Generated(data) => {
@@ -581,6 +586,7 @@ pub(super) fn pipe_read(p: &mut Process, end: &PipeEnd, buf: u64, count: u64, no
     copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
     if !peek {
         pipe.buf.drain(..n);
+        pipe.drained();
         pipe.touch();
     }
     Ok(n as u64)
@@ -608,11 +614,11 @@ pub(super) fn pipe_write(
     }
     // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
     let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
-    if pipe.space() < need {
+    if pipe.reserve(need) < need {
         drop(pipe);
         return would_block(p, nonblock);
     }
-    let n = (count as usize).min(pipe.space());
+    let n = pipe.reserve(count as usize);
     let mut tmp = alloc::vec![0u8; n];
     copy_in(&mut p.aspace, buf, &mut tmp)?;
     pipe.buf.extend(tmp);
@@ -1460,6 +1466,8 @@ pub fn signalfd4(p: &mut Process, fd: u64, maskp: u64, size: u64, flags: u64) ->
         let mut f = file.lock();
         let FileKind::SignalFd(m) = &mut f.kind else { return Err(EINVAL) };
         *m = mask;
+        // Readers waiting on it may now see a pending signal.
+        crate::ipc::changed();
         return Ok(fd);
     }
     let file = new_file(FileKind::SignalFd(mask), O_RDONLY | (flags as u32 & O_NONBLOCK));
@@ -1886,6 +1894,11 @@ pub fn inotify_add_watch(p: &mut Process, fd: u64, pathp: u64, mask: u64) -> Sys
     if let Some((&wd, _)) = n.watches.iter().find(|(_, w)| **w == ino) {
         return Ok(wd as u64);
     }
+    use core::sync::atomic::Ordering;
+    if crate::fd::WATCHES.load(Ordering::Relaxed) >= crate::fd::MAX_WATCHES {
+        return Err(ENOSPC);
+    }
+    crate::fd::WATCHES.fetch_add(1, Ordering::Relaxed);
     n.next_wd += 1;
     n.watches.insert(n.next_wd, ino);
     Ok(n.next_wd as u64)
@@ -1895,5 +1908,7 @@ pub fn inotify_rm_watch(p: &mut Process, fd: u64, wd: u64) -> SysResult {
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
     let FileKind::Inotify(n) = &mut f.kind else { return Err(EINVAL) };
-    n.watches.remove(&(wd as i32)).map(|_| 0).ok_or(EINVAL)
+    n.watches.remove(&(wd as i32)).ok_or(EINVAL)?;
+    crate::fd::WATCHES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    Ok(0)
 }
