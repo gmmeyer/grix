@@ -54,6 +54,22 @@ go to the PL011 UART, on a Unix socket the host reads (bounded). When the
 program ends (`process::finish`), `export.rs` sends the directories listed
 in `Image::exports` before the exit status (`wire::ExportMsg`).
 
+Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
+process is in `PROCESS`; every other one, and zombies, are in
+`procs::PROCS` (lock order: `PROCESS`, then `PROCS`). `sched::schedule`
+picks threads round-robin across processes, swapping bodies between the two
+and the address space in TTBR0. fork copies the address space
+copy-on-write (per-frame refcounts in `mm/frame.rs`; `AddressSpace::fork`
+and `unshare`; the kernel's own writes unshare in `ensure`). vfork is a
+copy too, with the parent waiting (`WaitOn::Vfork`) for exec or exit.
+Every way a process ends goes through `Process::terminate`: for init (pid
+1, the program) that ends the sandbox; any other process is marked, and
+`procs::finalize` (run from `schedule`, which `return_to_user` calls for an
+ended process) closes its files, leaves a zombie, gives its children to
+init and sends the exit signal. `execve` loads the new program into a fresh
+address space first (`process::load_program`), so a failure leaves the
+caller running.
+
 Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must
 wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
@@ -77,7 +93,10 @@ glibc on arm64 don't. `signal::send` rewinds a blocked receiver to its `svc`
 and sets `Thread::restarting`. I/O wakeups do the same. When a handler is
 then delivered, the call fails with EINTR unless the handler has
 `SA_RESTART` and the call is restartable. With no handler it simply re-runs,
-keeping its deadline (`restart_deadline`).
+keeping its deadline (`restart_deadline`). A woken call always re-runs once
+before signals are delivered (`Thread::recheck`), so one that can now
+complete does, as on Linux; it stays `restarting` until the svc actually
+runs again.
 
 ## Invariants: don't break these
 
@@ -124,10 +143,14 @@ keeping its deadline (`restart_deadline`).
       against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files) take a `kmem::Charge`.
-    - Counts are capped: mappings (`MAX_VMAS`), queued real-time signals,
-      inotify watches, POSIX timers, threads, descriptors.
+    - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
+      all processes), queued real-time signals, inotify watches, POSIX
+      timers, threads (all processes), descriptors, open files
+      (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
+      zombies included). argv and environment copies take a `kmem::Charge`.
 
-    Limits must be global, not per object: a program can open many objects.
+    Limits must be global, not per object: a program can open many objects,
+    and fork copies whatever is per process.
 11. **`fs::lock()` is not re-entrant**; it panics if the lock is already
     held. Drop the guard before calling anything that takes it
     (`Process::missing_path`, `procfs::generate`, …). Lock order:
@@ -139,6 +162,13 @@ keeping its deadline (`restart_deadline`).
     another exception level, AArch32 or masked interrupts, and keep only
     NZCV (`signal::read_frame`). Anything else that loads a user-supplied
     context needs the same check.
+13. **Only the running process's memory is reachable.** The kernel reads
+    and writes user memory through TTBR0, which holds the running process's
+    address space. Code acting on another process (signals, timers, kill,
+    wait, `finalize`) must not touch its user memory, unless it activates
+    that address space first and switches back (fork's `CLONE_CHILD_SETTID`).
+    A process that ended keeps its address space until another process is
+    switched in: never free the active one.
 
 ## Adding a syscall
 

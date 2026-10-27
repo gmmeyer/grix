@@ -54,8 +54,9 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         _ => return Err(EINVAL),
     };
     let prot = Prot::from_linux(prot);
+    let shared_anon = || Backing::Shared { pages: Default::default(), index: 0 };
     let backing = if flags & MAP_ANONYMOUS != 0 {
-        Backing::Anon
+        if shared { shared_anon() } else { Backing::Anon }
     } else {
         let file = p.fds.get(fd)?;
         let f = file.lock();
@@ -89,10 +90,12 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
                         ino,
                         shared,
                     },
-                    None => Backing::Data { data: c.clone(), offset: off, ino, shared },
+                    None => Backing::Data { data: c.clone(), offset: off, end: u64::MAX, ino, shared },
                 }
             }
-            (FileKind::Dev(..), _) => Backing::Anon, // /dev/zero
+            // /dev/zero, which Linux maps as shared anonymous memory when shared.
+            (FileKind::Dev(..), _) if shared => shared_anon(),
+            (FileKind::Dev(..), _) => Backing::Anon,
             _ => return Err(ENODEV),
         }
     };

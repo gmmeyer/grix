@@ -418,6 +418,75 @@ fn pthreads() {
 }
 
 #[test]
+fn processes() {
+    // fork, vfork, posix_spawn, execve of imported and written programs and
+    // #! scripts, wait4/waitid, SIGCHLD, orphans, process groups and
+    // sessions, copy-on-write, the process limit (see the fixture).
+    let b = with("procs")
+        .allow(Capability::Process)
+        .allow(Capability::Threads)
+        .allow(Capability::FsWrite)
+        .file("/data/plain.txt", "not a program\n", 0o644)
+        .unwrap();
+    let out = run(b, &["/bin/procs"]);
+    assert_eq!(
+        out.stdout_str(),
+        "child: procs child via-execve K=from-parent pid_is_new=1\n\
+         child: procs child via-vfork K=from-parent pid_is_new=1\n\
+         child: procs child via-posix_spawn K=from-parent pid_is_new=1\n\
+         child: procs2 child written K=from-parent pid_is_new=1\n\
+         child: /tmp/procs2 child /tmp/script arg K=from-parent pid_is_new=1\n\
+         procs ok\n"
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The missing program it tried, and the child it let crash.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::MissingPath { path }, GuestEvent::Fault { signal: 11, detail, .. }]
+            if path == "/no/such/program" && detail.starts_with("process ") && detail.contains("(procs): invalid write")),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
+fn shell_pipelines_and_subshells() {
+    let sb = Sandbox::builder()
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .env("PATH", "/bin")
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .build()
+        .unwrap();
+    let script = "/bin/busybox --install -s /bin && echo hello world | tr a-z A-Z && ls /bin | grep -c . >/dev/null && \
+                  x=$(echo sub; echo shell) && echo \"$x\" | sort -r && (exit 4); echo \"status $?\"; \
+                  sh -c 'exit 7'; echo \"nested $?\"; seq 1 5 | while read n; do echo -n \"$n,\"; done; echo; exit 3";
+    let out = sb.run(&["/bin/busybox", "sh", "-c", script]).unwrap();
+    assert_eq!(out.stdout_str(), "HELLO WORLD\nsub\nshell\nstatus 4\nnested 7\n1,2,3,4,5,\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(3));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn go_os_exec() {
+    let out = run(with("goexec").allow(Capability::Process).allow(Capability::Threads), &["/bin/goexec"]);
+    assert_eq!(
+        out.stdout_str(),
+        "output \"child K=go\\n\" code 3\nupper \"PIPED THROUGH GO\" <nil>\nkilled: signal: killed\n\
+         missing: fork/exec /no/such/program: no such file or directory\n",
+        "{}",
+        out.stderr_str()
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // Go probes pidfd_open, and falls back without it.
+    for e in &out.events {
+        let fine = matches!(e, GuestEvent::Unimplemented { syscall, .. } if syscall == "pidfd_open")
+            || matches!(e, GuestEvent::MissingPath { path } if path == "/no/such/program");
+        assert!(fine, "{e}");
+    }
+}
+
+#[test]
 fn deadlocks_are_reported_instead_of_hanging() {
     let out = run(with("deadlock").allow(Capability::Threads), &["/bin/deadlock"]);
     assert_eq!(out.status, ExitStatus::Signaled(9));
@@ -543,7 +612,8 @@ fn stdout_backpressure() {
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
     let want: Vec<u8> = (0..14usize << 20).map(|i| ((i % (1 << 20)) % 251) as u8).collect();
-    assert!(out.stdout == want, "stdout differs ({} bytes)", out.stdout.len());
+    let first = out.stdout.iter().zip(&want).position(|(a, b)| a != b);
+    assert!(out.stdout == want, "stdout differs: {} bytes, first difference at {first:?}", out.stdout.len());
 }
 
 #[test]

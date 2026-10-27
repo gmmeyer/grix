@@ -11,7 +11,7 @@ use crate::fd::FileKind;
 use crate::fs;
 use crate::mm::aspace::{Backing, STACK_TOP};
 use crate::mm::frame;
-use crate::process::{PID, Process};
+use crate::process::Process;
 use crate::time;
 
 pub const HOSTNAME: &str = "grix";
@@ -163,7 +163,7 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             let _ = writeln!(s, "{}.{:02} {}.{:02}", ms / 1000, ms % 1000 / 10, ms / 1000, ms % 1000 / 10);
         }
         ProcFile::Loadavg => {
-            let _ = writeln!(s, "0.00 0.00 0.00 1/{} {}", p.threads.len(), p.next_tid - 1);
+            let _ = writeln!(s, "0.00 0.00 0.00 1/{} {}", p.threads.len(), crate::process::new_tid() - 1);
         }
         ProcFile::Version => {
             let _ = writeln!(s, "Linux version {RELEASE} (grix) {VERSION}");
@@ -206,7 +206,7 @@ fn maps(p: &Process, s: &mut String) {
         for (on, c) in perms {
             flags.push(if on { c } else { '-' });
         }
-        flags.push('p');
+        flags.push(if matches!(v.backing, Backing::Shared { .. }) { 's' } else { 'p' });
         let (offset, inode, name) = match v.backing {
             Backing::File { offset, ino, .. } | Backing::Data { offset, ino, .. } => {
                 (offset, ino as u64 + 1, fs.path_of(ino))
@@ -216,6 +216,7 @@ fn maps(p: &Process, s: &mut String) {
             // What Linux calls the page holding the signal-return code on arm32.
             Backing::Sigpage => (0, 0, "[sigpage]".into()),
             Backing::Anon => (0, 0, String::new()),
+            Backing::Shared { index, .. } => (index * 4096, 0, "/dev/zero (deleted)".into()),
         };
         let dev = if inode == 0 { "00:00" } else { "00:01" };
         let _ = writeln!(s, "{:08x}-{:08x} {flags} {offset:08x} {dev} {inode:<10} {name}", v.start, v.end);
@@ -228,9 +229,10 @@ fn status(p: &Process, s: &mut String) {
     let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
     let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
     let (u, g) = (p.uid, p.gid);
+    let (pid, ppid) = (p.pid, p.ppid);
     let _ = write!(
         s,
-        "Name:\t{}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{PID}\nNgid:\t0\nPid:\t{PID}\nPPid:\t0\n\
+        "Name:\t{}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
          TracerPid:\t0\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nFDSize:\t{}\nGroups:\t{g}\n\
          VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/0\n\
          SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
@@ -252,9 +254,10 @@ fn stat(p: &Process, s: &mut String) {
     let (size, rss) = mem_pages(p);
     // utime, in clock ticks (all CPU time counts as user time).
     let ticks = p.process_cpu_ns() / 10_000_000;
+    let (pid, ppid, pgrp, sid) = (p.pid, p.ppid, p.pgid, p.sid);
     let _ = writeln!(
         s,
-        "{PID} ({}) R 0 {PID} {PID} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
+        "{pid} ({}) R {ppid} {pgrp} {sid} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
         comm(p),
         p.threads.len(),

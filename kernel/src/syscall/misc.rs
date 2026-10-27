@@ -3,7 +3,7 @@
 use super::table::nr;
 use crate::errno::*;
 use crate::mm::frame;
-use crate::process::{PID, Process};
+use crate::process::Process;
 use crate::uaccess::*;
 use crate::{rng, time};
 
@@ -43,8 +43,6 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(len)
         }
-        nr::getpid | nr::getpgid | nr::getsid => Ok(PID),
-        nr::getppid => Ok(0),
         nr::getuid | nr::geteuid => Ok(p.uid as u64),
         nr::getgid | nr::getegid => Ok(p.gid as u64),
         nr::getresuid | nr::getresgid => {
@@ -70,12 +68,12 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         nr::setrlimit => prlimit(p, 0, a[0], a[1], 0),
         nr::prlimit64 => prlimit(p, a[0], a[1], a[2], a[3]),
         nr::getrusage => {
-            // RUSAGE_SELF, RUSAGE_THREAD, or RUSAGE_CHILDREN (there are none).
+            // RUSAGE_SELF, RUSAGE_THREAD, or RUSAGE_CHILDREN (those waited for).
             // All CPU time counts as user time: system time isn't separated.
             let cpu = match a[0] as i32 {
                 0 => p.process_cpu_ns(),
                 1 => p.thread_cpu_ns(p.current).unwrap_or(0),
-                -1 => 0,
+                -1 => p.children_cpu_ns,
                 _ => return Err(EINVAL),
             };
             let mut b = [0u8; 144];
@@ -91,6 +89,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             if a[0] != 0 {
                 let mut b = [0u8; 32];
                 b[..8].copy_from_slice(&(p.process_cpu_ns() / 10_000_000).to_le_bytes()); // tms_utime
+                b[16..24].copy_from_slice(&(p.children_cpu_ns / 10_000_000).to_le_bytes()); // tms_cutime
                 copy_out(&mut p.aspace, a[0], &b)?;
             }
             Ok(ticks)
@@ -142,7 +141,7 @@ fn clock_now(p: &Process, clock: u64) -> Option<u64> {
             let id = !(c >> 3) as u32;
             if c & 4 != 0 {
                 p.thread_cpu_ns(if id == 0 { p.current } else { id })
-            } else if id == 0 || id == PID as u32 {
+            } else if id == 0 || id == p.pid {
                 Some(p.process_cpu_ns())
             } else {
                 None
@@ -328,7 +327,7 @@ fn mincore(p: &mut Process, addr: u64, len: u64, vec: u64) -> SysResult {
 }
 
 fn prlimit(p: &mut Process, pid: u64, res: u64, new: u64, old: u64) -> SysResult {
-    if pid != 0 && pid != PID {
+    if pid != 0 && pid != p.pid as u64 {
         return Err(ESRCH);
     }
     let i = usize::try_from(res).ok().filter(|&i| i < p.rlimits.len()).ok_or(EINVAL)?;

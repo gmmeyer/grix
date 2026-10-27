@@ -4,6 +4,7 @@ mod file;
 mod mem;
 mod misc;
 mod net;
+mod proc;
 mod signal;
 pub mod table;
 mod thread;
@@ -17,15 +18,27 @@ use crate::process::{PROCESS, Process};
 use crate::sched;
 use table::{Gate, nr};
 
+/// execve's dirfd for "relative to the working directory".
+const AT_FDCWD: i32 = -100;
+
 pub fn handle(tf: &mut TrapFrame) {
     let n = tf.x[8];
     let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("syscall without a process");
+    // A rewound call is running again: no longer something a signal must
+    // decide for (see `signal::return_to_user`).
+    p.cur().restarting = false;
     let result = match u32::try_from(n) {
         Ok(n) => dispatch(p, tf, n, a),
         Err(_) => p.unimplemented(u32::MAX, "unknown", "", ENOSYS),
     };
+    // The process ended (exit_group, a fatal signal to itself, a policy
+    // kill): it's finished off and something else runs.
+    if p.exit_status.is_some() {
+        sched::schedule(p, tf);
+        return;
+    }
     if result == Err(EBLOCKED) && !crate::signal::interrupt_self(p, tf) {
         // The thread blocked or exited: its return value is set when it wakes.
         // (schedule() saves its registers before waking any I/O waiters.)
@@ -43,7 +56,7 @@ pub fn handle(tf: &mut TrapFrame) {
         };
         crate::signal::syscall_done(p, result == Err(EINTR));
     }
-    p.wake_io_waiters();
+    sched::wake_io_everywhere(p);
     if p.resched {
         sched::schedule(p, tf);
     } else {
@@ -185,7 +198,10 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::clone => thread::clone(p, tf, a),
         nr::clone3 => thread::clone3(p, tf, a[0], a[1]),
         nr::exit => thread::exit_thread(p, (a[0] & 0xff) as i32),
-        nr::exit_group => crate::process::exit((a[0] & 0xff) as i32),
+        nr::exit_group => {
+            p.terminate(crate::process::exited((a[0] & 0xff) as i32));
+            Err(EBLOCKED)
+        }
         nr::futex => thread::futex(p, a),
         nr::set_tid_address => thread::set_tid_address(p, a[0]),
         nr::set_robust_list => {
@@ -220,6 +236,18 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::rt_sigreturn => crate::signal::sigreturn(p, tf),
         nr::sigaltstack => signal::sigaltstack(p, tf.sp_el0, a[0], a[1]),
         nr::kill => signal::kill(p, a[0], a[1]),
+
+        // processes
+        nr::execve => proc::execve(p, tf, AT_FDCWD as u64, a[0], a[1], a[2], 0),
+        nr::execveat => proc::execve(p, tf, a[0], a[1], a[2], a[3], a[4]),
+        nr::wait4 => proc::wait4(p, a[0], a[1], a[2], a[3]),
+        nr::waitid => proc::waitid(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::getpid => Ok(p.pid as u64),
+        nr::getppid => Ok(p.ppid as u64),
+        nr::getpgid => proc::group_of(p, a[0], false),
+        nr::getsid => proc::group_of(p, a[0], true),
+        nr::setpgid => proc::setpgid(p, a[0], a[1]),
+        nr::setsid => proc::setsid(p),
         nr::tkill => signal::tgkill(p, None, a[0], a[1]),
         nr::tgkill => signal::tgkill(p, Some(a[0]), a[1], a[2]),
 

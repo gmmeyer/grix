@@ -256,12 +256,13 @@ static int test_timerfd(void) {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     CHECK(fd >= 0);
     uint64_t ticks;
-    struct itimerspec its = {{0, 0}, {0, 30000000}}, cur;
+    // Long enough that it can't expire between two calls on a busy host.
+    struct itimerspec its = {{0, 0}, {0, 200000000}}, cur;
     long t0 = now_ms();
     CHECK(timerfd_settime(fd, 0, &its, 0) == 0);
     CHECK(timerfd_gettime(fd, &cur) == 0 && cur.it_value.tv_nsec > 0);
     CHECK(read(fd, &ticks, 8) == 8 && ticks == 1);  // blocks until it fires
-    CHECK(now_ms() - t0 >= 25);
+    CHECK(now_ms() - t0 >= 195);
     CHECK(read(fd, &ticks, 4) == -1 && errno == EINVAL);
     // Periodic: expiries add up until read.
     its = (struct itimerspec){{0, 10000000}, {0, 10000000}};

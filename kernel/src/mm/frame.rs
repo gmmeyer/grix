@@ -20,6 +20,16 @@ struct Frames {
     free: Vec<u64>,
     total: u64,
     in_use: u64,
+    /// How many mappings hold each frame (indexed from `base`): forked
+    /// processes share pages copy-on-write until one of them writes.
+    refs: Vec<u16>,
+    base: u64,
+}
+
+impl Frames {
+    fn refs(&mut self, pa: u64) -> &mut u16 {
+        &mut self.refs[((pa - self.base) / PAGE_SIZE) as usize]
+    }
 }
 
 static FRAMES: Mutex<Option<Frames>> = Mutex::new(None);
@@ -28,7 +38,10 @@ pub fn init(regions: &[(u64, u64)]) {
     let regions: Vec<(u64, u64)> = regions.iter().copied().filter(|(s, e)| s < e).collect();
     let total = regions.iter().map(|(s, e)| (e - s) / PAGE_SIZE).sum();
     let next = regions.first().map_or(0, |r| r.0);
-    *FRAMES.lock() = Some(Frames { regions, region: 0, next, free: Vec::new(), total, in_use: 0 });
+    let base = regions.iter().map(|r| r.0).min().unwrap_or(0);
+    let top = regions.iter().map(|r| r.1).max().unwrap_or(0);
+    let refs = alloc::vec![0; ((top - base) / PAGE_SIZE) as usize];
+    *FRAMES.lock() = Some(Frames { regions, region: 0, next, free: Vec::new(), total, in_use: 0, refs, base });
 }
 
 /// Allocate a zeroed 4 KiB frame. Returns its physical address.
@@ -50,17 +63,38 @@ pub fn alloc() -> Option<u64> {
             },
         };
         f.in_use += 1;
+        *f.refs(pa) = 1;
         pa
     };
     unsafe { core::ptr::write_bytes(p2v(pa) as *mut u8, 0, PAGE_SIZE as usize) };
     Some(pa)
 }
 
+/// Drop one reference to a frame; the last one frees it.
 pub fn free(pa: u64) {
     let mut guard = FRAMES.lock();
     let f = guard.as_mut().expect("frame allocator not initialised");
-    f.free.push(pa);
-    f.in_use -= 1;
+    let refs = f.refs(pa);
+    assert!(*refs > 0, "freeing free frame {pa:#x}");
+    *refs -= 1;
+    if *refs == 0 {
+        f.free.push(pa);
+        f.in_use -= 1;
+    }
+}
+
+/// Another mapping of a frame (fork shares pages copy-on-write).
+pub fn share(pa: u64) {
+    let mut guard = FRAMES.lock();
+    let f = guard.as_mut().expect("frame allocator not initialised");
+    *f.refs(pa) += 1;
+}
+
+/// Is a frame mapped more than once (so writing it needs a copy)?
+pub fn is_shared(pa: u64) -> bool {
+    let mut guard = FRAMES.lock();
+    let f = guard.as_mut().expect("frame allocator not initialised");
+    *f.refs(pa) > 1
 }
 
 /// (total frames, frames in use)

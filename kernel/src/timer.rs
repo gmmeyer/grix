@@ -165,7 +165,7 @@ pub fn fire(p: &mut Process) -> bool {
     let mut fired = false;
     if !p.timers.real_pending && p.timers.real.expire(now) > 0 {
         // Like Linux's it_real_fn: one SIGALRM however many periods passed.
-        let mut info = SigInfo::sent(SIGALRM, SI_KERNEL, 0, "SIGALRM: the interval timer (alarm/setitimer) expired");
+        let mut info = SigInfo::sent(SIGALRM, SI_KERNEL, 0, 0, "SIGALRM: the interval timer (alarm/setitimer) expired");
         info.fields = [0; 4]; // sent by the kernel: no pid or uid
         info.timer = Some(REAL_TIMER);
         p.timers.real_pending = send_timer_signal(p, Target::Process, info, REAL_TIMER);
@@ -182,7 +182,7 @@ pub fn fire(p: &mut Process) -> bool {
         fired = true;
         let Notify::Signal { signo, value, thread } = p.timers.posix[&id].notify else { continue };
         let extra = (n - 1).min(i32::MAX as u64);
-        let mut info = SigInfo::sent(signo, SI_TIMER, 0, "signal from a POSIX timer (timer_create)");
+        let mut info = SigInfo::sent(signo, SI_TIMER, 0, 0, "signal from a POSIX timer (timer_create)");
         info.fields = [id as u64 | extra << 32, value, 0, 0];
         info.timer = Some(id);
         let target = match thread {

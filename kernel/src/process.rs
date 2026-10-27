@@ -1,9 +1,11 @@
-//! The single process this kernel runs: its threads, exec, faults,
-//! termination, and reporting of denied/unimplemented operations.
+//! A process: its threads, exec, faults, termination, and reporting of
+//! denied/unimplemented operations. The one running is in `PROCESS`; the
+//! others, and zombies, are in `procs::PROCS`.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use grix_abi::image::Image;
 use grix_abi::policy::{DenyAction, Policy};
 use grix_abi::wire::{Event, ExitKind};
@@ -23,9 +25,28 @@ use crate::rng;
 use crate::signal::{self, AltStack, SigQueue};
 use crate::uaccess::copy_out;
 
-pub const PID: u64 = 1;
-/// Linux defaults to a much higher limit; this bounds kernel memory per sandbox.
+/// The program the sandbox runs. When it ends, the sandbox does.
+pub const INIT: u32 = 1;
+/// Threads in all processes together. Linux allows far more; this bounds
+/// kernel memory per sandbox.
 pub const MAX_THREADS: usize = 1024;
+
+/// Thread and process ids, from one sequence (a process's id is its first
+/// thread's). Never reused.
+static NEXT_TID: AtomicU32 = AtomicU32::new(INIT + 1);
+
+pub fn new_tid() -> u32 {
+    NEXT_TID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// wait4 statuses.
+pub fn exited(code: i32) -> i32 {
+    (code & 0xff) << 8
+}
+
+pub fn signaled(sig: u32) -> i32 {
+    (sig & 0x7f) as i32
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct SigAction {
@@ -47,6 +68,8 @@ pub enum WaitOn {
     Io,
     /// Any signal that runs a handler (rt_sigsuspend).
     Signal,
+    /// A vfork child to exec or exit (signals wait until then).
+    Vfork,
     /// One of these signals becoming pending (rt_sigtimedwait). The syscall
     /// is restarted to dequeue it.
     SigWait(u64),
@@ -86,6 +109,12 @@ pub struct Thread {
     /// signal handler runs before the call re-executes, the call may fail
     /// with EINTR instead (see `signal::return_to_user`).
     pub restarting: bool,
+    /// Rewound by a wakeup (a signal, an I/O change): the syscall re-runs
+    /// once before any signal is delivered, so a call that can now complete
+    /// does (and the handler runs after it), as Linux checks the wait's
+    /// condition before the signal. If it would block again,
+    /// `signal::interrupt_self` rewinds it for good and the handler decides.
+    pub recheck: bool,
     /// Bytes an unfinished write to stdout/stderr already sent before it
     /// blocked. Its re-run continues after them; a signal handler makes it
     /// return them instead of EINTR, as Linux returns a partial count.
@@ -110,6 +139,7 @@ impl Thread {
             robust_list: 0,
             restart_deadline: None,
             restarting: false,
+            recheck: false,
             io_done: 0,
             cpu_ns: 0,
         }
@@ -117,6 +147,24 @@ impl Thread {
 }
 
 pub struct Process {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    /// Sent to the parent when this process ends (clone's low byte, usually SIGCHLD).
+    pub exit_signal: u32,
+    /// Set once the process has ended (a wait4 status); the scheduler then
+    /// finishes it off (`procs::finalize`) before anything else of it runs.
+    pub exit_status: Option<i32>,
+    /// Finished off: no threads or files left, just the address space still
+    /// in TTBR0 until another process is switched in.
+    pub dead: bool,
+    /// This is the process in `PROCESS`, on the CPU.
+    pub running: bool,
+    /// A vfork child: the parent thread waiting for it to exec or exit.
+    pub vfork_parent: Option<(u32, u32)>,
+    /// CPU time of reaped children (RUSAGE_CHILDREN, times).
+    pub children_cpu_ns: u64,
     pub aspace: AddressSpace,
     pub fds: FdTable,
     pub cwd: Ino,
@@ -131,11 +179,12 @@ pub struct Process {
     pub shared_pending: SigQueue,
     pub rlimits: [(u64, u64); 16],
     pub name: [u8; 16],
-    reported: BTreeSet<(u8, u32, String)>,
     /// The running program (after `#!` resolution), its argv and environment.
     pub exe: String,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
+    /// The kernel memory `argv` and `envp` take (every fork copies them).
+    pub args_charge: crate::kmem::Charge,
 
     // Threads and scheduling (see sched.rs).
     pub threads: BTreeMap<u32, Thread>,
@@ -145,7 +194,6 @@ pub struct Process {
     pub runq: VecDeque<u32>,
     /// Futex wait queues: address -> (tid, bitset) in FIFO order.
     pub futexes: BTreeMap<u64, VecDeque<(u32, u32)>>,
-    pub next_tid: u32,
     /// When the current thread's time slice started (monotonic ns).
     pub slice_start: u64,
     /// Switch threads before returning to user space.
@@ -168,17 +216,31 @@ pub struct Process {
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 
+/// What has been reported to the host already, for every process: each
+/// denial, gap and missing path once.
+static REPORTED: Mutex<BTreeSet<(u8, u32, String)>> = Mutex::new(BTreeSet::new());
+
 const MAX_REPORTS: usize = 512;
 const RLIM_INFINITY: u64 = u64::MAX;
 
 impl Process {
-    fn new(policy: Policy, uid: u32, gid: u32) -> Self {
+    fn new(pid: u32, policy: Policy, uid: u32, gid: u32, aspace: AddressSpace) -> Self {
         let mut rlimits = [(RLIM_INFINITY, RLIM_INFINITY); 16];
         rlimits[3] = (STACK_SIZE, RLIM_INFINITY); // RLIMIT_STACK
         rlimits[4] = (0, 0); // RLIMIT_CORE
         rlimits[7] = (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64); // RLIMIT_NOFILE
         Process {
-            aspace: AddressSpace::new().expect("out of memory"),
+            pid,
+            ppid: 0,
+            pgid: pid,
+            sid: pid,
+            exit_signal: 0,
+            exit_status: None,
+            dead: false,
+            running: false,
+            vfork_parent: None,
+            children_cpu_ns: 0,
+            aspace,
             fds: FdTable::with_stdio(),
             cwd: ROOT,
             cwd_pin: None,
@@ -190,15 +252,14 @@ impl Process {
             shared_pending: SigQueue::default(),
             rlimits,
             name: [0; 16],
-            reported: BTreeSet::new(),
             exe: String::new(),
             argv: Vec::new(),
             envp: Vec::new(),
-            threads: BTreeMap::from([(PID as u32, Thread::new(PID as u32))]),
-            current: PID as u32,
+            args_charge: Default::default(),
+            threads: BTreeMap::from([(pid, Thread::new(pid))]),
+            current: pid,
             runq: VecDeque::new(),
             futexes: BTreeMap::new(),
-            next_tid: PID as u32 + 1,
             slice_start: 0,
             resched: false,
             timer_dirty: true,
@@ -211,12 +272,48 @@ impl Process {
         }
     }
 
+    /// A child, as fork makes it: the same memory (`aspace`, already
+    /// copied), files, handlers, limits and working directory, and one
+    /// thread, which the caller sets up. Timers aren't inherited (timerfds
+    /// are, being files).
+    pub fn fork(&self, pid: u32, aspace: AddressSpace) -> Result<Process, Errno> {
+        let args_charge = crate::kmem::Charge::new(self.args_charge.bytes())?;
+        let mut c = Process::new(pid, self.policy, self.uid, self.gid, aspace);
+        c.args_charge = args_charge;
+        c.ppid = self.pid;
+        c.pgid = self.pgid;
+        c.sid = self.sid;
+        c.fds = self.fds.clone();
+        c.cwd = self.cwd;
+        c.cwd_pin = self.cwd_pin.clone();
+        c.umask = self.umask;
+        c.sigactions = self.sigactions;
+        c.rlimits = self.rlimits;
+        c.name = self.name;
+        c.exe = self.exe.clone();
+        c.argv = self.argv.clone();
+        c.envp = self.envp.clone();
+        c.io_seen = self.io_seen;
+        c.timers.fds = self.timers.fds.clone();
+        c.uses_signalfd = self.uses_signalfd;
+        Ok(c)
+    }
+
+    /// The command name (comm), for reports.
+    pub fn comm(&self) -> &str {
+        let n = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..n]).unwrap_or("?")
+    }
+
     /// CPU time used by thread `tid` so far (ns). The running thread has
     /// been on the CPU since `slice_start`.
     pub fn thread_cpu_ns(&self, tid: u32) -> Option<u64> {
         let t = self.threads.get(&tid)?;
-        let running =
-            if tid == self.current { crate::time::monotonic_ns().saturating_sub(self.slice_start) } else { 0 };
+        let running = if self.running && tid == self.current {
+            crate::time::monotonic_ns().saturating_sub(self.slice_start)
+        } else {
+            0
+        };
         Some(t.cpu_ns + running)
     }
 
@@ -256,23 +353,27 @@ impl Process {
     }
 
     /// If any I/O state changed, restart every thread blocked on I/O.
-    pub fn wake_io_waiters(&mut self) {
+    /// Returns whether any was.
+    pub fn wake_io_waiters(&mut self) -> bool {
         let version = crate::ipc::generation();
         if version == self.io_seen {
-            return;
+            return false;
         }
         self.io_seen = version;
         let waiting: Vec<u32> =
             self.threads.values().filter(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io)).map(|t| t.tid).collect();
+        let any = !waiting.is_empty();
         for tid in waiting {
             let t = self.threads.get_mut(&tid).unwrap();
             t.wait = None;
             // Re-execute the svc: x0..x7 still hold the original arguments.
             t.regs.elr -= 4;
             t.restarting = true;
+            t.recheck = true;
             self.runq.push_back(tid);
             self.timer_dirty = true;
         }
+        any
     }
 
     /// Make a blocked thread runnable; its syscall returns `ret` (or its
@@ -302,7 +403,38 @@ impl Process {
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {
-        self.reported.len() < MAX_REPORTS && self.reported.insert((kind, nr, detail.into()))
+        let mut reported = REPORTED.lock();
+        reported.len() < MAX_REPORTS && reported.insert((kind, nr, detail.into()))
+    }
+
+    /// End the process with wait status `status`. The main program ending
+    /// ends the sandbox. Any other process is finished off by the scheduler
+    /// before anything of it runs again (`procs::finalize`): the syscall or
+    /// trap that got here unwinds normally first.
+    pub fn terminate(&mut self, status: i32) {
+        if self.pid == INIT {
+            match status & 0x7f {
+                0 => finish(ExitKind::Exited, (status >> 8) & 0xff),
+                sig => finish(ExitKind::Signaled, sig),
+            }
+        }
+        if self.exit_status.is_none() {
+            self.exit_status = Some(status);
+            crate::procs::DYING.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// End the process with signal `sig`. `report` sends a Fault event
+    /// (faults, policy kills); the main program always reports, since its
+    /// end is the sandbox's.
+    pub fn kill(&mut self, sig: u32, addr: u64, pc: u64, detail: &str, report: bool) {
+        if self.pid == INIT {
+            console::event(&Event::Fault { signal: sig, addr, pc, detail });
+        } else if report {
+            let detail = alloc::format!("process {} ({}): {detail}", self.pid, self.comm());
+            console::event(&Event::Fault { signal: sig, addr, pc, detail: &detail });
+        }
+        self.terminate(signaled(sig))
     }
 
     /// A syscall needed a capability the policy does not grant.
@@ -314,7 +446,9 @@ impl Process {
             DenyAction::Errno => Err(EPERM),
             DenyAction::Kill => {
                 let msg = alloc::format!("{syscall} denied (needs capability `{capability}`)");
-                exit_signaled(signal::SIGSYS, 0, 0, &msg)
+                self.kill(signal::SIGSYS, 0, 0, &msg, true);
+                // Unwinds to the syscall handler, which finishes the process off.
+                Err(EBLOCKED)
             }
         }
     }
@@ -356,17 +490,6 @@ pub fn finish(kind: ExitKind, code: i32) -> ! {
     console::power_off()
 }
 
-/// Exit the program normally.
-pub fn exit(code: i32) -> ! {
-    finish(ExitKind::Exited, code)
-}
-
-/// Terminate the program with a signal and report why.
-pub fn exit_signaled(signal: u32, addr: u64, pc: u64, detail: &str) -> ! {
-    console::event(&Event::Fault { signal, addr, pc, detail });
-    finish(ExitKind::Signaled, signal as i32)
-}
-
 /// Demand paging for a user translation fault.
 pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
     let mut guard = PROCESS.lock();
@@ -378,7 +501,7 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
             let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
             signal::fault(p, signal::SIGSEGV, code, fault, access.describe_violation())
         }
-        Err(FaultError::OutOfMemory) => exit_signaled(signal::SIGKILL, far, tf.elr, "out of memory"),
+        Err(FaultError::OutOfMemory) => p.kill(signal::SIGKILL, far, tf.elr, "out of memory", true),
     }
 }
 
@@ -388,135 +511,123 @@ pub fn start(img: Image<'static>) -> ! {
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);
-        exit(code)
+        finish(ExitKind::Exited, code)
     };
-    let mut fs = fs::Fs::build(&img.entries, img.uid, img.gid);
+    let fs = fs::Fs::build(&img.entries, img.uid, img.gid);
     let cwd = match fs.lookup(ROOT, img.cwd, true) {
         Ok(ino) if fs.is_dir(ino) => ino,
         _ => fail(127, &alloc::format!("working directory {} does not exist", img.cwd)),
     };
-    let argv = img.argv.iter().map(|s| String::from(*s)).collect();
-    let (exe, argv) = match resolve_interpreters(&fs, cwd, img.exe, argv) {
-        Ok(r) => r,
-        Err((code, reason)) => fail(code, &reason),
-    };
-    fs.set_exe(&exe);
     fs::install(fs);
     // Like tmpfs's default size: half of RAM for written file data.
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
     let stdin = img.stdin;
-    let mut p = Process::new(img.policy, img.uid, img.gid);
+    let aspace = AddressSpace::new().expect("out of memory at boot");
+    let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
     p.cwd = cwd;
     p.cwd_pin = Some(fs::lock().pin(cwd));
-    p.argv = argv;
-    p.envp = img.envp.iter().map(|s| String::from(*s)).collect();
-    p.exe = exe;
-    p.aspace.activate();
-    match exec(&mut p, img.exe) {
-        Ok((entry, sp)) => {
-            p.slice_start = crate::time::monotonic_ns();
-            *PROCESS.lock() = Some(p);
-            arch::irq::init();
-            console::start(stdin);
-            arch::enter_user(entry, sp)
-        }
-        Err((code, reason)) => fail(code, &reason),
-    }
-}
-
-/// Follow `#!` lines like Linux's binfmt_script: `#!interp [arg]` runs
-/// `interp [arg] script args...`. Returns the ELF to load and the final argv.
-fn resolve_interpreters(
-    fs: &fs::Fs,
-    cwd: Ino,
-    path: &str,
-    mut argv: Vec<String>,
-) -> Result<(String, Vec<String>), (i32, String)> {
-    let mut path = String::from(path);
-    for _ in 0..5 {
-        let what = if argv.first().is_some_and(|a| *a == path) || argv.is_empty() { "program" } else { "interpreter" };
-        let ino = fs
-            .lookup(cwd, &path, true)
-            .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        let node = fs.node(ino);
-        let data = match &node.kind {
-            Kind::File(c) if node.perm & 0o111 != 0 => image_of(c, path.as_str())?,
-            Kind::File(_) => return Err((126, alloc::format!("{what} {path} is not executable"))),
-            _ => return Err((126, alloc::format!("{what} {path} is not a regular file"))),
-        };
-        let Some(rest) = data.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), argv)) };
-        // Linux reads at most this much of the #! line.
-        let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
-        let line = core::str::from_utf8(&line[..line.len().min(254)])
-            .map_err(|_| (126, alloc::format!("{path}: invalid #! line")))?
-            .trim();
-        let (interp, arg) = match line.split_once([' ', '\t']) {
-            Some((i, a)) => (i, Some(a.trim()).filter(|a| !a.is_empty())),
-            None => (line, None),
-        };
-        if interp.is_empty() {
-            return Err((126, alloc::format!("{path}: empty #! line")));
-        }
-        let mut next = alloc::vec![String::from(interp)];
-        next.extend(arg.map(String::from));
-        next.push(path.clone());
-        next.extend(argv.into_iter().skip(1));
-        argv = next;
-        path = String::from(interp);
-    }
-    Err((126, alloc::format!("{path}: too many levels of #! interpreters")))
-}
-
-/// The bytes of a file to execute. Programs run straight from the boot
-/// image; a file the program wrote can't be executed yet (that comes with execve).
-fn image_of(c: &fs::Content, path: &str) -> Result<&'static [u8], (i32, String)> {
-    c.lock().image().ok_or_else(|| (126, alloc::format!("{path} was modified in the sandbox and can't be executed")))
-}
-
-/// Load `p.exe` (already resolved by `resolve_interpreters`) and build the
-/// initial stack. `execfn` is the path originally asked for (AT_EXECFN).
-fn exec(p: &mut Process, execfn: &str) -> Result<(u64, u64), (i32, String)> {
-    let fs = fs::lock();
-    let file = |path: &str, what: &str| -> Result<(&'static [u8], Ino), (i32, String)> {
-        let ino = fs
-            .lookup(p.cwd, path, true)
-            .map_err(|_| (127, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        match &fs.node(ino).kind {
-            Kind::File(c) => Ok((image_of(c, path)?, ino)),
-            _ => Err((126, alloc::format!("{what} {path} is not a regular file"))),
-        }
+    p.running = true;
+    let argv = img.argv.iter().map(|s| String::from(*s)).collect();
+    let envp = img.envp.iter().map(|s| String::from(*s)).collect();
+    let program = match load_program(&p, cwd, img.exe, argv, envp) {
+        Ok(program) => program,
+        Err(e) => fail(if e.errno == ENOENT { 127 } else { 126 }, &e.reason),
     };
+    fs::lock().set_exe(&program.exe);
+    let (entry, sp) = program.install(&mut p);
+    p.slice_start = crate::time::monotonic_ns();
+    *PROCESS.lock() = Some(p);
+    arch::irq::init();
+    console::start(stdin);
+    arch::enter_user(entry, sp)
+}
 
-    let (data, ino) = file(&p.exe, "program")?;
-    let exe = elf::load(&mut p.aspace, data, ino, Some(elf::DYN_BASE))
-        .map_err(|e| (126, alloc::format!("{}: {e}", p.exe)))?;
-    let (entry, interp_base) = match exe.interp {
-        Some(path) => {
-            let (idata, iino) = file(path, "ELF interpreter")?;
-            let interp =
-                elf::load(&mut p.aspace, idata, iino, None).map_err(|e| (126, alloc::format!("{path}: {e}")))?;
+/// Why a program couldn't be loaded: the errno execve returns, and the
+/// explanation reported for the first program.
+pub struct ExecError {
+    pub errno: Errno,
+    pub reason: String,
+}
+
+fn exec_error(errno: Errno, reason: String) -> ExecError {
+    ExecError { errno, reason }
+}
+
+/// A program loaded into a new address space, ready to replace a
+/// process's image (`install`).
+pub struct Program {
+    aspace: AddressSpace,
+    args_charge: crate::kmem::Charge,
+    entry: u64,
+    sp: u64,
+    /// The file actually run (the interpreter, for `#!` scripts), its argv
+    /// and environment.
+    exe: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
+}
+
+/// Find `path` (relative to directory `base`), follow `#!` lines, and load
+/// the ELF and its interpreter into a new address space with the initial
+/// stack built. `p` is untouched, so a failure leaves it running.
+pub fn load_program(
+    p: &Process,
+    base: Ino,
+    path: &str,
+    argv: Vec<String>,
+    envp: Vec<String>,
+) -> Result<Program, ExecError> {
+    let (exe, ino, src, argv) = {
+        let fs = fs::lock();
+        resolve_interpreters(&fs, base, path, argv)?
+    };
+    let bytes = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
+    let args_charge = crate::kmem::Charge::new(bytes)
+        .map_err(|e| exec_error(e, "no kernel memory left for argv and environment".into()))?;
+    let mut aspace = AddressSpace::new().ok_or_else(|| exec_error(ENOMEM, "out of memory".into()))?;
+    let loaded = elf::load(&mut aspace, &src, ino, Some(elf::DYN_BASE))
+        .map_err(|e| exec_error(ENOEXEC, alloc::format!("{exe}: {e}")))?;
+    let (entry, interp_base) = match &loaded.interp {
+        Some(ipath) => {
+            let (isrc, iino) = {
+                let fs = fs::lock();
+                let ino = fs.lookup(p.cwd, ipath, true).map_err(|_| {
+                    exec_error(ENOENT, alloc::format!("ELF interpreter {ipath} not found (was it imported?)"))
+                })?;
+                match &fs.node(ino).kind {
+                    Kind::File(c) => (elf::Source::of(c), ino),
+                    _ => {
+                        return Err(exec_error(
+                            EACCES,
+                            alloc::format!("ELF interpreter {ipath} is not a regular file"),
+                        ));
+                    }
+                }
+            };
+            let interp = elf::load(&mut aspace, &isrc, iino, None)
+                .map_err(|e| exec_error(ELIBBAD, alloc::format!("{ipath}: {e}")))?;
             if interp.interp.is_some() {
-                return Err((126, "ELF interpreter requests its own interpreter".into()));
+                return Err(exec_error(ELIBBAD, "ELF interpreter requests its own interpreter".into()));
             }
             (interp.entry, interp.base)
         }
-        None => (exe.entry, 0),
+        None => (loaded.entry, 0),
     };
 
-    p.aspace.brk_start = exe.end;
-    p.aspace.brk = exe.end;
-    p.aspace.map(Vma::anon(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW));
-    p.aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
+    aspace.brk_start = loaded.end;
+    aspace.brk = loaded.end;
+    aspace.map(Vma::anon(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW));
+    aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
 
     let auxv = [
-        (3, exe.phdr),    // AT_PHDR
-        (4, 56),          // AT_PHENT
-        (5, exe.phnum),   // AT_PHNUM
-        (6, 4096),        // AT_PAGESZ
-        (7, interp_base), // AT_BASE
-        (8, 0),           // AT_FLAGS
-        (9, exe.entry),   // AT_ENTRY
+        (3, loaded.phdr),  // AT_PHDR
+        (4, 56),           // AT_PHENT
+        (5, loaded.phnum), // AT_PHNUM
+        (6, 4096),         // AT_PAGESZ
+        (7, interp_base),  // AT_BASE
+        (8, 0),            // AT_FLAGS
+        (9, loaded.entry), // AT_ENTRY
         (11, p.uid as u64),
         (12, p.uid as u64),
         (13, p.gid as u64),
@@ -526,11 +637,81 @@ fn exec(p: &mut Process, execfn: &str) -> Result<(u64, u64), (i32, String)> {
         (23, 0),             // AT_SECURE
         (26, 0),             // AT_HWCAP2
     ];
-    let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
-    let envp: Vec<&str> = p.envp.iter().map(String::as_str).collect();
-    let sp = build_stack(&mut p.aspace, &argv, &envp, execfn, &auxv)
-        .map_err(|e| (126, alloc::format!("could not build initial stack (errno {})", e.0)))?;
-    Ok((entry, sp))
+    // The stack is written through the new address space's own mapping.
+    aspace.activate();
+    let sp = {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let env: Vec<&str> = envp.iter().map(String::as_str).collect();
+        build_stack(&mut aspace, &args, &env, path, &auxv)
+    };
+    p.aspace.activate();
+    let sp = sp.map_err(|e| exec_error(e, alloc::format!("could not build the initial stack (errno {})", e.0)))?;
+    Ok(Program { aspace, args_charge, entry, sp, exe, argv, envp })
+}
+
+impl Program {
+    /// Replace `p`'s image with this program (the point of no return).
+    /// Returns where it starts: (entry, sp).
+    pub fn install(self, p: &mut Process) -> (u64, u64) {
+        let old = core::mem::replace(&mut p.aspace, self.aspace);
+        p.aspace.activate();
+        drop(old);
+        let base = self.exe.rsplit('/').next().unwrap_or(&self.exe).as_bytes();
+        p.name = [0; 16];
+        p.name[..base.len().min(15)].copy_from_slice(&base[..base.len().min(15)]);
+        p.exe = self.exe;
+        p.argv = self.argv;
+        p.envp = self.envp;
+        p.args_charge = self.args_charge;
+        (self.entry, self.sp)
+    }
+}
+
+/// Follow `#!` lines like Linux's binfmt_script: `#!interp [arg]` runs
+/// `interp [arg] script args...`. Returns the ELF to load (its path, node
+/// and bytes) and the final argv.
+fn resolve_interpreters(
+    fs: &fs::Fs,
+    cwd: Ino,
+    path: &str,
+    mut argv: Vec<String>,
+) -> Result<(String, Ino, elf::Source, Vec<String>), ExecError> {
+    let mut path = String::from(path);
+    for _ in 0..5 {
+        let what = if argv.first().is_some_and(|a| *a == path) || argv.is_empty() { "program" } else { "interpreter" };
+        let ino = fs
+            .lookup(cwd, &path, true)
+            .map_err(|e| exec_error(e, alloc::format!("{what} {path} not found (was it imported?)")))?;
+        let node = fs.node(ino);
+        let src = match &node.kind {
+            Kind::File(c) if node.perm & 0o111 != 0 => elf::Source::of(c),
+            Kind::File(_) => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable"))),
+            _ => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file"))),
+        };
+        // Linux reads at most this much of the #! line.
+        let mut buf = [0u8; 256];
+        let n = src.read(0, &mut buf);
+        let head = &buf[..n];
+        let Some(rest) = head.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), ino, src, argv)) };
+        let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
+        let line = core::str::from_utf8(&line[..line.len().min(254)])
+            .map_err(|_| exec_error(ENOEXEC, alloc::format!("{path}: invalid #! line")))?
+            .trim();
+        let (interp, arg) = match line.split_once([' ', '\t']) {
+            Some((i, a)) => (i, Some(a.trim()).filter(|a| !a.is_empty())),
+            None => (line, None),
+        };
+        if interp.is_empty() {
+            return Err(exec_error(ENOEXEC, alloc::format!("{path}: empty #! line")));
+        }
+        let mut next = alloc::vec![String::from(interp)];
+        next.extend(arg.map(String::from));
+        next.push(path.clone());
+        next.extend(argv.into_iter().skip(1));
+        argv = next;
+        path = String::from(interp);
+    }
+    Err(exec_error(ELOOP, alloc::format!("{path}: too many levels of #! interpreters")))
 }
 
 /// Lay out argc/argv/envp/auxv at the top of the stack as Linux does.

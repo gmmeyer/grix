@@ -60,7 +60,7 @@ fn dir_base(p: &Process, dirfd: u64) -> Result<Ino, Errno> {
 }
 
 /// The directory a path is relative to.
-fn base_of(p: &Process, dirfd: u64, path: &str) -> Result<Ino, Errno> {
+pub(super) fn base_of(p: &Process, dirfd: u64, path: &str) -> Result<Ino, Errno> {
     if path.starts_with('/') { Ok(ROOT) } else { dir_base(p, dirfd) }
 }
 
@@ -89,7 +89,7 @@ fn parent_in(p: &mut Process, base: Ino, path: &str) -> Result<(Ino, String), Er
 }
 
 /// A file's node for *at(fd, "", AT_EMPTY_PATH) and f* calls.
-fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
+pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     if fd as i32 == AT_FDCWD {
         return Ok(p.cwd);
     }

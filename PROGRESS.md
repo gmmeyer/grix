@@ -232,7 +232,20 @@ Next, in TODO.md order:
   checks every path and size (`max_export`, 256 MiB), and `write_to`
   recreates the tree without following links.
 
-Next, in TODO.md order: fork/exec/wait, then networking through the host.
+- **Processes**: fork, vfork and posix_spawn (copy-on-write, with
+  per-frame refcounts), execve of imported and written programs and `#!`
+  scripts, wait4/waitid, SIGCHLD, zombies, orphans, process groups and
+  sessions, up to 128 processes. Shell pipelines, Python `subprocess` and
+  `os.fork`, Node `child_process` (including `fork` with IPC) and Go
+  `os/exec` work. The kernel now keeps the running process in `PROCESS` and
+  the rest in `procs::PROCS`, and the scheduler round-robins across them.
+  A woken syscall re-runs before signals are delivered, so `waitpid` with a
+  SIGCHLD handler returns the child instead of EINTR. Under a fully loaded
+  TCG suite that exposed a duplicated-output bug (an interrupt between
+  `eret` and the re-run `svc`), fixed by keeping `restarting` until the svc
+  runs again.
+
+Next, in TODO.md order: networking through the host.
 
 ### Notes for the next session
 

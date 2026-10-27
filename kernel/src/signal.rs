@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
 use crate::mm::aspace::{AddressSpace, SIGPAGE};
-use crate::process::{self, PID, PROCESS, Process, SigAction, Thread, Wait, WaitOn};
+use crate::process::{PROCESS, Process, SigAction, Thread, Wait, WaitOn};
 use crate::syscall::table::nr;
 use crate::time;
 use crate::uaccess::*;
@@ -30,6 +30,7 @@ pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
+pub const SIGCHLD: u32 = 17;
 pub const SIGSTOP: u32 = 19;
 pub const SIGSYS: u32 = 31;
 const SIGRTMIN: u32 = 32;
@@ -38,6 +39,7 @@ pub const NSIG: u32 = 64;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
+pub const SA_NOCLDWAIT: u64 = 2;
 pub const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_ONSTACK: u64 = 0x0800_0000;
@@ -58,6 +60,8 @@ pub const BUS_ADRALN: i32 = 1;
 pub const ILL_ILLOPC: i32 = 1;
 pub const TRAP_BRKPT: i32 = 1;
 pub const FPE_FLTUNK: i32 = 14;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
 
 pub const fn bit(sig: u32) -> u64 {
     1 << (sig - 1)
@@ -97,9 +101,20 @@ pub struct SigInfo {
 }
 
 impl SigInfo {
-    /// Sent by this process: kill, tgkill, or the kernel on its behalf (SIGPIPE).
-    pub fn sent(signo: u32, code: i32, uid: u32, why: &'static str) -> Self {
-        SigInfo { signo, code, fields: [PID | (uid as u64) << 32, 0, 0, 0], fault: None, timer: None, why }
+    /// Sent by process `pid`: kill, tgkill, or the kernel on its behalf (SIGPIPE).
+    pub fn sent(signo: u32, code: i32, pid: u32, uid: u32, why: &'static str) -> Self {
+        SigInfo { signo, code, fields: [pid as u64 | (uid as u64) << 32, 0, 0, 0], fault: None, timer: None, why }
+    }
+
+    /// A child ended (usually SIGCHLD): its pid, uid, and exit code or
+    /// signal, from wait4 status `status`.
+    pub fn child(signo: u32, pid: u32, uid: u32, status: i32) -> Self {
+        let (code, value) = match status & 0x7f {
+            0 => (CLD_EXITED, (status >> 8) & 0xff),
+            sig => (CLD_KILLED, sig),
+        };
+        let fields = [pid as u64 | (uid as u64) << 32, value as u32 as u64, 0, 0];
+        SigInfo { signo, code, fields, fault: None, timer: None, why: "a child process ended" }
     }
 
     pub fn bytes(&self) -> [u8; 128] {
@@ -328,7 +343,7 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
     // first, then the others.
     let receiver = match target {
         Target::Thread(tid) => Some(tid).filter(|&t| wants(t)),
-        Target::Process => [PID as u32, p.current].into_iter().chain(p.threads.keys().copied()).find(|&t| wants(t)),
+        Target::Process => [p.pid, p.current].into_iter().chain(p.threads.keys().copied()).find(|&t| wants(t)),
     };
     // A thread in rt_sigtimedwait takes the signal without acting on it.
     let sigwaiter = receiver.is_some_and(|tid| p.threads[&tid].sigmask & b != 0);
@@ -339,7 +354,8 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
             return Ok(());
         }
         if is_fatal(&act, sig) {
-            die(&info);
+            die(p, &info);
+            return Ok(());
         }
     }
     // A process signal goes to the chosen thread's queue, so no other thread
@@ -367,7 +383,7 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
 
 /// The kernel raises a signal at the calling thread (SIGPIPE).
 pub fn raise(p: &mut Process, sig: u32, why: &'static str) {
-    let info = SigInfo::sent(sig, SI_USER, p.uid, why);
+    let info = SigInfo::sent(sig, SI_USER, p.pid, p.uid, why);
     let _ = send(p, Target::Thread(p.current), info);
 }
 
@@ -378,15 +394,20 @@ pub fn fault(p: &mut Process, sig: u32, code: i32, fault: Fault, why: &'static s
     let act = p.sigactions[sig as usize];
     let t = p.cur();
     if act.handler == SIG_DFL || act.handler == SIG_IGN || t.sigmask & bit(sig) != 0 {
-        process::exit_signaled(sig, fault.addr, fault.pc, why);
+        p.kill(sig, fault.addr, fault.pc, why, true);
+        return;
     }
     let info = SigInfo { signo: sig, code, fields: [fault.addr, 0, 0, 0], fault: Some(fault), timer: None, why };
     t.pending.push(info).expect("standard signals always queue");
 }
 
-fn die(info: &SigInfo) -> ! {
+/// A signal's default action ends the process. Faults and signals the
+/// kernel raised are reported (for the main program, everything is: its end
+/// is the sandbox's), not one process signalling another.
+fn die(p: &mut Process, info: &SigInfo) {
     let (addr, pc) = info.fault.map_or((0, 0), |f| (f.addr, f.pc));
-    process::exit_signaled(info.signo, addr, pc, info.why)
+    let report = info.fault.is_some() || info.code > 0;
+    p.kill(info.signo, addr, pc, info.why, report)
 }
 
 // ---------------------------------------------------------------- interrupting blocked syscalls
@@ -406,6 +427,7 @@ fn restartable(regs: &TrapFrame) -> bool {
     match regs.x[8] as u32 {
         nr::read | nr::readv | nr::write | nr::writev | nr::pread64 | nr::pwrite64 | nr::preadv | nr::pwritev => true,
         nr::recvfrom | nr::recvmsg | nr::sendto | nr::sendmsg | nr::openat | nr::flock | nr::getrandom => true,
+        nr::wait4 | nr::waitid => true,
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
         nr::futex => matches!(regs.x[1] & 127, 0 | 9) && regs.x[3] == 0,
         _ => false,
@@ -416,6 +438,8 @@ fn restartable(regs: &TrapFrame) -> bool {
 fn should_wake(p: &Process, t: &Thread) -> bool {
     match t.wait {
         None => false,
+        // The parent of a vfork child takes its signals once the child execs or exits.
+        Some(Wait { on: WaitOn::Vfork, .. }) => false,
         // rt_sigtimedwait re-runs and dequeues it.
         Some(Wait { on: WaitOn::SigWait(set), .. }) if (t.pending.mask | p.shared_pending.mask) & set != 0 => true,
         Some(_) => acting_signal(p, t).is_some(),
@@ -433,6 +457,7 @@ fn notify(p: &mut Process, tid: u32) {
     let t = p.threads.get_mut(&tid).unwrap();
     t.regs.elr -= 4;
     t.restarting = true;
+    t.recheck = true;
     p.runq.push_back(tid);
 }
 
@@ -517,10 +542,35 @@ pub const TRAMPOLINE: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4]
 const MAX_FRAMES: usize = 8;
 
 /// Deliver the current thread's pending signals before it returns to EL0.
+/// A process that has ended (or ends now, from a signal) never returns:
+/// something else runs instead, and gets its signals.
 pub fn return_to_user(tf: &mut TrapFrame) {
     let mut guard = PROCESS.lock();
     let Some(p) = guard.as_mut() else { return };
+    loop {
+        if p.exit_status.is_some() {
+            crate::sched::schedule(p, tf);
+        }
+        deliver(p, tf);
+        if p.exit_status.is_none() {
+            break;
+        }
+    }
+    // A timer whose signal was just taken re-arms.
+    crate::sched::update_timer(p);
+}
+
+fn deliver(p: &mut Process, tf: &mut TrapFrame) {
     let tid = p.current;
+    // A woken syscall gets to see whether it can complete first (see
+    // `Thread::recheck`); signals wait for its next return to user space.
+    // It stays `restarting` until the svc actually runs again: an interrupt
+    // may come first, and then the signal decides as usual.
+    if let Some(t) = p.threads.get_mut(&tid)
+        && core::mem::take(&mut t.recheck)
+    {
+        return;
+    }
     let mut frames = 0;
     while frames < MAX_FRAMES {
         let Some(t) = p.threads.get_mut(&tid) else { return };
@@ -548,7 +598,8 @@ pub fn return_to_user(tf: &mut TrapFrame) {
             continue;
         }
         if is_fatal(&act, info.signo) {
-            die(&info);
+            die(p, &info);
+            return;
         }
         if core::mem::take(&mut t.restarting) {
             interrupt_syscall(&mut p.aspace, t, tf, &act);
@@ -556,7 +607,8 @@ pub fn return_to_user(tf: &mut TrapFrame) {
         if push_frame(p, tf, &info, &act).is_err() {
             // Linux's force_sigsegv: a signal that can't be delivered ends the program.
             let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
-            process::exit_signaled(SIGSEGV, tf.sp_el0, tf.elr, why);
+            p.kill(SIGSEGV, tf.sp_el0, tf.elr, why, true);
+            return;
         }
         frames += 1;
     }
@@ -565,8 +617,6 @@ pub fn return_to_user(tf: &mut TrapFrame) {
     if let Some(t) = p.threads.get_mut(&tid) {
         t.restarting = false;
     }
-    // A timer whose signal was just taken re-arms.
-    crate::sched::update_timer(p);
 }
 
 fn put_u32(b: &mut [u8], off: usize, v: u32) {
@@ -664,7 +714,8 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
 pub fn sigreturn(p: &mut Process, tf: &mut TrapFrame) -> SysResult {
     let frame = tf.sp_el0;
     let Ok((b, fp)) = read_frame(&mut p.aspace, frame) else {
-        process::exit_signaled(SIGSEGV, frame, tf.elr, "rt_sigreturn with a corrupt signal frame")
+        p.kill(SIGSEGV, frame, tf.elr, "rt_sigreturn with a corrupt signal frame", true);
+        return Err(EBLOCKED);
     };
     for (i, x) in tf.x.iter_mut().enumerate() {
         *x = get_u64(&b, MC_REGS + i * 8);

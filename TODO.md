@@ -24,23 +24,31 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
    100 KB/s and 25 KB/s on the UART.
 6. ~~**Getting written files back to the host**~~: done. `export` /
    `--export` / `[[export]]` send directories back when the program ends.
-7. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
-   pipelines and `git commit` (run through `sh`) all stop here.
+7. ~~**fork/exec/wait**~~: done. Shell pipelines, Python `subprocess`,
+   Node `child_process`, Go `os/exec` and posix_spawn work.
 8. **Networking through the host** (`net`).
 
 ## Processes and exec
 
-- [~] `#!` scripts for the initial exec and `execve`.
-      Done for the initial program, including nested interpreters (`pip3` runs). `execve` comes with processes.
-- [ ] `fork`/`vfork`/`clone` without `CLONE_THREAD`: separate address spaces
-      with copy-on-write. Python `subprocess`, Node `child_process`,
-      busybox `sh -c 'a | b'` ("can't fork"), make, compilers.
-- [ ] `execve`/`execveat`: replace the process image, close `O_CLOEXEC`
-      fds, keep pid.
-- [ ] `wait4`/`waitid`, exit statuses, zombies, `SIGCHLD`.
-- [ ] Process groups and sessions (`setpgid`, `setsid`, `kill(-pgid)`).
+- [x] `#!` scripts for the initial exec and `execve`, including nested
+      interpreters and scripts written in the sandbox.
+- [x] `fork`/`vfork`/`clone` without `CLONE_THREAD`: separate address spaces
+      with copy-on-write. vfork (and `CLONE_VM|CLONE_VFORK`, posix_spawn)
+      is a copy too, with the parent waiting for exec or exit. At most 128
+      processes (zombies included).
+- [x] `execve`/`execveat` (and fexecve): replace the process image, close
+      `O_CLOEXEC` fds, keep the pid, reset handlers. Programs written in the
+      sandbox run too (`cc` then `./a.out`).
+- [x] `wait4`/`waitid` (`WNOHANG`, `WNOWAIT`), exit statuses, zombies,
+      `SIGCHLD` (`SIG_IGN`/`SA_NOCLDWAIT` reap at once), orphans go to init.
+- [x] Process groups and sessions (`setpgid`, `setsid`, `kill(-pgid)`, `kill(-1)`).
+      Init (the program) ignores signals from other processes it has no handler for, as in a pid namespace.
 - [ ] `pidfd_open`/`pidfd_send_signal`/`CLONE_PIDFD` (newer Python, Go, systemd).
-- [ ] `/proc/<pid>/…` for every process; `ps` lists nothing today.
+      Go probes it, reports it unimplemented, and falls back.
+- [ ] `CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` without `CLONE_THREAD`, `CLONE_PARENT` (reported).
+- [ ] `/proc/<pid>/…` for every process; `ps` lists nothing today. `/proc/self` shows the
+      calling process's status, stat and fds, but `readlink /proc/self` and `/proc/self/exe` are init's.
+- [ ] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
 
 ## Signals
 
@@ -181,8 +189,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 ## Memory
 
-- [ ] Copy-on-write and shared-page refcounting (needed by fork);
-      `MAP_SHARED` anonymous memory across fork.
+- [x] Copy-on-write and shared-page refcounting (needed by fork).
+- [x] `MAP_SHARED` anonymous memory (and `/dev/zero`) shared across fork.
 - [ ] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
 - [~] `mincore`; accept the remaining `madvise` advice values.

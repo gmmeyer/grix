@@ -2,11 +2,13 @@
 //! Queues, delivery and rt_sigreturn are in `crate::signal`.
 
 use crate::errno::*;
-use crate::process::{PID, Process, SigAction, WaitOn};
+use crate::process::{INIT, Process, SigAction, WaitOn};
+use crate::procs::PROCS;
 use crate::signal::{
     self, AltStack, NSIG, SA_KNOWN, SI_TKILL, SI_USER, SIGKILL, SIGSTOP, SigInfo, Target, UNBLOCKABLE,
 };
 use crate::uaccess::*;
+use alloc::vec::Vec;
 
 /// The kernel's sigset_t is 64 bits; libc passes its size to every call.
 const SIGSET_SIZE: u64 = 8;
@@ -161,17 +163,34 @@ pub fn sigaltstack(p: &mut Process, sp: u64, ss: u64, oss: u64) -> SysResult {
 }
 
 pub fn kill(p: &mut Process, pid: u64, sig: u64) -> SysResult {
-    // 0 is our process group, which we lead. -1 means every process except
-    // the caller and init, so there is nobody to signal.
     let pid = pid as i32;
-    if pid != PID as i32 && pid != 0 {
-        return Err(ESRCH);
+    let sig = if sig == 0 { 0 } else { signo(sig)? };
+    let (me, my_pgid, uid) = (p.pid, p.pgid, p.uid);
+    let mut procs = PROCS.lock();
+    // A positive pid is one process; 0 our process group, -pgid another
+    // one; -1 everyone but init and ourselves.
+    let targets: Vec<u32> = match pid {
+        pid if pid > 0 => alloc::vec![pid as u32],
+        0 => procs.all(p).filter(|q| q.pgid == my_pgid).map(|q| q.pid).collect(),
+        -1 => procs.all(p).map(|q| q.pid).filter(|&q| q != INIT && q != me).collect(),
+        g if g == i32::MIN => return Err(ESRCH),
+        g => procs.all(p).filter(|q| q.pgid == g.unsigned_abs()).map(|q| q.pid).collect(),
+    };
+    let mut found = false;
+    for target in targets {
+        let Some(q) = procs.get(p, target) else {
+            // Signalling a zombie works, and does nothing.
+            found |= pid > 0 && procs.zombies.contains_key(&target);
+            continue;
+        };
+        found = true;
+        if sig == 0 || super::proc::shields_init(q, me, sig) {
+            continue;
+        }
+        signal::send(q, Target::Process, SigInfo::sent(sig, SI_USER, me, uid, SENT_BY_PROGRAM))?;
     }
-    if sig == 0 {
-        return Ok(0);
-    }
-    let sig = signo(sig)?;
-    signal::send(p, Target::Process, SigInfo::sent(sig, SI_USER, p.uid, SENT_BY_PROGRAM)).map(|_| 0)
+    p.timer_dirty = true;
+    if found { Ok(0) } else { Err(ESRCH) }
 }
 
 /// tkill(tid, sig) when `tgid` is None, tgkill(tgid, tid, sig) otherwise.
@@ -180,20 +199,29 @@ pub fn tgkill(p: &mut Process, tgid: Option<u64>, tid: u64, sig: u64) -> SysResu
     if tid <= 0 || tgid.is_some_and(|g| g <= 0) {
         return Err(EINVAL);
     }
-    if tgid.is_some_and(|g| g != PID as i32) || !p.threads.contains_key(&(tid as u32)) {
-        return Err(ESRCH);
-    }
+    let tid = tid as u32;
+    let (me, uid) = (p.pid, p.uid);
+    let mut procs = PROCS.lock();
+    let owner = procs.all(p).find(|q| q.threads.contains_key(&tid)).map(|q| q.pid);
+    let Some(owner) = owner.filter(|&o| tgid.is_none_or(|g| g as u32 == o)) else { return Err(ESRCH) };
     if sig == 0 {
         return Ok(0);
     }
     let sig = signo(sig)?;
-    let info = SigInfo::sent(sig, SI_TKILL, p.uid, SENT_BY_PROGRAM);
-    signal::send(p, Target::Thread(tid as u32), info).map(|_| 0)
+    let q = procs.get(p, owner).unwrap();
+    if super::proc::shields_init(q, me, sig) {
+        return Ok(0);
+    }
+    let info = SigInfo::sent(sig, SI_TKILL, me, uid, SENT_BY_PROGRAM);
+    signal::send(q, Target::Thread(tid), info)?;
+    p.timer_dirty = true;
+    Ok(0)
 }
 
 /// rt_sigqueueinfo(tgid, sig, info) when `tid` is None, rt_tgsigqueueinfo otherwise.
 pub fn rt_sigqueueinfo(p: &mut Process, tgid: u64, tid: Option<u64>, sig: u64, uinfo: u64) -> SysResult {
-    if tgid as i32 != PID as i32 || tid.is_some_and(|t| !p.threads.contains_key(&(t as u32))) {
+    if tgid as i32 != p.pid as i32 || tid.is_some_and(|t| !p.threads.contains_key(&(t as u32))) {
+        // Queueing to other processes isn't supported (it needs si_code checks).
         return Err(ESRCH);
     }
     let sig = signo(sig)?;

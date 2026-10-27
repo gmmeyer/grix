@@ -218,7 +218,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Network sockets (`net`) |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
-| Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
+| Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `pidfd_*`; `/proc/<pid>` for other processes |
+| With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec` | Job control (stopping and continuing) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
@@ -233,9 +234,10 @@ and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
 Alpine's **python3** (threads, asyncio, hashlib, json, signal handlers,
 KeyboardInterrupt, tempfile, shutil, an on-disk sqlite database) and
 **nodejs** (timers, crypto, fs reads and writes, worker_threads,
-`process.on('SIG…')`, `os.networkInterfaces()`); static Go binaries (goroutine preemption, nil
-dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
-`dd`, `find`.
+`process.on('SIG…')`, `os.networkInterfaces()`, `child_process`); static Go binaries
+(goroutine preemption, nil dereference panics, `os/signal`, `os/exec`); busybox
+`cp -r`, `mv`, `rm -rf`, `tar`, `dd`, `find`, and `sh` scripts with pipelines and
+subshells.
 
 ## Roadmap
 
@@ -245,13 +247,12 @@ dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
 2. **Host directories**: read-write host mounts gated by policy, and
    exporting only what changed. Exporting whole directories works today.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
-4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
-5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
+4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
    crate with no external dependencies.
-6. **Agent integrations**: an MCP server and Python bindings; prebuilt
+5. **Agent integrations**: an MCP server and Python bindings; prebuilt
    runtime bundles; snapshots for instant start.
-7. **SMP and x86_64 guests**.
+6. **SMP and x86_64 guests**.
 
 ## Repository layout
 

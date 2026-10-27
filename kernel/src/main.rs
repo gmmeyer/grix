@@ -24,6 +24,7 @@ mod mm;
 mod netlink;
 mod process;
 mod procfs;
+mod procs;
 mod rng;
 mod sched;
 mod signal;

@@ -12,7 +12,7 @@ use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, FileRef, O_NONBLOCK, O_RDWR, new_file};
 use crate::ipc;
 use crate::netlink::{self, MAX_REQUEST, Netlink};
-use crate::process::{PID, Process};
+use crate::process::Process;
 use crate::uaccess::*;
 
 const AF_UNIX: u64 = 1;
@@ -92,7 +92,7 @@ pub fn socket(p: &mut Process, domain: u64, ty: u64, proto: u64) -> SysResult {
                     EPROTONOSUPPORT,
                 );
             }
-            let file = new_file(FileKind::Netlink(Netlink::new(PID as u32)), flags);
+            let file = new_file(FileKind::Netlink(Netlink::new(p.pid)), flags);
             p.fds.alloc(FdEntry { file, cloexec }, 0)
         }
         // Local IPC, so not gated by `net`. Until binding to paths exists the

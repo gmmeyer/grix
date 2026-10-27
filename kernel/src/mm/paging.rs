@@ -59,6 +59,16 @@ impl Prot {
     }
 }
 
+/// A leaf entry with writes forbidden, for pages shared copy-on-write.
+pub fn read_only(pte: u64) -> u64 {
+    pte | PTE_AP_RO
+}
+
+/// Does a leaf entry let EL0 (and the kernel) write the page?
+pub fn writable(pte: u64) -> bool {
+    pte & PTE_AP_RO == 0
+}
+
 pub struct PageTable {
     pub root: u64,
 }
@@ -112,6 +122,24 @@ impl PageTable {
         if start < end {
             visit(self.root, 0, 0, start, end, &mut f);
         }
+    }
+}
+
+impl Drop for PageTable {
+    /// Free the table pages (not the pages they map: the address space does that).
+    fn drop(&mut self) {
+        fn free_level(table: u64, level: u32) {
+            if level < 3 {
+                for idx in 0..512 {
+                    let v = unsafe { *entry(table, idx) };
+                    if v & PTE_VALID != 0 {
+                        free_level(v & ADDR_MASK, level + 1);
+                    }
+                }
+            }
+            frame::free(table);
+        }
+        free_level(self.root, 0);
     }
 }
 

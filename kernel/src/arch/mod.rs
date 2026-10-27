@@ -108,8 +108,13 @@ fn el0_sync(tf: &mut TrapFrame) {
                 process::Access::Read
             };
             match dfsc {
-                // Translation fault at any level: demand paging.
+                // Translation fault at any level: demand paging. A
+                // permission fault on a write may be a page shared
+                // copy-on-write; `user_fault` tells.
                 0b000100..=0b000111 => return process::user_fault(tf, far, access, esr),
+                0b001101..=0b001111 if access == process::Access::Write => {
+                    return process::user_fault(tf, far, access, esr);
+                }
                 0b100001 => (SIGBUS, BUS_ADRALN, far, Some(esr), "alignment fault"),
                 _ => (SIGSEGV, SEGV_ACCERR, far, Some(esr), access.describe_violation()),
             }

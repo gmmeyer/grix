@@ -1,7 +1,10 @@
 //! ELF64 (AArch64) loader. Segments become file-backed VMAs that are paged in
-//! on demand straight from the boot image.
+//! on demand: straight from the boot image, or from a file the program wrote.
 
-use crate::fs::Ino;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::fs::{Content, Ino};
 use crate::mm::aspace::{AddressSpace, Backing, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_down, page_up};
@@ -17,6 +20,51 @@ const PHDR_SIZE: usize = 56;
 /// Where position-independent main executables go (like Linux's ELF_ET_DYN_BASE).
 pub const DYN_BASE: u64 = 0x0000_aaaa_aaa0_0000;
 
+/// An executable's bytes: imported and unchanged (in the boot image), or
+/// written in the sandbox.
+#[derive(Clone)]
+pub enum Source {
+    Image(&'static [u8]),
+    Written(Content),
+}
+
+impl Source {
+    pub fn of(c: &Content) -> Source {
+        match c.lock().image() {
+            Some(bytes) => Source::Image(bytes),
+            None => Source::Written(c.clone()),
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            Source::Image(d) => d.len() as u64,
+            Source::Written(c) => c.lock().len(),
+        }
+    }
+
+    /// Bytes at `off`; returns how many there were.
+    pub fn read(&self, off: u64, out: &mut [u8]) -> usize {
+        match self {
+            Source::Image(d) => {
+                let from = (off as usize).min(d.len());
+                let n = out.len().min(d.len() - from);
+                out[..n].copy_from_slice(&d[from..from + n]);
+                n
+            }
+            Source::Written(c) => c.lock().read(off, out),
+        }
+    }
+
+    /// A VMA backing for `filesz` file bytes at `offset` (zero after them).
+    fn backing(&self, offset: u64, filesz: u64, ino: Ino) -> Backing {
+        match self {
+            Source::Image(data) => Backing::File { data, offset, filesz, ino, shared: None },
+            Source::Written(c) => Backing::Data { data: c.clone(), offset, end: offset + filesz, ino, shared: None },
+        }
+    }
+}
+
 pub struct Loaded {
     pub entry: u64,
     /// Load bias (0 for ET_EXEC).
@@ -25,7 +73,7 @@ pub struct Loaded {
     pub phnum: u64,
     /// End of the highest segment, page aligned.
     pub end: u64,
-    pub interp: Option<&'static str>,
+    pub interp: Option<String>,
 }
 
 struct Phdr {
@@ -49,16 +97,17 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, &'static str> {
     Ok(u64::from_le_bytes(d.get(o..o + 8).ok_or("truncated ELF")?.try_into().unwrap()))
 }
 
-/// Load `data` into `aspace`. For ET_DYN, `base` picks the load address
+/// Load `src` into `aspace`. For ET_DYN, `base` picks the load address
 /// (None = let the address space choose).
-pub fn load(
-    aspace: &mut AddressSpace,
-    data: &'static [u8],
-    ino: Ino,
-    base: Option<u64>,
-) -> Result<Loaded, &'static str> {
+pub fn load(aspace: &mut AddressSpace, src: &Source, ino: Ino, base: Option<u64>) -> Result<Loaded, &'static str> {
+    let mut header = [0u8; 64];
+    let n = src.read(0, &mut header);
+    let data = &header[..n];
     if data.get(..4) != Some(b"\x7fELF") {
         return Err("not an ELF file");
+    }
+    if data.len() < 64 {
+        return Err("truncated ELF");
     }
     if data[4] != 2 || data[5] != 1 {
         return Err("not a 64-bit little-endian ELF");
@@ -80,9 +129,14 @@ pub fn load(
         return Err("bad program header count");
     }
 
-    let mut phdrs = alloc::vec::Vec::with_capacity(phnum);
+    let mut table = alloc::vec![0u8; phnum * PHDR_SIZE];
+    if src.read(phoff as u64, &mut table) != table.len() {
+        return Err("truncated ELF");
+    }
+    let data = &table;
+    let mut phdrs = Vec::with_capacity(phnum);
     for i in 0..phnum {
-        let o = phoff.checked_add(i * PHDR_SIZE).ok_or("bad phoff")?;
+        let o = i * PHDR_SIZE;
         phdrs.push(Phdr {
             ty: u32_at(data, o)?,
             flags: u32_at(data, o + 4)?,
@@ -111,7 +165,7 @@ pub fn load(
 
     let mut end = 0;
     for p in loads() {
-        if p.filesz > p.memsz || p.offset.checked_add(p.filesz).is_none_or(|e| e > data.len() as u64) {
+        if p.filesz > p.memsz || p.offset.checked_add(p.filesz).is_none_or(|e| e > src.len()) {
             return Err("segment outside file");
         }
         if p.offset % PAGE_SIZE != p.vaddr % PAGE_SIZE {
@@ -128,7 +182,7 @@ pub fn load(
             start,
             end: vend,
             prot: Prot::from_elf(p.flags),
-            backing: Backing::File { data, offset: p.offset - skew, filesz: p.filesz + skew, ino, shared: None },
+            backing: src.backing(p.offset - skew, p.filesz + skew, ino),
         });
         end = end.max(vend);
     }
@@ -144,11 +198,15 @@ pub fn load(
     };
 
     let interp = match phdrs.iter().find(|p| p.ty == PT_INTERP) {
-        Some(p) => {
-            let raw = data.get(p.offset as usize..(p.offset + p.filesz) as usize).ok_or("bad PT_INTERP")?;
-            let raw = raw.split(|&b| b == 0).next().unwrap_or(raw);
-            Some(core::str::from_utf8(raw).map_err(|_| "bad PT_INTERP")?)
+        Some(p) if p.filesz <= 4096 => {
+            let mut raw = alloc::vec![0u8; p.filesz as usize];
+            if src.read(p.offset, &mut raw) != raw.len() {
+                return Err("bad PT_INTERP");
+            }
+            let raw = raw.split(|&b| b == 0).next().unwrap_or(&raw);
+            Some(String::from(core::str::from_utf8(raw).map_err(|_| "bad PT_INTERP")?))
         }
+        Some(_) => return Err("bad PT_INTERP"),
         None => None,
     };
 

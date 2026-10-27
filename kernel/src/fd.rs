@@ -3,6 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::errno::*;
@@ -10,6 +11,10 @@ use crate::fs::{Content, Dev, Ino};
 use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd, SocketEnd};
 
 pub const MAX_FDS: usize = 1024;
+/// Open file descriptions in all processes together (Linux's file-max):
+/// each takes kernel memory, and descriptor limits are per process.
+pub const MAX_OPEN_FILES: usize = 4096;
+static OPEN_FILES: AtomicUsize = AtomicUsize::new(0);
 
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_RDONLY: u32 = 0o0;
@@ -113,6 +118,12 @@ pub struct OpenFile {
     pub held: Option<crate::kmem::Charge>,
 }
 
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        OPEN_FILES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl OpenFile {
     pub fn nonblocking(&self) -> bool {
         self.flags & O_NONBLOCK != 0
@@ -142,11 +153,15 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
+/// A process's descriptors. Forking copies the table; the open files are
+/// shared, as on Linux.
+#[derive(Clone)]
 pub struct FdTable {
     slots: Vec<Option<FdEntry>>,
 }
 
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
+    OPEN_FILES.fetch_add(1, Ordering::Relaxed);
     Arc::new(Mutex::new(OpenFile {
         kind,
         offset: 0,
@@ -168,6 +183,26 @@ impl FdTable {
         t
     }
 
+    /// No descriptors at all (a process that has ended).
+    pub fn empty() -> Self {
+        ipc::changed();
+        FdTable { slots: Vec::new() }
+    }
+
+    /// execve: close what's marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        let mut closed = false;
+        for s in self.slots.iter_mut() {
+            if s.as_ref().is_some_and(|e| e.cloexec) {
+                *s = None;
+                closed = true;
+            }
+        }
+        if closed {
+            ipc::changed();
+        }
+    }
+
     fn slot(&self, fd: u64) -> Option<&FdEntry> {
         self.slots.get(usize::try_from(fd as i32).ok()?)?.as_ref()
     }
@@ -181,8 +216,13 @@ impl FdTable {
         self.slots.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)
     }
 
-    /// Install at the lowest free descriptor >= `min`.
+    /// Install at the lowest free descriptor >= `min`. Fails with ENFILE
+    /// once there are too many open files everywhere (the new one, already
+    /// made, is then dropped by the caller).
     pub fn alloc(&mut self, entry: FdEntry, min: usize) -> Result<u64, Errno> {
+        if OPEN_FILES.load(Ordering::Relaxed) > MAX_OPEN_FILES {
+            return Err(ENFILE);
+        }
         let start = min.min(MAX_FDS);
         let i = (start..MAX_FDS).find(|&i| self.slots.get(i).is_none_or(|s| s.is_none())).ok_or(EMFILE)?;
         if i >= self.slots.len() {

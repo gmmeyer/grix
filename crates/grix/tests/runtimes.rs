@@ -305,6 +305,51 @@ fn results_from_python_and_node() {
     assert_eq!(paths, [("js", ExportContent::Dir), ("js/out.txt", ExportContent::File(b"from node".to_vec()))]);
 }
 
+/// A runtime that can run programs: busybox's applets in /bin.
+fn with_shell(name: &str) -> SandboxBuilder {
+    let mut b =
+        sandbox(name).allow(Capability::Process).import(runtime("alpine/bin/busybox.static"), "/bin/busybox").unwrap();
+    for applet in ["sh", "echo", "tr", "ls", "cat"] {
+        b = b.symlink(&format!("/bin/{applet}"), "busybox").unwrap();
+    }
+    b
+}
+
+#[test]
+fn subprocesses_from_python_and_node() {
+    let py = r#"
+import os, subprocess, sys
+print(subprocess.run(["echo", "hi"], capture_output=True, text=True).stdout.strip())
+r = subprocess.run("echo $((6*7)) | tr 4 X; exit 5", shell=True, capture_output=True, text=True)
+print("shell", r.returncode, r.stdout.strip())
+p = subprocess.Popen([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+print("child", p.communicate("through python")[0].strip(), p.returncode)
+pid = os.fork()
+if pid == 0:
+    os._exit(9)
+print("fork", os.waitpid(pid, 0)[1] >> 8)
+"#;
+    let out = run(with_shell("python").env("PYTHONDONTWRITEBYTECODE", "1"), &["/usr/bin/python3", "-c", py]);
+    assert_eq!(out.stdout_str(), "hi\nshell 5 X2\nchild THROUGH PYTHON 0\nfork 9\n");
+    assert_no_surprises(&out);
+
+    let js = r#"
+const cp = require('child_process');
+console.log(cp.execSync('echo hi | tr a-z A-Z').toString().trim());
+const r = cp.spawnSync('sh', ['-c', 'echo out; echo err >&2; exit 6']);
+console.log('spawnSync', r.status, r.stdout.toString().trim(), r.stderr.toString().trim());
+const child = cp.spawn(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)']);
+let out = '';
+child.stdout.on('data', d => out += d);
+child.on('close', code => console.log('spawn', code, out.trim()));
+child.stdin.end('through node');
+"#;
+    let out = run(with_shell("node"), &["/usr/bin/node", "-e", js]);
+    assert_eq!(out.stdout_str(), "HI\nspawnSync 6 out err\nspawn 0 through node\n");
+    assert_no_surprises(&out);
+}
+
 #[test]
 fn stdin_for_python_and_node() {
     let py = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").build().unwrap();

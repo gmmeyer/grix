@@ -4,8 +4,10 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex;
 
-use super::paging::{ADDR_MASK, PageTable, Prot};
+use super::paging::{self, ADDR_MASK, PageTable, Prot};
 use super::{PAGE_SIZE, frame, p2v, page_down};
 use crate::arch;
 use crate::errno::*;
@@ -20,6 +22,10 @@ pub const SIGPAGE: u64 = STACK_TOP + 0x1_0000;
 /// At most this many mappings (Linux's vm.max_map_count is 65530): each
 /// takes kernel heap, so a program mapping page after page gets ENOMEM.
 pub const MAX_VMAS: usize = 32768;
+/// Mappings in all address spaces together: fork copies them, so the
+/// per-process limit alone doesn't bound kernel memory.
+pub const MAX_VMAS_TOTAL: usize = 65536;
+static VMAS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 /// mmap allocates top-down from here, leaving a gap below the stack.
 pub const MMAP_TOP: u64 = STACK_TOP - STACK_SIZE - (128 << 20);
 pub const MMAP_BOTTOM: u64 = 1 << 32;
@@ -49,10 +55,28 @@ pub enum Backing {
     /// `o < filesz`, and zero after that (ELF .bss). `ino` names the file.
     File { data: &'static [u8], offset: u64, filesz: u64, ino: Ino, shared: Option<Arc<()>> },
     /// Private copy of a file written in the sandbox: each page is copied
-    /// from byte `offset + o` of the file when it faults in.
-    Data { data: Content, offset: u64, ino: Ino, shared: Option<Arc<()>> },
+    /// from byte `offset + o` of the file when it faults in. File bytes at
+    /// or past `end` read as zero (an ELF segment's .bss).
+    Data { data: Content, offset: u64, end: u64, ino: Ino, shared: Option<Arc<()>> },
     /// Each page starts with the signal-return trampoline (`signal::TRAMPOLINE`).
     Sigpage,
+    /// MAP_SHARED anonymous memory: page `index + o / PAGE_SIZE` of
+    /// `pages`, which every mapping of it sees, in every process that
+    /// shares it since a fork. Never copy-on-write.
+    Shared { pages: Arc<SharedPages>, index: u64 },
+}
+
+/// The pages of a MAP_SHARED anonymous mapping, made as they're first
+/// touched. Holds a reference to each (every mapping holds its own).
+#[derive(Debug, Default)]
+pub struct SharedPages(Mutex<BTreeMap<u64, u64>>);
+
+impl Drop for SharedPages {
+    fn drop(&mut self) {
+        for &pa in self.0.get_mut().values() {
+            frame::free(pa);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,10 +98,13 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
-            Backing::Data { ref data, offset, ino, ref shared } => {
-                Backing::Data { data: data.clone(), offset: offset + skip, ino, shared: shared.clone() }
+            Backing::Data { ref data, offset, end, ino, ref shared } => {
+                Backing::Data { data: data.clone(), offset: offset + skip, end, ino, shared: shared.clone() }
             }
             Backing::Sigpage => Backing::Sigpage,
+            Backing::Shared { ref pages, index } => {
+                Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
+            }
             Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
                 data,
                 offset: offset + skip,
@@ -113,13 +140,92 @@ pub enum FaultError {
 pub struct AddressSpace {
     pub pt: PageTable,
     vmas: BTreeMap<u64, Vma>,
+    /// How many of `vmas` are counted in VMAS_TOTAL.
+    counted: usize,
     pub brk_start: u64,
     pub brk: u64,
 }
 
+impl Drop for AddressSpace {
+    /// Release every page (shared ones lose a reference). Must not be the
+    /// active address space.
+    fn drop(&mut self) {
+        self.pt.for_each_mapped(0, USER_TOP, |_, pte| unsafe {
+            frame::free(*pte & ADDR_MASK);
+            *pte = 0;
+        });
+        VMAS_TOTAL.fetch_sub(self.counted, Ordering::Relaxed);
+    }
+}
+
 impl AddressSpace {
     pub fn new() -> Option<Self> {
-        Some(Self { pt: PageTable::new()?, vmas: BTreeMap::new(), brk_start: 0, brk: 0 })
+        Some(Self { pt: PageTable::new()?, vmas: BTreeMap::new(), counted: 0, brk_start: 0, brk: 0 })
+    }
+
+    /// Bring VMAS_TOTAL up to date after the mappings changed.
+    fn recount(&mut self) {
+        let n = self.vmas.len();
+        VMAS_TOTAL.fetch_add(n, Ordering::Relaxed);
+        VMAS_TOTAL.fetch_sub(self.counted, Ordering::Relaxed);
+        self.counted = n;
+    }
+
+    /// A copy for a forked child: the same mappings, sharing every page.
+    /// Writable pages become read-only in both, and the first write to one
+    /// copies it (`fault`'s copy-on-write).
+    pub fn fork(&mut self) -> Result<AddressSpace, Errno> {
+        if VMAS_TOTAL.load(Ordering::Relaxed) + self.vmas.len() > MAX_VMAS_TOTAL {
+            return Err(ENOMEM);
+        }
+        let mut child = AddressSpace::new().ok_or(ENOMEM)?;
+        child.vmas = self.vmas.clone();
+        child.recount();
+        child.brk_start = self.brk_start;
+        child.brk = self.brk;
+        let mut out_of_memory = false;
+        for v in self.vmas.values() {
+            let cow = v.prot.write && !matches!(v.backing, Backing::Shared { .. });
+            self.pt.for_each_mapped(v.start, v.end, |va, pte| unsafe {
+                if out_of_memory {
+                    return;
+                }
+                let shared = if cow { paging::read_only(*pte) } else { *pte };
+                let pa = shared & ADDR_MASK;
+                frame::share(pa);
+                if child.pt.map(va, pa, shared & !ADDR_MASK).is_none() {
+                    frame::free(pa);
+                    out_of_memory = true;
+                }
+                *pte = shared;
+            });
+        }
+        arch::flush_tlb();
+        // The child is dropped, which releases what it got; the parent's
+        // pages are just read-only now, and fault back in writable.
+        if out_of_memory { Err(ENOMEM) } else { Ok(child) }
+    }
+
+    /// The page at `page` is mapped read-only in a writable mapping: it's
+    /// shared with a forked process. Copy it, unless nobody else has it
+    /// any more, then make it writable.
+    fn unshare(&mut self, page: u64, pte: u64, prot: Prot) -> Result<(), FaultError> {
+        let old = pte & ADDR_MASK;
+        let pa = if frame::is_shared(old) {
+            let new = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+            // SAFETY: both frames are mapped linearly; `new` is ours alone.
+            unsafe { core::ptr::copy_nonoverlapping(p2v(old) as *const u8, p2v(new) as *mut u8, PAGE_SIZE as usize) };
+            frame::free(old);
+            new
+        } else {
+            old
+        };
+        if prot.exec {
+            arch::sync_icache(p2v(pa), PAGE_SIZE);
+        }
+        self.pt.map(page, pa, prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
+        arch::flush_tlb();
+        Ok(())
     }
 
     pub fn activate(&self) {
@@ -139,7 +245,11 @@ impl AddressSpace {
 
     /// Room for `more` mappings (an operation that may split some)?
     pub fn has_room(&self, more: usize) -> Result<(), Errno> {
-        if self.vmas.len() + more > MAX_VMAS { Err(ENOMEM) } else { Ok(()) }
+        if self.vmas.len() + more > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + more > MAX_VMAS_TOTAL {
+            Err(ENOMEM)
+        } else {
+            Ok(())
+        }
     }
 
     /// Would changing `[start, end)` stay within MAX_VMAS? The mappings it
@@ -151,7 +261,12 @@ impl AddressSpace {
         let edges =
             overlapping.iter().filter(|v| v.start < start).count() + overlapping.iter().filter(|v| v.end > end).count();
         let after = self.vmas.len() - overlapping.len() + edges + if keep { overlapping.len() } else { 0 } + added;
-        if after > MAX_VMAS && after > self.vmas.len() { Err(ENOMEM) } else { Ok(()) }
+        let growth = after.saturating_sub(self.vmas.len());
+        if growth > 0 && (after > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + growth > MAX_VMAS_TOTAL) {
+            Err(ENOMEM)
+        } else {
+            Ok(())
+        }
     }
 
     /// Grow the anonymous mapping that ends at `end` up to `new_end`, if
@@ -189,6 +304,7 @@ impl AddressSpace {
     pub fn map(&mut self, vma: Vma) {
         self.unmap(vma.start, vma.end);
         self.vmas.insert(vma.start, vma);
+        self.recount();
     }
 
     /// Remove `[start, end)` from the VMA set without touching pages.
@@ -213,6 +329,7 @@ impl AddressSpace {
     pub fn unmap(&mut self, start: u64, end: u64) {
         self.carve(start, end);
         self.discard(start, end);
+        self.recount();
     }
 
     /// Free the pages in `[start, end)` but keep the VMAs; the next access
@@ -248,18 +365,22 @@ impl AddressSpace {
         if expected < end {
             return Err(ENOMEM);
         }
+        let flags = prot.pte_flags();
         for mut piece in self.carve(start, end) {
             piece.prot = prot;
+            // A page shared with a forked process stays read-only until
+            // it's written (and copied); shared memory is meant to be shared.
+            let cow = prot.write && !matches!(piece.backing, Backing::Shared { .. });
+            self.pt.for_each_mapped(piece.start, piece.end, |_, pte| unsafe {
+                let pa = *pte & ADDR_MASK;
+                *pte = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
+                if prot.exec {
+                    arch::sync_icache(p2v(pa), PAGE_SIZE);
+                }
+            });
             self.vmas.insert(piece.start, piece);
         }
-        let flags = prot.pte_flags();
-        self.pt.for_each_mapped(start, end, |_, pte| unsafe {
-            let pa = *pte & ADDR_MASK;
-            *pte = pa | flags;
-            if prot.exec {
-                arch::sync_icache(p2v(pa), PAGE_SIZE);
-            }
-        });
+        self.recount();
         arch::flush_tlb();
         Ok(())
     }
@@ -295,6 +416,7 @@ impl AddressSpace {
         moved.start = new;
         moved.end = new + new_len;
         self.vmas.insert(new, moved);
+        self.recount();
         for (off, pte) in pages {
             self.pt.map(new + off, pte & ADDR_MASK, pte & !ADDR_MASK).ok_or(ENOMEM)?;
         }
@@ -302,23 +424,59 @@ impl AddressSpace {
         Ok(new)
     }
 
-    /// Resolve a fault on an unmapped page.
+    /// Resolve a fault: an unmapped page, or a write to one shared
+    /// copy-on-write.
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), FaultError> {
         let page = page_down(va);
         let vma = self.find(va).ok_or(FaultError::Segv)?.clone();
-        if !vma.allows(access) || self.pt.lookup(page).is_some() {
+        if !vma.allows(access) {
             return Err(FaultError::Segv);
+        }
+        if let Some(pte) = self.pt.lookup(page) {
+            return match vma.backing {
+                _ if access != Access::Write || paging::writable(pte) => Err(FaultError::Segv),
+                Backing::Shared { .. } => {
+                    self.pt.map(page, pte & ADDR_MASK, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
+                    arch::flush_tlb();
+                    Ok(())
+                }
+                _ => self.unshare(page, pte, vma.prot),
+            };
+        }
+        if let Backing::Shared { ref pages, index } = vma.backing {
+            let idx = index + (page - vma.start) / PAGE_SIZE;
+            let mut pages = pages.0.lock();
+            let pa = match pages.get(&idx) {
+                Some(&pa) => pa,
+                None => {
+                    let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+                    pages.insert(idx, pa);
+                    pa
+                }
+            };
+            if vma.prot.exec {
+                arch::sync_icache(p2v(pa), PAGE_SIZE);
+            }
+            frame::share(pa);
+            if self.pt.map(page, pa, vma.prot.pte_flags()).is_none() {
+                frame::free(pa);
+                return Err(FaultError::OutOfMemory);
+            }
+            return Ok(());
         }
         let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
         let src: &[u8] = match vma.backing {
             Backing::Anon => &[],
-            Backing::Data { ref data, offset, .. } => {
+            Backing::Data { ref data, offset, end, .. } => {
                 // SAFETY: `pa` is the frame just allocated, mapped linearly.
                 let dst = unsafe { core::slice::from_raw_parts_mut(p2v(pa) as *mut u8, PAGE_SIZE as usize) };
-                data.lock().read(offset + (page - vma.start), dst);
+                let at = offset + (page - vma.start);
+                let n = end.saturating_sub(at).min(PAGE_SIZE) as usize;
+                data.lock().read(at, &mut dst[..n]);
                 &[]
             }
             Backing::Sigpage => &crate::signal::TRAMPOLINE,
+            Backing::Shared { .. } => unreachable!("handled above"),
             Backing::File { data, offset, filesz, .. } => {
                 let o = page - vma.start;
                 let n = filesz.saturating_sub(o).min(PAGE_SIZE);
@@ -355,7 +513,10 @@ impl AddressSpace {
             if !self.find(page).ok_or(EFAULT)?.allows(access) {
                 return Err(EFAULT);
             }
-            if self.pt.lookup(page).is_none() {
+            let pte = self.pt.lookup(page);
+            // Not there yet, or shared copy-on-write and about to be written:
+            // the kernel's own access must not fault.
+            if pte.is_none_or(|pte| write && !paging::writable(pte)) {
                 self.fault(page, access).map_err(|e| match e {
                     FaultError::OutOfMemory => ENOMEM,
                     FaultError::Segv => EFAULT,

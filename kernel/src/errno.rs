@@ -22,6 +22,7 @@ pub const ENODEV: Errno = Errno(19);
 pub const ENOTDIR: Errno = Errno(20);
 pub const EISDIR: Errno = Errno(21);
 pub const EINVAL: Errno = Errno(22);
+pub const ENFILE: Errno = Errno(23);
 pub const EMFILE: Errno = Errno(24);
 pub const ENOTTY: Errno = Errno(25);
 pub const EFBIG: Errno = Errno(27);
@@ -39,6 +40,9 @@ pub const EOPNOTSUPP: Errno = Errno(95);
 pub const ENOBUFS: Errno = Errno(105);
 pub const ENOTCONN: Errno = Errno(107);
 pub const E2BIG: Errno = Errno(7);
+pub const ENOEXEC: Errno = Errno(8);
+pub const ECHILD: Errno = Errno(10);
+pub const ELIBBAD: Errno = Errno(80);
 pub const ETIMEDOUT: Errno = Errno(110);
 
 /// Internal: the syscall blocked the calling thread (or it exited); the

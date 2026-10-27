@@ -10,15 +10,15 @@ use crate::process::{self, MAX_THREADS, Process, Thread, WaitOn};
 use crate::time;
 use crate::uaccess::*;
 
-const CLONE_VM: u64 = 0x100;
+pub const CLONE_VM: u64 = 0x100;
 const CLONE_SIGHAND: u64 = 0x800;
 const CLONE_PIDFD: u64 = 0x1000;
-const CLONE_VFORK: u64 = 0x4000;
+pub const CLONE_VFORK: u64 = 0x4000;
 const CLONE_THREAD: u64 = 0x10000;
-const CLONE_SETTLS: u64 = 0x80000;
-const CLONE_PARENT_SETTID: u64 = 0x10_0000;
-const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
-const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+pub const CLONE_SETTLS: u64 = 0x80000;
+pub const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
 /// CLONE_NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET
 const CLONE_NAMESPACES: u64 = 0x2_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
 
@@ -45,6 +45,9 @@ pub fn clone3(p: &mut Process, tf: &TrapFrame, uargs: u64, size: u64) -> SysResu
     let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     // struct clone_args: flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls
     let (stack, stack_size) = (w(5), w(6));
+    if w(4) > crate::signal::NSIG as u64 || w(0) & 0xff != 0 {
+        return Err(EINVAL);
+    }
     let args = CloneArgs {
         flags: w(0) | (w(4) & 0xff),
         stack: if stack == 0 { 0 } else { stack.checked_add(stack_size).ok_or(EINVAL)? },
@@ -62,9 +65,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return p.deny(n, name, "privileged", "new namespaces");
     }
     if flags & CLONE_THREAD == 0 {
-        require(p, n, Capability::Process, "")?;
-        let what = if flags & CLONE_VFORK != 0 { "vfork" } else { "fork" };
-        return p.unimplemented(n, name, what, ENOSYS);
+        return super::proc::fork(p, tf, n, args);
     }
     require(p, n, Capability::Threads, "")?;
     if flags & (CLONE_VM | CLONE_SIGHAND) != CLONE_VM | CLONE_SIGHAND {
@@ -73,11 +74,11 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & CLONE_PIDFD != 0 {
         return p.unimplemented(n, name, "CLONE_PIDFD", EINVAL);
     }
-    if p.threads.len() >= MAX_THREADS {
+    if crate::procs::PROCS.lock().threads(p) >= MAX_THREADS {
         return Err(EAGAIN);
     }
 
-    let tid = p.next_tid;
+    let tid = process::new_tid();
     // The child resumes right after the svc with the parent's registers, x0 = 0.
     let mut regs = *tf;
     regs.x[0] = 0;
@@ -99,7 +100,6 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.tpidr = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tpidr() };
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     t.sigmask = sigmask;
-    p.next_tid += 1;
     p.threads.insert(tid, t);
     p.runq.push_back(tid);
     p.timer_dirty = true;
@@ -113,7 +113,8 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     // Its queued signals went with it, perhaps a timer's.
     crate::timer::resync(p);
     if p.threads.is_empty() {
-        process::exit(code);
+        p.terminate(process::exited(code));
+        return Err(EBLOCKED);
     }
     if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
         futex_wake(p, t.clear_child_tid, 1, u32::MAX);

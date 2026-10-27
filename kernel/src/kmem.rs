@@ -23,6 +23,10 @@ pub fn available() -> u64 {
 pub struct Charge(u64);
 
 impl Charge {
+    pub fn bytes(&self) -> u64 {
+        self.0
+    }
+
     pub fn new(bytes: u64) -> Result<Charge, Errno> {
         let mut c = Charge(0);
         c.resize(bytes)?;

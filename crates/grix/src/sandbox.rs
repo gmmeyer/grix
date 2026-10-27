@@ -200,6 +200,17 @@ impl SandboxBuilder {
         Ok(self)
     }
 
+    /// Create a symbolic link at `guest` pointing to `target` (absolute,
+    /// or relative to the link's directory), like `ln -s target guest`.
+    pub fn symlink(mut self, guest: &str, target: &str) -> Result<Self> {
+        let path = image::guest_path(guest)?;
+        if target.is_empty() || target.contains('\0') {
+            bail!("symlink target {target:?} for {guest} must be non-empty, without NUL");
+        }
+        self.files.insert(path, Node::Symlink { target: target.into() });
+        Ok(self)
+    }
+
     /// Create an empty directory at `guest`.
     pub fn dir(mut self, guest: &str) -> Result<Self> {
         let path = image::guest_path(guest)?;
