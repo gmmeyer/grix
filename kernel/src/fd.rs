@@ -46,6 +46,8 @@ pub enum FileKind {
     UnixUnbound(u64),
     /// signalfd: reads pending signals in this mask.
     SignalFd(u64),
+    /// An AF_INET/AF_INET6 socket (inet.rs).
+    Inet(crate::inet::Inet),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -94,6 +96,7 @@ impl FileKind {
             // Depends on the reader's pending signals: see file::poll_kind.
             FileKind::SignalFd(_) => (0, 0),
             FileKind::Socket(s) => s.poll(),
+            FileKind::Inet(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).
             FileKind::Epoll(_) => (0, 0),

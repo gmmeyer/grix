@@ -54,6 +54,20 @@ go to the PL011 UART, on a Unix socket the host reads (bounded). When the
 program ends (`process::finish`), `export.rs` sends the directories listed
 in `Image::exports` before the exit status (`wire::ExportMsg`).
 
+Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
+`crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):
+the guest has no TCP/IP stack. A TCP connect becomes `link::ToHost::Connect`
+on `Channel::Link`, the host checks its `NetPolicy` and connects, and data
+flows as `Data` messages with credit-based flow control (`link::WINDOW` per
+connection each way; stdin uses the same scheme). Connections to the
+guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
+socket pairs queued on the listener. Ports forwarded from the host arrive
+as `Incoming`. UDP only carries DNS: queries to port 53 go to the host's
+resolver. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
+(`host.grix.internal`, only with an explicit rule), and the nameserver is
+10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
+denials come back as `Denied` events with capability `allow_host`.
+
 Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
 process is in `PROCESS`; every other one, and zombies, are in
 `procs::PROCS` (lock order: `PROCESS`, then `PROCS`). `sched::schedule`
@@ -128,6 +142,12 @@ runs again.
    only devices are the PL011 and the virtio console, and both carry
    nothing but the framed channel to the host; keep it that way (no more
    ports, no `virtconsole`, which drops output under backpressure).
+   Networking is no exception: there's no NIC and no guest TCP/IP stack.
+   Sockets are `link` messages on the console, and the host's proxy
+   (`crates/grix/src/net.rs`) makes every connection after checking the
+   policy, so a compromised guest can't reach anything the policy doesn't
+   allow. The host never trusts the guest's flow control either: credit,
+   threads, lookups and queued frames all have host-side caps.
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).
@@ -142,12 +162,14 @@ runs again.
     - File data counts pages (`fs::set_limit`), and nodes and names count
       against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
-      files) take a `kmem::Charge`.
+      files, network receive windows, DNS answers) take a `kmem::Charge`.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
       all processes), queued real-time signals, inotify watches, POSIX
       timers, threads (all processes), descriptors, open files
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
-      zombies included). argv and environment copies take a `kmem::Charge`.
+      zombies included), network connections (`inet::MAX_CONNS`) and
+      connections waiting to be accepted (`inet::MAX_PENDING`). argv and
+      environment copies take a `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,
     and fork copies whatever is per process.

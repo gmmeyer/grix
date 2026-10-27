@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::event::GuestEvent;
 use crate::export::{Collector, Export};
 use crate::image::{self, Node};
+use crate::net::{ForwardFrom, HostRule, NetPolicy};
 use crate::vmm::{self, VmConfig, VmEnd};
 
 /// Room the kernel needs below the boot image (kernel, heap, page tables).
@@ -109,13 +110,18 @@ impl RunOutput {
         self.exports.iter().find(|e| e.dir == dir)
     }
 
-    /// Capabilities the program asked for but did not have.
+    /// Capabilities the program asked for but did not have (not counting
+    /// connections the network policy refused).
     pub fn missing_capabilities(&self) -> Vec<String> {
         let mut caps: Vec<String> = self
             .events
             .iter()
             .filter_map(|e| match e {
-                GuestEvent::Denied { capability, .. } if capability != "privileged" => Some(capability.clone()),
+                GuestEvent::Denied { capability, .. }
+                    if capability != "privileged" && capability != crate::event::NET_POLICY =>
+                {
+                    Some(capability.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -151,6 +157,7 @@ pub struct SandboxBuilder {
     max_output: usize,
     exports: Vec<String>,
     max_export: usize,
+    net: NetPolicy,
     uid: u32,
     gid: u32,
     kernel: PathBuf,
@@ -171,6 +178,7 @@ impl Default for SandboxBuilder {
             max_output: DEFAULT_MAX_OUTPUT,
             exports: Vec::new(),
             max_export: DEFAULT_MAX_EXPORT,
+            net: NetPolicy::default(),
             uid: 1000,
             gid: 1000,
             kernel: env_path(
@@ -279,6 +287,47 @@ impl SandboxBuilder {
     pub fn max_export(mut self, bytes: usize) -> Self {
         self.max_export = bytes;
         self
+    }
+
+    /// Let the program connect (with [`Capability::Net`]) only to hosts a
+    /// rule allows: `example.com`, `*.example.com`, `1.2.3.4`,
+    /// `10.0.0.0/8`, `[::1]`, each optionally with `:port`. Names cover the
+    /// addresses DNS gives for them, and only allowed names resolve.
+    ///
+    /// Without any rule, `net` allows connections anywhere except the host
+    /// itself (`host.grix.internal`, which reaches the host's localhost) and
+    /// link-local addresses such as cloud metadata services: those need a
+    /// rule naming them either way.
+    pub fn allow_host(mut self, rule: &str) -> Result<Self> {
+        let rule = HostRule::parse(rule)?;
+        self.net.allow.get_or_insert_with(Vec::new).push(rule);
+        Ok(self)
+    }
+
+    /// Forward connections to `host` (an address and port the host listens
+    /// on, like `127.0.0.1:8080`) to `guest_port`, where a program in the
+    /// sandbox listens (with [`Capability::Net`]).
+    pub fn forward(mut self, host: &str, guest_port: u16) -> Result<Self> {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
+            .with_context(|| format!("forward address {host:?}"))?
+            .next()
+            .with_context(|| format!("forward address {host:?} resolves to nothing"))?;
+        if guest_port == 0 {
+            bail!("forwarding {host} needs a guest port");
+        }
+        self.net.forwards.push((ForwardFrom::Addr(addr), guest_port));
+        Ok(self)
+    }
+
+    /// Like [`forward`](SandboxBuilder::forward), from a listener the
+    /// caller bound: to port 0, say, to get a free port and know which.
+    /// Every run of the sandbox serves it.
+    pub fn forward_listener(mut self, listener: std::net::TcpListener, guest_port: u16) -> Result<Self> {
+        if guest_port == 0 {
+            bail!("forwarding a listener needs a guest port");
+        }
+        self.net.forwards.push((ForwardFrom::Listener(std::sync::Arc::new(listener)), guest_port));
+        Ok(self)
     }
 
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
@@ -400,11 +449,13 @@ impl Sandbox {
             entries: image::entries(&cfg.files),
             exports: cfg.exports.iter().map(String::as_str).collect(),
             export_budget: cfg.max_export as u64,
+            forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
         }
         .encode();
         let mut exports = Collector::new(&cfg.exports, cfg.max_export as u64);
 
         let vm = VmConfig {
+            net: cfg.net.clone(),
             qemu: cfg.qemu.clone(),
             kernel: cfg.kernel.clone(),
             memory_mb: cfg.memory_mb,
@@ -430,7 +481,7 @@ impl Sandbox {
             *truncated |= room < payload.len();
             room
         };
-        let end = vmm::run(&vm, &bytes, cfg.timeout, stdin, |ch, payload| match ch {
+        let run = vmm::run(&vm, &bytes, cfg.timeout, stdin, |ch, payload| match ch {
             Channel::Stdout => {
                 let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
                 on_output(Stream::Stdout, &payload[..n]);
@@ -445,8 +496,10 @@ impl Sandbox {
                 Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
             Channel::Export => exports.push(payload),
-            Channel::Exit => {}
+            Channel::Exit | Channel::Link => {}
         })?;
+        out.events.extend(run.events);
+        let end = run.end;
         out.exports = exports.finish();
         out.duration = started.elapsed();
         out.status = match end {

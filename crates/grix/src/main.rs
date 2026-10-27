@@ -34,6 +34,15 @@ struct RunArgs {
     /// not exist yet, or be empty). Repeatable.
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
+    /// With `net`, only connect to hosts these rules allow (example.com,
+    /// *.example.com, 1.2.3.4, 10.0.0.0/8, each optionally :port).
+    /// host.grix.internal is the host's own localhost. Repeatable.
+    #[arg(long = "allow-host", value_name = "RULE")]
+    allow_hosts: Vec<String>,
+    /// Forward [ADDR:]HOSTPORT on the host (127.0.0.1 by default) to
+    /// GUESTPORT in the sandbox. Repeatable.
+    #[arg(short = 'p', long = "publish", value_name = "[ADDR:]HOSTPORT:GUESTPORT")]
+    publish: Vec<String>,
     /// Grant a capability (fs_write, threads, process, net). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
@@ -124,6 +133,19 @@ fn run(args: RunArgs) -> Result<i32> {
         Export::check_destination(host).context("export destination")?;
         if exports[..i].iter().any(|(_, h)| h == host) {
             bail!("{} is the destination of two exports", host.display());
+        }
+    }
+    for rule in &args.allow_hosts {
+        b = b.allow_host(rule)?;
+    }
+    for spec in &args.publish {
+        let (host, guest) =
+            spec.rsplit_once(':').with_context(|| format!("--publish {spec:?} must be HOSTPORT:GUESTPORT"))?;
+        let guest: u16 = guest.parse().with_context(|| format!("--publish {spec:?}: bad guest port"))?;
+        let host = if host.contains(':') { host.to_string() } else { format!("127.0.0.1:{host}") };
+        b = b.forward(&host, guest)?;
+        if !args.quiet {
+            eprintln!("grix: forwarding {host} to port {guest} in the sandbox");
         }
     }
     for name in &args.allow {

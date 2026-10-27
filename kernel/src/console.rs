@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use grix_abi::wire::{self, Channel, ExitKind, Input, InputDecoder};
 use spin::Mutex;
@@ -61,10 +62,11 @@ fn frames(ch: Channel, data: &[u8], mut out: impl FnMut(&[&[u8]])) {
     }
 }
 
-/// stdin bytes received from the host and not read yet. When it's full the
-/// receive buffers stay with us, so QEMU stops reading the host's input:
-/// backpressure all the way to whatever feeds the sandbox.
-const STDIN_CAPACITY: usize = 64 * 1024;
+/// stdin bytes received from the host and not read yet. The host sends no
+/// more than the credit it was given (`link::STDIN_WINDOW`, then what the
+/// program reads), so the console never stalls on stdin and networking
+/// flows past it: backpressure all the way to whatever feeds the sandbox.
+const STDIN_CAPACITY: usize = grix_abi::link::STDIN_WINDOW as usize;
 
 struct Stdin {
     buf: VecDeque<u8>,
@@ -73,6 +75,8 @@ struct Stdin {
     decoder: Box<InputDecoder>,
     /// Bumped whenever stdin gets data or ends (for edge-triggered epoll).
     version: u64,
+    /// Read since credit was last returned to the host.
+    owed: u32,
 }
 
 struct Console {
@@ -87,7 +91,7 @@ static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 /// Switch to virtio-console. Needs the frame allocator.
 pub fn init_virtio() {
     let dev = virtio::Console::probe().expect("no virtio console (QEMU must be started with one)");
-    let stdin = Stdin { buf: VecDeque::new(), eof: true, decoder: Box::default(), version: 0 };
+    let stdin = Stdin { buf: VecDeque::new(), eof: true, decoder: Box::default(), version: 0, owed: 0 };
     *CONSOLE.lock() = Some(Console { dev, stdin, out_version: 0 });
 }
 
@@ -192,9 +196,11 @@ pub fn start(stdin_from_host: bool) {
     crate::arch::irq::enable_spi(c.dev.irq);
     if stdin_from_host {
         c.stdin.eof = false;
-        // Whatever the host sent while we booted.
-        drain(c);
     }
+    // Whatever the host sent while we booted.
+    let link = drain(c);
+    drop(guard);
+    dispatch(link);
 }
 
 /// Handle interrupt `id` if it's the console's: move received frames into
@@ -203,35 +209,38 @@ pub fn interrupt(id: u32) -> bool {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut().filter(|c| c.dev.irq == id) else { return false };
     c.dev.ack_interrupt();
-    drain(c);
+    let link = drain(c);
     if c.dev.tx_interrupt() {
         c.out_version += 1;
         crate::ipc::changed();
     }
+    drop(guard);
+    dispatch(link);
     true
 }
 
-fn drain(c: &mut Console) {
+/// Take what the host sent: stdin into its buffer, and networking messages
+/// out, for `dispatch` once the console lock is released (handling them may
+/// send replies).
+fn drain(c: &mut Console) -> Vec<Vec<u8>> {
     let Console { dev, stdin, .. } = c;
-    let Stdin { buf, eof, decoder, version } = stdin;
+    let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
+    let mut link = Vec::new();
     dev.receive(|bytes| {
-        // Frames decode to no more bytes than they arrived in.
-        if buf.len() + bytes.len() > STDIN_CAPACITY {
-            return false;
-        }
         for &b in bytes {
             match decoder.push(b) {
-                _ if *eof => {}
-                Some((Input::Stdin, data)) => {
+                Some((Input::Link, msg)) => link.push(msg.to_vec()),
+                // The host keeps within its credit; nothing past it fits.
+                Some((Input::Stdin, data)) if !*eof && buf.len() + data.len() <= STDIN_CAPACITY => {
                     buf.extend(data);
                     changed = true;
                 }
-                Some((Input::StdinEof, _)) => {
+                Some((Input::StdinEof, _)) if !*eof => {
                     *eof = true;
                     changed = true;
                 }
-                None => {}
+                _ => {}
             }
         }
         true
@@ -239,6 +248,13 @@ fn drain(c: &mut Console) {
     if changed {
         *version += 1;
         crate::ipc::changed();
+    }
+    link
+}
+
+fn dispatch(link: Vec<Vec<u8>>) {
+    for msg in link {
+        crate::inet::from_host(&msg);
     }
 }
 
@@ -253,22 +269,30 @@ pub enum StdinRead {
 pub fn stdin_read(out: &mut [u8]) -> StdinRead {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return StdinRead::Eof };
-    // Pick up anything that arrived since the last interrupt, and repost
-    // buffers there's room for again.
-    drain(c);
+    // Pick up anything that arrived since the last interrupt.
+    let link = drain(c);
     let s = &mut c.stdin;
-    if s.buf.is_empty() {
-        return if s.eof { StdinRead::Eof } else { StdinRead::Empty };
-    }
-    let n = out.len().min(s.buf.len());
-    for (o, b) in out.iter_mut().zip(s.buf.drain(..n)) {
-        *o = b;
-    }
-    if s.buf.is_empty() {
-        s.buf = VecDeque::new(); // give the memory back
-    }
-    drain(c);
-    StdinRead::Data(n)
+    let result = if s.buf.is_empty() {
+        if s.eof { StdinRead::Eof } else { StdinRead::Empty }
+    } else {
+        let n = out.len().min(s.buf.len());
+        for (o, b) in out.iter_mut().zip(s.buf.drain(..n)) {
+            *o = b;
+        }
+        if s.buf.is_empty() {
+            s.buf = VecDeque::new(); // give the memory back
+        }
+        // Credit for the host, in batches (or once the buffer is empty).
+        s.owed += n as u32;
+        if !s.eof && (s.owed >= STDIN_CAPACITY as u32 / 4 || s.buf.is_empty()) {
+            let msg = grix_abi::link::ToHost::StdinCredit { bytes: core::mem::take(&mut s.owed) }.encode();
+            c.dev.send(&[&wire::frame_header(Channel::Link, msg.len()), &msg]);
+        }
+        StdinRead::Data(n)
+    };
+    drop(guard);
+    dispatch(link);
+    result
 }
 
 /// (bytes ready to read, readable: data or end-of-file, version)
@@ -284,6 +308,7 @@ pub fn stdin_state() -> (usize, bool, u64) {
 /// taking output? Then it isn't deadlocked. Output room that came back
 /// (the interrupt for it may still be pending) wakes writers right away.
 pub fn host_pending() -> bool {
+    let net = crate::inet::host_pending();
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return false };
     if c.dev.tx_interrupt() {
@@ -291,7 +316,7 @@ pub fn host_pending() -> bool {
         crate::ipc::changed();
         return true;
     }
-    !c.stdin.eof || c.dev.in_flight()
+    net || !c.stdin.eof || c.dev.in_flight()
 }
 
 /// Report the program's final status. (Exports may follow.)

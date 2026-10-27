@@ -13,7 +13,7 @@ host:
 fixtures:
 	./fixtures/build.sh
 	python3 -I tools/alpine.py --out fixtures/build/alpine busybox-static busybox
-	python3 -I tools/alpine.py --out fixtures/build/python python3
+	python3 -I tools/alpine.py --out fixtures/build/python python3 ca-certificates-bundle
 	python3 -I tools/alpine.py --out fixtures/build/node nodejs
 
 test: kernel fixtures

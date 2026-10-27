@@ -26,7 +26,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
    `--export` / `[[export]]` send directories back when the program ends.
 7. ~~**fork/exec/wait**~~: done. Shell pipelines, Python `subprocess`,
    Node `child_process`, Go `os/exec` and posix_spawn work.
-8. **Networking through the host** (`net`).
+8. ~~**Networking through the host** (`net`)~~: done. TCP clients and
+   servers, DNS, loopback, port forwards and an allow-list.
 
 ## Processes and exec
 
@@ -151,22 +152,32 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
 - [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
       A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
-- [ ] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
+- [~] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
       bundle in `/etc/ssl/certs`.
+      `/etc/hosts` and `/etc/resolv.conf` are generated unless imported. Alpine's
+      runtimes bring their own CA bundle (`ca-certificates`); there's no option yet
+      to pass in the host's.
 - [ ] Configurable hostname.
 
 ## Networking (`net`)
 
-- [ ] TCP/UDP sockets (AF_INET/AF_INET6) proxied through the host: connect,
-      send/recv, nonblocking + epoll, `SO_ERROR` for async connect. Python
-      `getaddrinfo` and Node `dns` get ENOSYS today.
-- [ ] Listening sockets with port forwarding to the host (bind/listen/accept4).
-      Node `http.createServer().listen()` fails today. This is the web-server goal.
-- [ ] Host-side policy: allow-list for outbound connections
+- [x] TCP sockets (AF_INET/AF_INET6) proxied through the host: connect,
+      send/recv, nonblocking + epoll, `SO_ERROR` for async connect.
+      Credit-based flow control (32 KiB per connection each way), half-close,
+      `SO_RCVTIMEO`/`SO_SNDTIMEO`. Other socket options are accepted and ignored.
+- [ ] UDP beyond DNS, raw sockets, ICMP. Reported as unsupported.
+- [x] Listening sockets with port forwarding to the host (bind/listen/accept4).
+      `forward` / `-p` / `[[forward]]`. Node and Python servers work.
+- [~] Host-side policy: allow-list for outbound connections
       (hosts/ports/CIDRs), DNS policy, bandwidth limits.
-- [ ] DNS through a host resolver.
-- [ ] Loopback (127.0.0.1) inside the sandbox, so a server and its client in
-      the same sandbox work without the host.
+      `allow_host` rules (names, wildcards, IPs, CIDRs, ports); DNS only for names
+      they cover; the host and special addresses need their own rule. No bandwidth
+      limits yet.
+- [x] DNS through a host resolver (A and AAAA; other types get empty answers).
+- [x] Loopback (127.0.0.1, `::1`, 10.0.2.15) inside the sandbox, so a server
+      and its client in the same sandbox work without the host.
+- [ ] Forwarded connections reach a listener whatever address it bound
+      (Docker-like), not only 0.0.0.0. Decide whether that should be stricter.
 - [x] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
       `os.networkInterfaces()` throws today.
       No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
@@ -174,8 +185,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       datagram and seqpacket pairs, `SCM_RIGHTS` fd passing.
       `socket(AF_UNIX)` works for ioctls. bind, connect and listen on it are reported as unimplemented.
 - [x] A fast host transport. virtio-console (port 1 of a
-      `virtio-serial-device`) carries the framed channel. Networking can
-      add its own frames there, or a second port.
+      `virtio-serial-device`) carries the framed channel. Networking adds
+      `link` messages there.
 
 ## stdio and host interaction
 

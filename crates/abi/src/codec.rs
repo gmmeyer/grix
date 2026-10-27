@@ -111,6 +111,18 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
+    /// Everything left.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let out = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        out
+    }
+
+    /// Fail unless everything was read.
+    pub fn done(&self) -> Result<(), DecodeError> {
+        if self.remaining() == 0 { Ok(()) } else { Err(DecodeError) }
+    }
+
     pub fn str(&mut self) -> Result<&'a str, DecodeError> {
         core::str::from_utf8(self.bytes()?).map_err(|_| DecodeError)
     }

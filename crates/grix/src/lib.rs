@@ -19,10 +19,12 @@
 //! capabilities you grant ([`Capability`]). Anything it tries beyond that is
 //! denied and reported in [`RunOutput::events`].
 
+mod dns;
 mod event;
 mod export;
 mod image;
 mod manifest;
+mod net;
 mod sandbox;
 mod vmm;
 

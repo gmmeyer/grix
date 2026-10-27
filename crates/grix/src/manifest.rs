@@ -15,6 +15,12 @@
 //! host = "build/hello"       # relative to this manifest
 //! guest = "/bin/hello"
 //!
+//! allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
+//!
+//! [[forward]]                # host 127.0.0.1:8080 -> port 8000 in the sandbox
+//! host = "127.0.0.1:8080"
+//! guest = 8000
+//!
 //! [[export]]                 # copied out when the program ends (CLI)
 //! guest = "/out"
 //! host = "results"           # relative to this manifest; must not exist yet
@@ -44,6 +50,10 @@ pub struct Manifest {
     pub memory_mb: Option<u64>,
     pub timeout_secs: Option<u64>,
     pub max_export_mb: Option<usize>,
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    #[serde(default, rename = "forward")]
+    pub forwards: Vec<Forward>,
     #[serde(default, rename = "import")]
     pub imports: Vec<Import>,
     #[serde(default, rename = "export")]
@@ -55,6 +65,14 @@ pub struct Manifest {
 pub struct Import {
     pub host: PathBuf,
     pub guest: String,
+}
+
+/// A host address whose connections go to a port in the sandbox.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forward {
+    pub host: String,
+    pub guest: u16,
 }
 
 /// A guest directory to export, and where on the host to write it.
@@ -115,6 +133,12 @@ impl Manifest {
         }
         if let Some(mb) = self.max_export_mb {
             b = b.max_export(mb << 20);
+        }
+        for rule in &self.allow_hosts {
+            b = b.allow_host(rule)?;
+        }
+        for f in &self.forwards {
+            b = b.forward(&f.host, f.guest)?;
         }
         for imp in &self.imports {
             b = b.import(&imp.host, &imp.guest)?;

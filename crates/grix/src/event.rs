@@ -33,6 +33,10 @@ impl From<Event<'_>> for GuestEvent {
     }
 }
 
+/// The "capability" of a Denied event for something the network policy
+/// (`SandboxBuilder::allow_host`) refused, rather than a missing capability.
+pub(crate) const NET_POLICY: &str = "allow_host";
+
 impl fmt::Display for GuestEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -43,6 +47,8 @@ impl fmt::Display for GuestEvent {
                 }
                 if capability == "privileged" {
                     write!(f, ": never available in the sandbox")
+                } else if capability == NET_POLICY {
+                    write!(f, ": not allowed by the network policy (allow_host)")
                 } else {
                     write!(f, ": needs capability `{capability}`")
                 }

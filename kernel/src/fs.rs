@@ -550,6 +550,24 @@ impl Fs {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "localtime", Kind::File(FileData::new(&UTC_TZIF)), 0o644);
         }
+        // Name resolution: the virtual nameserver (whatever server a
+        // program asks, the host answers: see inet.rs), and the usual
+        // local names plus the host's.
+        if fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            let [a, b, c, d] = grix_abi::link::DNS_V4;
+            let text = alloc::format!("nameserver {a}.{b}.{c}.{d}\n");
+            fs.insert(etc, "resolv.conf", Kind::File(FileData::new(leak(text))), 0o644);
+        }
+        if fs.lookup(ROOT, "/etc/hosts", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            let [a, b, c, d] = grix_abi::link::HOST_V4;
+            let text = alloc::format!(
+                "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{a}.{b}.{c}.{d}\t{}\n",
+                grix_abi::link::HOST_NAME
+            );
+            fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
+        }
         if fs.lookup(ROOT, "/etc/mtab", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "mtab", Kind::Symlink("/proc/self/mounts".into()), 0o777);

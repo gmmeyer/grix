@@ -30,6 +30,8 @@ pub enum Channel {
     Exit = 5,
     /// Exported directories, after the final status; see [`ExportMsg`].
     Export = 6,
+    /// Networking and flow control: `link::ToHost`.
+    Link = 7,
 }
 
 impl Channel {
@@ -41,6 +43,7 @@ impl Channel {
             4 => Some(Self::Event),
             5 => Some(Self::Exit),
             6 => Some(Self::Export),
+            7 => Some(Self::Link),
             _ => None,
         }
     }
@@ -59,6 +62,8 @@ pub enum Input {
     Stdin = 1,
     /// stdin has ended: reads return 0 once the data is used up.
     StdinEof = 2,
+    /// Networking: `link::ToGuest`.
+    Link = 3,
 }
 
 impl Input {
@@ -66,6 +71,7 @@ impl Input {
         match v {
             1 => Some(Self::Stdin),
             2 => Some(Self::StdinEof),
+            3 => Some(Self::Link),
             _ => None,
         }
     }

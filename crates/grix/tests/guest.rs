@@ -98,6 +98,102 @@ fn network_is_denied_by_default() {
     assert_eq!(out.missing_capabilities(), ["net"]);
 }
 
+/// An echo server on the host's loopback; returns its port.
+fn echo_server() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut c = c;
+                let mut r = c.try_clone().unwrap();
+                let _ = std::io::copy(&mut r, &mut c);
+            });
+        }
+    });
+    port
+}
+
+/// A port nothing listens on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+#[test]
+fn networking_through_the_host() {
+    // Blocking and nonblocking connects to the host, 1 MiB each way,
+    // half-close, refusals and policy denials, loopback, and DNS (see the
+    // fixture).
+    let port = echo_server();
+    // (The fixture expects port + 1 to be denied, so that's not the closed one.)
+    let closed = std::iter::repeat_with(free_port).find(|&c| c != port + 1).unwrap();
+    let b = with("inet")
+        .allow(Capability::Net)
+        .allow_host(&format!("host.grix.internal:{port}"))
+        .unwrap()
+        .allow_host(&format!("host.grix.internal:{closed}"))
+        .unwrap();
+    let out = run(b, &["/bin/inet", "client", &port.to_string(), &closed.to_string()]);
+    assert_eq!(out.stdout_str(), "net ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let denied: Vec<&str> = out
+        .events
+        .iter()
+        .map(|e| match e {
+            GuestEvent::Denied { syscall, detail, .. } if syscall == "connect" => detail.as_str(),
+            e => panic!("unexpected event {e}"),
+        })
+        .collect();
+    assert_eq!(denied.len(), 2, "{denied:?}");
+    assert!(denied[0].starts_with(&format!("10.0.2.2:{} is the host itself", port + 1)));
+    assert!(denied[1].starts_with("93.184.216.34:80 isn't in the allow-list"));
+    // Not a missing capability: the policy said no.
+    assert!(out.missing_capabilities().is_empty());
+
+    // Names the guest doesn't know go to the host's resolver; with an
+    // allow-list, only names on it.
+    let b = with("inet").allow(Capability::Net).file("/etc/hosts", "127.0.0.1 localhost\n", 0o644).unwrap();
+    let out = run(b, &["/bin/inet", "resolve", "host.grix.internal"]);
+    assert_eq!(out.stdout_str(), "host.grix.internal is 10.0.2.2\n");
+    let b = with("inet").allow(Capability::Net).allow_host("example.com").unwrap();
+    let out = run(b, &["/bin/inet", "resolve", "elsewhere.example"]);
+    assert!(out.stdout_str().starts_with("elsewhere.example: "), "{}", out.stdout_str());
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { syscall, .. }] if syscall == "DNS lookup"),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
+fn serving_through_a_forwarded_port() {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let sb = with("inet").allow(Capability::Net).forward_listener(listener, 8000).unwrap().build().unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/bin/inet", "server", "8000"]).unwrap());
+    // Until the program listens, the guest refuses what the host accepts.
+    let started = std::time::Instant::now();
+    let reply = loop {
+        assert!(started.elapsed() < Duration::from_secs(30), "the server never answered");
+        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", host_port)) else { continue };
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        if c.write_all(b"ping\n").is_err() {
+            continue;
+        }
+        let mut line = String::new();
+        if std::io::BufReader::new(c).read_line(&mut line).is_ok() && !line.is_empty() {
+            break line;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(reply, "pong: ping\n");
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "served one\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn network_interfaces_without_net() {
     // getifaddrs, if_nameindex and netlink describe lo; nothing else exists.
@@ -118,7 +214,7 @@ fn kill_on_deny() {
 
 #[test]
 fn granted_but_unimplemented_is_reported_as_such() {
-    let out = run(with("net").allow(Capability::Net), &["/bin/net"]);
+    let out = run(with("net").allow(Capability::Net), &["/bin/net", "raw"]);
     assert_eq!(out.status, ExitStatus::Exited(1));
     assert!(out.missing_capabilities().is_empty());
     assert!(out.events.iter().any(|e| matches!(e, GuestEvent::Unimplemented { syscall, .. } if syscall == "socket")));

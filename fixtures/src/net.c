@@ -1,11 +1,14 @@
-// Try to open a socket. Without the `net` capability this must fail with EPERM.
+// Try to open a socket. Without the `net` capability this must fail with
+// EPERM. With "raw", a raw IP socket, which isn't implemented.
 #include <errno.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 
-int main(void) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+int main(int argc, char **argv) {
+    int raw = argc > 1 && strcmp(argv[1], "raw") == 0;
+    int s = raw ? socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) : socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
         printf("socket: %s\n", strerror(errno));
         return errno == EPERM ? 0 : 1;

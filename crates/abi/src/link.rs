@@ -1,0 +1,291 @@
+//! The link between the guest kernel and the host for networking and flow
+//! control. The guest has no TCP/IP stack: its network sockets are
+//! connections the host makes for it (and polices), and its DNS questions
+//! go to a virtual nameserver the host answers.
+//!
+//! Guest to host: [`ToHost`] in `Channel::Link` frames. Host to guest:
+//! [`ToGuest`] in `Input::Link` frames. Both sides decode what the other
+//! says defensively: the host treats the guest as untrusted.
+//!
+//! Flow control is by credit, so a full buffer never stalls the console,
+//! which carries everything else too. Each side starts out allowed to send
+//! [`WINDOW`] bytes on a connection, and may send more as the other side
+//! returns credit for what it consumed. stdin works the same way, starting
+//! at [`STDIN_WINDOW`].
+
+use alloc::vec::Vec;
+
+use crate::codec::{DecodeError, Reader, Writer};
+use crate::wire::MAX_FRAME;
+
+/// What each side may send on a new connection before getting credit back.
+pub const WINDOW: u32 = 32 * 1024;
+/// stdin the host may send before the guest returns credit.
+pub const STDIN_WINDOW: u32 = 64 * 1024;
+/// The most data one `Data` message carries.
+pub const MAX_DATA: usize = MAX_FRAME - 8;
+
+/// The guest's address on its one network.
+pub const GUEST_V4: [u8; 4] = [10, 0, 2, 15];
+/// The host's own loopback services, as the guest reaches them (what QEMU's
+/// user networking calls the gateway). Only allowed when named explicitly.
+pub const HOST_V4: [u8; 4] = [10, 0, 2, 2];
+/// The virtual nameserver (`/etc/resolv.conf`).
+pub const DNS_V4: [u8; 4] = [10, 0, 2, 3];
+/// A name for `HOST_V4`.
+pub const HOST_NAME: &str = "host.grix.internal";
+
+/// Ids of connections the host opens (to forwarded ports) have this bit
+/// set; the guest picks the others.
+pub const HOST_ID: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Addr {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+impl Addr {
+    fn put(&self, w: &mut Writer) {
+        match self {
+            Addr::V4(a) => {
+                w.u8(4);
+                w.raw(a);
+            }
+            Addr::V6(a) => {
+                w.u8(6);
+                w.raw(a);
+            }
+        }
+    }
+
+    fn get(r: &mut Reader) -> Result<Addr, DecodeError> {
+        Ok(match r.u8()? {
+            4 => Addr::V4(r.take(4)?.try_into().unwrap()),
+            6 => Addr::V6(r.take(16)?.try_into().unwrap()),
+            _ => return Err(DecodeError),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToHost<'a> {
+    /// Open a TCP connection; the answer is `Connected` or `Failed`.
+    Connect { id: u32, addr: Addr, port: u16 },
+    /// Bytes for the connection's peer, within the credit the host gave.
+    Data { id: u32, data: &'a [u8] },
+    /// The guest consumed this much of what the host sent on `id`.
+    Credit { id: u32, bytes: u32 },
+    /// The guest won't send more on `id` (shutdown for writing).
+    Shutdown { id: u32 },
+    /// The guest is done with `id` (or refuses an `Incoming` one).
+    Close { id: u32 },
+    /// A DNS query (a UDP payload) for the virtual nameserver. The answer
+    /// comes back with the same id.
+    Dns { id: u32, query: &'a [u8] },
+    /// The program read this much stdin.
+    StdinCredit { bytes: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToGuest<'a> {
+    Connected {
+        id: u32,
+    },
+    /// The connection couldn't be made, or broke: a Linux errno.
+    Failed {
+        id: u32,
+        errno: u16,
+    },
+    Data {
+        id: u32,
+        data: &'a [u8],
+    },
+    /// The host passed on this much of what the guest sent on `id`.
+    Credit {
+        id: u32,
+        bytes: u32,
+    },
+    /// The peer won't send more.
+    Eof {
+        id: u32,
+    },
+    DnsAnswer {
+        id: u32,
+        answer: &'a [u8],
+    },
+    /// Someone connected to the host side of a forwarded port: connection
+    /// `id` (with `HOST_ID` set) for guest port `port`, from `peer`.
+    Incoming {
+        id: u32,
+        port: u16,
+        peer: Addr,
+        peer_port: u16,
+    },
+}
+
+impl<'a> ToHost<'a> {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match *self {
+            ToHost::Connect { id, addr, port } => {
+                w.u8(1);
+                w.u32(id);
+                addr.put(&mut w);
+                w.raw(&port.to_le_bytes());
+            }
+            ToHost::Data { id, data } => {
+                w.u8(2);
+                w.u32(id);
+                w.raw(data);
+            }
+            ToHost::Credit { id, bytes } => {
+                w.u8(3);
+                w.u32(id);
+                w.u32(bytes);
+            }
+            ToHost::Shutdown { id } => {
+                w.u8(4);
+                w.u32(id);
+            }
+            ToHost::Close { id } => {
+                w.u8(5);
+                w.u32(id);
+            }
+            ToHost::Dns { id, query } => {
+                w.u8(6);
+                w.u32(id);
+                w.raw(query);
+            }
+            ToHost::StdinCredit { bytes } => {
+                w.u8(7);
+                w.u32(bytes);
+            }
+        }
+        w.buf
+    }
+
+    pub fn decode(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(buf);
+        let msg = match r.u8()? {
+            1 => {
+                let id = r.u32()?;
+                let addr = Addr::get(&mut r)?;
+                ToHost::Connect { id, addr, port: u16::from_le_bytes(r.take(2)?.try_into().unwrap()) }
+            }
+            2 => ToHost::Data { id: r.u32()?, data: r.rest() },
+            3 => ToHost::Credit { id: r.u32()?, bytes: r.u32()? },
+            4 => ToHost::Shutdown { id: r.u32()? },
+            5 => ToHost::Close { id: r.u32()? },
+            6 => ToHost::Dns { id: r.u32()?, query: r.rest() },
+            7 => ToHost::StdinCredit { bytes: r.u32()? },
+            _ => return Err(DecodeError),
+        };
+        r.done()?;
+        Ok(msg)
+    }
+}
+
+impl<'a> ToGuest<'a> {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match *self {
+            ToGuest::Connected { id } => {
+                w.u8(1);
+                w.u32(id);
+            }
+            ToGuest::Failed { id, errno } => {
+                w.u8(2);
+                w.u32(id);
+                w.raw(&errno.to_le_bytes());
+            }
+            ToGuest::Data { id, data } => {
+                w.u8(3);
+                w.u32(id);
+                w.raw(data);
+            }
+            ToGuest::Credit { id, bytes } => {
+                w.u8(4);
+                w.u32(id);
+                w.u32(bytes);
+            }
+            ToGuest::Eof { id } => {
+                w.u8(5);
+                w.u32(id);
+            }
+            ToGuest::DnsAnswer { id, answer } => {
+                w.u8(6);
+                w.u32(id);
+                w.raw(answer);
+            }
+            ToGuest::Incoming { id, port, peer, peer_port } => {
+                w.u8(7);
+                w.u32(id);
+                w.raw(&port.to_le_bytes());
+                peer.put(&mut w);
+                w.raw(&peer_port.to_le_bytes());
+            }
+        }
+        w.buf
+    }
+
+    pub fn decode(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(buf);
+        let u16_at =
+            |r: &mut Reader<'a>| -> Result<u16, DecodeError> { Ok(u16::from_le_bytes(r.take(2)?.try_into().unwrap())) };
+        let msg = match r.u8()? {
+            1 => ToGuest::Connected { id: r.u32()? },
+            2 => ToGuest::Failed { id: r.u32()?, errno: u16_at(&mut r)? },
+            3 => ToGuest::Data { id: r.u32()?, data: r.rest() },
+            4 => ToGuest::Credit { id: r.u32()?, bytes: r.u32()? },
+            5 => ToGuest::Eof { id: r.u32()? },
+            6 => ToGuest::DnsAnswer { id: r.u32()?, answer: r.rest() },
+            7 => {
+                let id = r.u32()?;
+                let port = u16_at(&mut r)?;
+                let peer = Addr::get(&mut r)?;
+                ToGuest::Incoming { id, port, peer, peer_port: u16_at(&mut r)? }
+            }
+            _ => return Err(DecodeError),
+        };
+        r.done()?;
+        Ok(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_reject_garbage() {
+        let to_host = [
+            ToHost::Connect { id: 3, addr: Addr::V6([7; 16]), port: 443 },
+            ToHost::Data { id: 3, data: b"GET /" },
+            ToHost::Credit { id: 3, bytes: 900 },
+            ToHost::Shutdown { id: 3 },
+            ToHost::Close { id: 3 },
+            ToHost::Dns { id: 9, query: &[1, 2, 3] },
+            ToHost::StdinCredit { bytes: 5 },
+        ];
+        for m in to_host {
+            assert_eq!(ToHost::decode(&m.encode()), Ok(m));
+        }
+        let to_guest = [
+            ToGuest::Connected { id: 3 },
+            ToGuest::Failed { id: 3, errno: 111 },
+            ToGuest::Data { id: 3, data: b"HTTP/1.1" },
+            ToGuest::Credit { id: 3, bytes: 1 },
+            ToGuest::Eof { id: 3 },
+            ToGuest::DnsAnswer { id: 9, answer: &[4] },
+            ToGuest::Incoming { id: HOST_ID | 1, port: 8000, peer: Addr::V4([127, 0, 0, 1]), peer_port: 5555 },
+        ];
+        for m in to_guest {
+            assert_eq!(ToGuest::decode(&m.encode()), Ok(m));
+        }
+        for bad in [&[][..], &[0], &[1, 0, 0], &[1, 0, 0, 0, 0, 5, 0], &[3, 0, 0, 0, 0, 0, 0, 0, 0, 9]] {
+            assert!(ToHost::decode(bad).is_err(), "{bad:?}");
+        }
+        assert!(ToGuest::decode(&[7, 1, 0, 0, 0, 1, 0, 4, 1]).is_err());
+    }
+}

@@ -508,6 +508,7 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
 /// Load the image's program and jump to it.
 pub fn start(img: Image<'static>) -> ! {
     crate::export::init(img.exports.clone(), img.export_budget);
+    crate::inet::init(img.forwards.clone());
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);

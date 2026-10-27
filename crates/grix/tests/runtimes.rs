@@ -350,6 +350,104 @@ child.stdin.end('through node');
     assert_no_surprises(&out);
 }
 
+/// An HTTP server on the host's loopback that answers every request with
+/// `body`; returns its port.
+fn http_server(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    port
+}
+
+#[test]
+fn network_from_python_and_node() {
+    let port = http_server("hello from the host");
+    let host = format!("host.grix.internal:{port}");
+    let py = format!(
+        r#"
+import asyncio, urllib.request
+print(urllib.request.urlopen("http://{host}/").read().decode())
+async def main():
+    async def echo(r, w):
+        w.write((await r.read()).upper()); await w.drain(); w.close()
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    r, w = await asyncio.open_connection("localhost", server.sockets[0].getsockname()[1])
+    w.write(b"x" * 100000); w.write_eof()
+    got = await r.read()
+    print("loopback", len(got), got[:2].decode())
+    server.close()
+asyncio.run(main())
+"#
+    );
+    let b = sandbox("python").allow(Capability::Net).allow_host(&host).unwrap().env("PYTHONDONTWRITEBYTECODE", "1");
+    let out = run(b, &["/usr/bin/python3", "-c", &py]);
+    assert_eq!(out.stdout_str(), "hello from the host\nloopback 100000 XX\n");
+    assert_no_surprises(&out);
+
+    // A Node server, reached from the host through a forwarded port, that
+    // itself fetches from the host.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let forwarded = listener.local_addr().unwrap().port();
+    let js = format!(
+        r#"
+const http = require('http');
+const srv = http.createServer((req, res) => {{
+  http.get('http://{host}/', up => {{
+    let body = '';
+    up.on('data', d => body += d);
+    up.on('end', () => {{ res.end(`node saw: ${{body}} for ${{req.url}}`); srv.close(); }});
+  }});
+}});
+srv.listen(8000);
+"#
+    );
+    let sb = sandbox("node")
+        .allow(Capability::Net)
+        .allow_host(&host)
+        .unwrap()
+        .forward_listener(listener, 8000)
+        .unwrap()
+        .build()
+        .unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/usr/bin/node", "-e", &js]).unwrap());
+    let started = std::time::Instant::now();
+    let reply = loop {
+        assert!(started.elapsed() < Duration::from_secs(60), "node never answered");
+        if let Some(r) = get(forwarded, "/page") {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(reply.ends_with("node saw: hello from the host for /page"), "{reply}");
+    let out = guest.join().unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
+    assert_no_surprises(&out);
+}
+
+/// GET `path` from the host's localhost:`port`; None if nobody answered.
+fn get(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    c.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+    write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").ok()?;
+    let mut s = String::new();
+    c.read_to_string(&mut s).ok()?;
+    (!s.is_empty()).then_some(s)
+}
+
 #[test]
 fn stdin_for_python_and_node() {
     let py = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").build().unwrap();

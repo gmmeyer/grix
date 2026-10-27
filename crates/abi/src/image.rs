@@ -62,6 +62,8 @@ pub struct Image<'a> {
     /// (`wire::export_cost`).
     pub exports: Vec<&'a str>,
     pub export_budget: u64,
+    /// Guest ports the host forwards connections to (`link::ToGuest::Incoming`).
+    pub forwards: Vec<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,10 @@ impl<'a> Image<'a> {
         }
         w.strs(&self.exports);
         w.u64(self.export_budget);
+        w.u32(self.forwards.len() as u32);
+        for port in &self.forwards {
+            w.u32(*port as u32);
+        }
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -151,6 +157,11 @@ impl<'a> Image<'a> {
         }
         let exports = r.strs()?;
         let export_budget = r.u64()?;
+        let n = r.u32()? as usize;
+        if n > r.remaining() / 4 {
+            return Err(DecodeError);
+        }
+        let forwards = (0..n).map(|_| r.u32().map(|p| p as u16)).collect::<Result<_, _>>()?;
         Ok(Image {
             ram_size: header.ram_size,
             boot_time_ns,
@@ -166,6 +177,7 @@ impl<'a> Image<'a> {
             entries,
             exports,
             export_budget,
+            forwards,
         })
     }
 }
@@ -196,6 +208,7 @@ mod tests {
             ],
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,
+            forwards: vec![8000, 80],
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -221,6 +234,7 @@ mod tests {
             entries: vec![],
             exports: vec![],
             export_budget: 0,
+            forwards: vec![],
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

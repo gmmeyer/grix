@@ -170,20 +170,21 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
 
         // sockets
         nr::socketpair => net::socketpair(p, a[0], a[1], a[2], a[3]),
-        nr::sendto => net::sendto(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::sendto => net::sendto(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::recvfrom => net::recvfrom(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sendmsg => net::sendmsg(p, a[0], a[1], a[2]),
         nr::recvmsg => net::recvmsg(p, a[0], a[1], a[2]),
         nr::getsockopt => net::getsockopt(p, a[0], a[1], a[2], a[3], a[4]),
-        nr::setsockopt => net::setsockopt(p, a[0], a[1], a[2]),
+        nr::setsockopt => net::setsockopt(p, a[0], a[1], a[2], a[3], a[4]),
         nr::shutdown => net::shutdown(p, a[0], a[1]),
         nr::getsockname => net::getname(p, a[0], a[1], a[2], false),
         nr::getpeername => net::getname(p, a[0], a[1], a[2], true),
         nr::socket => net::socket(p, a[0], a[1], a[2]),
         nr::bind => net::bind(p, a[0], a[1], a[2]),
-        nr::connect => net::connect(p, a[0]),
-        nr::listen => net::listen(p, a[0]),
-        nr::accept | nr::accept4 => net::accept(p, a[0]),
+        nr::connect => net::connect(p, a[0], a[1], a[2]),
+        nr::listen => net::listen(p, a[0], a[1]),
+        nr::accept => net::accept4(p, a[0], a[1], a[2], 0),
+        nr::accept4 => net::accept4(p, a[0], a[1], a[2], a[3]),
 
         // memory
         nr::brk => mem::brk(p, a[0]),

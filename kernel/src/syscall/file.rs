@@ -43,7 +43,7 @@ const SETFL_MASK: u32 = 0o2000 | 0o4000; // O_APPEND | O_NONBLOCK
 
 /// Linux caps a single read/write at this many bytes.
 const MAX_RW: u64 = 0x7fff_f000;
-const CHUNK: usize = 4096;
+pub(super) const CHUNK: usize = 4096;
 
 // ---------------------------------------------------------------- paths
 
@@ -136,7 +136,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600, 0),
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
-        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) => {
+        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) => {
             anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0)
         }
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
@@ -399,6 +399,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             Some(rx) => pipe_read(p, rx, buf, count, nonblock, false),
             None => Ok(0), // shut down for reading
         },
+        FileKind::Inet(s) => super::net::inet_read(p, s, buf, count, nonblock, false).map(|(n, _)| n),
         FileKind::EventFd(e) => {
             if count < 8 {
                 return Err(EINVAL);
@@ -546,6 +547,10 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
                     Err(EPIPE)
                 }
             };
+        }
+        FileKind::Inet(_) => {
+            let FileKind::Inet(s) = &mut f.kind else { unreachable!() };
+            return super::net::inet_write(p, s, buf, count, nonblock, true, None);
         }
         FileKind::EventFd(e) => {
             if count < 8 {
@@ -1127,7 +1132,7 @@ fn writable_file(p: &Process, fd: u64, not_file: Errno) -> Result<(Ino, Content)
     match (&f.kind, &f.content) {
         (FileKind::Node(ino), Some(c)) if f.flags & O_ACCMODE != O_RDONLY && !f.path_only => Ok((*ino, c.clone())),
         (FileKind::Node(_), Some(_)) => Err(EBADF),
-        (FileKind::Pipe(_) | FileKind::Socket(_), _) => Err(ESPIPE),
+        (FileKind::Pipe(_) | FileKind::Socket(_) | FileKind::Inet(_), _) => Err(ESPIPE),
         _ => Err(not_file),
     }
 }
@@ -1556,8 +1561,10 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     const FIOCLEX: u64 = 0x5451;
     const SIOCGIFCONF: u64 = 0x8912;
     let entry = p.fds.entry_mut(fd)?;
-    let socket =
-        matches!(entry.file.lock().kind, FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_));
+    let socket = matches!(
+        entry.file.lock().kind,
+        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_)
+    );
     if socket && req == SIOCGIFCONF {
         // struct ifconf { int ifc_len; char *ifc_buf; }: one entry, for lo.
         let len = read_u32(&mut p.aspace, arg)? as usize;
@@ -1584,6 +1591,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             let avail = match &entry.file.lock().kind {
                 FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
                 FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
+                FileKind::Inet(s) => super::net::inet_available(s) as u32,
                 FileKind::Stdin => console::stdin_state().0 as u32,
                 _ => return Err(ENOTTY),
             };

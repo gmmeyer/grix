@@ -245,7 +245,20 @@ Next, in TODO.md order:
   `eret` and the re-run `svc`), fixed by keeping `restarting` until the svc
   runs again.
 
-Next, in TODO.md order: networking through the host.
+- **Networking through the host**: the guest has no TCP/IP stack and the
+  VM no network card. TCP sockets become `link` messages on the console;
+  the host's proxy checks `allow_host` rules, connects, forwards ports and
+  answers DNS from its own resolver. Flow control is by credit both ways
+  (stdin moved to the same scheme). Connections to the guest's own
+  addresses are kernel socket pairs. busybox `wget`/`nslookup`, Python
+  `urllib` and asyncio, and a Node server behind a forward work. A review
+  found and we fixed: an unbounded accept queue that panicked the kernel,
+  connect threads and queued frames the guest could pile up on the host,
+  broad rules (`0.0.0.0/0`, `10.0.0.0/8`) opening the host or the metadata
+  address, v4-mapped addresses dodging checks, data sent right after
+  `Connected` being dropped, and a lost wakeup on close.
+
+Next, from the README roadmap: host directories, then signals from the host.
 
 ### Notes for the next session
 

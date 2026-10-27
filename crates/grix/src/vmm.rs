@@ -1,15 +1,16 @@
 //! VM backend: QEMU `virt` machine.
 //!
 //! The VM gets exactly: RAM, a virtio console (the framed channel back to
-//! us, and stdin to it, on QEMU's stdio), a PL011 serial port on a Unix
-//! socket (early boot and panic messages), the kernel, and the boot image. No
-//! network card, no disks, no semihosting (which would expose the host
-//! filesystem) and no QEMU monitor.
+//! us, and stdin and networking to it, on QEMU's stdio), a PL011 serial port
+//! on a Unix socket (early boot and panic messages), the kernel, and the
+//! boot image. No network card (connections go through `net::Proxy`), no
+//! disks, no semihosting (which would expose the host filesystem) and no
+//! QEMU monitor.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -19,7 +20,11 @@ use anyhow::{Context, Result};
 use grix_abi::image::IMAGE_BASE;
 use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder, Input};
 
+use crate::event::GuestEvent;
+use crate::net::{NetPolicy, Outbox, Proxy, StdinGate};
+
 pub(crate) struct VmConfig {
+    pub net: NetPolicy,
     pub qemu: PathBuf,
     pub kernel: PathBuf,
     pub memory_mb: u64,
@@ -126,10 +131,9 @@ fn read_uart(mut stream: UnixStream) -> Vec<u8> {
     kept
 }
 
-/// Feed `input` to the guest's stdin as frames, then end it. QEMU reads
-/// only as much as the guest has buffers for, so writes here block: that's
-/// the backpressure. They fail once QEMU is gone.
-fn feed_stdin(mut qemu_in: &ChildStdin, mut input: Box<dyn Read + Send>) {
+/// Feed `input` to the guest's stdin as frames, then end it, no faster than
+/// the guest gives credit back: that's the backpressure.
+fn feed_stdin(to_guest: Arc<Outbox>, gate: StdinGate, mut input: Box<dyn Read + Send>) {
     let mut buf = vec![0u8; wire::MAX_FRAME];
     loop {
         let n = match input.read(&mut buf) {
@@ -139,12 +143,24 @@ fn feed_stdin(mut qemu_in: &ChildStdin, mut input: Box<dyn Read + Send>) {
             // An unreadable input ends stdin, like a closed pipe.
             Err(_) => break,
         };
-        if qemu_in.write_all(&wire::input_header(Input::Stdin, n)).and_then(|_| qemu_in.write_all(&buf[..n])).is_err() {
-            return;
+        let mut sent = 0;
+        while sent < n {
+            let Some(k) = gate.take(n - sent) else { return };
+            let mut frame = wire::input_header(Input::Stdin, k).to_vec();
+            frame.extend_from_slice(&buf[sent..sent + k]);
+            if !to_guest.send(frame) {
+                return;
+            }
+            sent += k;
         }
     }
-    let _ = qemu_in.write_all(&wire::input_header(Input::StdinEof, 0));
-    let _ = qemu_in.flush();
+    to_guest.send(wire::input_header(Input::StdinEof, 0).to_vec());
+}
+
+/// How a run ended, and what the host itself saw (network policy denials).
+pub(crate) struct VmRun {
+    pub end: VmEnd,
+    pub events: Vec<GuestEvent>,
 }
 
 pub(crate) fn run(
@@ -153,7 +169,7 @@ pub(crate) fn run(
     timeout: Duration,
     stdin: Option<Box<dyn Read + Send>>,
     mut on_frame: impl FnMut(Channel, &[u8]),
-) -> Result<VmEnd> {
+) -> Result<VmRun> {
     if !cfg.kernel.exists() {
         anyhow::bail!(
             "grix kernel not found at {} (build it with `make kernel` or set GRIX_KERNEL)",
@@ -161,6 +177,11 @@ pub(crate) fn run(
         );
     }
     let img = write_temp("img", image)?;
+    // Everything for the guest's console input (stdin, networking) goes
+    // through one writer, a frame at a time. Forwarded ports are bound
+    // before QEMU starts, so a busy one fails the run at once.
+    let to_guest = Outbox::new();
+    let proxy = Proxy::start(cfg.net.clone(), to_guest.clone())?;
     let uart_path = temp_path("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
@@ -195,12 +216,22 @@ pub(crate) fn run(
     let uart = accept_uart(&listener, &mut child.0)?;
     drop(listener);
     let uart_thread = thread::spawn(move || uart.map(read_uart).unwrap_or_default());
-    // Kept open until QEMU is gone, after stdin's end frame too.
-    let qemu_in = Arc::new(child.0.stdin.take().unwrap());
+    // Kept open until QEMU is gone (the proxy stops), after stdin's end
+    // frame too.
+    let mut qemu_in = child.0.stdin.take().unwrap();
+    let outbox = to_guest.clone();
+    thread::spawn(move || {
+        while let Some(frame) = outbox.next() {
+            if qemu_in.write_all(&frame).is_err() {
+                break;
+            }
+        }
+        outbox.close();
+    });
     if let Some(input) = stdin {
-        let qemu_in = qemu_in.clone();
+        let (tx, gate) = (to_guest.clone(), proxy.stdin_gate());
         // Detached: it may be blocked reading `input` when the VM ends.
-        thread::spawn(move || feed_stdin(&qemu_in, input));
+        thread::spawn(move || feed_stdin(tx, gate, input));
     }
 
     let mut stdout = child.0.stdout.take().unwrap();
@@ -238,10 +269,11 @@ pub(crate) fn run(
             // Out of time. If the program had ended, that's its status (and
             // the exports are incomplete); otherwise it timed out.
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Ok(match exit {
+                let end = match exit {
                     Some((kind, code)) => VmEnd::Exited { kind, code },
                     None => VmEnd::Timeout,
-                });
+                };
+                return Ok(VmRun { end, events: proxy.stop() });
             }
         };
         decoder.push(&chunk, |ch, payload| match ch {
@@ -252,11 +284,12 @@ pub(crate) fn run(
                 }
             }
             Channel::Exit => {}
+            Channel::Link => proxy.handle(payload),
             _ => on_frame(ch, payload),
         });
     }
     let status = child.0.wait()?;
-    drop(qemu_in);
+    let events = proxy.stop();
     // A panic's message and status come on the serial port.
     let early = uart_thread.join().unwrap_or_default();
     FrameDecoder::new().push(&early, |ch, payload| match ch {
@@ -264,8 +297,9 @@ pub(crate) fn run(
         _ => on_frame(ch, payload),
     });
     let qemu_stderr = stderr_thread.join().unwrap_or_default();
-    Ok(match exit {
+    let end = match exit {
         Some((kind, code)) => VmEnd::Exited { kind, code },
         None => VmEnd::Lost { qemu_status: status.code(), qemu_stderr },
-    })
+    };
+    Ok(VmRun { end, events })
 }

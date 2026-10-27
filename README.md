@@ -22,8 +22,9 @@ grix: missing /etc/passwd: not imported
 > **Node 22** (Alpine's builds), **Go** programs, busybox, and static,
 > static-PIE or dynamically linked musl programs, with threads, signal
 > handlers, pipes, eventfd, epoll and (with `fs_write`) a writable in-memory
-> filesystem. Processes (fork/exec) and networking are gated by capabilities
-> but **not implemented yet**. See
+> filesystem. With the matching capabilities it also runs processes
+> (fork/exec) and **networks through the host**: clients, servers on
+> forwarded ports, and DNS, under an allow-list. See
 > [Compatibility](#compatibility) and [Roadmap](#roadmap).
 
 ## Quick start
@@ -51,6 +52,14 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # Language runtimes: import a whole root filesystem and allow threads.
 ./target/release/grix run -a threads -i fixtures/build/python:/ -- /usr/bin/python3 -c 'print(6*7)'
 ./target/release/grix run -a threads -i fixtures/build/node:/ -- /usr/bin/node -e 'console.log(6*7)'
+
+# Networking: only to example.com, port 443.
+./target/release/grix run -a net -a threads --allow-host example.com:443 -i fixtures/build/python:/ -- \
+    /usr/bin/python3 -c 'import urllib.request as u; print(u.urlopen("https://example.com").status)'
+
+# A server: host port 8080 goes to port 8000 in the sandbox.
+./target/release/grix run -a net -a threads -p 8080:8000 -i fixtures/build/python:/ -- \
+    /usr/bin/python3 -m http.server 8000
 ```
 
 grix uses hardware virtualization when the host has it (Hypervisor.framework
@@ -96,6 +105,50 @@ The CLI checks `-x` destinations before the run.
 Every `run` boots a new VM from the same configuration, so runs don't share
 state. `run_streaming` delivers stdout/stderr as they arrive.
 
+### Networking
+
+With `Capability::Net`, sockets work, but the VM still has no network card.
+Each connection the program makes is made by the host on its behalf, after
+a policy check:
+
+```rust
+let sandbox = Sandbox::builder()
+    .import("./fixtures/build/python", "/")?
+    .allow(Capability::Net)
+    .allow(Capability::Threads)
+    .allow_host("pypi.org")?               // names, *.wildcards, IPs, CIDRs, each with an optional :port
+    .allow_host("*.pythonhosted.org:443")?
+    .allow_host("host.grix.internal:5432")? // the host's own 127.0.0.1:5432
+    .forward("127.0.0.1:8080", 8000)?      // host 8080 -> sandbox port 8000
+    .build()?;
+```
+
+- Without `allow_host` rules, the program may connect anywhere except the
+  host itself and special addresses (loopback, link-local such as cloud
+  metadata at 169.254.169.254, multicast). With rules, only what they match,
+  and DNS answers only names they cover, so lookups can't carry data out
+  either. Special addresses need a rule for them specifically: `0.0.0.0/0`
+  doesn't open them.
+- The host's own services are `host.grix.internal` (10.0.2.2) and need a
+  rule naming them.
+- Connections inside the sandbox (127.0.0.1, `::1`, its own 10.0.2.15) stay
+  in the sandbox, so a server and its client in one sandbox work with no
+  rules.
+- DNS goes to the host's resolver: the sandbox gets an `/etc/resolv.conf`
+  and `/etc/hosts` unless you import your own.
+- Denials come back as events: `denied connect (93.184.216.34:80 isn't in
+  the allow-list): not allowed by the network policy (allow_host)`.
+- HTTPS needs CA certificates in the sandbox. Node has its own; for Python
+  or curl, add Alpine's `ca-certificates-bundle` to the runtime (the test
+  fixture has it).
+- `forward_listener` takes a `TcpListener` you bound (port 0 to let the OS
+  pick), for tests.
+
+The CLI has `--allow-host RULE` and `-p/--publish [ADDR:]HOSTPORT:GUESTPORT`;
+manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host` and
+`guest`. Only TCP and DNS are supported: other UDP, raw sockets and ICMP are
+reported as unsupported.
+
 ## Manifests
 
 The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
@@ -104,6 +157,7 @@ The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
 capabilities = []        # fs_write, threads, process, net
 on_deny = "errno"        # "errno" (EPERM) or "kill" (SIGSYS, like seccomp)
+# allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
 memory_mb = 256
 timeout_secs = 30
 
@@ -117,6 +171,10 @@ guest = "/bin/busybox"
 [[export]]               # copied out when the program ends (needs fs_write to fill it)
 guest = "/out"
 host = "results"         # relative to the manifest; must not exist yet, or be empty
+
+# [[forward]]            # with net: host 127.0.0.1:8080 -> port 8000 in the sandbox
+# host = "127.0.0.1:8080"
+# guest = 8000
 ```
 
 ## What you can import
@@ -151,7 +209,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 | `fs_write` | Denied: the filesystem is read-only | `allow(Capability::FsWrite)`: the whole tree becomes writable in guest memory (copy-on-write over the imports, up to half of RAM). The host's files never change. |
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
-| `net` | Denied, and the VM has no network device | `allow(Capability::Net)` |
+| `net` | Denied, and the VM has no network device | `allow(Capability::Net)`: TCP and DNS through the host, which checks `allow_host` rules; `forward` for servers |
 | Privileged (mount, ptrace, bpf, module loading, changing uid, …) | Always denied | — |
 
 A program can't get around the policy by making the call itself (with
@@ -194,6 +252,10 @@ Events tell you what happened:
 - **The VM's devices.** The VM gets RAM, the virtio console, a serial port,
   and nothing else: no network card, no disks, no QEMU monitor, and no
   semihosting (which would expose host files).
+- **Networking without a network card.** The guest kernel turns sockets
+  into messages on the console. The host makes the connections (after the
+  policy check), forwards ports, and answers DNS. Flow control is by credit
+  in both directions, so a slow connection never stalls the console.
 
 ### Security model
 
@@ -216,7 +278,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Works today | Not yet |
 |---|---|
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Network sockets (`net`) |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | UDP other than DNS, raw sockets, ICMP (`ping`) |
+| With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `pidfd_*`; `/proc/<pid>` for other processes |
 | With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec` | Job control (stopping and continuing) |
@@ -234,16 +297,17 @@ and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
 Alpine's **python3** (threads, asyncio, hashlib, json, signal handlers,
 KeyboardInterrupt, tempfile, shutil, an on-disk sqlite database) and
 **nodejs** (timers, crypto, fs reads and writes, worker_threads,
-`process.on('SIG…')`, `os.networkInterfaces()`, `child_process`); static Go binaries
+`process.on('SIG…')`, `os.networkInterfaces()`, `child_process`, `http`
+servers and `fetch`); Python `urllib` and `asyncio` servers; busybox `wget` and
+`nslookup`; static Go binaries
 (goroutine preemption, nil dereference panics, `os/signal`, `os/exec`); busybox
 `cp -r`, `mv`, `rm -rf`, `tar`, `dd`, `find`, and `sh` scripts with pipelines and
 subshells.
 
 ## Roadmap
 
-1. **Networking** (`net`), so web servers can run: socket syscalls in the
-   guest, proxied to the host, which enforces allow-lists for outbound
-   connections and forwards listening ports. The guest needs no TCP/IP stack.
+1. ~~**Networking**~~: done. Sockets are proxied through the host, which
+   enforces the allow-list and forwards ports. The guest has no TCP/IP stack.
 2. **Host directories**: read-write host mounts gated by policy, and
    exporting only what changed. Exporting whole directories works today.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
