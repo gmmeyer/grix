@@ -30,13 +30,14 @@ grix: missing /etc/passwd: not imported
 
 ## Quick start
 
-Requirements: macOS or Linux on any host, Rust (stable), QEMU
-(`qemu-system-aarch64`), [zig](https://ziglang.org) to build the C test
-programs, and Go to build the Go ones.
+Requirements: macOS 15+ on Apple silicon or arm64 Linux with KVM (grix's own
+VMM), or QEMU (`qemu-system-aarch64`) on anything else; Rust (stable);
+[zig](https://ziglang.org) to build the C test programs, and Go to build the
+Go ones. `make test` needs QEMU too, since some tests run on both VMMs.
 
 ```sh
-make            # kernel + host CLI + test fixtures (downloads Alpine busybox, python3, nodejs)
-make test       # unit tests + end-to-end tests that boot the kernel in QEMU
+make            # kernel + host CLI + grix-vmm + test fixtures (downloads Alpine busybox, python3, nodejs)
+make test       # unit tests + end-to-end tests that boot the kernel
 
 ./target/release/grix run -i fixtures/build/hello:/bin/hello -e GREETING=hi -- /bin/hello world
 ./target/release/grix run -m examples/busybox.toml
@@ -63,10 +64,19 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
     /usr/bin/python3 -m http.server 8000
 ```
 
-grix uses hardware virtualization when the host has it (Hypervisor.framework
-on Apple Silicon, KVM on arm64 Linux) and QEMU's emulator otherwise. Set
-`GRIX_ACCEL=tcg|hvf|kvm` to choose. A Node script that boots, starts a worker
-thread and exits takes about 0.9s with HVF, 9s emulated.
+On arm64 macOS 15+ and arm64 Linux with KVM, grix runs its kernel in its
+own VMM, `grix-vmm` (Hypervisor.framework or KVM, about 1,300 lines of
+Rust, no QEMU needed). A run that boots, runs a program and exits takes
+about 0.1 s. Elsewhere it uses QEMU, with its emulator if the host can't
+virtualize arm64. `GRIX_ACCEL=tcg|hvf|kvm` chooses QEMU with that
+accelerator, and `GRIX_VMM=PATH|qemu` picks the VMM. A Node script that
+boots, starts a worker thread and exits takes about 0.9s with HVF, 9s
+emulated.
+
+`grix-vmm` lives next to `grix` or in this tree's `target/release/`. On
+macOS it must be signed with the hypervisor entitlement (`make vmm` does
+it, ad hoc). `make test-kvm` checks the KVM side from an M3 (or later)
+Mac: it boots Linux in QEMU with nested virtualization and runs grix there.
 
 ## Using it from an agent (Rust)
 
@@ -418,12 +428,12 @@ Events tell you what happened:
 ## How it works
 
 ```
- host process (your agent)                          microVM (QEMU virt, 1 vCPU)
+ host process (your agent)                          microVM (grix-vmm or QEMU, 1 vCPU)
 ┌──────────────────────────────┐                   ┌─────────────────────────────────┐
 │ grix crate                   │  boot image       │ grix kernel (no_std Rust)       │
 │  - collects imports          │ ───────────────►  │  - boots at EL1, high-half MMU  │
 │  - encodes policy+argv+env   │  @0x4800_0000     │  - reads image, builds RO fs    │
-│  - starts QEMU               │                   │  - loads ELF (+ interpreter)    │
+│  - starts the VMM            │                   │  - loads ELF (+ interpreter)    │
 │  - decodes framed console    │ ◄───────────────  │  - runs program at EL0          │
 │    stdout/stderr/events/exit │  virtio frames    │  - Linux syscall ABI + policy   │
 └──────────────────────────────┘                   └─────────────────────────────────┘
@@ -443,6 +453,13 @@ Events tell you what happened:
 - **The VM's devices.** The VM gets RAM, the virtio console, a serial port,
   and nothing else: no network card, no disks, no QEMU monitor, and no
   semihosting (which would expose host files).
+- **Its own VMM.** `grix-vmm` (`crates/vmm`) makes that machine on
+  Hypervisor.framework or KVM: one vCPU, the hypervisor's own GICv3, a
+  PL011 and the virtio console, emulated in a few hundred lines. It runs as
+  a child process like QEMU would, and once the VM is set up it confines
+  itself (a deny-everything macOS sandbox; a seccomp allowlist on Linux):
+  no files, no network, no new processes, only its stdin, stdout and the
+  serial socket.
 - **Host directories without a disk.** A live mount is served by the host
   over the console too: the kernel asks for listings and bytes as the
   program needs them, and sends its changes as it makes them.
@@ -459,10 +476,11 @@ disk, and only the imported files in its memory. The guest kernel's policy
 checks are what make the sandbox *least privilege* and *observable*, but they
 aren't the only wall.
 
-Caveat: the current VMM is QEMU, which is large. A minimal Rust VMM
-(Hypervisor.framework / KVM, one console device) is on the roadmap and would
-shrink that attack surface substantially. Until then, don't treat this as
-hardened against a determined attacker.
+Where it runs (arm64 macOS and Linux), the VMM is grix's own: small, and
+confined itself, so a guest that escaped the hypervisor into it would
+still have no files or network. Elsewhere it's QEMU, which is large.
+Either way, don't treat grix as hardened against a determined attacker yet:
+it hasn't had an outside security review.
 
 ## Compatibility
 
@@ -508,9 +526,9 @@ subshells.
    any size) and mounts whose changes are applied when the program ends.
 3. ~~**Signals from the host**~~: done (`RunControl`, Ctrl-C in the CLI,
    SIGTERM and a grace period on timeout).
-4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
-   QEMU. That means faster boots, a smaller attack surface, and a `grix`
-   crate with no external dependencies.
+4. ~~**Own VMM**~~: `grix-vmm` on Hypervisor.framework and KVM is done
+   (the default where it runs: about twice as fast to start as QEMU, and
+   confined). Next: snapshots.
 5. ~~**Agent integrations**~~: images (`grix build`), the MCP server and
    Python bindings are done. Next: snapshots for instant start.
 6. **SMP and x86_64 guests**.
@@ -519,7 +537,8 @@ subshells.
 
 ```
 crates/abi/        shared host<->guest definitions: boot image, policy, wire protocol (no_std)
-crates/grix/       host library + `grix` CLI (builds images, runs QEMU, decodes output)
+crates/grix/       host library + `grix` CLI (builds images, runs the VMM, decodes output)
+crates/vmm/        grix-vmm: the VMM (Hypervisor.framework, KVM), PL011 + virtio console
 kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
   src/arch/        boot.S (MMU bring-up), vectors.S (traps), system registers
   src/mm/          frame allocator, page tables, address spaces / VMAs

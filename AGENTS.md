@@ -8,8 +8,10 @@ what the project is and how to use it, see [README.md](README.md).
 ```sh
 make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 make host        # host CLI      -> target/release/grix
+make vmm         # our own VMM   -> target/release/grix-vmm (arm64 macOS 15+ / Linux KVM; codesigned on macOS)
 make fixtures    # C (zig) and Go test programs + Alpine busybox, python3, nodejs (network, cached)
-make test        # everything; end-to-end tests boot the kernel in QEMU
+make test        # everything; end-to-end tests boot the kernel in grix-vmm (or QEMU)
+make test-kvm    # grix-vmm on KVM: Linux in QEMU with nested virtualization (M3+ Mac)
 make check       # clippy for host and kernel
 ```
 
@@ -18,15 +20,26 @@ make check       # clippy for host and kernel
   `cargo test` at the root does **not** rebuild it, so after changing kernel code
   run `make kernel` (or `make test`) before the end-to-end tests.
 - End-to-end tests live in `crates/grix/tests/guest.rs` (C fixtures, busybox)
-  and `crates/grix/tests/runtimes.rs` (Python, Node). They need QEMU, the
-  built kernel, and `fixtures/build/`. Missing pieces fail loudly; they are
-  never skipped.
+  and `crates/grix/tests/runtimes.rs` (Python, Node). They need
+  `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
+  built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
+  are never skipped.
+- Which VMM: grix's own (`crates/vmm`) on arm64 macOS 15+ and arm64 Linux
+  with KVM, when it's built; QEMU otherwise. `GRIX_ACCEL=hvf|kvm|tcg` (or
+  `.accel(...)`) means QEMU with that accelerator; `GRIX_VMM=PATH|qemu`
+  picks too. The machine layout is `grix_abi::machine`'s; the one thing
+  that differs, where the GIC redistributors are, is in the boot image's
+  header.
+  Rebuilding `grix-vmm` with plain cargo drops its signature: use `make
+  vmm`, or every run fails with a "denied" error from Hypervisor.framework.
 - Tests use hardware virtualization when available (HVF/KVM). Also run them
   with `GRIX_ACCEL=tcg` when touching boot, MMU, cache, page-table, timer or
-  scheduler code. Emulation and real hardware catch different mistakes, and
-  timing-dependent bugs show up differently on each. Concurrency changes
-  deserve a stress loop (run the `threads`/`events`/`signals`/`gosignals`
-  fixtures 30× each).
+  scheduler code, and with `GRIX_ACCEL=hvf` (QEMU) when touching the VMM
+  or anything the kernel expects of the machine. Emulation, QEMU and our
+  VMM catch different mistakes, and timing-dependent bugs show up
+  differently on each. Concurrency changes deserve a stress loop (run the
+  `threads`/`events`/`signals`/`gosignals` fixtures 30× each). Changes to
+  `crates/vmm` also get `make test-kvm`.
 - Debugging a guest: `grix run -v ...` prints the kernel log, and `--json`
   shows status, output and events together. A kernel panic message ends up in
   `RunOutput::kernel_log`.
@@ -34,7 +47,8 @@ make check       # clippy for host and kernel
 ## Architecture in one paragraph
 
 The host (`crates/grix`) turns imports, argv/env and a capability `Policy`
-into a boot image (`crates/abi/src/image.rs`). QEMU loads the image at
+into a boot image (`crates/abi/src/image.rs`). The VMM, a child process
+(`crates/vmm`'s `grix-vmm` on Hypervisor.framework, or QEMU), loads the image at
 physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`kernel/src`) enables the MMU in `arch/boot.S`, runs in the high half
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
@@ -44,7 +58,7 @@ After that, every bit of kernel work happens in an exception handler
 (`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames
 (`console.rs`, format in `crates/abi/src/wire.rs`) on a virtio console
-(`virtio.rs`: virtio-mmio, port 1 of a `virtio-serial-device`, on QEMU's
+(`virtio.rs`: virtio-mmio, port 1 of a `virtio-serial-device`, on the VMM's
 stdio), and stdin comes back on it as `wire::Input` frames. When the host
 reads slowly, program writes to stdout/stderr block like pipe writes (woken
 by the device's interrupt; `Thread::io_done` lets a re-run continue after
@@ -168,12 +182,19 @@ treated as deadlocked.
 6. **Guest output is untrusted.** Host-side decoding (`FrameDecoder`,
    `Event::decode`) must bound lengths and survive garbage. Don't add host
    code that trusts guest-provided sizes, paths or strings.
-7. **Least privilege at the VM level too.** Don't add QEMU devices (NICs,
-   disks, virtio-fs), semihosting, or the monitor unless a capability gates
-   them. Semihosting in particular gives the guest host file access. The
-   only devices are the PL011 and the virtio console, and both carry
+7. **Least privilege at the VM level too.** Don't add devices (NICs,
+   disks, virtio-fs), semihosting, or QEMU's monitor unless a capability
+   gates them. Semihosting in particular gives the guest host file access.
+   The only devices are the PL011 and the virtio console, and both carry
    nothing but the framed channel to the host; keep it that way (no more
    ports, no `virtconsole`, which drops output under backpressure).
+   `grix-vmm` is the same machine, and everything the guest tells its
+   devices (ring addresses, descriptor lengths, MMIO) is checked against
+   guest RAM and bounded before use. Once the VM exists it confines itself
+   (`hvf::confine`: a deny-everything macOS sandbox; `kvm::confine`: a
+   seccomp allowlist on every thread): keep new work in it to what's
+   already open (stdin, stdout, the serial socket), and add a system call
+   to the allowlist only when it can't reach anything new.
    Networking is no exception: there's no NIC and no guest TCP/IP stack.
    Sockets are `link` messages on the console, and the host's proxy
    (`crates/grix/src/net.rs`) makes every connection after checking the

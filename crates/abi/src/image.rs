@@ -1,8 +1,9 @@
 //! Boot image: everything the guest needs to run one program.
 //!
 //! The host places the encoded image at [`IMAGE_BASE`] in guest physical memory.
-//! Layout: a fixed [`HEADER_LEN`]-byte header (magic, total length, RAM size)
-//! followed by a body encoded with [`crate::codec`].
+//! Layout: a fixed [`HEADER_LEN`]-byte header (magic, total length, RAM size,
+//! where the GIC redistributors are) followed by a body encoded with
+//! [`crate::codec`].
 
 use alloc::vec::Vec;
 
@@ -10,7 +11,7 @@ use crate::codec::{DecodeError, Reader, Writer};
 use crate::policy::{DenyAction, Policy};
 
 pub const MAGIC: [u8; 8] = *b"GRIXIMG1";
-pub const HEADER_LEN: usize = 24;
+pub const HEADER_LEN: usize = 32;
 
 /// Guest physical memory layout (QEMU `virt` machine).
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -47,6 +48,9 @@ pub struct Entry<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image<'a> {
     pub ram_size: u64,
+    /// The GIC redistributors' base (`machine::GICR_QEMU` or
+    /// `machine::GICR_GRIX_VMM`): the one thing that differs between VMMs.
+    pub gicr: u64,
     /// Host wall-clock time when the image was built, in ns since the Unix epoch.
     pub boot_time_ns: u64,
     /// Entropy for the guest CSPRNG.
@@ -79,7 +83,20 @@ pub struct Image<'a> {
     pub live_mounts: Vec<LiveMount<'a>>,
     /// Guest ports the host forwards connections to (`link::ToGuest::Incoming`).
     pub forwards: Vec<u16>,
+    /// Snapshot the machine when the program first waits for stdin (see
+    /// [`SNAPSHOT_CALL`]).
+    pub snapshot: bool,
 }
+
+/// The hypervisor call (SMCCC vendor-specific hypervisor service, HVC) the
+/// kernel makes to have the VMM snapshot the whole machine. It returns
+/// [`SNAPSHOT_TAKEN`] in x0 in the run that took it (whose VMM then stops
+/// it there), [`SNAPSHOT_RESTORED`] in each run restored from it, with 32
+/// bytes of fresh entropy in x1..x4, or PSCI's NOT_SUPPORTED (-1) when the
+/// VMM can't.
+pub const SNAPSHOT_CALL: u64 = 0xc600_0001;
+pub const SNAPSHOT_TAKEN: u64 = 0;
+pub const SNAPSHOT_RESTORED: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveMount<'a> {
@@ -91,6 +108,7 @@ pub struct LiveMount<'a> {
 pub struct Header {
     pub total_len: u64,
     pub ram_size: u64,
+    pub gicr: u64,
 }
 
 pub fn parse_header(buf: &[u8]) -> Result<Header, DecodeError> {
@@ -100,10 +118,11 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, DecodeError> {
     }
     let total_len = r.u64()?;
     let ram_size = r.u64()?;
+    let gicr = r.u64()?;
     if total_len < HEADER_LEN as u64 {
         return Err(DecodeError);
     }
-    Ok(Header { total_len, ram_size })
+    Ok(Header { total_len, ram_size, gicr })
 }
 
 impl<'a> Image<'a> {
@@ -112,6 +131,7 @@ impl<'a> Image<'a> {
         w.raw(&MAGIC);
         w.u64(0); // total length, patched below
         w.u64(self.ram_size);
+        w.u64(self.gicr);
         w.u64(self.boot_time_ns);
         w.raw(&self.seed);
         w.u64(self.policy.caps);
@@ -143,6 +163,7 @@ impl<'a> Image<'a> {
         for port in &self.forwards {
             w.u32(*port as u32);
         }
+        w.u8(self.snapshot as u8);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -198,8 +219,10 @@ impl<'a> Image<'a> {
             return Err(DecodeError);
         }
         let forwards = (0..n).map(|_| r.u32().map(|p| p as u16)).collect::<Result<_, _>>()?;
+        let snapshot = r.u8()? != 0;
         Ok(Image {
             ram_size: header.ram_size,
+            gicr: header.gicr,
             boot_time_ns,
             seed,
             policy: Policy { caps, on_deny },
@@ -216,6 +239,7 @@ impl<'a> Image<'a> {
             mounts,
             live_mounts,
             forwards,
+            snapshot,
         })
     }
 }
@@ -229,6 +253,7 @@ mod tests {
     fn roundtrip() {
         let img = Image {
             ram_size: 256 << 20,
+            gicr: crate::machine::GICR_QEMU,
             boot_time_ns: 1_700_000_000_000_000_000,
             seed: [7; 32],
             policy: Policy { caps: 0b101, on_deny: DenyAction::Kill },
@@ -249,6 +274,7 @@ mod tests {
             mounts: vec!["/work"],
             live_mounts: vec![LiveMount { path: "/src", writable: false }],
             forwards: vec![8000, 80],
+            snapshot: true,
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -261,6 +287,7 @@ mod tests {
     fn rejects_truncated() {
         let img = Image {
             ram_size: 1,
+            gicr: 0,
             boot_time_ns: 0,
             seed: [0; 32],
             policy: Policy::default(),
@@ -277,6 +304,7 @@ mod tests {
             mounts: vec![],
             live_mounts: vec![],
             forwards: vec![],
+            snapshot: false,
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

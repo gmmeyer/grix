@@ -1,10 +1,11 @@
-//! VM backend: QEMU `virt` machine.
+//! VM backends: grix's own VMM (`crates/vmm`, Hypervisor.framework) or
+//! QEMU's `virt` machine. Either is a child process on the same terms.
 //!
 //! The VM gets exactly: RAM, a virtio console (the framed channel back to
-//! us, and stdin and networking to it, on QEMU's stdio), a PL011 serial port
-//! on a Unix socket (early boot and panic messages), the kernel, and the
-//! boot image. No network card (connections go through `net::Proxy`), no
-//! disks, no semihosting (which would expose the host filesystem) and no
+//! us, and stdin and networking to it, on the VMM's stdio), a PL011 serial
+//! port on a Unix socket (early boot and panic messages), the kernel, and
+//! the boot image. No network card (connections go through `net::Proxy`),
+//! no disks, no semihosting (which would expose the host filesystem) and no
 //! QEMU monitor.
 
 use std::io::{ErrorKind, Read, Write};
@@ -34,6 +35,8 @@ pub(crate) struct VmConfig {
     pub kernel: PathBuf,
     pub memory_mb: u64,
     pub accel: String,
+    /// grix-vmm, instead of QEMU.
+    pub vmm: Option<PathBuf>,
 }
 
 pub(crate) enum VmEnd {
@@ -44,14 +47,14 @@ pub(crate) enum VmEnd {
     Timeout,
     /// `RunControl::stop`.
     Stopped,
-    /// QEMU exited without the guest reporting a status.
+    /// The VMM exited without the guest reporting a status.
     Lost {
-        qemu_status: Option<i32>,
-        qemu_stderr: String,
+        vmm_status: Option<i32>,
+        vmm_stderr: String,
     },
 }
 
-/// Kills QEMU if we bail out early (error, timeout, caller panic).
+/// Kills the VMM if we bail out early (error, timeout, caller panic).
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -95,8 +98,8 @@ const EXPORT_GRACE: Duration = Duration::from_secs(30);
 /// there before the virtio console is up and when it panics.
 const MAX_UART: usize = 1 << 20;
 
-/// Wait for QEMU to connect to the serial port's socket, which it does
-/// while starting up, before the guest runs. `None` if QEMU exits first.
+/// Wait for the VMM to connect to the serial port's socket, which it does
+/// while starting up, before the guest runs. `None` if it exits first.
 fn accept_uart(listener: &UnixListener, child: &mut Child) -> Result<Option<UnixStream>> {
     listener.set_nonblocking(true)?;
     let started = Instant::now();
@@ -107,13 +110,13 @@ fn accept_uart(listener: &UnixListener, child: &mut Child) -> Result<Option<Unix
                 return Ok(Some(stream));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e).context("accepting QEMU's serial connection"),
+            Err(e) => return Err(e).context("accepting the VMM's serial connection"),
         }
         if child.try_wait()?.is_some() {
             return Ok(None);
         }
         if started.elapsed() > Duration::from_secs(30) {
-            anyhow::bail!("QEMU didn't connect its serial port");
+            anyhow::bail!("the VMM didn't connect its serial port");
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -199,11 +202,59 @@ pub(crate) fn run(
     // before QEMU starts, so a busy one fails the run at once.
     let to_guest = Outbox::new();
     let proxy = Proxy::start(cfg.net.clone(), to_guest.clone())?;
-    let mut fs = crate::hostfs::Server::new(&cfg.live)?;
+    let fs = crate::hostfs::Server::new(&cfg.live)?;
     let uart_path = temp_path("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
     let _uart_path = TempFile(uart_path.clone());
+    let mut cmd = match &cfg.vmm {
+        Some(vmm) => {
+            let mut cmd = Command::new(vmm);
+            cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(&img.0);
+            cmd.args(["--mem", &cfg.memory_mb.to_string()]).arg("--uart").arg(&uart_path);
+            cmd
+        }
+        None => qemu_command(cfg, &uart_path, &img.0),
+    };
+    cmd
+        // Piped even without input: QEMU disconnects the port when its
+        // stdin ends, and then discards what the guest writes.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group: a terminal's Ctrl-C is for the program,
+        // which grix passes on; it mustn't end the VM.
+        .process_group(0);
+    // Still, it goes when grix goes, however that happens.
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl is async-signal-safe, as pre_exec requires.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    let vmm = cfg.vmm.as_ref().unwrap_or(&cfg.qemu);
+    let child = cmd.spawn().with_context(|| {
+        if cfg.vmm.is_none() {
+            // QEMU is the fallback; say what would have made it unnecessary.
+            format!(
+                "starting {} (grix runs its own VMM instead on arm64 macOS 15+, and on arm64 Linux with \
+                 /dev/kvm: in a container, pass --device /dev/kvm)",
+                vmm.display()
+            )
+        } else {
+            format!("starting {}", vmm.display())
+        }
+    })?;
+    let mut child = ChildGuard(child);
+    let uart = accept_uart(&listener, &mut child.0)?;
+    drop(listener);
+    run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
+}
+
+/// QEMU's command line for the machine.
+fn qemu_command(cfg: &VmConfig, uart_path: &std::path::Path, image: &std::path::Path) -> Command {
     // Under emulation use QEMU's richest CPU model; with hardware virtualization, the host CPU.
     let cpu = if cfg.accel == "tcg" { "max,pauth-impdef=on" } else { "host" };
     let mut cmd = Command::new(&cfg.qemu);
@@ -223,28 +274,22 @@ pub(crate) fn run(
         .arg("-kernel")
         .arg(&cfg.kernel)
         .arg("-device")
-        .arg(format!("loader,file={},addr={IMAGE_BASE:#x},force-raw=on", img.0.display()))
-        // Piped even without input: QEMU disconnects the port when its
-        // stdin ends, and then discards what the guest writes.
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Its own process group: a terminal's Ctrl-C is for the program,
-        // which grix passes on; it mustn't end the VM.
-        .process_group(0);
-    // Still, it goes when grix goes, however that happens.
-    #[cfg(target_os = "linux")]
-    // SAFETY: prctl is async-signal-safe, as pre_exec requires.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            Ok(())
-        });
-    }
-    let child = cmd.spawn().with_context(|| format!("starting {}", cfg.qemu.display()))?;
-    let mut child = ChildGuard(child);
-    let uart = accept_uart(&listener, &mut child.0)?;
-    drop(listener);
+        .arg(format!("loader,file={},addr={IMAGE_BASE:#x},force-raw=on", image.display()));
+    cmd
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_vm(
+    cfg: &VmConfig,
+    mut child: ChildGuard,
+    uart: Option<UnixStream>,
+    to_guest: Arc<Outbox>,
+    proxy: Proxy,
+    mut fs: crate::hostfs::Server,
+    timeout: Duration,
+    stdin: Option<Box<dyn Read + Send>>,
+    on_frame: &mut impl FnMut(Channel, &[u8]),
+) -> Result<VmRun> {
     let uart_thread = thread::spawn(move || uart.map(read_uart).unwrap_or_default());
     // Kept open until QEMU is gone (the proxy stops), after stdin's end
     // frame too.
@@ -346,10 +391,10 @@ pub(crate) fn run(
         Channel::Exit => exit = exit.or(wire::decode_exit(payload)),
         _ => on_frame(ch, payload),
     });
-    let qemu_stderr = stderr_thread.join().unwrap_or_default();
+    let vmm_stderr = stderr_thread.join().unwrap_or_default();
     let end = match exit {
         Some((kind, code)) => VmEnd::Exited { kind, code },
-        None => VmEnd::Lost { qemu_status: status.code(), qemu_stderr },
+        None => VmEnd::Lost { vmm_status: status.code(), vmm_stderr },
     };
     Ok(VmRun { end, events, timed_out })
 }

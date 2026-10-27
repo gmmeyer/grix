@@ -14,7 +14,7 @@ use spin::Mutex;
 use crate::mm::KERNEL_OFFSET;
 use crate::virtio;
 
-const UART: u64 = KERNEL_OFFSET + 0x0900_0000;
+const UART: u64 = KERNEL_OFFSET + grix_abi::machine::UART;
 const UART_DR: u64 = 0x00;
 const UART_FR: u64 = 0x18;
 const UART_LCR_H: u64 = 0x2c;
@@ -397,11 +397,16 @@ pub fn report_exit(kind: ExitKind, code: i32) {
     write(Channel::Exit, &wire::encode_exit(kind, code));
 }
 
-/// Power off once everything sent has reached the host.
-pub fn power_off() -> ! {
+/// Wait until everything sent has reached the host.
+pub fn flush() {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.dev.flush(|| false);
     }
+}
+
+/// Power off once everything sent has reached the host.
+pub fn power_off() -> ! {
+    flush();
     crate::arch::power_off()
 }
 

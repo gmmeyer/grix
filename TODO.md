@@ -49,8 +49,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] Registries that need credentials (only anonymous pulls today).
 - [ ] Multi-image layering without re-reading the base (a cache of applied
       bases); building is a full re-import every time.
-- [ ] A Docker image of grix itself (`Dockerfile`), from scratch once grix
-      has its own VMM (QEMU needs a distribution's libraries today).
+- [ ] A Docker image of grix itself (`Dockerfile`): static `grix` and
+      `grix-vmm`, FROM scratch, run with `--device /dev/kvm`.
 
 ## Processes and exec
 
@@ -261,6 +261,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 ## Performance and scale
 
 - [ ] SMP: more than one vCPU.
-- [ ] Our own VMM instead of QEMU (boot time, attack surface).
+- [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
+      (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s
+      per run. `make test-kvm` tests KVM from a Mac.
 - [ ] Snapshots of booted runtimes for instant start.
 - [x] `getdents64` is O(n²) on large directories.

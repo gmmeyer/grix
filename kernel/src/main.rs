@@ -33,6 +33,7 @@ mod procfs;
 mod procs;
 mod rng;
 mod sched;
+mod snapshot;
 mod signal;
 mod syscall;
 mod time;
@@ -58,6 +59,7 @@ pub extern "C" fn kernel_main() -> ! {
     time::init(img.boot_time_ns);
     console::init_virtio();
     rng::init(&img.seed);
+    snapshot::init(img.snapshot);
     arch::allow_el0_counter();
     klog!("grix kernel: {} MiB RAM, {} imported paths, exec {}\n", img.ram_size >> 20, img.entries.len(), img.exe);
     process::start(img)

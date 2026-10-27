@@ -27,6 +27,17 @@ pub fn init(seed: &[u8; 32]) {
     rng.fill(&mut scratch);
 }
 
+/// Mix fresh entropy in (a run restored from a snapshot gets some, so it
+/// doesn't repeat what every other run from the snapshot draws).
+pub fn reseed(entropy: &[u8; 32]) {
+    let mut rng = RNG.lock();
+    for (i, k) in rng.key.iter_mut().enumerate() {
+        *k ^= u32::from_le_bytes(entropy[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    let mut scratch = [0u8; 32];
+    rng.fill(&mut scratch);
+}
+
 pub fn fill(out: &mut [u8]) {
     RNG.lock().fill(out);
 }

@@ -162,6 +162,14 @@ static CONNS: Mutex<BTreeMap<u32, Weak<Mutex<Conn>>>> = Mutex::new(BTreeMap::new
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
 
+/// Connections through the host, and DNS lookups, still going: what a
+/// snapshot can't carry (the host's ends don't come with it).
+pub fn host_state() -> usize {
+    let conns = CONNS.lock().values().filter(|w| w.strong_count() > 0).count();
+    let lookups = DNS.lock().values().filter(|w| w.strong_count() > 0).count();
+    conns + lookups
+}
+
 /// A local port for a socket that didn't bind one (32768-60999, Linux's
 /// ip_local_port_range).
 pub fn ephemeral_port() -> u16 {

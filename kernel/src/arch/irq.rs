@@ -1,4 +1,4 @@
-//! Interrupts: GICv3 (QEMU `virt` layout) and the EL1 virtual timer.
+//! Interrupts: GICv3 (`grix_abi::machine`'s layout) and the EL1 virtual timer.
 //!
 //! The kernel always runs with IRQs masked. Interrupts are taken only from
 //! EL0 (preemption) or noticed after `wfi` in the idle loop, which wakes on a
@@ -9,10 +9,7 @@ use core::arch::asm;
 use crate::mm::KERNEL_OFFSET;
 use crate::time;
 
-const GICD: u64 = KERNEL_OFFSET + 0x0800_0000;
-/// Redistributor of CPU 0: RD_base frame, then SGI_base frame 64 KiB later.
-const GICR: u64 = KERNEL_OFFSET + 0x080A_0000;
-const GICR_SGI: u64 = GICR + 0x1_0000;
+const GICD: u64 = KERNEL_OFFSET + grix_abi::machine::GICD;
 
 /// Virtual timer PPI.
 pub const TIMER_INTID: u32 = 27;
@@ -22,21 +19,26 @@ fn reg32(addr: u64) -> *mut u32 {
     addr as *mut u32
 }
 
-pub fn init() {
+/// Set the GIC up. `gicr` is the redistributors' physical base, which
+/// depends on the VMM (the boot image says).
+pub fn init(gicr: u64) {
+    // CPU 0's redistributor: RD_base frame, then SGI_base frame 64 KiB later.
+    let gicr = KERNEL_OFFSET + gicr;
+    let gicr_sgi = gicr + 0x1_0000;
     unsafe {
         // Distributor: affinity routing, group 1 enabled (single security state).
         let ctlr = reg32(GICD);
         ctlr.write_volatile((1 << 4) | (1 << 1));
         while ctlr.read_volatile() & (1 << 31) != 0 {}
         // Wake the redistributor.
-        let waker = reg32(GICR + 0x14);
+        let waker = reg32(gicr + 0x14);
         waker.write_volatile(waker.read_volatile() & !(1 << 1));
         while waker.read_volatile() & (1 << 2) != 0 {}
         // Timer PPI: group 1, mid priority, enabled.
-        let igroupr0 = reg32(GICR_SGI + 0x80);
+        let igroupr0 = reg32(gicr_sgi + 0x80);
         igroupr0.write_volatile(igroupr0.read_volatile() | (1 << TIMER_INTID));
-        ((GICR_SGI + 0x400 + TIMER_INTID as u64) as *mut u8).write_volatile(0x80);
-        reg32(GICR_SGI + 0x100).write_volatile(1 << TIMER_INTID);
+        ((gicr_sgi + 0x400 + TIMER_INTID as u64) as *mut u8).write_volatile(0x80);
+        reg32(gicr_sgi + 0x100).write_volatile(1 << TIMER_INTID);
         // CPU interface (system registers): enable, unmask all priorities, group 1 on.
         asm!("mrs {t}, S3_0_C12_C12_5", "orr {t}, {t}, #1", "msr S3_0_C12_C12_5, {t}", "isb", t = out(reg) _); // ICC_SRE_EL1
         asm!("msr S3_0_C4_C6_0, {}", in(reg) 0xffu64); // ICC_PMR_EL1

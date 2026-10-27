@@ -14,13 +14,11 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{Ordering, fence};
 
+use grix_abi::machine::{CONSOLE_CONTROL_TX, CONSOLE_PORT, CONSOLE_RX, CONSOLE_TX, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE};
+
 use crate::mm::{KERNEL_OFFSET, PAGE_SIZE, frame, p2v};
 
-const MMIO_BASE: u64 = KERNEL_OFFSET + 0x0a00_0000;
-const MMIO_STRIDE: u64 = 0x200;
-const MMIO_SLOTS: u64 = 32;
-/// Transport i interrupts on SPI 16 + i.
-const IRQ_BASE: u32 = 48;
+const MMIO_BASE: u64 = KERNEL_OFFSET + grix_abi::machine::VIRTIO;
 
 const MAGIC: u64 = 0x000;
 const VERSION: u64 = 0x004;
@@ -51,13 +49,12 @@ const F_VERSION_1_HI: u32 = 1;
 const F_MULTIPORT: u32 = 1 << 1;
 const DEVICE_CONSOLE: u32 = 3;
 
-/// The port we use, and its queues (port n > 0 has 2n + 2 and 2n + 3).
-const PORT: u32 = 1;
-const PORT_RX: u32 = 2 * PORT + 2;
-const PORT_TX: u32 = 2 * PORT + 3;
-/// The control transmit queue. We don't set up the control receive queue:
-/// QEMU drops the messages it would put there, and we need none of them.
-const CONTROL_TX: u32 = 3;
+/// The port we use and its queues. We don't set up the control receive
+/// queue: QEMU drops the messages it would put there, and we need none.
+const PORT: u32 = CONSOLE_PORT;
+const PORT_RX: u32 = CONSOLE_RX;
+const PORT_TX: u32 = CONSOLE_TX;
+const CONTROL_TX: u32 = CONSOLE_CONTROL_TX;
 /// struct virtio_console_control events.
 const DEVICE_READY: u16 = 0;
 const PORT_READY: u16 = 3;
@@ -214,7 +211,7 @@ pub struct Console {
 impl Console {
     /// Find the virtio console and set it up. `None` if there is none.
     pub fn probe() -> Option<Console> {
-        let base = (0..MMIO_SLOTS).map(|i| MMIO_BASE + i * MMIO_STRIDE).find(|&b| {
+        let base = (0..VIRTIO_SLOTS).map(|i| MMIO_BASE + i * VIRTIO_STRIDE).find(|&b| {
             read(b, MAGIC) == 0x7472_6976 && read(b, VERSION) == 2 && read(b, DEVICE_ID) == DEVICE_CONSOLE
         })?;
         write(base, STATUS, 0); // reset
@@ -252,8 +249,8 @@ impl Console {
         control.control(base, PORT, PORT_READY);
         control.control(base, PORT, PORT_OPEN);
         rx.notify(base);
-        let slot = ((base - MMIO_BASE) / MMIO_STRIDE) as u32;
-        Some(Console { base, irq: IRQ_BASE + slot, rx, tx, tx_free: (0..QSIZE).rev().collect(), tx_irq: false })
+        let slot = ((base - MMIO_BASE) / VIRTIO_STRIDE) as u32;
+        Some(Console { base, irq: VIRTIO_IRQ + slot, rx, tx, tx_free: (0..QSIZE).rev().collect(), tx_irq: false })
     }
 
     /// Queue `parts` (encoded frames) for the host, packed into as few

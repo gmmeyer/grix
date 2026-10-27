@@ -1,0 +1,14 @@
+[package]
+name = "grix-vmm"
+description = "grix's own virtual machine monitor: one vCPU, a PL011 and a virtio console, nothing else"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "grix-vmm"
+path = "src/main.rs"
+
+[dependencies]
+grix-abi = { path = "../abi" }
+libc = "0.2"

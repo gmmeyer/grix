@@ -168,6 +168,10 @@ fn idle(p: &mut Process, procs: &mut Procs) {
         None => deadlock(p, procs),
     }
     p.timer_dirty = true;
+    // The moment a snapshot wants: everything started, waiting for input.
+    if waiting_for_input(p, procs) {
+        crate::snapshot::take_if_wanted();
+    }
     // Checking on the host may itself have freed room for a writer. (Not
     // `p.io_seen`: `p` may have just ended, and nothing updates that.)
     if crate::ipc::generation() != POLLED.load(Ordering::Relaxed) {

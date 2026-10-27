@@ -70,6 +70,8 @@ fn linux_errno(e: &io::Error) -> u16 {
         libc::ENAMETOOLONG => 36,
         libc::ENOTEMPTY => 39,
         libc::ELOOP => 40,
+        // The same number on Linux, two on macOS.
+        #[allow(unreachable_patterns)]
         libc::ENOTSUP | libc::EOPNOTSUPP => 95,
         libc::EDQUOT => 122,
         _ => EIO,
@@ -399,10 +401,9 @@ impl Server {
                 }
                 if atime_ns.is_some() || mtime_ns.is_some() {
                     let t = |v: Option<u64>| match v {
-                        Some(ns) => libc::timespec {
-                            tv_sec: (ns / 1_000_000_000) as libc::time_t,
-                            tv_nsec: (ns % 1_000_000_000) as _,
-                        },
+                        Some(ns) => {
+                            libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ }
+                        }
                         None => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ },
                     };
                     let times = [t(atime_ns), t(mtime_ns)];
@@ -664,8 +665,12 @@ fn rename(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, noreplace: boo
     let r = if !noreplace {
         unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) }
     } else {
+        // The system call itself: musl has no wrapper for it.
         #[cfg(target_os = "linux")]
-        let r = unsafe { libc::renameat2(from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_NOREPLACE) };
+        let r = unsafe {
+            libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_NOREPLACE)
+                as libc::c_int
+        };
         #[cfg(target_os = "macos")]
         let r = unsafe { libc::renameatx_np(from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_EXCL) };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

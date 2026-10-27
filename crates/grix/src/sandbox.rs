@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::image::{IMAGE_BASE, Image, MAX_ENTRIES, MAX_RAM, RAM_BASE};
+use grix_abi::machine;
 use grix_abi::policy::{Capability, DenyAction, Policy};
 use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
@@ -159,6 +160,61 @@ fn default_accel() -> &'static str {
     "tcg"
 }
 
+/// The macOS major version (`kern.osproductversion`).
+#[cfg(not(target_os = "macos"))]
+fn macos_major() -> Option<u32> {
+    None
+}
+
+/// The macOS major version (`kern.osproductversion`).
+#[cfg(target_os = "macos")]
+fn macos_major() -> Option<u32> {
+    let mut buf = [0u8; 32];
+    let mut len = buf.len();
+    // SAFETY: a NUL-terminated name, and a buffer with its length.
+    let r = unsafe {
+        libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..len]).ok()?.trim_end_matches('\0');
+    s.split('.').next()?.parse().ok()
+}
+
+/// grix's own VMM where it runs (arm64 macOS 15+, arm64 Linux with KVM)
+/// and is installed: `GRIX_VMM`, next to the running program, or this
+/// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
+/// means QEMU.
+fn default_vmm() -> Option<PathBuf> {
+    if std::env::var_os("GRIX_ACCEL").is_some() {
+        return None;
+    }
+    // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
+    let runs = match default_accel() {
+        "hvf" => macos_major().is_none_or(|v| v >= 15),
+        "kvm" => true,
+        _ => false,
+    };
+    if !runs {
+        return None;
+    }
+    match std::env::var_os("GRIX_VMM") {
+        Some(v) if v == "qemu" => return None,
+        Some(v) => return Some(v.into()),
+        None => {}
+    }
+    let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("grix-vmm")));
+    let built = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/grix-vmm"));
+    beside.into_iter().chain([built]).find(|p| p.is_file())
+}
+
 /// How [`SandboxBuilder::mount_with`] mounts a host directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +249,8 @@ pub struct SandboxBuilder {
     kernel: PathBuf,
     qemu: PathBuf,
     accel: String,
+    /// grix's own VMM, instead of QEMU.
+    vmm: Option<PathBuf>,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -226,6 +284,7 @@ impl Default for SandboxBuilder {
             ),
             qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
             accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| default_accel().into()),
+            vmm: default_vmm(),
             command: Vec::new(),
         }
     }
@@ -525,16 +584,33 @@ impl SandboxBuilder {
         Ok(self)
     }
 
+    /// Run in QEMU, this one.
     pub fn qemu(mut self, path: impl Into<PathBuf>) -> Self {
         self.qemu = path.into();
+        self.vmm = None;
         self
     }
 
-    /// QEMU accelerator: `hvf` (macOS), `kvm` (Linux) or `tcg` (emulation, works
-    /// everywhere). Defaults to hardware virtualization when the host has it.
+    /// Run in QEMU with this accelerator: `hvf` (macOS), `kvm` (Linux) or
+    /// `tcg` (emulation, works everywhere). By default grix uses its own VMM
+    /// where there is one (macOS on Apple silicon), otherwise QEMU with
+    /// hardware virtualization when the host has it.
     pub fn accel(mut self, accel: impl Into<String>) -> Self {
         self.accel = accel.into();
+        self.vmm = None;
         self
+    }
+
+    /// Run in grix's own VMM (`grix-vmm`, built by `make vmm`; macOS on
+    /// Apple silicon), this one.
+    pub fn vmm(mut self, path: impl Into<PathBuf>) -> Self {
+        self.vmm = Some(path.into());
+        self
+    }
+
+    /// The VMM a run uses: `grix-vmm`'s path, or `None` for QEMU.
+    pub fn vmm_path(&self) -> Option<&Path> {
+        self.vmm.as_deref()
     }
 
     pub fn build(mut self) -> Result<Sandbox> {
@@ -672,8 +748,10 @@ impl Sandbox {
             entries.extend(image::entries(&i.files));
         }
         let boot_time_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let gicr = if cfg.vmm.is_some() { machine::GICR_GRIX_VMM } else { machine::GICR_QEMU };
         let bytes = Image {
             ram_size: cfg.memory_mb << 20,
+            gicr,
             boot_time_ns,
             seed,
             policy: cfg.policy,
@@ -694,6 +772,7 @@ impl Sandbox {
                 .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable })
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
+            snapshot: false,
         }
         .encode();
         let mut exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
@@ -709,6 +788,7 @@ impl Sandbox {
             kernel: cfg.kernel.clone(),
             memory_mb: cfg.memory_mb,
             accel: cfg.accel.clone(),
+            vmm: cfg.vmm.clone(),
         };
         let mut out = RunOutput {
             status: ExitStatus::Timeout,
@@ -766,9 +846,10 @@ impl Sandbox {
             VmEnd::Exited { kind: ExitKind::Panic, .. } => ExitStatus::KernelPanic,
             VmEnd::Timeout => ExitStatus::Timeout,
             VmEnd::Stopped => ExitStatus::Stopped,
-            VmEnd::Lost { qemu_status, qemu_stderr } => ExitStatus::VmFailed(format!(
-                "qemu exited ({qemu_status:?}) without a guest status: {}",
-                qemu_stderr.trim()
+            VmEnd::Lost { vmm_status, vmm_stderr } => ExitStatus::VmFailed(format!(
+                "{} exited ({vmm_status:?}) without a guest status: {}",
+                if cfg.vmm.is_some() { "grix-vmm" } else { "qemu" },
+                vmm_stderr.trim()
             )),
         };
         Ok(out)

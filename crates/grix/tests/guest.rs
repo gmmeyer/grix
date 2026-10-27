@@ -1304,3 +1304,96 @@ fn busybox_sees_user_and_system_info() {
     assert!(busybox(&sb, &["df", "/"]).stdout_str().contains("grix"));
     assert_eq!(busybox(&sb, &["ls", "/proc/self/fd"]).stdout_str(), "0\n1\n2\n3\n");
 }
+
+/// A stand-in kernel, hand-assembled: it writes `serial` to the PL011 and
+/// powers off, which is what the real one does when it panics.
+fn fake_kernel(serial: &[u8]) -> Vec<u8> {
+    const BASE: u64 = 0x4020_0000;
+    assert!(serial.len() < 1 << 16);
+    let code: [u32; 13] = [
+        0xd2a1_2001,                              // movz x1, #0x0900, lsl #16   (the PL011)
+        0x5280_2022,                              // movz w2, #0x101
+        0xb900_3022,                              // str  w2, [x1, #0x30]        (UARTCR: on, transmit)
+        0x1000_0143,                              // adr  x3, serial             (40 bytes on)
+        0xd280_0004 | (serial.len() as u32) << 5, // movz x4, #len
+        0x3840_1462,                              // ldrb w2, [x3], #1
+        0xb900_0022,                              // str  w2, [x1]               (UARTDR)
+        0xf100_0484,                              // subs x4, x4, #1
+        0x54ff_ffa1,                              // b.ne (the ldrb)
+        0xd280_0100,                              // movz x0, #8
+        0xf2b0_8000,                              // movk x0, #0x8400, lsl #16   (PSCI SYSTEM_OFF)
+        0xd400_0002,                              // hvc  #0
+        0x1400_0000,                              // b    .
+    ];
+    let mut segment: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
+    segment.extend_from_slice(serial);
+    segment.extend_from_slice(&grix_abi::abi_marker());
+    let mut elf = Vec::new();
+    elf.extend_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+    elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf.extend_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&BASE.to_le_bytes()); // entry
+    elf.extend_from_slice(&64u64.to_le_bytes()); // program headers
+    elf.extend_from_slice(&0u64.to_le_bytes()); // no section headers
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    for v in [64u16, 56, 1, 64, 0, 0] {
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // rwx
+    for v in [0x1000, BASE, BASE, segment.len() as u64, segment.len() as u64, 0x1000] {
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.resize(0x1000, 0);
+    elf.extend_from_slice(&segment);
+    elf
+}
+
+/// What a kernel says on the serial port (early boot, panics) reaches the
+/// host, whichever VMM runs it.
+#[test]
+fn kernel_panics_come_through_the_serial_port() {
+    use grix_abi::wire::{Channel, ExitKind, encode_exit, frame_header};
+    let msg = b"kernel panic: a stand-in";
+    let mut serial = frame_header(Channel::Log, msg.len()).to_vec();
+    serial.extend_from_slice(msg);
+    serial.extend_from_slice(&frame_header(Channel::Exit, 5));
+    serial.extend_from_slice(&encode_exit(ExitKind::Panic, -1));
+    let kernel = temp_dir("fake-kernel").join("kernel");
+    std::fs::write(&kernel, fake_kernel(&serial)).unwrap();
+    let default = Sandbox::builder();
+    let mut backends = vec![("default", default.clone())];
+    if default.vmm_path().is_some() {
+        backends.push(("qemu", default.accel("tcg")));
+    }
+    for (name, b) in backends {
+        let out = b.kernel(&kernel).timeout(Duration::from_secs(30)).build().unwrap().run(&["/x"]).unwrap();
+        assert_eq!(out.status, ExitStatus::KernelPanic, "{name}: {}", out.kernel_log);
+        assert!(out.kernel_log.contains("kernel panic: a stand-in"), "{name}: {}", out.kernel_log);
+    }
+}
+
+/// On arm64 macOS 15+ and on arm64 Linux with KVM, runs use grix's own VMM
+/// (`make vmm`) unless QEMU is asked for.
+#[test]
+fn the_default_vmm() {
+    let qemu_asked =
+        std::env::var_os("GRIX_ACCEL").is_some() || std::env::var_os("GRIX_VMM").is_some_and(|v| v == "qemu");
+    let kvm = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
+    let macos_15 = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next()?.trim().parse::<u32>().ok())
+        .is_some_and(|v| v >= 15);
+    let native =
+        cfg!(target_arch = "aarch64") && (cfg!(target_os = "macos") && macos_15 || cfg!(target_os = "linux") && kvm);
+    if native && !qemu_asked {
+        let vmm = Sandbox::builder().vmm_path().map(Path::to_path_buf);
+        assert!(vmm.as_ref().is_some_and(|p| p.is_file()), "grix-vmm not found: run `make vmm`");
+    } else {
+        assert!(Sandbox::builder().vmm_path().is_none());
+    }
+    assert!(Sandbox::builder().accel("hvf").vmm_path().is_none(), "an accelerator means QEMU");
+}

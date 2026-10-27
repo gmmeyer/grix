@@ -558,7 +558,7 @@ pub fn start(img: Image<'static>) -> ! {
     // Like tmpfs's default size: half of RAM for written file data.
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
-    let stdin = img.stdin;
+    let (stdin, gicr) = (img.stdin, img.gicr);
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
     p.cwd = cwd;
@@ -575,7 +575,7 @@ pub fn start(img: Image<'static>) -> ! {
     let (entry, sp) = program.install(&mut p);
     p.slice_start = crate::time::monotonic_ns();
     *PROCESS.lock() = Some(p);
-    arch::irq::init();
+    arch::irq::init(gicr);
     console::start(stdin);
     arch::enter_user(entry, sp)
 }

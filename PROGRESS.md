@@ -310,6 +310,28 @@ Next, in TODO.md order:
   kernel; registry token services and redirects must be https. `python/`
   is a small package over `grix run --json`.
 
+- **Own VMM** (`crates/vmm`, `grix-vmm`): Hypervisor.framework, one vCPU,
+  the framework's GICv3 (`hv_gic`, macOS 15+) at QEMU `virt`'s addresses,
+  so the kernel didn't change. It emulates a PL011 (transmit only, to the
+  serial socket) and a virtio-mmio console in slot 0 (SPI 16), which
+  holds output back until stdout takes it and waits for the guest's
+  receive buffers. WFI sleeps until a device interrupts or the vtimer's
+  deadline; the framework delivers the timer itself. PSCI SYSTEM_OFF ends
+  the process. After setup it enters a `(deny default)` macOS sandbox.
+  The host runs it as a child process exactly like QEMU (same stdio and
+  serial socket); it's the default on macOS when built (`make vmm`
+  codesigns it), and `GRIX_ACCEL=...` or `GRIX_VMM=qemu` mean QEMU. A
+  hand-assembled stand-in kernel tests the serial/panic path on both.
+  On Linux the same machine runs on KVM (`kvm.rs`: in-kernel vGICv3,
+  PSCI and WFI; we see MMIO and the power-off), confined by a seccomp
+  allowlist applied to every thread (TSYNC). The layout moved to
+  `grix_abi::machine`, with the GIC redistributors' base in the boot
+  image header (ABI 2): Hypervisor.framework reserves 32 MiB of
+  redistributors, which from QEMU's base would cover the UART and virtio,
+  so grix-vmm puts them at 0x1000_0000. `make test-kvm` boots Alpine's
+  kernel in QEMU with nested virtualization (HVF, M3+) and runs static
+  musl builds of grix and grix-vmm there.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
