@@ -473,13 +473,17 @@ content = "a note"
     // outside, so here it's let out, as a path on the command line would be.
     let err = grix::build::Grixfile::build_file(
         &dir.join("Grixfile"),
-        grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {} },
+        grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
     );
     assert!(err.err().unwrap().to_string().contains("outside the build context"));
     let mut g = grix::build::Grixfile::parse(&grixfile).unwrap();
     g.from_outside_context = true;
     let mut log = Vec::new();
-    let opts = grix::build::BuildOptions { kernel: None, on_output: &mut |_, d: &[u8]| log.extend_from_slice(d) };
+    let opts = grix::build::BuildOptions {
+        kernel: None,
+        on_output: &mut |_, d: &[u8]| log.extend_from_slice(d),
+        policy: Default::default(),
+    };
     let image = g.build(&dir, opts).unwrap();
     image.write_to(dir.join("hello.grix")).unwrap();
     let image = grix::Image::open(dir.join("hello.grix")).unwrap();
@@ -519,7 +523,12 @@ fn images_with_no_other_os() {
         ],
         ..Default::default()
     };
-    let image = g.build(Path::new("."), grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {} }).unwrap();
+    let image = g
+        .build(
+            Path::new("."),
+            grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
+        )
+        .unwrap();
     let (n, _) = image.size();
     assert_eq!(n, 5, "only what was put in");
     let sb = Sandbox::builder().image(&image).unwrap().build().unwrap();

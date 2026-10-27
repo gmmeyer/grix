@@ -553,7 +553,12 @@ impl Registry {
                     return Ok(resp);
                 }
                 let to = resp.header("location").context("redirect without a location")?.to_string();
-                let to = if to.starts_with("http") { to } else { format!("https://{}{to}", self.host) };
+                let to = if to.starts_with('/') { format!("https://{}{to}", self.host) } else { to };
+                // Elsewhere, over TLS only (what comes back is checked by digest,
+                // but a plain-HTTP hop could still be steered at local services).
+                if !to.starts_with("https://") {
+                    bail!("{url}: redirected to {to}, which isn't https");
+                }
                 resp = match self.agent.get(&to).call() {
                     Ok(r) => r,
                     Err(ureq::Error::Status(code, _)) => bail!("{to}: HTTP {code}"),
@@ -575,6 +580,9 @@ impl Registry {
             }
         }
         let realm = fields.get("realm").context("challenge without a realm")?;
+        if !realm.starts_with("https://") {
+            bail!("the registry's token service {realm} isn't https");
+        }
         let mut req = self.agent.get(realm);
         if let Some(s) = fields.get("service") {
             req = req.query("service", s);

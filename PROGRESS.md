@@ -301,6 +301,15 @@ Next, in TODO.md order:
   2.6 MB. The host's network proxy now enforces `net` itself, since an
   image's kernel isn't trusted to.
 
+- **MCP and Python**: `grix mcp` serves agents a `run` tool (files, image,
+  mounts, stdin, capabilities, exports back in the answer) and
+  `build_image`, confined to roots and an allowed capability set (no `net`
+  unless enabled). Agents only read the host unless the server is
+  `--writable`; builds follow the server's policy (`build::BuildPolicy`:
+  no registry or Docker sources without `net`); images run on the server's
+  kernel; registry token services and redirects must be https. `python/`
+  is a small package over `grix run --json`.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

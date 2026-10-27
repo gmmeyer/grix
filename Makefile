@@ -21,6 +21,7 @@ fixtures:
 
 test: kernel fixtures
 	cargo test --workspace
+	python3 -m unittest discover -s python/tests
 
 # Lints for host and kernel.
 check:

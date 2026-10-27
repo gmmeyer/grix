@@ -29,6 +29,16 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 8. ~~**Networking through the host** (`net`)~~: done. TCP clients and
    servers, DNS, loopback, port forwards and an allow-list.
 
+## Agent integrations
+
+- [x] MCP server (`grix mcp`): `run` and `build_image` tools, confined to
+      roots, an allowed capability set and time/memory caps; host writes
+      only with `--writable`.
+- [x] Python bindings (`python/`), over `grix run --json`.
+- [ ] Streaming output and signals over MCP (progress notifications,
+      cancellation into `RunControl`).
+- [ ] Native Python bindings (PyO3) instead of driving the CLI.
+
 ## Images
 
 - [x] `grix build` from a Grixfile or flags: a Docker/OCI image (registry,

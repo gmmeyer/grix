@@ -129,6 +129,37 @@ pub struct BuildOptions<'a> {
     pub kernel: Option<PathBuf>,
     /// Each build step's output, as it comes.
     pub on_output: &'a mut dyn FnMut(Stream, &[u8]),
+    /// What a build may do (the default: anything a user's own build may).
+    pub policy: BuildPolicy,
+}
+
+/// What a build may reach, for builds someone else asks for (an agent).
+#[derive(Clone, Debug)]
+pub struct BuildPolicy {
+    /// Build steps get `net`, under these `allow_host` rules (none: anywhere
+    /// but the host and special addresses).
+    pub net: bool,
+    pub allow_hosts: Vec<String>,
+    /// `from` may name a registry image (the host fetches it).
+    pub registries: bool,
+    /// `from` may be `docker:NAME` (the host's Docker daemon).
+    pub docker: bool,
+    /// Each step's time limit and the most memory it may have.
+    pub step_timeout: Duration,
+    pub step_memory_mb: u64,
+}
+
+impl Default for BuildPolicy {
+    fn default() -> Self {
+        BuildPolicy {
+            net: true,
+            allow_hosts: Vec::new(),
+            registries: true,
+            docker: true,
+            step_timeout: Duration::from_secs(1800),
+            step_memory_mb: 3000,
+        }
+    }
 }
 
 impl Grixfile {
@@ -155,6 +186,13 @@ impl Grixfile {
                 image::import(&mut files, &dir, "/")?;
             }
             Some(source) => {
+                let local = ["oci:", "docker-archive:", "docker:"].iter().any(|p| source.starts_with(p));
+                if source.starts_with("docker:") && !opts.policy.docker {
+                    bail!("this build may not read images from the Docker daemon");
+                }
+                if !local && !opts.policy.registries {
+                    bail!("this build may not pull images from registries");
+                }
                 // Paths in it stay in the build context too.
                 for prefix in ["oci:", "docker-archive:"] {
                     if let Some(p) = source.strip_prefix(prefix) {
@@ -215,31 +253,41 @@ impl Grixfile {
         crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", kernel_path.display()))?;
         let mut image = Image::new(files, config, kernel);
         for step in &self.run {
-            image = run_step(image, step, opts.on_output)?;
+            image = run_step(image, step, &opts.policy, opts.on_output)?;
         }
         Ok(image)
     }
 }
 
 /// Run one build step in `image` and take the file tree it leaves.
-fn run_step(image: Image, step: &Step, on_output: &mut dyn FnMut(Stream, &[u8])) -> Result<Image> {
+fn run_step(
+    image: Image,
+    step: &Step,
+    policy: &BuildPolicy,
+    on_output: &mut dyn FnMut(Stream, &[u8]),
+) -> Result<Image> {
     let argv = step.argv();
     if argv.is_empty() {
         bail!("an empty build step");
     }
     let (_, bytes) = image.size();
     // Room for the tree, what the step adds, and the export of it all.
-    let memory_mb = (bytes * 3 / (1 << 20) + 512).min(3000);
+    let memory_mb = (bytes * 3 / (1 << 20) + 512).min(policy.step_memory_mb);
     let mut b = Sandbox::builder()
         .image_files_only(&image)?
         .memory_mb(memory_mb)
-        .timeout(Duration::from_secs(1800))
+        .timeout(policy.step_timeout)
         .max_export((bytes as usize).saturating_mul(4).max(1 << 30))
         .allow(Capability::FsWrite)
         .allow(Capability::Process)
         .allow(Capability::Threads)
-        .allow(Capability::Net)
         .export("/")?;
+    if policy.net {
+        b = b.allow(Capability::Net);
+        for rule in &policy.allow_hosts {
+            b = b.allow_host(rule)?;
+        }
+    }
     for e in &image.config.env {
         if let Some((k, v)) = e.split_once('=') {
             b = b.env(k, v);

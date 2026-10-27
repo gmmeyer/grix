@@ -28,6 +28,7 @@ mod export;
 mod hostfs;
 mod image;
 mod manifest;
+pub mod mcp;
 mod mount;
 mod net;
 mod oci;

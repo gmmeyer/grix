@@ -288,6 +288,12 @@ impl SandboxBuilder {
         self
     }
 
+    /// The memory the sandbox gets so far (an [`image`](Self::image) may
+    /// have raised it).
+    pub fn current_memory_mb(&self) -> u64 {
+        self.memory_mb
+    }
+
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self

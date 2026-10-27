@@ -1,0 +1,187 @@
+//! The MCP server, through the `grix mcp` binary, as an agent sees it.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use serde_json::{Value, json};
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").canonicalize().unwrap()
+}
+
+struct Server {
+    child: Child,
+    to: Option<ChildStdin>,
+    from: BufReader<ChildStdout>,
+    next: u64,
+}
+
+impl Server {
+    fn start(args: &[&str], roots: &[&Path]) -> Server {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_grix"));
+        cmd.arg("mcp").args(args);
+        for r in roots {
+            cmd.arg("--root").arg(r);
+        }
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let to = child.stdin.take();
+        let from = BufReader::new(child.stdout.take().unwrap());
+        Server { child, to, from, next: 1 }
+    }
+
+    fn call(&mut self, msg: Value) -> Value {
+        writeln!(self.to.as_mut().unwrap(), "{msg}").unwrap();
+        let mut line = String::new();
+        self.from.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// A tool call's result.
+    fn tool(&mut self, name: &str, arguments: Value) -> Value {
+        self.next += 1;
+        let id = self.next;
+        let reply = self.call(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                                     "params": {"name": name, "arguments": arguments}}));
+        reply["result"].clone()
+    }
+
+    fn end(mut self) {
+        drop(self.to.take());
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+fn text(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap()
+}
+
+#[test]
+fn an_agent_runs_programs_over_mcp() {
+    let fixtures = fixtures();
+    let mut server = Server::start(&[], &[&fixtures]);
+    let mut call = |msg: Value| server.call(msg);
+    let init =
+        call(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+    assert_eq!(init["result"]["capabilities"]["tools"], json!({}));
+    let busybox = fixtures.join("alpine/bin/busybox.static");
+    let run = call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run", "arguments": {
+        "imports": [{"host": busybox, "guest": "/bin/busybox"}],
+        "files": [{"path": "/in.txt", "content": "pear\napple\n"}],
+        "command": ["/bin/busybox", "sh", "-c", "/bin/busybox sort /in.txt | /bin/busybox tee /out/sorted; /bin/busybox wget -q -O- http://example.com"],
+        "stdin": "",
+        "capabilities": ["fs_write", "process"],
+        "exports": ["/out"]
+    }}}));
+    let r = &run["result"];
+    assert_eq!(r["isError"], false, "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["stdout"], "apple\npear\n");
+    assert_eq!(s["exports"][0]["entries"][0]["content"], "apple\npear\n");
+    // No net: wget's socket is denied, and the agent hears which capability.
+    assert_eq!(s["missing_capabilities"], json!(["net"]));
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("--- events ---"));
+    // Only what the server allows.
+    let denied =
+        call(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run", "arguments": {
+        "command": ["/bin/busybox"], "capabilities": ["net"]}}}));
+    assert_eq!(denied["result"]["isError"], true);
+    // Limits the agent can't talk its way past.
+    for (args, why) in [
+        (json!({"command": ["/bin/busybox"], "timeout_secs": -1}), "timeout_secs"),
+        (json!({"command": ["/bin/busybox"], "timeout_secs": "soon"}), "timeout_secs"),
+        (json!({"command": ["/bin/busybox"], "memory_mb": -5}), "memory_mb"),
+        (json!({"command": ["/bin/busybox"], "imports": [{"host": "/etc/hosts", "guest": "/h"}]}), "doesn't exist in"),
+        (
+            json!({"command": ["/bin/busybox"], "imports": [{"host": fixtures.join("nope"), "guest": "/h"}]}),
+            "doesn't exist in",
+        ),
+        (
+            json!({"command": ["/bin/busybox"], "mounts": [{"host": fixtures, "guest": "/m", "mode": "rw"}]}),
+            "writable mounts",
+        ),
+        (
+            json!({"command": ["/bin/busybox"], "mounts": [{"host": fixtures, "guest": "/m", "mode": "on_exit"}]}),
+            "writable mounts",
+        ),
+    ] {
+        let r = server.tool("run", args);
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(text(&r).contains(why), "{why}: {}", text(&r));
+    }
+    let r =
+        server.tool("build_image", json!({"grixfile": fixtures.join("Grixfile"), "output": fixtures.join("x.grix")}));
+    assert!(text(&r).contains("isn't --writable"), "{}", text(&r));
+    server.end();
+}
+
+/// With `--writable`: mounts that write back, and images built from what
+/// the server allows (no registry or Docker without `net`).
+#[test]
+fn a_writable_server_builds_images_and_writes_mounts() {
+    let fixtures = fixtures();
+    let dir = std::env::temp_dir().join(format!("grix-mcp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    std::fs::create_dir_all(dir.join("ctx")).unwrap();
+    std::fs::copy(fixtures.join("alpine/bin/busybox.static"), dir.join("ctx/busybox")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let mut server = Server::start(&["--writable", "--max-mem", "1024"], &[&fixtures, &dir]);
+    let busybox = fixtures.join("alpine/bin/busybox.static");
+
+    let r = server.tool(
+        "run",
+        json!({
+            "imports": [{"host": busybox, "guest": "/bin/busybox"}],
+            "mounts": [{"host": dir.join("work"), "guest": "/work", "mode": "on_exit"}],
+            "command": ["/bin/busybox", "sh", "-c", "echo made > /work/new.txt"],
+            "capabilities": ["fs_write", "process"],
+        }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let m = &r["structuredContent"]["mount_changes"][0];
+    assert_eq!(m["state"], "applied", "{m}");
+    assert_eq!(m["written"], json!(["new.txt"]));
+    assert_eq!(std::fs::read_to_string(dir.join("work/new.txt")).unwrap(), "made\n");
+    // More memory than the server allows is capped; more than it can give fails.
+    let r = server.tool(
+        "run",
+        json!({"imports": [{"host": busybox, "guest": "/bin/busybox"}],
+                                      "command": ["/bin/busybox", "true"], "memory_mb": 99999}),
+    );
+    assert_eq!(r["structuredContent"]["exit_code"], 0, "{r}");
+
+    for (from, why) in [("alpine:3.21", "may not pull images from registries"), ("docker:alpine", "Docker daemon")] {
+        std::fs::write(dir.join("ctx/Grixfile"), format!("from = {from:?}\n")).unwrap();
+        let r = server.tool("build_image", json!({"grixfile": dir.join("ctx/Grixfile"), "output": dir.join("x.grix")}));
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(text(&r).contains(why), "{from}: {}", text(&r));
+    }
+    // From nothing, with a build step (which runs with the server's caps).
+    std::fs::write(
+        dir.join("ctx/Grixfile"),
+        "command = [\"/bin/busybox\", \"cat\", \"/msg\"]\n\
+         capabilities = [\"process\"]\n\
+         run = [[\"/bin/busybox\", \"sh\", \"-c\", \"echo built > /msg\"]]\n\
+         [[copy]]\nhost = \"busybox\"\nguest = \"/bin/busybox\"\n",
+    )
+    .unwrap();
+    let r = server.tool("build_image", json!({"grixfile": dir.join("ctx/Grixfile"), "output": dir.join("x.grix")}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = server.tool("run", json!({"image": dir.join("x.grix")}));
+    assert_eq!(r["structuredContent"]["stdout"], "built\n", "{r}");
+    // An image may ask only for what the server allows.
+    std::fs::write(
+        dir.join("ctx/Grixfile"),
+        "command = [\"/bin/busybox\"]\ncapabilities = [\"threads\"]\n[[copy]]\nhost = \"busybox\"\nguest = \"/bin/busybox\"\n",
+    )
+    .unwrap();
+    server.end();
+    let mut server = Server::start(&["--writable", "-a", "process", "-a", "fs_write"], &[&dir]);
+    let r = server.tool("build_image", json!({"grixfile": dir.join("ctx/Grixfile"), "output": dir.join("y.grix")}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = server.tool("run", json!({"image": dir.join("y.grix")}));
+    assert!(text(&r).contains("threads capability, which this server doesn't allow"), "{}", text(&r));
+    server.end();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

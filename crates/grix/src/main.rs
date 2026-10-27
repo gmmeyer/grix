@@ -34,8 +34,34 @@ enum Cmd {
     },
     /// Show a grix image's settings and size.
     Inspect { image: PathBuf },
+    /// Serve AI agents over MCP (stdio): a `run` tool for sandboxed programs, and `build_image`.
+    Mcp(McpArgs),
     /// List the capabilities a sandbox can be granted.
     Caps,
+}
+
+#[derive(Parser)]
+struct McpArgs {
+    /// A host directory agents may import, mount, and read images and
+    /// Grixfiles from. Repeatable. Default: the current directory.
+    #[arg(long = "root", value_name = "DIR")]
+    roots: Vec<PathBuf>,
+    /// A capability agents may grant (default: fs_write, threads, process). Repeatable.
+    #[arg(short = 'a', long = "allow", value_name = "CAP")]
+    allow: Vec<String>,
+    /// With `-a net`: the only hosts runs may reach. Repeatable.
+    #[arg(long = "allow-host", value_name = "RULE")]
+    allow_hosts: Vec<String>,
+    /// The longest a run may take, in seconds (default 300).
+    #[arg(long, value_name = "SECS")]
+    max_timeout: Option<u64>,
+    /// The most memory a run may have, in MiB (default 2048).
+    #[arg(long, value_name = "MIB")]
+    max_mem: Option<u64>,
+    /// Let agents change files under the roots: writable mounts (rw,
+    /// on_exit) and build_image's output. Without it they only read.
+    #[arg(long)]
+    writable: bool,
 }
 
 /// The flags add to the Grixfile, or make the whole image without one:
@@ -173,6 +199,7 @@ fn main() -> ExitCode {
         }
         Cmd::Run(args) => run(*args),
         Cmd::Build(args) => build(*args, matches.subcommand_matches("build")),
+        Cmd::Mcp(args) => mcp(args),
         Cmd::Pull { reference, oci } => grix::pull(&reference, &oci).map(|digest| {
             eprintln!("grix: pulled {reference} ({digest}) into {}", oci.display());
             0
@@ -319,7 +346,9 @@ fn run(args: RunArgs) -> Result<i32> {
     };
     if args.json {
         let out = run(&mut |_, _| {})?;
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        let mut json = serde_json::to_value(&out)?;
+        json["missing_capabilities"] = serde_json::json!(out.missing_capabilities());
+        println!("{}", serde_json::to_string_pretty(&json)?);
         let wrote = write_exports(&out, &exports, args.quiet);
         let applied = report_mounts(&out, true);
         return Ok(if wrote && applied { out.status.code() } else { 125 });
@@ -556,10 +585,36 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
     );
     steps.sort_by_key(|(i, _)| *i);
     g.run.extend(steps.into_iter().map(|(_, s)| s));
-    let opts = grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output };
+    let opts = grix::build::BuildOptions {
+        kernel: args.kernel.clone(),
+        on_output: &mut on_output,
+        policy: Default::default(),
+    };
     let image = g.build(&base, opts)?;
     image.write_to(&args.output)?;
     let (n, bytes) = image.size();
     eprintln!("grix: built {} ({n} entries, {} MiB)", args.output.display(), bytes >> 20);
+    Ok(0)
+}
+
+fn mcp(args: McpArgs) -> Result<i32> {
+    let roots = if args.roots.is_empty() { vec![std::env::current_dir()?] } else { args.roots.clone() };
+    let mut config = grix::mcp::McpConfig::new(&roots)?;
+    if !args.allow.is_empty() {
+        config.capabilities = args
+            .allow
+            .iter()
+            .map(|n| Capability::from_name(n).with_context(|| format!("unknown capability {n:?}")))
+            .collect::<Result<_>>()?;
+    }
+    config.allow_hosts = args.allow_hosts.clone();
+    if let Some(s) = args.max_timeout {
+        config.max_timeout = Duration::from_secs(s);
+    }
+    if let Some(mb) = args.max_mem {
+        config.max_memory_mb = mb;
+    }
+    config.writable = args.writable;
+    grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout().lock())?;
     Ok(0)
 }

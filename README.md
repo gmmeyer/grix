@@ -238,6 +238,49 @@ manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host` and
 `guest`. Only TCP and DNS are supported: other UDP, raw sockets and ICMP are
 reported as unsupported.
 
+## MCP server and Python
+
+`grix mcp` serves AI agents over the Model Context Protocol (stdio). Its
+`run` tool runs a program in a fresh sandbox: imports, inline files, a
+grix image, mounts, env, stdin, capabilities and exports. It answers with
+the exit status, output, events, missing capabilities and the exported
+files, and what writable mounts changed on the host. Its `build_image`
+tool builds an image from a Grixfile. Agents get only what the server
+allows:
+
+```sh
+grix mcp --root ~/projects/demo          # host paths only under the roots (default: the current directory)
+grix mcp -a fs_write -a process          # capabilities agents may grant (default: fs_write, threads, process)
+grix mcp -a net --allow-host pypi.org    # net only if allowed, and only where the rules say
+grix mcp --writable                      # rw/on_exit mounts and build_image (default: agents only read the host)
+grix mcp --max-timeout 120 --max-mem 1024
+```
+
+Images an agent runs get the server's kernel, and may ask only for
+capabilities the server allows. Builds follow the same policy: their steps
+get `net` (under the same host rules) and `from` may pull from a registry
+only if the server allows `net`; `docker:` sources are refused.
+
+For example, in a Claude Code or other MCP client config:
+
+```json
+{"mcpServers": {"grix": {"command": "grix", "args": ["mcp", "--root", "/path/to/project"]}}}
+```
+
+Python (`pip install ./python`) drives the same CLI:
+
+```python
+import grix
+
+sb = grix.Sandbox(imports={"./busybox": "/bin/busybox"}, files={"/data/in.txt": "b\na\n"},
+                  capabilities=["process"], timeout=30)
+r = sb.run(["/bin/busybox", "sort", "/data/in.txt"])
+print(r.exit_code, r.stdout, r.events, r.missing_capabilities)
+
+grix.build("app.grix", grixfile="Grixfile")        # images too
+print(grix.Sandbox(image="app.grix").run().stdout)
+```
+
 ## Images
 
 A grix image is a file tree, the settings to run it with, and the grix
@@ -468,8 +511,8 @@ subshells.
 4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
    crate with no external dependencies.
-5. **Agent integrations**: an MCP server and Python bindings; snapshots for
-   instant start. Images (`grix build`) are done.
+5. ~~**Agent integrations**~~: images (`grix build`), the MCP server and
+   Python bindings are done. Next: snapshots for instant start.
 6. **SMP and x86_64 guests**.
 
 ## Repository layout
