@@ -440,6 +440,102 @@ fn timeout() {
 
 // ---------------------------------------------------------------- real-world binaries (Alpine)
 
+#[test]
+fn mounted_directory_changes_go_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = std::env::temp_dir().join(format!("grix-mount-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host);
+    std::fs::create_dir_all(host.join("olddir")).unwrap();
+    std::fs::create_dir_all(host.join("sub")).unwrap();
+    let old = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    for (name, data) in [
+        ("keep.txt", "keep\n"),
+        ("edit.txt", "old\n"),
+        ("gone.txt", "x"),
+        ("olddir/f", "f"),
+        ("mv-src.txt", "moved\n"),
+        ("sub/deep.txt", "deep\n"),
+    ] {
+        std::fs::write(host.join(name), data).unwrap();
+        std::fs::File::options().write(true).open(host.join(name)).unwrap().set_modified(old).unwrap();
+    }
+    // A mount at /etc gets none of the files the kernel would make there.
+    let etc = std::env::temp_dir().join(format!("grix-mount-etc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&etc);
+    std::fs::create_dir(&etc).unwrap();
+    let sb = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount(&host, "/work")
+        .unwrap()
+        .mount(&etc, "/etc")
+        .unwrap()
+        .allow(Capability::Process)
+        .cwd("/work")
+        .build()
+        .unwrap();
+    let script = "set -e
+        b=/bin/busybox
+        $b stat -c %Y keep.txt
+        echo new > edit.txt
+        $b rm gone.txt
+        $b rm -r olddir
+        $b mv mv-src.txt renamed.txt
+        $b mkdir -p made/inner
+        echo hi > made/inner/x.txt
+        $b ln -s renamed.txt link
+        $b chmod 755 sub/deep.txt
+        $b mv /work /elsewhere 2>&1 || true";
+    let out = sb.run(&["/bin/busybox", "sh", "-c", script]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    // Real host mtimes, and the mount point stays put.
+    assert_eq!(out.stdout_str(), "1600000000\nmv: can't rename '/work': Resource busy\n");
+    assert!(matches!(&out.events[..], [GuestEvent::MissingPath { path }] if path == "/elsewhere"), "{:?}", out.events);
+    let m = &out.mounts[0];
+    assert_eq!(m.state, grix::MountState::Applied);
+    assert!(m.conflicts.is_empty(), "{m:?}");
+    assert_eq!(m.removed, ["gone.txt", "mv-src.txt", "olddir"]);
+    assert_eq!(
+        m.written,
+        ["edit.txt", "link", "made", "made/inner", "made/inner/x.txt", "renamed.txt", "sub/deep.txt"]
+    );
+    let read = |p: &str| std::fs::read_to_string(host.join(p)).unwrap();
+    assert_eq!(
+        (read("edit.txt"), read("renamed.txt"), read("made/inner/x.txt")),
+        ("new\n".into(), "moved\n".into(), "hi\n".into())
+    );
+    assert!(!host.join("gone.txt").exists() && !host.join("olddir").exists() && !host.join("mv-src.txt").exists());
+    assert_eq!(std::fs::read_link(host.join("link")).unwrap(), PathBuf::from("renamed.txt"));
+    assert_eq!(std::fs::metadata(host.join("sub/deep.txt")).unwrap().permissions().mode() & 0o777, 0o755);
+    // Untouched files aren't rewritten.
+    assert_eq!(std::fs::metadata(host.join("keep.txt")).unwrap().modified().unwrap(), old);
+    let etc_changes = &out.mounts[1];
+    assert_eq!((etc_changes.written.len(), etc_changes.removed.len()), (0, 0), "{etc_changes:?}");
+    assert_eq!(std::fs::read_dir(&etc).unwrap().count(), 0);
+
+    // The next run sees the directory as it is now, and changes nothing.
+    let out = sb.run(&["/bin/busybox", "sh", "-c", "/bin/busybox cat renamed.txt; /bin/busybox ls"]).unwrap();
+    assert_eq!(out.stdout_str(), "moved\nedit.txt\nkeep.txt\nlink\nmade\nrenamed.txt\nsub\n");
+    let m = &out.mounts[0];
+    assert_eq!((m.state.clone(), m.written.len(), m.removed.len()), (grix::MountState::Applied, 0, 0));
+
+    // Changes over max_export don't go back at all.
+    let small = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount(&host, "/work")
+        .unwrap()
+        .max_export(4096)
+        .build()
+        .unwrap();
+    let out = small.run(&["/bin/busybox", "dd", "if=/dev/zero", "of=/work/big", "bs=1024", "count=64"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
+    assert_eq!(out.mounts[0].state, grix::MountState::NotApplied);
+    assert!(!host.join("big").exists());
+    std::fs::remove_dir_all(&host).unwrap();
+    std::fs::remove_dir_all(&etc).unwrap();
+}
+
 fn busybox_sandbox() -> Sandbox {
     Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")

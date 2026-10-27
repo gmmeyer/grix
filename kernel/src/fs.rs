@@ -333,6 +333,9 @@ pub struct Node {
     /// renamed or have its attributes changed (as with devtmpfs for a
     /// non-root user, and procfs).
     pub system: bool,
+    /// A directory mounted from the host: it can't be removed or renamed
+    /// (EBUSY, as on Linux), so its changes always have a place to go.
+    pub mount_point: bool,
     /// Realtime nanoseconds.
     pub atime: u64,
     pub mtime: u64,
@@ -354,6 +357,7 @@ impl Node {
             nlink: 1,
             changed: false,
             system: false,
+            mount_point: false,
             atime: time,
             mtime: time,
             ctime: time,
@@ -468,7 +472,7 @@ fn leak(s: String) -> &'static [u8] {
 }
 
 impl Fs {
-    pub fn build(entries: &[Entry<'static>], uid: u32, gid: u32) -> Fs {
+    pub fn build(entries: &[Entry<'static>], mounts: &[&str], uid: u32, gid: u32) -> Fs {
         let now = crate::time::realtime_ns();
         // The sandbox user owns the root and everything imported, so a program
         // can create files next to its inputs. System parts (/dev, /proc,
@@ -493,7 +497,11 @@ impl Fs {
                 EntryKind::Symlink => Kind::Symlink(String::from_utf8_lossy(e.data).into_owned()),
             };
             let ino = fs.insert(parent, name, kind, e.mode & 0o7777);
-            (fs.nodes[ino].uid, fs.nodes[ino].gid) = (uid, gid);
+            let n = &mut fs.nodes[ino];
+            (n.uid, n.gid) = (uid, gid);
+            if e.mtime_ns != 0 {
+                (n.atime, n.mtime, n.ctime) = (e.mtime_ns, e.mtime_ns, e.mtime_ns);
+            }
         }
         let dev = fs.mkdir_p("/dev");
         fs.insert(dev, "null", Kind::Dev(Dev::Null), 0o666);
@@ -528,38 +536,45 @@ impl Fs {
         let shm = fs.mkdir_p("/dev/shm");
         (fs.nodes[shm].perm, fs.nodes[shm].system) = (0o1777, false);
 
+        // Nothing of the kernel's own goes in a mounted directory: it would
+        // be sent back to the host as the program's.
+        let mounted = |path: &str| {
+            mounts.iter().any(|m| path == *m || path.strip_prefix(*m).is_some_and(|rest| rest.starts_with('/')))
+        };
         // Describe the sandbox user unless the host imported its own files.
-        if fs.lookup(ROOT, "/etc/passwd", false).is_err() {
+        if fs.lookup(ROOT, "/etc/passwd", false).is_err() && !mounted("/etc/passwd") {
             let etc = fs.mkdir_p("/etc");
             let passwd = alloc::format!(
                 "root:x:0:0:root:/root:/sbin/nologin\ngrix:x:{uid}:{gid}:grix:/home/grix:/bin/sh\n\
                  nobody:x:65534:65534:nobody:/:/sbin/nologin\n"
             );
             fs.insert(etc, "passwd", Kind::File(FileData::new(leak(passwd))), 0o644);
-            fs.mkdir_p("/home");
-            fs.mkdir_owned("/home/grix", (uid, gid));
+            if !mounted("/home/grix") {
+                fs.mkdir_p("/home");
+                fs.mkdir_owned("/home/grix", (uid, gid));
+            }
         }
-        if fs.lookup(ROOT, "/etc/group", false).is_err() {
+        if fs.lookup(ROOT, "/etc/group", false).is_err() && !mounted("/etc/group") {
             let etc = fs.mkdir_p("/etc");
             let group = alloc::format!("root:x:0:\ngrix:x:{gid}:\nnobody:x:65534:\n");
             fs.insert(etc, "group", Kind::File(FileData::new(leak(group))), 0o644);
         }
         // No timezone was imported: say UTC explicitly, as musl and glibc
         // would assume anyway.
-        if fs.lookup(ROOT, "/etc/localtime", false).is_err() {
+        if fs.lookup(ROOT, "/etc/localtime", false).is_err() && !mounted("/etc/localtime") {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "localtime", Kind::File(FileData::new(&UTC_TZIF)), 0o644);
         }
         // Name resolution: the virtual nameserver (whatever server a
         // program asks, the host answers: see inet.rs), and the usual
         // local names plus the host's.
-        if fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() {
+        if fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() && !mounted("/etc/resolv.conf") {
             let etc = fs.mkdir_p("/etc");
             let [a, b, c, d] = grix_abi::link::DNS_V4;
             let text = alloc::format!("nameserver {a}.{b}.{c}.{d}\n");
             fs.insert(etc, "resolv.conf", Kind::File(FileData::new(leak(text))), 0o644);
         }
-        if fs.lookup(ROOT, "/etc/hosts", false).is_err() {
+        if fs.lookup(ROOT, "/etc/hosts", false).is_err() && !mounted("/etc/hosts") {
             let etc = fs.mkdir_p("/etc");
             let [a, b, c, d] = grix_abi::link::HOST_V4;
             let text = alloc::format!(
@@ -568,7 +583,7 @@ impl Fs {
             );
             fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
         }
-        if fs.lookup(ROOT, "/etc/mtab", false).is_err() {
+        if fs.lookup(ROOT, "/etc/mtab", false).is_err() && !mounted("/etc/mtab") {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "mtab", Kind::Symlink("/proc/self/mounts".into()), 0o777);
         }
@@ -597,6 +612,15 @@ impl Fs {
         let (uid, gid) = (owner.uid, owner.gid);
         let n = &mut self.nodes[exe];
         (n.uid, n.gid, n.system) = (uid, gid, true);
+    }
+
+    /// Make the directory at `path` a mount point.
+    pub fn mark_mount(&mut self, path: &str) {
+        if let Ok(ino) = self.lookup(ROOT, path, false)
+            && self.is_dir(ino)
+        {
+            self.nodes[ino].mount_point = true;
+        }
     }
 
     pub fn node_count(&self) -> usize {
@@ -831,6 +855,9 @@ impl Fs {
     fn may_change(&self, dir: Ino, victim: Option<Ino>, uid: u32, gid: u32) -> Result<(), Errno> {
         if self.nodes[dir].system || !self.permits(dir, uid, gid, MAY_WRITE | MAY_EXEC) {
             return Err(EACCES);
+        }
+        if victim.is_some_and(|v| self.nodes[v].mount_point) {
+            return Err(EBUSY);
         }
         if let Some(v) = victim
             && self.nodes[dir].perm & S_ISVTX != 0

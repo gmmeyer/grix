@@ -1,5 +1,8 @@
 //! Sending the directories the host asked for (`Image::exports`) back to it
-//! when the program ends: the agent's results. See `wire::ExportMsg`.
+//! when the program ends: the agent's results. See `wire::ExportMsg`. For a
+//! directory mounted from the host (`Image::mounts`), only what changed goes
+//! back: entries that differ from what the host imported, and the paths
+//! that are gone, which the host then applies to its directory.
 //!
 //! The walk allocates nothing per entry (names are borrowed from the locked
 //! filesystem), and what it sends is bounded twice: by the host's budget,
@@ -9,22 +12,43 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Bound;
+use grix_abi::image::{Entry, EntryKind};
 use grix_abi::wire::{Channel, ExportKind, ExportMsg, MAX_EXPORT_PATH, export_cost};
 use spin::Once;
 
 use crate::console::{self, klog};
 use crate::fs::{self, Content, Fs, Ino, Kind, Node, ROOT};
 
+struct Root {
+    path: &'static str,
+    /// For a mount: what the host imported under it (indices into
+    /// `Config::entries`), sorted by path.
+    imported: Option<Vec<u32>>,
+}
+
 struct Config {
-    roots: Vec<&'static str>,
+    roots: Vec<Root>,
     budget: u64,
+    entries: &'static [Entry<'static>],
+}
+
+/// An imported entry's path relative to the mount at `root`.
+fn rel(e: &Entry<'static>, root: &str) -> &'static str {
+    &e.path[root.len() + 1..]
 }
 
 static CONFIG: Once<Config> = Once::new();
 
 /// Remember what to export, and the most it may cost (from the boot image).
-pub fn init(roots: Vec<&'static str>, budget: u64) {
-    CONFIG.call_once(|| Config { roots, budget });
+pub fn init(exports: &[&'static str], mounts: &[&'static str], entries: &'static [Entry<'static>], budget: u64) {
+    let mut roots: Vec<Root> = exports.iter().map(|&path| Root { path, imported: None }).collect();
+    for &path in mounts {
+        let inside = |e: &Entry| e.path.strip_prefix(path).is_some_and(|r| r.len() > 1 && r.starts_with('/'));
+        let mut imported: Vec<u32> = (0..entries.len() as u32).filter(|&i| inside(&entries[i as usize])).collect();
+        imported.sort_unstable_by(|&a, &b| entries[a as usize].path.cmp(entries[b as usize].path));
+        roots.push(Root { path, imported: Some(imported) });
+    }
+    CONFIG.call_once(|| Config { roots, budget, entries });
 }
 
 /// Send every export, then `Done`. The host reads each directory's state as
@@ -38,12 +62,28 @@ pub fn send() {
         klog!("export skipped: the filesystem isn't available\n");
         return;
     };
-    let mut walk = Walk { budget: cfg.budget, data: Data::new(), truncated: false, skipped: false };
-    for (index, path) in cfg.roots.iter().enumerate() {
-        let root = fs.lookup(ROOT, path, true).ok().filter(|&ino| fs.is_dir(ino));
-        message(&ExportMsg::Root { index: index as u32, found: root.is_some() });
-        if let Some(root) = root {
-            walk.tree(&fs, root);
+    let mut walk = Walk {
+        budget: cfg.budget,
+        data: Data::new(),
+        truncated: false,
+        skipped: false,
+        entries: cfg.entries,
+        root: "",
+        imported: &[],
+        seen: Vec::new(),
+        scratch: Vec::new(),
+    };
+    for (index, root) in cfg.roots.iter().enumerate() {
+        let dir = fs.lookup(ROOT, root.path, true).ok().filter(|&ino| fs.is_dir(ino));
+        message(&ExportMsg::Root { index: index as u32, found: dir.is_some() });
+        walk.root = root.path;
+        walk.imported = root.imported.as_deref().unwrap_or(&[]);
+        walk.seen = alloc::vec![false; walk.imported.len()];
+        if let Some(dir) = dir {
+            walk.tree(&fs, dir, root.imported.is_some());
+            if root.imported.is_some() {
+                walk.removed();
+            }
         }
         if core::mem::take(&mut walk.truncated) {
             message(&ExportMsg::Truncated);
@@ -59,20 +99,29 @@ fn message(m: &ExportMsg) {
     console::write(Channel::Export, &m.encode());
 }
 
-struct Walk {
+struct Walk<'a> {
     /// What may still be sent, in `export_cost` units.
     budget: u64,
     data: Data,
     /// Something was left out (budget, path length) or couldn't be read.
     truncated: bool,
     skipped: bool,
+    /// A mount (its path), its imported entries, and which of them are
+    /// still there.
+    entries: &'static [Entry<'static>],
+    root: &'static str,
+    imported: &'a [u32],
+    seen: Vec<bool>,
+    /// For comparing written files with what was imported.
+    scratch: Vec<u8>,
 }
 
-impl Walk {
+impl Walk<'_> {
     /// Everything under directory `root`, depth first, parents before
     /// children. An entry that doesn't fit is left out (a directory with
-    /// everything in it), and smaller ones after it still go.
-    fn tree(&mut self, fs: &Fs, root: Ino) {
+    /// everything in it), and smaller ones after it still go. With
+    /// `changes`, only what differs from `imported` is sent.
+    fn tree(&mut self, fs: &Fs, root: Ino, changes: bool) {
         let mut path = String::with_capacity(MAX_EXPORT_PATH);
         // Directories being walked: (ino, length of `path` without its
         // name, the last child visited). At most MAX_EXPORT_PATH / 2 deep.
@@ -103,19 +152,101 @@ impl Walk {
                 path.push('/');
             }
             path.push_str(name);
+            let send = !changes || !self.unchanged(node, &path);
             match &node.kind {
                 Kind::Dir(_) => {
-                    if self.entry(ExportKind::Dir, node, &path, 0) {
+                    // A mount's directories are always walked: what's in
+                    // them is only gone if it isn't found.
+                    if (send && self.entry(ExportKind::Dir, node, &path, 0)) || changes {
                         self.data.flush();
                         stack.push((ino, parent_len, None));
                         continue;
                     }
                 }
-                Kind::File(c) => self.file(node, &path, c),
-                Kind::Symlink(target) => self.symlink(node, &path, target),
+                Kind::File(c) if send => self.file(node, &path, c),
+                Kind::Symlink(target) if send => self.symlink(node, &path, target),
                 _ => {}
             }
             path.truncate(parent_len);
+        }
+    }
+
+    /// Is `node`, at `path` in a mount, just as the host imported it? Marks
+    /// the imported entry at `path` as still there either way: if it
+    /// changed, sending the new one replaces it.
+    fn unchanged(&mut self, node: &Node, path: &str) -> bool {
+        let Ok(i) = self.find(path) else { return false };
+        self.seen[i] = true;
+        let e = &self.entries[self.imported[i] as usize];
+        match (&node.kind, e.kind) {
+            (Kind::Dir(_), EntryKind::Dir) => node.perm == e.mode & 0o7777,
+            (Kind::Symlink(t), EntryKind::Symlink) => t.as_bytes() == e.data,
+            // A second name is new to the host, so both get sent.
+            (Kind::File(c), EntryKind::File) => {
+                node.perm == e.mode & 0o7777
+                    && node.mtime == e.mtime_ns
+                    && node.nlink == 1
+                    && self.same_bytes(c, e.data)
+            }
+            _ => false,
+        }
+    }
+
+    /// The index in `imported` of the entry at `path` (relative).
+    fn find(&self, path: &str) -> Result<usize, usize> {
+        self.imported.binary_search_by(|&i| rel(&self.entries[i as usize], self.root).cmp(path))
+    }
+
+    fn same_bytes(&mut self, content: &Content, data: &[u8]) -> bool {
+        let Some(c) = content.try_lock() else { return false };
+        if let Some(base) = c.image() {
+            return core::ptr::eq(base, data);
+        }
+        if c.len() != data.len() as u64 {
+            return false;
+        }
+        // Written to, perhaps with the same bytes.
+        self.scratch.resize(4096, 0);
+        let mut off = 0;
+        while off < data.len() {
+            let n = c.read(off as u64, &mut self.scratch);
+            if n == 0 || self.scratch[..n] != data[off..off + n] {
+                return false;
+            }
+            off += n;
+        }
+        true
+    }
+
+    /// `Removed` for what the host imported into a mount that's no longer
+    /// at its path: only the topmost of what's gone, since a directory goes
+    /// with everything in it.
+    fn removed(&mut self) {
+        for i in 0..self.imported.len() {
+            if self.seen[i] {
+                continue;
+            }
+            let path = rel(&self.entries[self.imported[i] as usize], self.root);
+            if let Some((parent, _)) = path.rsplit_once('/')
+                && self.find(parent).is_ok_and(|j| !self.seen[j])
+            {
+                continue;
+            }
+            let cost = export_cost(path.len(), 0);
+            if path.len() > MAX_EXPORT_PATH || cost > self.budget {
+                self.truncated = true;
+                continue;
+            }
+            self.budget -= cost;
+            message(&ExportMsg::Entry {
+                kind: ExportKind::Removed,
+                mode: 0,
+                mtime_ns: 0,
+                path_len: path.len() as u32,
+                data_len: 0,
+            });
+            self.data.put(path.as_bytes());
+            self.data.flush();
         }
     }
 

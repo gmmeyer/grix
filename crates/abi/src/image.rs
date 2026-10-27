@@ -18,6 +18,10 @@ pub const RAM_BASE: u64 = 0x4000_0000;
 pub const IMAGE_BASE: u64 = 0x4800_0000;
 /// The kernel linearly maps physical memory up to 4 GiB.
 pub const MAX_RAM: u64 = 3 << 30;
+/// The most entries (files, directories, links) an image may have, imports
+/// and mounts together. Each costs a few hundred bytes of the kernel's small
+/// heap, and the files a program creates need room there too.
+pub const MAX_ENTRIES: usize = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -35,6 +39,8 @@ pub struct Entry<'a> {
     pub kind: EntryKind,
     /// Permission bits (e.g. 0o755).
     pub mode: u32,
+    /// Modification time on the host, in ns since the Unix epoch (0: boot time).
+    pub mtime_ns: u64,
     pub data: &'a [u8],
 }
 
@@ -62,6 +68,11 @@ pub struct Image<'a> {
     /// (`wire::export_cost`).
     pub exports: Vec<&'a str>,
     pub export_budget: u64,
+    /// Directories mounted read-write from the host: when the program ends,
+    /// what changed in each is sent back (`ExportKind::Removed` for what's
+    /// gone), after the exports and within the same budget. Their entries
+    /// are among `entries`, as the host found them.
+    pub mounts: Vec<&'a str>,
     /// Guest ports the host forwards connections to (`link::ToGuest::Incoming`).
     pub forwards: Vec<u16>,
 }
@@ -107,10 +118,12 @@ impl<'a> Image<'a> {
             w.str(e.path);
             w.u8(e.kind as u8);
             w.u32(e.mode);
+            w.u64(e.mtime_ns);
             w.bytes(e.data);
         }
         w.strs(&self.exports);
         w.u64(self.export_budget);
+        w.strs(&self.mounts);
         w.u32(self.forwards.len() as u32);
         for port in &self.forwards {
             w.u32(*port as u32);
@@ -139,7 +152,7 @@ impl<'a> Image<'a> {
         let argv = r.strs()?;
         let envp = r.strs()?;
         let n = r.u32()? as usize;
-        if n > r.remaining() / 8 {
+        if n > r.remaining() / 16 {
             return Err(DecodeError);
         }
         let mut entries = Vec::with_capacity(n);
@@ -152,11 +165,13 @@ impl<'a> Image<'a> {
                 _ => return Err(DecodeError),
             };
             let mode = r.u32()?;
+            let mtime_ns = r.u64()?;
             let data = r.bytes()?;
-            entries.push(Entry { path, kind, mode, data });
+            entries.push(Entry { path, kind, mode, mtime_ns, data });
         }
         let exports = r.strs()?;
         let export_budget = r.u64()?;
+        let mounts = r.strs()?;
         let n = r.u32()? as usize;
         if n > r.remaining() / 4 {
             return Err(DecodeError);
@@ -177,6 +192,7 @@ impl<'a> Image<'a> {
             entries,
             exports,
             export_budget,
+            mounts,
             forwards,
         })
     }
@@ -202,12 +218,13 @@ mod tests {
             argv: vec!["hello", "world"],
             envp: vec!["A=1"],
             entries: vec![
-                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, data: b"" },
-                Entry { path: "/bin/hello", kind: EntryKind::File, mode: 0o755, data: b"\x7fELF" },
-                Entry { path: "/bin/hi", kind: EntryKind::Symlink, mode: 0o777, data: b"hello" },
+                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, mtime_ns: 0, data: b"" },
+                Entry { path: "/bin/hello", kind: EntryKind::File, mode: 0o755, mtime_ns: 5, data: b"\x7fELF" },
+                Entry { path: "/bin/hi", kind: EntryKind::Symlink, mode: 0o777, mtime_ns: 9, data: b"hello" },
             ],
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,
+            mounts: vec!["/work"],
             forwards: vec![8000, 80],
         };
         let bytes = img.encode();
@@ -234,6 +251,7 @@ mod tests {
             entries: vec![],
             exports: vec![],
             export_budget: 0,
+            mounts: vec![],
             forwards: vec![],
         };
         let bytes = img.encode();

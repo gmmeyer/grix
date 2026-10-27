@@ -258,7 +258,18 @@ Next, in TODO.md order:
   address, v4-mapped addresses dodging checks, data sent right after
   `Connected` being dropped, and a lost wakeup on close.
 
-Next, from the README roadmap: host directories, then signals from the host.
+- **Read-write host mounts**: `mount(host, guest)` / `--mount` /
+  `[[mount]]`. Each run imports the directory fresh, now with the host's
+  mtimes (all imports have them now). When the program ends the kernel
+  sends only what changed, comparing each node with what was imported (a
+  pointer comparison for untouched files), plus the topmost removed paths.
+  The host applies the change set only if it all arrived, never through a
+  link, replacing files by rename, and leaves anything that changed on the
+  host during the run as a reported conflict. The mount point can't be
+  removed or renamed (EBUSY).
+
+Next: live mounts (fetch files from the host on demand), then signals from
+the host.
 
 ### Notes for the next session
 

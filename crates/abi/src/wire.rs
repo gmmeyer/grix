@@ -210,6 +210,9 @@ pub enum ExportKind {
     Dir = 0,
     File = 1,
     Symlink = 2,
+    /// In a mount's changes: the path (and everything under it) is gone.
+    /// No contents; mode and mtime are 0.
+    Removed = 3,
 }
 
 /// The longest path an export entry may have (relative to its directory).
@@ -224,15 +227,16 @@ pub fn export_cost(path_len: usize, data_len: u64) -> u64 {
 }
 
 /// [`Channel::Export`] messages: the directories the host asked for
-/// (`Image::exports`), sent when the program ends, after its status. For
-/// each directory in order, `Root`, then an `Entry` for everything under it
-/// (parents before children). Each `Entry` is followed by `Data` messages
+/// (`Image::exports`, then `Image::mounts`), sent when the program ends,
+/// after its status. For each directory in order, `Root`, then an `Entry`
+/// for everything under it (parents before children); for a mount, only
+/// what changed, then `Removed` entries for what's gone. Each `Entry` is followed by `Data` messages
 /// carrying exactly its path (relative to the directory, `/`-separated) and
 /// then its contents (file bytes or link target). `Done` ends the export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportMsg<'a> {
-    /// Directory `index` of `Image::exports`; `found` if it exists and is a
-    /// directory.
+    /// Directory `index` of `Image::exports` followed by `Image::mounts`;
+    /// `found` if it exists and is a directory.
     Root {
         index: u32,
         found: bool,
@@ -295,6 +299,7 @@ impl<'a> ExportMsg<'a> {
                     0 => ExportKind::Dir,
                     1 => ExportKind::File,
                     2 => ExportKind::Symlink,
+                    3 => ExportKind::Removed,
                     _ => return Err(DecodeError),
                 };
                 ExportMsg::Entry { kind, mode: r.u32()?, mtime_ns: r.u64()?, path_len: r.u32()?, data_len: r.u64()? }

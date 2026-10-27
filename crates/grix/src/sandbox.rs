@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use grix_abi::image::{IMAGE_BASE, Image, MAX_RAM, RAM_BASE};
+use grix_abi::image::{IMAGE_BASE, Image, MAX_ENTRIES, MAX_RAM, RAM_BASE};
 use grix_abi::policy::{Capability, DenyAction, Policy};
 use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::event::GuestEvent;
 use crate::export::{Collector, Export};
 use crate::image::{self, Node};
+use crate::mount::{Mount, MountChanges};
 use crate::net::{ForwardFrom, HostRule, NetPolicy};
 use crate::vmm::{self, VmConfig, VmEnd};
 
@@ -77,6 +78,9 @@ pub struct RunOutput {
     /// The directories given to [`SandboxBuilder::export`], in that order,
     /// as the program left them.
     pub exports: Vec<Export>,
+    /// What happened to each directory given to [`SandboxBuilder::mount`],
+    /// in that order.
+    pub mounts: Vec<MountChanges>,
     pub kernel_log: String,
     #[serde(serialize_with = "millis")]
     pub duration: Duration,
@@ -157,6 +161,7 @@ pub struct SandboxBuilder {
     max_output: usize,
     exports: Vec<String>,
     max_export: usize,
+    mounts: Vec<Mount>,
     net: NetPolicy,
     uid: u32,
     gid: u32,
@@ -178,6 +183,7 @@ impl Default for SandboxBuilder {
             max_output: DEFAULT_MAX_OUTPUT,
             exports: Vec::new(),
             max_export: DEFAULT_MAX_EXPORT,
+            mounts: Vec::new(),
             net: NetPolicy::default(),
             uid: 1000,
             gid: 1000,
@@ -204,7 +210,7 @@ impl SandboxBuilder {
     /// Create a file with the given contents at `guest`.
     pub fn file(mut self, guest: &str, data: impl Into<Vec<u8>>, mode: u32) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::File { data: data.into(), mode: mode & 0o7777 });
+        self.files.insert(path, Node::File { data: data.into(), mode: mode & 0o7777, mtime_ns: image::now_ns() });
         Ok(self)
     }
 
@@ -215,14 +221,14 @@ impl SandboxBuilder {
         if target.is_empty() || target.contains('\0') {
             bail!("symlink target {target:?} for {guest} must be non-empty, without NUL");
         }
-        self.files.insert(path, Node::Symlink { target: target.into() });
+        self.files.insert(path, Node::Symlink { target: target.into(), mtime_ns: image::now_ns() });
         Ok(self)
     }
 
     /// Create an empty directory at `guest`.
     pub fn dir(mut self, guest: &str) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::Dir { mode: 0o755 });
+        self.files.insert(path, Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
         Ok(self)
     }
 
@@ -277,6 +283,43 @@ impl SandboxBuilder {
         if !self.exports.contains(&path) {
             self.exports.push(path);
         }
+        Ok(self)
+    }
+
+    /// Mount host directory `host` read-write at `guest`. Each run sees it
+    /// as it is when the run starts. When the program ends (except on a
+    /// timeout or kernel panic), what it changed there is applied to
+    /// `host`: new and changed files, links and directories, and removals.
+    /// Only the changes are sent, and they count against
+    /// [`max_export`](SandboxBuilder::max_export); if they don't all fit,
+    /// nothing is applied. Anything that also changed on the host during
+    /// the run is left as the host has it ([`MountChanges::conflicts`]).
+    ///
+    /// The program can't remove or rename the mount point itself (EBUSY).
+    /// Changing files needs [`Capability::FsWrite`], which this grants (it
+    /// lets the program write anywhere in its own filesystem, but nothing
+    /// else reaches the host). The directory lives in guest memory during
+    /// the run, so `memory_mb` bounds its size.
+    pub fn mount(mut self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        let host = host.as_ref();
+        let canonical = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
+        if !canonical.is_dir() {
+            bail!("mounting {}: not a directory", host.display());
+        }
+        let guest = image::guest_path(guest)?;
+        if guest == "/" {
+            bail!("mount {} at a directory other than /", host.display());
+        }
+        let nested = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
+        if let Some(m) = self.mounts.iter().find(|m| nested(&guest, &m.guest) || nested(&m.guest, &guest)) {
+            bail!("mounts at {guest} and {} overlap", m.guest);
+        }
+        // One's changes could otherwise move the other's directory.
+        if let Some(m) = self.mounts.iter().find(|m| canonical.starts_with(&m.host) || m.host.starts_with(&canonical)) {
+            bail!("mounted directories {} and {} overlap", canonical.display(), m.host.display());
+        }
+        self.policy.grant(Capability::FsWrite);
+        self.mounts.push(Mount { host: canonical, guest });
         Ok(self)
     }
 
@@ -348,7 +391,21 @@ impl SandboxBuilder {
     }
 
     pub fn build(mut self) -> Result<Sandbox> {
-        for dir in &self.exports {
+        for m in &self.mounts {
+            let inside = format!("{}/", m.guest);
+            if let Some(p) = self.files.keys().find(|p| **p == m.guest || p.starts_with(&inside)) {
+                bail!("mount at {} overlaps imported {p}", m.guest);
+            }
+            // Where it goes must be a directory, or not there yet.
+            if let Some((p, _)) =
+                self.files.iter().find(|(p, n)| !matches!(n, Node::Dir { .. }) && m.guest.starts_with(&format!("{p}/")))
+            {
+                bail!("mount at {} is inside imported file {p}", m.guest);
+            }
+        }
+        let mounted =
+            |dir: &str| self.mounts.iter().any(|m| dir == m.guest || dir.starts_with(&format!("{}/", m.guest)));
+        for dir in self.exports.iter().filter(|d| !mounted(d)) {
             let inside = format!("{dir}/");
             let exists = self.files.keys().any(|p| p == dir || p.starts_with(&inside));
             // Not under an imported file or link: that would replace it.
@@ -357,11 +414,14 @@ impl SandboxBuilder {
                 .iter()
                 .all(|(p, n)| matches!(n, Node::Dir { .. }) || !(p == "/" || dir.starts_with(&format!("{p}/"))));
             if !exists && room {
-                self.files.insert(dir.clone(), Node::Dir { mode: 0o755 });
+                self.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
             }
         }
         if !self.cwd.starts_with('/') {
             bail!("working directory {:?} must be absolute", self.cwd);
+        }
+        if self.files.len() > MAX_ENTRIES {
+            bail!("{} files, directories and links imported: at most {MAX_ENTRIES} fit", self.files.len());
         }
         let ram = self.memory_mb << 20;
         let needed = RESERVED_LOW + image::imported_bytes(&self.files) + MIN_FREE;
@@ -433,6 +493,31 @@ impl Sandbox {
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed))
             .context("reading /dev/urandom")?;
+        // Mounts are read now, as they are for this run.
+        let mounted = cfg.mounts.iter().map(Mount::import).collect::<Result<Vec<_>>>()?;
+        let mount_dirs: Vec<String> = cfg.mounts.iter().map(|m| m.guest.clone()).collect();
+        let imported =
+            image::imported_bytes(&cfg.files) + mounted.iter().map(|i| image::imported_bytes(&i.files)).sum::<u64>();
+        let count = cfg.files.len() + mounted.iter().map(|i| i.files.len()).sum::<usize>();
+        if count > MAX_ENTRIES {
+            bail!(
+                "{count} files, directories and links in the imports and mounts: at most {MAX_ENTRIES} fit \
+                 (mount a smaller directory)"
+            );
+        }
+        let needed = RESERVED_LOW + imported + MIN_FREE;
+        if cfg.memory_mb << 20 < needed {
+            bail!(
+                "memory_mb = {} is too small for {} MiB of imports and mounts (need at least {} MiB)",
+                cfg.memory_mb,
+                imported >> 20,
+                needed.div_ceil(1 << 20)
+            );
+        }
+        let mut entries = image::entries(&cfg.files);
+        for i in &mounted {
+            entries.extend(image::entries(&i.files));
+        }
         let boot_time_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
         let bytes = Image {
             ram_size: cfg.memory_mb << 20,
@@ -446,13 +531,14 @@ impl Sandbox {
             exe,
             argv: argv.clone(),
             envp: env.iter().map(String::as_str).collect(),
-            entries: image::entries(&cfg.files),
+            entries,
             exports: cfg.exports.iter().map(String::as_str).collect(),
             export_budget: cfg.max_export as u64,
+            mounts: mount_dirs.iter().map(String::as_str).collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
         }
         .encode();
-        let mut exports = Collector::new(&cfg.exports, cfg.max_export as u64);
+        let mut exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
 
         let vm = VmConfig {
             net: cfg.net.clone(),
@@ -469,6 +555,7 @@ impl Sandbox {
             stderr_truncated: false,
             events: Vec::new(),
             exports: Vec::new(),
+            mounts: Vec::new(),
             kernel_log: String::new(),
             duration: Duration::ZERO,
         };
@@ -500,7 +587,9 @@ impl Sandbox {
         })?;
         out.events.extend(run.events);
         let end = run.end;
-        out.exports = exports.finish();
+        let (exported, changes) = exports.finish();
+        out.exports = exported;
+        out.mounts = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
         out.duration = started.elapsed();
         out.status = match end {
             VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),

@@ -1,11 +1,11 @@
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grix::{Capability, DenyAction, Export, ExportState, Manifest, RunOutput, Sandbox, Stream};
+use grix::{Capability, DenyAction, Export, ExportState, Manifest, MountState, RunOutput, Sandbox, Stream};
 
 #[derive(Parser)]
 #[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
@@ -34,6 +34,11 @@ struct RunArgs {
     /// not exist yet, or be empty). Repeatable.
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
+    /// Mount host directory HOST read-write at GUEST: what the program
+    /// changes there is applied to HOST when it ends. Grants fs_write.
+    /// Repeatable.
+    #[arg(long = "mount", value_name = "HOST:GUEST")]
+    mounts: Vec<String>,
     /// With `net`, only connect to hosts these rules allow (example.com,
     /// *.example.com, 1.2.3.4, 10.0.0.0/8, each optionally :port).
     /// host.grix.internal is the host's own localhost. Repeatable.
@@ -135,6 +140,22 @@ fn run(args: RunArgs) -> Result<i32> {
             bail!("{} is the destination of two exports", host.display());
         }
     }
+    let mut mounted: Vec<PathBuf> = manifest.mounts.iter().filter_map(|m| m.host.canonicalize().ok()).collect();
+    for spec in &args.mounts {
+        let (host, guest) = spec.rsplit_once(':').with_context(|| format!("--mount {spec:?} must be HOST:GUEST"))?;
+        b = b.mount(host, guest)?;
+        mounted.extend(Path::new(host).canonicalize().ok());
+    }
+    // Mounts are applied first: one's changes mustn't decide where an
+    // export goes.
+    for (_, dest) in &exports {
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        if let Ok(parent) = parent.canonicalize()
+            && let Some(m) = mounted.iter().find(|m| parent.starts_with(m))
+        {
+            bail!("export destination {} is inside mounted {}", dest.display(), m.display());
+        }
+    }
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }
@@ -193,7 +214,8 @@ fn run(args: RunArgs) -> Result<i32> {
         let out = run(&mut |_, _| {})?;
         println!("{}", serde_json::to_string_pretty(&out)?);
         let wrote = write_exports(&out, &exports, args.quiet);
-        return Ok(if wrote { out.status.code() } else { 125 });
+        let applied = report_mounts(&out, true);
+        return Ok(if wrote && applied { out.status.code() } else { 125 });
     }
 
     let out = run(&mut |stream, data| {
@@ -231,7 +253,45 @@ fn run(args: RunArgs) -> Result<i32> {
         _ => {}
     }
     let wrote = write_exports(&out, &exports, args.quiet);
-    Ok(if wrote { out.status.code() } else { 125 })
+    let applied = report_mounts(&out, args.quiet);
+    Ok(if wrote && applied { out.status.code() } else { 125 })
+}
+
+/// Say what happened to each mount. False if a program that ended
+/// normally didn't get its changes applied.
+fn report_mounts(out: &RunOutput, quiet: bool) -> bool {
+    let ended = matches!(out.status, grix::ExitStatus::Exited(_) | grix::ExitStatus::Signaled(_));
+    let mut ok = true;
+    for m in &out.mounts {
+        let host = m.host.display();
+        let (w, r) = (m.written.len(), m.removed.len());
+        match &m.state {
+            MountState::Applied if quiet || w + r == 0 => {}
+            MountState::Applied => eprintln!("grix: applied the changes to {host}: {w} written, {r} removed"),
+            MountState::NotApplied if ended => {
+                eprintln!(
+                    "grix: the changes to {host} weren't applied: they didn't all arrive \
+                     (over --max-export, or paths nested deeper than 4096 bytes)"
+                );
+                ok = false;
+            }
+            MountState::NotApplied => eprintln!("grix: the changes to {host} weren't applied"),
+            MountState::Failed(why) => {
+                eprintln!("grix: applying the changes to {host} failed after {w} written, {r} removed: {why}");
+                ok = false;
+            }
+        }
+        if !m.conflicts.is_empty() {
+            let n = m.conflicts.len();
+            let shown: Vec<&str> = m.conflicts.iter().take(10).map(String::as_str).collect();
+            let more = if n > 10 { format!(" and {} more", n - 10) } else { String::new() };
+            eprintln!(
+                "grix: {n} path(s) in {host} changed on the host during the run too and were left as they are: {}{more}",
+                shown.join(", ")
+            );
+        }
+    }
+    ok
 }
 
 /// Write each exported directory to its host path, saying what happened.

@@ -52,7 +52,13 @@ what it already sent) or fail with EAGAIN; the kernel's own messages spin
 until there's room. Before the virtio console is up, and for panics, frames
 go to the PL011 UART, on a Unix socket the host reads (bounded). When the
 program ends (`process::finish`), `export.rs` sends the directories listed
-in `Image::exports` before the exit status (`wire::ExportMsg`).
+in `Image::exports` before the exit status (`wire::ExportMsg`), then, for
+each of `Image::mounts`, only what differs from what was imported (a file
+is unchanged if it still points at its image bytes, or has the same ones)
+and `ExportKind::Removed` for the topmost paths that are gone. The host
+(`crates/grix/src/mount.rs`) applies those to the mounted directory
+without following links and skips anything that changed on the host during
+the run. Mount points are `Node::mount_point` (EBUSY to remove or rename).
 
 Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 `crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):

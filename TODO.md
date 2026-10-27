@@ -100,10 +100,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       their own tree.
 - [x] Hand writable directories back to the host after a run (the agent's results).
       `SandboxBuilder::export` / `--export GUEST:HOST` / `[[export]]`. Sent when the program ends (exit, crash, deadlock), into `RunOutput::exports`, under a `max_export` budget. `Export::write_to` recreates it on the host without following links.
-- [ ] Export only what changed in an imported tree (an overlay's upper layer, with deletions), instead of all of it.
+- [x] Export only what changed in an imported tree (an overlay's upper layer, with deletions), instead of all of it.
+      Mounts do this: the kernel compares each node with what was imported and sends new and changed entries and the topmost removed paths.
 - [ ] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
 - [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
-- [ ] Read-write host directory mounts, gated by policy.
+- [~] Read-write host directory mounts, gated by policy.
+      `SandboxBuilder::mount` / `--mount HOST:GUEST` / `[[mount]]`. Each run imports the directory; what the program changed is applied to it when the program ends, without following links, leaving anything that changed on the host meanwhile (conflicts). The mount point can't be removed or renamed (EBUSY). Missing: live mounts (changes visible to the host during the run, and directories larger than guest memory), which need the guest to fetch files from the host on demand; changes after a timeout.
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
@@ -112,9 +114,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Watches can be added and removed but never fire, even now that files change.
 - [ ] `flock` and `fcntl` record locks with real semantics (sqlite) once there
       are writers.
-- [~] Real file timestamps from the host (make, build caches). Everything
+- [x] Real file timestamps from the host (make, build caches). Everything
       shows boot time today.
-      Files the program changes get real atime/mtime/ctime. Imports still show boot time.
+      Imports carry the host's mtime (atime and ctime start there too), and files the program changes get real times.
 - [~] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
       `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice` and `tee` are missing.

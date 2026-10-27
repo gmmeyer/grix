@@ -230,9 +230,21 @@ struct Pending {
     received: usize,
 }
 
-/// Turns the guest's `Channel::Export` messages into [`Export`]s.
+/// What changed in a mounted directory: entries that are new or differ
+/// from what was imported, and the paths that are gone.
+pub(crate) struct Changes {
+    pub state: ExportState,
+    pub entries: Vec<ExportEntry>,
+    pub removed: Vec<String>,
+}
+
+/// Turns the guest's `Channel::Export` messages into [`Export`]s, and the
+/// changes in mounts.
 pub(crate) struct Collector {
+    /// The exports, then the mounts.
     exports: Vec<Export>,
+    removed: Vec<Vec<String>>,
+    first_mount: usize,
     /// What may still be kept, in `wire::export_cost` units. The guest
     /// counts the same way and leaves out what wouldn't fit, so running out
     /// here means it didn't.
@@ -249,12 +261,15 @@ pub(crate) struct Collector {
 }
 
 impl Collector {
-    pub fn new(dirs: &[String], budget: u64) -> Collector {
-        let exports = dirs
+    pub fn new(dirs: &[String], mounts: &[String], budget: u64) -> Collector {
+        let exports: Vec<Export> = dirs
             .iter()
+            .chain(mounts)
             .map(|d| Export { dir: d.clone(), state: ExportState::Incomplete, entries: Vec::new() })
             .collect();
         Collector {
+            removed: vec![Vec::new(); exports.len()],
+            first_mount: dirs.len(),
             exports,
             budget,
             current: None,
@@ -297,10 +312,12 @@ impl Collector {
                 let cur = self.current?;
                 let path_len = path_len as usize;
                 let data_len = usize::try_from(data_len).ok()?;
+                let empty = matches!(kind, ExportKind::Dir | ExportKind::Removed);
                 if self.exports[cur].state == ExportState::Missing
                     || path_len == 0
                     || path_len > MAX_EXPORT_PATH
-                    || (kind == ExportKind::Dir && data_len != 0)
+                    || (empty && data_len != 0)
+                    || (kind == ExportKind::Removed && cur < self.first_mount)
                 {
                     return None;
                 }
@@ -357,13 +374,17 @@ impl Collector {
     /// Add an entry whose bytes have all arrived to its export.
     fn add(&mut self, p: Pending) -> Option<()> {
         let path = String::from_utf8(p.path).ok().filter(|s| valid_path(s))?;
+        let cur = self.current?;
         let content = match p.kind {
             ExportKind::Dir => ExportContent::Dir,
             ExportKind::File => ExportContent::File(p.data),
             ExportKind::Symlink => ExportContent::Symlink(String::from_utf8(p.data).ok()?),
+            ExportKind::Removed => {
+                self.removed[cur].push(path);
+                return Some(());
+            }
         };
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_nanos(p.mtime_ns);
-        let cur = self.current?;
         self.exports[cur].entries.push(ExportEntry { path, mode: p.mode & 0o7777, mtime, content });
         Some(())
     }
@@ -378,7 +399,8 @@ impl Collector {
         }
     }
 
-    pub fn finish(mut self) -> Vec<Export> {
+    /// The exports, and the mounts' changes.
+    pub fn finish(mut self) -> (Vec<Export>, Vec<Changes>) {
         if !self.done
             && let Some(cur) = self.current
             && self.exports[cur].state == ExportState::Truncated
@@ -386,7 +408,14 @@ impl Collector {
             // Cut off while being sent: more is missing than the limit.
             self.exports[cur].state = ExportState::Incomplete;
         }
-        self.exports
+        let mounts = self.exports.split_off(self.first_mount);
+        let removed = self.removed.split_off(self.first_mount);
+        let changes = mounts
+            .into_iter()
+            .zip(removed)
+            .map(|(e, removed)| Changes { state: e.state, entries: e.entries, removed })
+            .collect();
+        (self.exports, changes)
     }
 }
 
@@ -415,11 +444,39 @@ mod tests {
 
     fn collect(dirs: &[&str], budget: u64, msgs: &[Vec<u8>]) -> Vec<Export> {
         let dirs: Vec<String> = dirs.iter().map(|d| d.to_string()).collect();
-        let mut c = Collector::new(&dirs, budget);
+        let mut c = Collector::new(&dirs, &[], budget);
         for m in msgs {
             c.push(m);
         }
-        c.finish()
+        c.finish().0
+    }
+
+    #[test]
+    fn collects_a_mounts_changes() {
+        let msgs = stream(vec![
+            vec![ExportMsg::Root { index: 0, found: true }.encode()],
+            entry(ExportKind::File, "a", b"x"),
+            vec![ExportMsg::Root { index: 1, found: true }.encode()],
+            entry(ExportKind::File, "src/new.rs", b"fn main() {}"),
+            entry(ExportKind::Removed, "old", b""),
+            vec![ExportMsg::Done.encode()],
+        ]);
+        let mut c = Collector::new(&["/out".into()], &["/work".into()], 1 << 20);
+        for m in &msgs {
+            c.push(m);
+        }
+        let (exports, changes) = c.finish();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].entries.len(), 1);
+        assert_eq!(changes[0].state, ExportState::Complete);
+        assert_eq!(changes[0].entries[0].path, "src/new.rs");
+        assert_eq!(changes[0].removed, ["old"]);
+        // Removed only belongs in a mount.
+        let bad = stream(vec![
+            vec![ExportMsg::Root { index: 0, found: true }.encode()],
+            entry(ExportKind::Removed, "x", b""),
+        ]);
+        assert_eq!(collect(&["/out"], 1 << 20, &bad)[0].state, ExportState::Incomplete);
     }
 
     fn stream(parts: Vec<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {

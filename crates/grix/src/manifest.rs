@@ -24,6 +24,10 @@
 //! [[export]]                 # copied out when the program ends (CLI)
 //! guest = "/out"
 //! host = "results"           # relative to this manifest; must not exist yet
+//!
+//! [[mount]]                  # read-write: changes go back when the program ends
+//! host = "."                 # relative to this manifest
+//! guest = "/work"
 //! ```
 
 use std::collections::BTreeMap;
@@ -58,6 +62,8 @@ pub struct Manifest {
     pub imports: Vec<Import>,
     #[serde(default, rename = "export")]
     pub exports: Vec<ExportTo>,
+    #[serde(default, rename = "mount")]
+    pub mounts: Vec<Import>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,6 +109,11 @@ impl Manifest {
                 exp.host = dir.join(&exp.host);
             }
         }
+        for mount in &mut m.mounts {
+            if mount.host.is_relative() {
+                mount.host = dir.join(&mount.host);
+            }
+        }
         Ok(m)
     }
 
@@ -145,6 +156,9 @@ impl Manifest {
         }
         for exp in &self.exports {
             b = b.export(&exp.guest)?;
+        }
+        for mount in &self.mounts {
+            b = b.mount(&mount.host, &mount.guest)?;
         }
         Ok(b)
     }

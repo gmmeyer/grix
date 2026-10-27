@@ -507,14 +507,19 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
 
 /// Load the image's program and jump to it.
 pub fn start(img: Image<'static>) -> ! {
-    crate::export::init(img.exports.clone(), img.export_budget);
+    // Kept for good (this never returns), for comparing mounts at the end.
+    let entries: &'static [grix_abi::image::Entry<'static>] = img.entries.leak();
+    crate::export::init(&img.exports, &img.mounts, entries, img.export_budget);
     crate::inet::init(img.forwards.clone());
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);
         finish(ExitKind::Exited, code)
     };
-    let fs = fs::Fs::build(&img.entries, img.uid, img.gid);
+    let mut fs = fs::Fs::build(entries, &img.mounts, img.uid, img.gid);
+    for m in &img.mounts {
+        fs.mark_mount(m);
+    }
     let cwd = match fs.lookup(ROOT, img.cwd, true) {
         Ok(ino) if fs.is_dir(ino) => ino,
         _ => fail(127, &alloc::format!("working directory {} does not exist", img.cwd)),
