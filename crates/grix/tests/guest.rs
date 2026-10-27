@@ -440,6 +440,165 @@ fn timeout() {
 
 // ---------------------------------------------------------------- real-world binaries (Alpine)
 
+fn temp_dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("grix-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d.canonicalize().unwrap()
+}
+
+#[test]
+fn live_mount_works_on_the_host_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = temp_dir("live");
+    std::fs::create_dir(host.join("sub")).unwrap();
+    std::fs::create_dir(host.join("inbox")).unwrap();
+    std::fs::create_dir(host.join("locked")).unwrap();
+    std::fs::set_permissions(host.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::write(host.join("a.txt"), "hello\n").unwrap();
+    std::os::unix::fs::symlink("a.txt", host.join("link")).unwrap();
+    // Outside the mount, where a link the program makes points.
+    let outside = temp_dir("live-outside");
+    std::fs::write(outside.join("secret"), "no\n").unwrap();
+    let sb = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount(&host, "/work")
+        .unwrap()
+        .allow(Capability::Process)
+        .cwd("/work")
+        .build()
+        .unwrap();
+    let script = format!(
+        "b=/bin/busybox
+        $b cat link
+        echo more >> a.txt
+        echo new > sub/new.txt
+        $b mkdir d2
+        $b mv sub/new.txt d2/moved.txt
+        $b rm link
+        $b chmod 600 a.txt
+        $b ln -s {outside} out
+        echo through > out/secret 2>/dev/null; echo \"write through link: $?\"
+        $b ln a.txt hard 2>&1 | $b grep -o 'Operation not permitted'
+        $b mv /work /elsewhere 2>&1 | $b grep -o 'Resource busy'
+        $b dd if=/dev/zero of=big bs=1k count=3000 2>/dev/null
+        $b sha256sum big | $b cut -c1-16
+        # Removed while open: still readable through the descriptor.
+        echo kept > gone.txt; exec 3< gone.txt; $b rm gone.txt; $b cat <&3; exec 3<&-
+        $b ls locked 2>&1 | $b grep -o 'Permission denied'
+        $b chown 0 a.txt 2>&1 | $b grep -o 'Operation not permitted'
+        # Ready: the host adds a file, which shows up here.
+        $b touch ready
+        cd /
+        i=0; while [ ! -e /work/inbox/from-host ] && [ $i -lt 300 ]; do $b sleep 0.1; i=$((i+1)); done
+        $b cat /work/inbox/from-host",
+        outside = outside.display()
+    );
+    let watcher = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            // Patient: under emulation the guest takes a while to get there.
+            for _ in 0..3000 {
+                if host.join("ready").exists() {
+                    std::fs::write(host.join("inbox/from-host"), "hi from the host\n").unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let out = sb.run(&["/bin/busybox", "sh", "-c", &script]).unwrap();
+    watcher.join().unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(
+        out.stdout_str(),
+        "hello\nwrite through link: 1\nOperation not permitted\nResource busy\n\
+         76ed5c9c326ba623\nkept\nPermission denied\nOperation not permitted\nhi from the host\n"
+    );
+    assert!(
+        out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { path } if path == "/elsewhere")),
+        "{:?}",
+        out.events
+    );
+    // Everything happened on the host, at once.
+    let read = |p: &str| std::fs::read_to_string(host.join(p)).unwrap();
+    assert_eq!(read("a.txt"), "hello\nmore\n");
+    assert_eq!(read("d2/moved.txt"), "new\n");
+    assert!(!host.join("link").exists() && !host.join("sub/new.txt").exists() && !host.join("hard").exists());
+    assert_eq!(std::fs::metadata(host.join("a.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(host.join("big")).unwrap().len(), 3000 * 1024);
+    // The program's link was made, but it points into the guest's own
+    // namespace, and the host never follows links: the host's file is safe.
+    assert_eq!(std::fs::read_link(host.join("out")).unwrap(), outside);
+    assert_eq!(std::fs::read_to_string(outside.join("secret")).unwrap(), "no\n");
+
+    // Read-only: changes fail with EROFS and nothing changes.
+    let ro = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount_read_only(&host, "/work")
+        .unwrap()
+        .allow(Capability::FsWrite)
+        .build()
+        .unwrap();
+    let out = ro.run(&["/bin/busybox", "rm", "/work/a.txt"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    assert!(out.stderr_str().contains("Read-only file system"), "{}", out.stderr_str());
+    assert!(host.join("a.txt").exists());
+    std::fs::set_permissions(host.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&host).unwrap();
+    std::fs::remove_dir_all(&outside).unwrap();
+}
+
+#[test]
+fn live_mount_walks_trees_larger_than_the_kernel_keeps() {
+    // More nodes than the kernel's budget holds at once: 10 directories of
+    // 1,000 files, which it forgets once it's done with them, and one of
+    // 40,200 entries, whose names it looks up one at a time.
+    let host = temp_dir("live-big");
+    let mut dirs: Vec<(String, usize)> = (0..10).map(|i| (format!("dir{i:02}"), 1000)).collect();
+    dirs.push(("huge".into(), 40_000));
+    for (name, n) in &dirs {
+        let d = host.join(name);
+        std::fs::create_dir(&d).unwrap();
+        for j in 0..*n {
+            std::fs::File::create(d.join(format!("a-somewhat-long-file-name-{j:05}.txt"))).unwrap();
+        }
+    }
+    std::fs::write(host.join("huge/a-somewhat-long-file-name-01234.txt"), "found\n").unwrap();
+    // Directories inside the large one, listed while it fills the budget.
+    for i in 0..200 {
+        let d = host.join(format!("huge/sub{i:03}"));
+        std::fs::create_dir(&d).unwrap();
+        for j in 0..5 {
+            std::fs::File::create(d.join(format!("f{j}"))).unwrap();
+        }
+    }
+    let sb = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount_read_only(&host, "/work")
+        .unwrap()
+        .allow(Capability::Process)
+        // Three passes over 50,000 entries, which takes a while emulated.
+        .timeout(Duration::from_secs(600))
+        .build()
+        .unwrap();
+    let script = "b=/bin/busybox; $b find /work -type f | $b wc -l; $b ls /work/huge | $b wc -l
+        $b cat /work/huge/a-somewhat-long-file-name-01234.txt
+        $b stat -c %i /work/huge/a-somewhat-long-file-name-01234.txt
+        $b ls -i /work/huge | $b grep 01234 | $b cut -d' ' -f1";
+    let out = sb.run(&["/bin/busybox", "sh", "-c", script]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    let lines: Vec<&str> = out.stdout_str().leak().lines().map(str::trim).collect();
+    assert_eq!(lines[..3], ["51000", "40200", "found"]);
+    // The same inode number from stat and getdents.
+    assert_eq!(lines[3], lines[4]);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    std::fs::remove_dir_all(&host).unwrap();
+}
+
 #[test]
 fn mounted_directory_changes_go_back() {
     use std::os::unix::fs::PermissionsExt;
@@ -466,9 +625,9 @@ fn mounted_directory_changes_go_back() {
     let sb = Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
         .unwrap()
-        .mount(&host, "/work")
+        .mount_on_exit(&host, "/work")
         .unwrap()
-        .mount(&etc, "/etc")
+        .mount_on_exit(&etc, "/etc")
         .unwrap()
         .allow(Capability::Process)
         .cwd("/work")
@@ -491,7 +650,7 @@ fn mounted_directory_changes_go_back() {
     // Real host mtimes, and the mount point stays put.
     assert_eq!(out.stdout_str(), "1600000000\nmv: can't rename '/work': Resource busy\n");
     assert!(matches!(&out.events[..], [GuestEvent::MissingPath { path }] if path == "/elsewhere"), "{:?}", out.events);
-    let m = &out.mounts[0];
+    let m = &out.mount_changes[0];
     assert_eq!(m.state, grix::MountState::Applied);
     assert!(m.conflicts.is_empty(), "{m:?}");
     assert_eq!(m.removed, ["gone.txt", "mv-src.txt", "olddir"]);
@@ -509,28 +668,28 @@ fn mounted_directory_changes_go_back() {
     assert_eq!(std::fs::metadata(host.join("sub/deep.txt")).unwrap().permissions().mode() & 0o777, 0o755);
     // Untouched files aren't rewritten.
     assert_eq!(std::fs::metadata(host.join("keep.txt")).unwrap().modified().unwrap(), old);
-    let etc_changes = &out.mounts[1];
+    let etc_changes = &out.mount_changes[1];
     assert_eq!((etc_changes.written.len(), etc_changes.removed.len()), (0, 0), "{etc_changes:?}");
     assert_eq!(std::fs::read_dir(&etc).unwrap().count(), 0);
 
     // The next run sees the directory as it is now, and changes nothing.
     let out = sb.run(&["/bin/busybox", "sh", "-c", "/bin/busybox cat renamed.txt; /bin/busybox ls"]).unwrap();
     assert_eq!(out.stdout_str(), "moved\nedit.txt\nkeep.txt\nlink\nmade\nrenamed.txt\nsub\n");
-    let m = &out.mounts[0];
+    let m = &out.mount_changes[0];
     assert_eq!((m.state.clone(), m.written.len(), m.removed.len()), (grix::MountState::Applied, 0, 0));
 
     // Changes over max_export don't go back at all.
     let small = Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
         .unwrap()
-        .mount(&host, "/work")
+        .mount_on_exit(&host, "/work")
         .unwrap()
         .max_export(4096)
         .build()
         .unwrap();
     let out = small.run(&["/bin/busybox", "dd", "if=/dev/zero", "of=/work/big", "bs=1024", "count=64"]).unwrap();
     assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
-    assert_eq!(out.mounts[0].state, grix::MountState::NotApplied);
+    assert_eq!(out.mount_changes[0].state, grix::MountState::NotApplied);
     assert!(!host.join("big").exists());
     std::fs::remove_dir_all(&host).unwrap();
     std::fs::remove_dir_all(&etc).unwrap();

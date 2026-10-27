@@ -32,6 +32,8 @@ pub enum Channel {
     Export = 6,
     /// Networking and flow control: `link::ToHost`.
     Link = 7,
+    /// Live mounts: `hostfs::Request`s, a frame of a message each.
+    Fs = 8,
 }
 
 impl Channel {
@@ -44,6 +46,7 @@ impl Channel {
             5 => Some(Self::Exit),
             6 => Some(Self::Export),
             7 => Some(Self::Link),
+            8 => Some(Self::Fs),
             _ => None,
         }
     }
@@ -64,6 +67,8 @@ pub enum Input {
     StdinEof = 2,
     /// Networking: `link::ToGuest`.
     Link = 3,
+    /// Live mounts: `hostfs::Reply`s, a frame of a message each.
+    Fs = 4,
 }
 
 impl Input {
@@ -72,6 +77,7 @@ impl Input {
             1 => Some(Self::Stdin),
             2 => Some(Self::StdinEof),
             3 => Some(Self::Link),
+            4 => Some(Self::Fs),
             _ => None,
         }
     }

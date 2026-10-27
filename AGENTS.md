@@ -74,6 +74,18 @@ resolver. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.
 
+Live mounts (`hostfs.rs` in the kernel and in `crates/grix/src`, messages
+in `crates/abi/src/hostfs.rs`): directories the host serves while the
+program runs. Their nodes carry `Node::remote` (the host's id), and their
+files' `FileData` reads and writes go to the host. A directory's entries
+are fetched on first use and kept for `hostfs::FRESH_NS` (`Fs::ensure`).
+Under memory pressure `Fs::evict` forgets idle directories' entries. A
+directory too big to hold is `Remote::large`: names are looked up one at a
+time and getdents pages through the host. Each request waits for the
+host's answer in `console::host_request`. The host walks every path down
+from the mount's root fd with `openat`/`O_NOFOLLOW`, so nothing the guest
+says can lead outside the mount.
+
 Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
 process is in `PROCESS`; every other one, and zombies, are in
 `procs::PROCS` (lock order: `PROCESS`, then `PROCS`). `sched::schedule`
@@ -158,7 +170,11 @@ runs again.
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).
 9. **The kernel never blocks inside a syscall.** There is one kernel stack,
-   so waiting means returning `EBLOCKED` after recording a wait. Anything
+   so waiting means returning `EBLOCKED` after recording a wait. The one
+   exception is a live mount's request (`console::host_request`), which
+   spins for the host's answer so file system code stays synchronous;
+   networking messages that arrive meanwhile wait for the console
+   interrupt. Anything
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
@@ -169,6 +185,9 @@ runs again.
       against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files, network receive windows, DNS answers) take a `kmem::Charge`.
+    - A live mount's nodes count against `META_LIMIT` like the program's
+      own; when it's full, `Fs::evict` forgets idle ones (the host still
+      has them) before anything fails.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
       all processes), queued real-time signals, inotify watches, POSIX
       timers, threads (all processes), descriptors, open files

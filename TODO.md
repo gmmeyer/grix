@@ -104,8 +104,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Mounts do this: the kernel compares each node with what was imported and sends new and changed entries and the topmost removed paths.
 - [ ] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
 - [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
-- [~] Read-write host directory mounts, gated by policy.
-      `SandboxBuilder::mount` / `--mount HOST:GUEST` / `[[mount]]`. Each run imports the directory; what the program changed is applied to it when the program ends, without following links, leaving anything that changed on the host meanwhile (conflicts). The mount point can't be removed or renamed (EBUSY). Missing: live mounts (changes visible to the host during the run, and directories larger than guest memory), which need the guest to fetch files from the host on demand; changes after a timeout.
+- [x] Read-write host directory mounts, gated by policy.
+      Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.
+- [ ] Live mounts: a file the host replaces while the program has it open can show the new contents once the host's descriptor for it ages out (it reopens by name). Pin descriptors for files the guest has open (Open/Close requests).
+- [ ] Live mounts: changes on a read-only mount without `fs_write` report "needs fs_write" (the syscall gate runs first) instead of EROFS.
+- [ ] Live mounts: inotify for host-side changes; hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
+- [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.

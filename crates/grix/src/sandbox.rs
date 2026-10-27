@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::event::GuestEvent;
 use crate::export::{Collector, Export};
+use crate::hostfs::LiveMount;
 use crate::image::{self, Node};
 use crate::mount::{Mount, MountChanges};
 use crate::net::{ForwardFrom, HostRule, NetPolicy};
@@ -78,9 +79,9 @@ pub struct RunOutput {
     /// The directories given to [`SandboxBuilder::export`], in that order,
     /// as the program left them.
     pub exports: Vec<Export>,
-    /// What happened to each directory given to [`SandboxBuilder::mount`],
-    /// in that order.
-    pub mounts: Vec<MountChanges>,
+    /// What happened to each directory given to
+    /// [`SandboxBuilder::mount_on_exit`], in that order.
+    pub mount_changes: Vec<MountChanges>,
     pub kernel_log: String,
     #[serde(serialize_with = "millis")]
     pub duration: Duration,
@@ -149,6 +150,18 @@ fn default_accel() -> &'static str {
     "tcg"
 }
 
+/// How [`SandboxBuilder::mount_with`] mounts a host directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountMode {
+    /// Live and writable ([`SandboxBuilder::mount`]).
+    ReadWrite,
+    /// Live and read-only ([`SandboxBuilder::mount_read_only`]).
+    ReadOnly,
+    /// Changes applied when the program ends ([`SandboxBuilder::mount_on_exit`]).
+    OnExit,
+}
+
 /// Configure a [`Sandbox`]: what the program can see and do.
 #[derive(Clone)]
 pub struct SandboxBuilder {
@@ -162,6 +175,7 @@ pub struct SandboxBuilder {
     exports: Vec<String>,
     max_export: usize,
     mounts: Vec<Mount>,
+    live: Vec<LiveMount>,
     net: NetPolicy,
     uid: u32,
     gid: u32,
@@ -184,6 +198,7 @@ impl Default for SandboxBuilder {
             exports: Vec::new(),
             max_export: DEFAULT_MAX_EXPORT,
             mounts: Vec::new(),
+            live: Vec::new(),
             net: NetPolicy::default(),
             uid: 1000,
             gid: 1000,
@@ -280,27 +295,57 @@ impl SandboxBuilder {
     /// program that makes it itself needs `mkdir -p` or the like.
     pub fn export(mut self, guest: &str) -> Result<Self> {
         let path = image::guest_path(guest)?;
+        if let Some(m) = self.live.iter().find(|m| path == m.guest || path.starts_with(&format!("{}/", m.guest))) {
+            bail!("{path} is in live mount {}: its files are on the host already", m.guest);
+        }
         if !self.exports.contains(&path) {
             self.exports.push(path);
         }
         Ok(self)
     }
 
-    /// Mount host directory `host` read-write at `guest`. Each run sees it
-    /// as it is when the run starts. When the program ends (except on a
-    /// timeout or kernel panic), what it changed there is applied to
-    /// `host`: new and changed files, links and directories, and removals.
-    /// Only the changes are sent, and they count against
-    /// [`max_export`](SandboxBuilder::max_export); if they don't all fit,
-    /// nothing is applied. Anything that also changed on the host during
-    /// the run is left as the host has it ([`MountChanges::conflicts`]).
+    /// Mount host directory `host` read-write at `guest`, live: the
+    /// program sees the directory as it is, and what it changes there
+    /// changes on the host at once. Nothing of it is copied into the
+    /// sandbox up front: the kernel asks the host for directory listings
+    /// and file contents as the program needs them, so the directory can be
+    /// any size. Changes made on the host during the run show up within a
+    /// second.
     ///
-    /// The program can't remove or rename the mount point itself (EBUSY).
-    /// Changing files needs [`Capability::FsWrite`], which this grants (it
-    /// lets the program write anywhere in its own filesystem, but nothing
-    /// else reaches the host). The directory lives in guest memory during
-    /// the run, so `memory_mb` bounds its size.
-    pub fn mount(mut self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+    /// The program can't reach anything outside `host` through it: the host
+    /// never follows a link there, and never lets a name lead out. It can't
+    /// remove or rename the mount point itself (EBUSY). Changing files
+    /// needs [`Capability::FsWrite`], which this grants (it also lets the
+    /// program write anywhere in its own in-memory filesystem, but nothing
+    /// else reaches the host).
+    pub fn mount(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, MountMode::ReadWrite)
+    }
+
+    /// Like [`mount`](SandboxBuilder::mount), but read-only (EROFS): a way
+    /// to give the program a large directory without copying it in.
+    pub fn mount_read_only(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, MountMode::ReadOnly)
+    }
+
+    /// Mount `host` read-write at `guest`, but apply the program's changes
+    /// to it only when the program ends, all at once. Each run imports the
+    /// directory as it is when the run starts. When the program ends
+    /// (except on a timeout or kernel panic), only the changes are sent:
+    /// new and changed files, links and directories, and removals. They
+    /// count against [`max_export`](SandboxBuilder::max_export), and if
+    /// they don't all fit, nothing is applied. Anything that also changed
+    /// on the host during the run is left as the host has it
+    /// ([`MountChanges::conflicts`]). See [`RunOutput::mount_changes`].
+    ///
+    /// The directory lives in guest memory during the run, so `memory_mb`
+    /// bounds its size. Grants [`Capability::FsWrite`].
+    pub fn mount_on_exit(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, MountMode::OnExit)
+    }
+
+    /// Mount `host` at `guest` in `mode`.
+    pub fn mount_with(mut self, host: impl AsRef<Path>, guest: &str, mode: MountMode) -> Result<Self> {
         let host = host.as_ref();
         let canonical = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
         if !canonical.is_dir() {
@@ -311,16 +356,34 @@ impl SandboxBuilder {
             bail!("mount {} at a directory other than /", host.display());
         }
         let nested = |a: &str, b: &str| a == b || a.starts_with(&format!("{b}/"));
-        if let Some(m) = self.mounts.iter().find(|m| nested(&guest, &m.guest) || nested(&m.guest, &guest)) {
-            bail!("mounts at {guest} and {} overlap", m.guest);
+        for (g, h) in self.mount_points() {
+            if nested(&guest, g) || nested(g, &guest) {
+                bail!("mounts at {guest} and {g} overlap");
+            }
+            // One's changes could otherwise move the other's directory.
+            if canonical.starts_with(h) || h.starts_with(&canonical) {
+                bail!("mounted directories {} and {} overlap", canonical.display(), h.display());
+            }
         }
-        // One's changes could otherwise move the other's directory.
-        if let Some(m) = self.mounts.iter().find(|m| canonical.starts_with(&m.host) || m.host.starts_with(&canonical)) {
-            bail!("mounted directories {} and {} overlap", canonical.display(), m.host.display());
+        if mode != MountMode::OnExit
+            && let Some(e) = self.exports.iter().find(|e| **e == guest || e.starts_with(&format!("{guest}/")))
+        {
+            bail!("export {e} would be in live mount {guest}: its files are on the host already");
         }
-        self.policy.grant(Capability::FsWrite);
-        self.mounts.push(Mount { host: canonical, guest });
+        match mode {
+            MountMode::OnExit => self.mounts.push(Mount { host: canonical, guest }),
+            _ => self.live.push(LiveMount { host: canonical, guest, writable: mode == MountMode::ReadWrite }),
+        }
+        if mode != MountMode::ReadOnly {
+            self.policy.grant(Capability::FsWrite);
+        }
         Ok(self)
+    }
+
+    /// (guest path, host directory) of every mount.
+    fn mount_points(&self) -> impl Iterator<Item = (&str, &Path)> {
+        let on_exit = self.mounts.iter().map(|m| (m.guest.as_str(), m.host.as_path()));
+        on_exit.chain(self.live.iter().map(|m| (m.guest.as_str(), m.host.as_path())))
     }
 
     /// Send at most this many bytes of exports in all (256 MiB by default,
@@ -391,20 +454,20 @@ impl SandboxBuilder {
     }
 
     pub fn build(mut self) -> Result<Sandbox> {
-        for m in &self.mounts {
-            let inside = format!("{}/", m.guest);
-            if let Some(p) = self.files.keys().find(|p| **p == m.guest || p.starts_with(&inside)) {
-                bail!("mount at {} overlaps imported {p}", m.guest);
+        for (guest, _) in self.mount_points() {
+            let inside = format!("{guest}/");
+            if let Some(p) = self.files.keys().find(|p| *p == guest || p.starts_with(&inside)) {
+                bail!("mount at {guest} overlaps imported {p}");
             }
             // Where it goes must be a directory, or not there yet.
             if let Some((p, _)) =
-                self.files.iter().find(|(p, n)| !matches!(n, Node::Dir { .. }) && m.guest.starts_with(&format!("{p}/")))
+                self.files.iter().find(|(p, n)| !matches!(n, Node::Dir { .. }) && guest.starts_with(&format!("{p}/")))
             {
-                bail!("mount at {} is inside imported file {p}", m.guest);
+                bail!("mount at {guest} is inside imported file {p}");
             }
         }
-        let mounted =
-            |dir: &str| self.mounts.iter().any(|m| dir == m.guest || dir.starts_with(&format!("{}/", m.guest)));
+        let points: Vec<String> = self.mount_points().map(|(g, _)| g.to_string()).collect();
+        let mounted = |dir: &str| points.iter().any(|g| dir == g || dir.starts_with(&format!("{g}/")));
         for dir in self.exports.iter().filter(|d| !mounted(d)) {
             let inside = format!("{dir}/");
             let exists = self.files.keys().any(|p| p == dir || p.starts_with(&inside));
@@ -535,6 +598,11 @@ impl Sandbox {
             exports: cfg.exports.iter().map(String::as_str).collect(),
             export_budget: cfg.max_export as u64,
             mounts: mount_dirs.iter().map(String::as_str).collect(),
+            live_mounts: cfg
+                .live
+                .iter()
+                .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable })
+                .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
         }
         .encode();
@@ -542,6 +610,7 @@ impl Sandbox {
 
         let vm = VmConfig {
             net: cfg.net.clone(),
+            live: cfg.live.clone(),
             qemu: cfg.qemu.clone(),
             kernel: cfg.kernel.clone(),
             memory_mb: cfg.memory_mb,
@@ -555,7 +624,7 @@ impl Sandbox {
             stderr_truncated: false,
             events: Vec::new(),
             exports: Vec::new(),
-            mounts: Vec::new(),
+            mount_changes: Vec::new(),
             kernel_log: String::new(),
             duration: Duration::ZERO,
         };
@@ -583,13 +652,13 @@ impl Sandbox {
                 Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
             Channel::Export => exports.push(payload),
-            Channel::Exit | Channel::Link => {}
+            Channel::Exit | Channel::Link | Channel::Fs => {}
         })?;
         out.events.extend(run.events);
         let end = run.end;
         let (exported, changes) = exports.finish();
         out.exports = exported;
-        out.mounts = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
+        out.mount_changes = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
         out.duration = started.elapsed();
         out.status = match end {
             VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),

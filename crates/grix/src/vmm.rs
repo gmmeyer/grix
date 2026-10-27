@@ -25,6 +25,7 @@ use crate::net::{NetPolicy, Outbox, Proxy, StdinGate};
 
 pub(crate) struct VmConfig {
     pub net: NetPolicy,
+    pub live: Vec<crate::hostfs::LiveMount>,
     pub qemu: PathBuf,
     pub kernel: PathBuf,
     pub memory_mb: u64,
@@ -182,6 +183,7 @@ pub(crate) fn run(
     // before QEMU starts, so a busy one fails the run at once.
     let to_guest = Outbox::new();
     let proxy = Proxy::start(cfg.net.clone(), to_guest.clone())?;
+    let mut fs = crate::hostfs::Server::new(&cfg.live)?;
     let uart_path = temp_path("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
@@ -285,6 +287,7 @@ pub(crate) fn run(
             }
             Channel::Exit => {}
             Channel::Link => proxy.handle(payload),
+            Channel::Fs => to_guest.urgent(fs.handle(payload)),
             _ => on_frame(ch, payload),
         });
     }

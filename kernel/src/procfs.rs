@@ -209,7 +209,7 @@ fn maps(p: &Process, s: &mut String) {
         flags.push(if matches!(v.backing, Backing::Shared { .. }) { 's' } else { 'p' });
         let (offset, inode, name) = match v.backing {
             Backing::File { offset, ino, .. } | Backing::Data { offset, ino, .. } => {
-                (offset, ino as u64 + 1, fs.path_of(ino))
+                (offset, fs.ino_number(ino), fs.path_of(ino))
             }
             Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
             Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),

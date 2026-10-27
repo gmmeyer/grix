@@ -22,6 +22,7 @@
 mod dns;
 mod event;
 mod export;
+mod hostfs;
 mod image;
 mod manifest;
 mod mount;
@@ -34,4 +35,4 @@ pub use export::{Export, ExportContent, ExportEntry, ExportState};
 pub use grix_abi::policy::{Capability, DenyAction};
 pub use manifest::{ExportTo, Manifest};
 pub use mount::{MountChanges, MountState};
-pub use sandbox::{ExitStatus, RunOutput, Sandbox, SandboxBuilder, Stream};
+pub use sandbox::{ExitStatus, MountMode, RunOutput, Sandbox, SandboxBuilder, Stream};

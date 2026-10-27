@@ -135,6 +135,8 @@ pub enum FaultError {
     /// No mapping, or the mapping forbids this access.
     Segv,
     OutOfMemory,
+    /// The file behind the mapping couldn't be read (a live mount's).
+    Io,
 }
 
 pub struct AddressSpace {
@@ -472,7 +474,10 @@ impl AddressSpace {
                 let dst = unsafe { core::slice::from_raw_parts_mut(p2v(pa) as *mut u8, PAGE_SIZE as usize) };
                 let at = offset + (page - vma.start);
                 let n = end.saturating_sub(at).min(PAGE_SIZE) as usize;
-                data.lock().read(at, &mut dst[..n]);
+                if data.lock().read_at(at, &mut dst[..n]).is_err() {
+                    frame::free(pa);
+                    return Err(FaultError::Io);
+                }
                 &[]
             }
             Backing::Sigpage => &crate::signal::TRAMPOLINE,
@@ -520,6 +525,7 @@ impl AddressSpace {
                 self.fault(page, access).map_err(|e| match e {
                     FaultError::OutOfMemory => ENOMEM,
                     FaultError::Segv => EFAULT,
+                    FaultError::Io => EIO,
                 })?;
             }
             page += PAGE_SIZE;

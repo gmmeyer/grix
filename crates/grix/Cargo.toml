@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 grix-abi = { path = "../abi" }
 anyhow = "1"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

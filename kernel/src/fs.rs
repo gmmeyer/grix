@@ -18,10 +18,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
 use core::sync::atomic::{AtomicU64, Ordering};
-use grix_abi::image::{Entry, EntryKind};
+use grix_abi::hostfs::{Attr, FileType};
+use grix_abi::image::{Entry, EntryKind, LiveMount};
 use spin::{Mutex, MutexGuard};
 
+use crate::console::klog;
 use crate::errno::*;
+use crate::hostfs;
 use crate::mm::{PAGE_SIZE, frame, p2v};
 use crate::procfs::{self, ProcFile};
 
@@ -106,6 +109,12 @@ pub struct FileData {
     shared_maps: Vec<Weak<()>>,
     /// memfd seals (F_SEAL_*); `None` for files that can't be sealed.
     pub seals: Option<u32>,
+    /// A live mount's file: the host's id for it. Its bytes are on the host
+    /// (`len` is its size as last heard).
+    remote: Option<u64>,
+    /// A live mount's file the program removed (or replaced) while it had
+    /// it: the host keeps it open until this goes.
+    pub unlinked: bool,
 }
 
 pub const F_SEAL_SEAL: u32 = 1;
@@ -130,7 +139,26 @@ impl FileData {
             len: base.len() as u64,
             shared_maps: Vec::new(),
             seals: None,
+            remote: None,
+            unlinked: false,
         }))
+    }
+
+    /// A live mount's file `id`, `size` bytes long.
+    pub fn remote(id: u64, size: u64) -> Content {
+        Arc::new(Mutex::new(FileData {
+            base: &[],
+            pages: BTreeMap::new(),
+            len: size,
+            shared_maps: Vec::new(),
+            seals: None,
+            remote: Some(id),
+            unlinked: false,
+        }))
+    }
+
+    pub fn remote_id(&self) -> Option<u64> {
+        self.remote
     }
 
     pub fn len(&self) -> u64 {
@@ -140,7 +168,7 @@ impl FileData {
     /// The imported bytes, if the file was never changed. Exec and mmap use
     /// them directly.
     pub fn image(&self) -> Option<&'static [u8]> {
-        (self.pages.is_empty() && self.len == self.base.len() as u64).then_some(self.base)
+        (self.remote.is_none() && self.pages.is_empty() && self.len == self.base.len() as u64).then_some(self.base)
     }
 
     /// May bytes be written up to offset `end`? Seals forbid writing at all,
@@ -175,8 +203,24 @@ impl FileData {
         self.shared_maps.iter().any(|w| w.strong_count() > 0)
     }
 
-    /// Copy the bytes at `off` into `out`; returns how many there were.
+    /// Copy the bytes at `off` into `out`; returns how many there were. A
+    /// live mount's file that can't be read reads as ended (and is logged);
+    /// `read_at` says why.
     pub fn read(&self, off: u64, out: &mut [u8]) -> usize {
+        self.read_at(off, out).unwrap_or_else(|e| {
+            klog!("reading a mounted file: errno {}\n", e.0);
+            0
+        })
+    }
+
+    pub fn read_at(&self, off: u64, out: &mut [u8]) -> Result<usize, Errno> {
+        if let Some(id) = self.remote {
+            return hostfs::read(id, off, out);
+        }
+        Ok(self.read_local(off, out))
+    }
+
+    fn read_local(&self, off: u64, out: &mut [u8]) -> usize {
         if off >= self.len {
             return 0;
         }
@@ -223,6 +267,9 @@ impl FileData {
     /// Write `data` at `off`, growing the file. On ENOSPC part of it may have
     /// been written; the error carries how much.
     pub fn write(&mut self, off: u64, data: &[u8]) -> Result<usize, (usize, Errno)> {
+        if self.remote.is_some() {
+            return self.write_remote(off, false, data).map(|(n, _)| n);
+        }
         let mut done = 0;
         while done < data.len() {
             let pos = off + done as u64;
@@ -238,10 +285,49 @@ impl FileData {
         Ok(done)
     }
 
+    /// A live mount's file: write `data` at `off`, or at its end with
+    /// `append`. Returns how much was written and where it started.
+    pub fn write_remote(&mut self, off: u64, append: bool, data: &[u8]) -> Result<(usize, u64), (usize, Errno)> {
+        let Some(id) = self.remote else { return Err((0, EINVAL)) };
+        let mut done = 0;
+        let mut start = off;
+        while done < data.len() {
+            let chunk = &data[done..(done + grix_abi::hostfs::IO_MAX).min(data.len())];
+            // An append goes where the host's end is; the rest follows it.
+            let first_append = append && done == 0;
+            match hostfs::write(id, start + done as u64, first_append, chunk) {
+                Ok((n, size)) => {
+                    if first_append {
+                        start = size.saturating_sub(n as u64);
+                    }
+                    self.len = size;
+                    done += n;
+                    if n < chunk.len() {
+                        break;
+                    }
+                }
+                Err(e) => return Err((done, e)),
+            }
+        }
+        Ok((done, start))
+    }
+
+    /// The size the host says a live mount's file has.
+    pub fn set_size(&mut self, size: u64) {
+        if self.remote.is_some() {
+            self.len = size;
+        }
+    }
+
     /// Set the length. Growing adds zeros (without allocating); shrinking
     /// frees whole pages and zeroes the rest of the last one, so a later
     /// extension reads zeros.
-    pub fn truncate(&mut self, len: u64) {
+    pub fn truncate(&mut self, len: u64) -> Result<(), Errno> {
+        if let Some(id) = self.remote {
+            hostfs::set_len(id, len)?;
+            self.len = len;
+            return Ok(());
+        }
         if len < self.len {
             let keep = len.div_ceil(PAGE_SIZE);
             for (_, pa) in self.pages.split_off(&keep) {
@@ -255,6 +341,7 @@ impl FileData {
             self.base = &self.base[..self.base.len().min(len as usize)];
         }
         self.len = len;
+        Ok(())
     }
 }
 
@@ -262,6 +349,9 @@ impl Drop for FileData {
     fn drop(&mut self) {
         for &pa in self.pages.values() {
             free_page(pa);
+        }
+        if let Some(id) = self.remote.filter(|_| self.unlinked) {
+            hostfs::release(id);
         }
     }
 }
@@ -336,6 +426,8 @@ pub struct Node {
     /// A directory mounted from the host: it can't be removed or renamed
     /// (EBUSY, as on Linux), so its changes always have a place to go.
     pub mount_point: bool,
+    /// Part of a live mount: the host has it.
+    pub remote: Option<Box<Remote>>,
     /// Realtime nanoseconds.
     pub atime: u64,
     pub mtime: u64,
@@ -358,6 +450,7 @@ impl Node {
             changed: false,
             system: false,
             mount_point: false,
+            remote: None,
             atime: time,
             mtime: time,
             ctime: time,
@@ -367,9 +460,67 @@ impl Node {
 
     /// Heap bytes counted against the metadata budget, besides its names.
     fn cost(&self) -> u64 {
-        NODE_COST + if let Kind::Symlink(t) = &self.kind { t.len() as u64 } else { 0 }
+        let remote = if self.remote.is_some() { REMOTE_COST } else { 0 };
+        NODE_COST + remote + if let Kind::Symlink(t) = &self.kind { t.len() as u64 } else { 0 }
     }
 }
+
+/// A node of a live mount.
+pub struct Remote {
+    /// The host's id for it.
+    pub id: u64,
+    /// Which live mount (`Image::live_mounts`).
+    pub mount: usize,
+    pub writable: bool,
+    /// When its attributes were last heard from the host, in monotonic
+    /// ns; 0 for never.
+    pub fetched: u64,
+    /// A directory whose entries are all in the tree, and since when.
+    pub listed: bool,
+    pub listed_at: u64,
+    /// A directory with more entries than the kernel can hold: its names
+    /// are looked up one at a time, and getdents reads it from the host.
+    pub large: bool,
+}
+
+impl Remote {
+    fn new(id: u64, mount: usize, writable: bool, fetched: u64) -> Box<Remote> {
+        Box::new(Remote { id, mount, writable, fetched, listed: false, listed_at: 0, large: false })
+    }
+}
+
+/// An entry of a directory, for getdents.
+#[derive(Clone)]
+pub struct DirItem {
+    pub name: String,
+    /// The inode number (`Fs::ino_number`).
+    pub ino: u64,
+    pub d_type: u8,
+}
+
+/// A page of a large live directory, as the host listed it after `from`.
+struct Page {
+    dir: Ino,
+    from: String,
+    items: Vec<DirItem>,
+    more: bool,
+    at: u64,
+}
+
+fn d_type_of(ty: FileType) -> u8 {
+    match ty {
+        FileType::File => 8,
+        FileType::Dir => 4,
+        FileType::Symlink => 10,
+    }
+}
+
+/// The `Remote` and its share of `Fs::remote_files`.
+const REMOTE_COST: u64 = core::mem::size_of::<Remote>() as u64 + 64;
+
+/// Inode numbers for live mounts' files: the host's ids, which stay the
+/// same even when the guest forgets a node and lists it again.
+const REMOTE_INO: u64 = 1 << 40;
 
 pub struct StatInfo {
     pub ino: u64,
@@ -396,6 +547,12 @@ pub struct Fs {
     free: Vec<Ino>,
     /// `/proc/1/fd`, whose entries are the live descriptors.
     pub fd_dir: Ino,
+    /// The last page read of a large live directory.
+    page: Option<Page>,
+    /// A live mount's files' contents by host id, so a node made again for
+    /// a file (after the kernel forgot it) shares what open descriptors and
+    /// mappings still hold.
+    remote_files: BTreeMap<u64, Weak<Mutex<FileData>>>,
 }
 
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
@@ -472,13 +629,20 @@ fn leak(s: String) -> &'static [u8] {
 }
 
 impl Fs {
-    pub fn build(entries: &[Entry<'static>], mounts: &[&str], uid: u32, gid: u32) -> Fs {
+    pub fn build(entries: &[Entry<'static>], mounts: &[&str], live: &[LiveMount], uid: u32, gid: u32) -> Fs {
         let now = crate::time::realtime_ns();
         // The sandbox user owns the root and everything imported, so a program
         // can create files next to its inputs. System parts (/dev, /proc,
         // /sys, generated /etc files) belong to root, and /tmp is 1777.
         let root = Node::new(Kind::Dir(BTreeMap::new()), 0o755, (uid, gid), ROOT, "", now);
-        let mut fs = Fs { nodes: vec![Box::new(root)], orphans: Vec::new(), free: Vec::new(), fd_dir: ROOT };
+        let mut fs = Fs {
+            nodes: vec![Box::new(root)],
+            orphans: Vec::new(),
+            free: Vec::new(),
+            fd_dir: ROOT,
+            page: None,
+            remote_files: BTreeMap::new(),
+        };
         for e in entries {
             let path = e.path.trim_end_matches('/');
             if path.is_empty() {
@@ -538,11 +702,16 @@ impl Fs {
 
         // Nothing of the kernel's own goes in a mounted directory: it would
         // be sent back to the host as the program's.
-        let mounted = |path: &str| {
-            mounts.iter().any(|m| path == *m || path.strip_prefix(*m).is_some_and(|rest| rest.starts_with('/')))
-        };
+        let inside = |path: &str, m: &str| path == m || path.strip_prefix(m).is_some_and(|rest| rest.starts_with('/'));
+        let mounted = |path: &str| mounts.iter().any(|m| inside(path, m)) || live.iter().any(|m| inside(path, m.path));
+        for (i, m) in live.iter().enumerate() {
+            let ino = fs.mkdir_owned(m.path, (uid, gid));
+            let n = &mut fs.nodes[ino];
+            n.mount_point = true;
+            n.remote = Some(Remote::new(i as u64 + 1, i, m.writable, 0));
+        }
         // Describe the sandbox user unless the host imported its own files.
-        if fs.lookup(ROOT, "/etc/passwd", false).is_err() && !mounted("/etc/passwd") {
+        if !mounted("/etc/passwd") && fs.lookup(ROOT, "/etc/passwd", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             let passwd = alloc::format!(
                 "root:x:0:0:root:/root:/sbin/nologin\ngrix:x:{uid}:{gid}:grix:/home/grix:/bin/sh\n\
@@ -554,27 +723,27 @@ impl Fs {
                 fs.mkdir_owned("/home/grix", (uid, gid));
             }
         }
-        if fs.lookup(ROOT, "/etc/group", false).is_err() && !mounted("/etc/group") {
+        if !mounted("/etc/group") && fs.lookup(ROOT, "/etc/group", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             let group = alloc::format!("root:x:0:\ngrix:x:{gid}:\nnobody:x:65534:\n");
             fs.insert(etc, "group", Kind::File(FileData::new(leak(group))), 0o644);
         }
         // No timezone was imported: say UTC explicitly, as musl and glibc
         // would assume anyway.
-        if fs.lookup(ROOT, "/etc/localtime", false).is_err() && !mounted("/etc/localtime") {
+        if !mounted("/etc/localtime") && fs.lookup(ROOT, "/etc/localtime", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "localtime", Kind::File(FileData::new(&UTC_TZIF)), 0o644);
         }
         // Name resolution: the virtual nameserver (whatever server a
         // program asks, the host answers: see inet.rs), and the usual
         // local names plus the host's.
-        if fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() && !mounted("/etc/resolv.conf") {
+        if !mounted("/etc/resolv.conf") && fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             let [a, b, c, d] = grix_abi::link::DNS_V4;
             let text = alloc::format!("nameserver {a}.{b}.{c}.{d}\n");
             fs.insert(etc, "resolv.conf", Kind::File(FileData::new(leak(text))), 0o644);
         }
-        if fs.lookup(ROOT, "/etc/hosts", false).is_err() && !mounted("/etc/hosts") {
+        if !mounted("/etc/hosts") && fs.lookup(ROOT, "/etc/hosts", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             let [a, b, c, d] = grix_abi::link::HOST_V4;
             let text = alloc::format!(
@@ -583,7 +752,7 @@ impl Fs {
             );
             fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
         }
-        if fs.lookup(ROOT, "/etc/mtab", false).is_err() && !mounted("/etc/mtab") {
+        if !mounted("/etc/mtab") && fs.lookup(ROOT, "/etc/mtab", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "mtab", Kind::Symlink("/proc/self/mounts".into()), 0o777);
         }
@@ -707,14 +876,14 @@ impl Fs {
     }
 
     /// Resolve `path` relative to directory `start`.
-    pub fn lookup(&self, start: Ino, path: &str, follow_last: bool) -> Result<Ino, Errno> {
+    pub fn lookup(&mut self, start: Ino, path: &str, follow_last: bool) -> Result<Ino, Errno> {
         let mut links = 0;
         self.walk(start, path, follow_last, &mut links)
     }
 
     /// `links` counts every symlink followed in the whole lookup, so a chain
     /// of links that each expand into several more can't make it exponential.
-    fn walk(&self, start: Ino, path: &str, follow_last: bool, links: &mut u32) -> Result<Ino, Errno> {
+    fn walk(&mut self, start: Ino, path: &str, follow_last: bool, links: &mut u32) -> Result<Ino, Errno> {
         if path.is_empty() {
             return Err(ENOENT);
         }
@@ -723,12 +892,15 @@ impl Fs {
         let must_be_dir = path.ends_with('/');
         for (i, c) in comps.iter().enumerate() {
             let last = i + 1 == comps.len();
-            let Kind::Dir(children) = &self.nodes[cur].kind else { return Err(ENOTDIR) };
+            if !self.is_dir(cur) {
+                return Err(ENOTDIR);
+            }
             match *c {
                 "." => {}
                 ".." => cur = self.nodes[cur].parent,
                 name => {
-                    let child = *children.get(name).ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
+                    let child =
+                        self.find_child(cur, name)?.ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
                     if let Kind::Symlink(target) = &self.nodes[child].kind
                         && (!last || follow_last || must_be_dir)
                     {
@@ -736,7 +908,8 @@ impl Fs {
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        cur = self.walk(cur, target, true, links)?;
+                        let target = target.clone();
+                        cur = self.walk(cur, &target, true, links)?;
                         continue;
                     }
                     cur = child;
@@ -752,7 +925,7 @@ impl Fs {
     /// Split `path` into its parent directory (resolved) and last component,
     /// for calls that create or remove a name. The root has no last
     /// component (""); a trailing slash is allowed.
-    pub fn lookup_parent(&self, start: Ino, path: &str) -> Result<(Ino, String), Errno> {
+    pub fn lookup_parent(&mut self, start: Ino, path: &str) -> Result<(Ino, String), Errno> {
         if path.is_empty() {
             return Err(ENOENT);
         }
@@ -790,7 +963,10 @@ impl Fs {
         s
     }
 
-    pub fn stat(&self, ino: Ino) -> StatInfo {
+    pub fn stat(&mut self, ino: Ino) -> StatInfo {
+        // What the host has now, give or take a second. If it can't say,
+        // what it said last.
+        let _ = self.refresh(ino);
         let n = &self.nodes[ino];
         let (ty, size, nlink, rdev) = match &n.kind {
             Kind::File(c) => (S_IFREG, c.lock().len(), n.nlink, 0),
@@ -810,7 +986,7 @@ impl Fs {
             Kind::Proc(_) => (S_IFREG, 0, 1, 0),
         };
         StatInfo {
-            ino: ino as u64 + 1,
+            ino: self.ino_number(ino),
             mode: ty | n.perm,
             nlink,
             uid: n.uid,
@@ -826,10 +1002,35 @@ impl Fs {
 
     /// The child after `after` in name order (the first one for `None`), for
     /// getdents. A name cursor stays correct while entries come and go.
-    pub fn dir_next(&self, dir: Ino, after: Option<&str>) -> Option<(String, Ino)> {
-        let Kind::Dir(children) = &self.nodes[dir].kind else { return None };
+    pub fn dir_next(&mut self, dir: Ino, after: Option<&str>) -> Result<Option<DirItem>, Errno> {
+        self.ensure(dir)?;
+        if let Some(r) = self.nodes[dir].remote.as_deref()
+            && r.large
+        {
+            return self.large_next(dir, r.id, after.unwrap_or(""));
+        }
+        let Kind::Dir(children) = &self.nodes[dir].kind else { return Ok(None) };
         let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
-        children.range::<str, _>((lower, Bound::Unbounded)).next().map(|(k, v)| (k.clone(), *v))
+        let next = children.range::<str, _>((lower, Bound::Unbounded)).next().map(|(k, v)| (k.clone(), *v));
+        Ok(next.map(|(name, ino)| DirItem { name, ino: self.ino_number(ino), d_type: self.d_type(ino) }))
+    }
+
+    /// Before a live directory is opened: its entries, so an error shows
+    /// now rather than as an empty directory.
+    pub fn list_now(&mut self, dir: Ino) -> Result<(), Errno> {
+        self.ensure(dir)
+    }
+
+    /// The inode number `stat` and `getdents` give `ino`. A live mount's
+    /// node has the host's id, which stays the same while the kernel
+    /// forgets and finds it again.
+    pub fn ino_number(&self, ino: Ino) -> u64 {
+        self.nodes[ino].remote.as_ref().map_or(ino as u64 + 1, |r| REMOTE_INO + r.id)
+    }
+
+    /// The host id of a live mount's node.
+    pub fn remote_id(&self, ino: Ino) -> Option<u64> {
+        self.nodes[ino].remote.as_ref().map(|r| r.id)
     }
 
     /// Linux d_type for a node.
@@ -882,8 +1083,8 @@ impl Fs {
         self.nodes[ino].ctime = crate::time::realtime_ns();
     }
 
-    pub fn child_of(&self, dir: Ino, name: &str) -> Option<Ino> {
-        self.child(dir, name)
+    pub fn child_of(&mut self, dir: Ino, name: &str) -> Option<Ino> {
+        self.find_child(dir, name).ok().flatten()
     }
 
     fn touch_dir(&mut self, dir: Ino) {
@@ -897,19 +1098,23 @@ impl Fs {
     /// program itself, or is a sticky scratch directory like /tmp: then the
     /// name is the program's business (a file it deleted, or is checking for
     /// before creating it).
-    pub fn missing_is_import_gap(&self, base: Ino, path: &str) -> bool {
-        let gap = |ino: Ino| !self.nodes[ino].changed && self.nodes[ino].perm & S_ISVTX == 0;
+    pub fn missing_is_import_gap(&mut self, base: Ino, path: &str) -> bool {
+        // A live mount has whatever the host has: nothing there is missing.
+        let gap = |fs: &Fs, ino: Ino| {
+            let n = &fs.nodes[ino];
+            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none()
+        };
         let mut p = path.trim_end_matches('/');
         loop {
             match p.rsplit_once('/') {
                 Some((dir, _)) => {
                     let dir = if dir.is_empty() { "/" } else { dir };
                     if let Ok(ino) = self.lookup(base, dir, true) {
-                        return gap(ino);
+                        return gap(self, ino);
                     }
                     p = dir.trim_end_matches('/');
                 }
-                None => return gap(base),
+                None => return gap(self, base),
             }
         }
     }
@@ -952,6 +1157,9 @@ impl Fs {
         if self.nodes[dir].nlink == 0 {
             return Err(ENOENT); // the directory was removed
         }
+        if self.nodes[dir].remote.is_some() {
+            return self.create_remote(dir, name, kind, perm, uid, gid);
+        }
         if name.is_empty() || name == "." || name == ".." || self.child(dir, name).is_some() {
             return Err(EEXIST);
         }
@@ -970,6 +1178,10 @@ impl Fs {
     /// An unnamed file in `dir` (O_TMPFILE). It goes away when its last
     /// descriptor closes, unless linkat gives it a name.
     pub fn create_unnamed(&mut self, dir: Ino, perm: u32, uid: u32, gid: u32) -> Result<(Ino, Content), Errno> {
+        // As on Linux for a filesystem that can't do O_TMPFILE.
+        if self.nodes[dir].remote.is_some() {
+            return Err(EOPNOTSUPP);
+        }
         self.may_change(dir, None, uid, gid)?;
         let content = FileData::new(&[]);
         let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: true };
@@ -1021,15 +1233,26 @@ impl Fs {
 
     /// unlink / rmdir `name` in `dir`.
     pub fn remove(&mut self, dir: Ino, name: &str, rmdir: bool, uid: u32, gid: u32) -> Result<(), Errno> {
-        let ino = self.child(dir, name).ok_or(ENOENT)?;
+        let ino = self.find_child(dir, name)?.ok_or(ENOENT)?;
+        let remote = self.nodes[dir].remote.as_ref().map(|r| (r.id, r.writable));
         match (&self.nodes[ino].kind, rmdir) {
-            (Kind::Dir(c), true) if !c.is_empty() => return Err(ENOTEMPTY),
+            // The host knows whether a live mount's directory is empty.
+            (Kind::Dir(c), true) if !c.is_empty() && remote.is_none() => return Err(ENOTEMPTY),
             (Kind::Dir(_), true) => {}
             (Kind::Dir(_), false) => return Err(EISDIR),
             (_, true) => return Err(ENOTDIR),
             (_, false) => {}
         }
         self.may_change(dir, Some(ino), uid, gid)?;
+        if let Some((id, writable)) = remote {
+            if !writable {
+                return Err(EROFS);
+            }
+            hostfs::remove(id, name, rmdir)?;
+            self.unlink_child(dir, name, ino, true);
+            self.touch_dir(dir);
+            return Ok(());
+        }
         let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
         children.remove(name);
         release(entry_cost(name));
@@ -1042,6 +1265,13 @@ impl Fs {
     pub fn link(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
         if self.is_dir(ino) {
             return Err(EPERM);
+        }
+        // Live mounts don't do hard links (EPERM, as on Linux for a
+        // filesystem that can't), and nothing links across a mount.
+        match (self.nodes[ino].remote.as_ref(), self.nodes[dir].remote.as_ref()) {
+            (None, None) => {}
+            (Some(a), Some(b)) if a.mount == b.mount => return Err(EPERM),
+            _ => return Err(EXDEV),
         }
         if self.nodes[dir].nlink == 0 {
             return Err(ENOENT);
@@ -1090,11 +1320,19 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<(), Errno> {
-        let src = self.child(odir, oname).ok_or(ENOENT)?;
-        let dst = self.child(ndir, nname);
+        let src = self.find_child(odir, oname)?.ok_or(ENOENT)?;
+        // Finding the destination may make room by forgetting idle nodes.
+        let _src = self.pin(src);
+        let dst = self.find_child(ndir, nname)?;
         if self.nodes[ndir].nlink == 0 {
             return Err(ENOENT);
         }
+        // Within one live mount, or not touching one at all.
+        let remote = match (self.nodes[odir].remote.as_ref(), self.nodes[ndir].remote.as_ref()) {
+            (None, None) => None,
+            (Some(a), Some(b)) if a.mount == b.mount => Some((a.id, b.id, a.writable)),
+            _ => return Err(EXDEV),
+        };
         self.may_change(odir, Some(src), uid, gid)?;
         self.may_change(ndir, dst, uid, gid)?;
         // A directory can't move into itself or its own subtree.
@@ -1111,6 +1349,51 @@ impl Fs {
                     d = self.nodes[d].parent;
                 }
             }
+        }
+        if let Some((oid, nid, writable)) = remote {
+            if !writable {
+                return Err(EROFS);
+            }
+            if exchange {
+                return Err(EINVAL);
+            }
+            match dst {
+                Some(_) if noreplace => return Err(EEXIST),
+                Some(dst) if dst == src => return Ok(()),
+                Some(dst) => match (self.is_dir(src), self.is_dir(dst)) {
+                    (true, false) => return Err(ENOTDIR),
+                    (false, true) => return Err(EISDIR),
+                    _ => {}
+                },
+                None => {}
+            }
+            charge(entry_cost(nname))?;
+            if let Err(e) = hostfs::rename(oid, oname, nid, nname, noreplace) {
+                release(entry_cost(nname));
+                return Err(e);
+            }
+            if let Some(dst) = dst {
+                // Its entry is replaced below; only the node goes.
+                self.forget_children(dst);
+                if let Kind::File(c) = &self.nodes[dst].kind {
+                    c.lock().unlinked = true;
+                }
+                let Kind::Dir(children) = &mut self.nodes[ndir].kind else { unreachable!() };
+                children.remove(nname);
+                release(entry_cost(nname));
+                self.drop_name(dst);
+            }
+            let Kind::Dir(children) = &mut self.nodes[odir].kind else { unreachable!() };
+            children.remove(oname);
+            release(entry_cost(oname));
+            let Kind::Dir(children) = &mut self.nodes[ndir].kind else { unreachable!() };
+            children.insert(nname.into(), src);
+            (self.nodes[src].parent, self.nodes[src].name) = (ndir, nname.into());
+            let now = crate::time::realtime_ns();
+            self.nodes[src].ctime = now;
+            self.touch_dir(odir);
+            self.touch_dir(ndir);
+            return Ok(());
         }
         if exchange {
             let dst = dst.ok_or(ENOENT)?;
@@ -1148,5 +1431,423 @@ impl Fs {
         self.touch_dir(odir);
         self.touch_dir(ndir);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- live mounts
+
+impl Fs {
+    /// Before using directory `dir`'s entries: for a live mount's, have
+    /// them from the host, and recently.
+    fn ensure(&mut self, dir: Ino) -> Result<(), Errno> {
+        let n = &self.nodes[dir];
+        let Some(r) = n.remote.as_deref() else { return Ok(()) };
+        let fresh = r.listed && crate::time::monotonic_ns().saturating_sub(r.listed_at) < hostfs::FRESH_NS;
+        if fresh || r.large || n.nlink == 0 || !matches!(n.kind, Kind::Dir(_)) {
+            return Ok(());
+        }
+        self.list_remote(dir)
+    }
+
+    /// For `stat`: a live mount's node as the host has it now (give or take
+    /// `FRESH_NS`).
+    fn refresh(&mut self, ino: Ino) -> Result<(), Errno> {
+        let Some(r) = self.nodes[ino].remote.as_deref() else { return Ok(()) };
+        if self.is_dir(ino) {
+            return self.ensure(ino);
+        }
+        if crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS || self.nodes[ino].nlink == 0 {
+            return Ok(());
+        }
+        let id = r.id;
+        match hostfs::stat(id) {
+            Ok(attr) if attr.ty == self.file_type(ino) => {
+                self.apply_attr(ino, &attr);
+                Ok(())
+            }
+            // Gone or replaced on the host: the directory's next listing
+            // drops it.
+            result => {
+                let parent = self.nodes[ino].parent;
+                if let Some(p) = self.nodes[parent].remote.as_deref_mut() {
+                    p.listed_at = 0;
+                }
+                result.map(|_| ())
+            }
+        }
+    }
+
+    fn file_type(&self, ino: Ino) -> FileType {
+        match self.nodes[ino].kind {
+            Kind::Dir(_) => FileType::Dir,
+            Kind::Symlink(_) => FileType::Symlink,
+            _ => FileType::File,
+        }
+    }
+
+    fn apply_attr(&mut self, ino: Ino, attr: &Attr) {
+        let n = &mut self.nodes[ino];
+        n.perm = attr.mode & 0o7777;
+        (n.atime, n.mtime, n.ctime) = (attr.atime_ns, attr.mtime_ns, attr.ctime_ns);
+        if let Kind::File(c) = &n.kind {
+            c.lock().set_size(attr.size);
+        }
+        if let Some(r) = n.remote.as_deref_mut() {
+            r.fetched = crate::time::monotonic_ns();
+        }
+    }
+
+    /// Bring live directory `dir`'s entries in line with the host's, a page
+    /// at a time: nodes the host still has (by id) stay, with what they are
+    /// now, so open files and the working directory keep theirs.
+    fn list_remote(&mut self, dir: Ino) -> Result<(), Errno> {
+        // Busy while it's listed: making room mustn't forget it.
+        let _busy = self.pin(dir);
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (id, mount, writable) = (r.id, r.mount, r.writable);
+        let mut after = String::new();
+        loop {
+            let (attr, entries, more) = hostfs::list(id, &after)?;
+            self.apply_attr(dir, &attr);
+            let last = if more { entries.last().map(|e| e.name.clone()) } else { None };
+            // What's in this page's range of names but not in the page.
+            let lo = if after.is_empty() { Bound::Unbounded } else { Bound::Excluded(after.as_str()) };
+            let hi = last.as_deref().map_or(Bound::Unbounded, Bound::Included);
+            let Kind::Dir(children) = &self.nodes[dir].kind else { return Err(ENOTDIR) };
+            let gone: Vec<(String, Ino)> = children
+                .range::<str, _>((lo, hi))
+                .filter(|&(name, &ino)| {
+                    let same = |e: &hostfs::Entry| {
+                        self.nodes[ino].remote.as_ref().is_some_and(|r| r.id == e.id)
+                            && self.file_type(ino) == e.attr.ty
+                    };
+                    entries.binary_search_by(|e| e.name.as_str().cmp(name)).map_or(true, |i| !same(&entries[i]))
+                })
+                .map(|(name, &ino)| (name.clone(), ino))
+                .collect();
+            for (name, ino) in gone {
+                self.unlink_child(dir, &name, ino, false);
+            }
+            for e in &entries {
+                match self.child(dir, &e.name) {
+                    Some(ino) => {
+                        self.apply_attr(ino, &e.attr);
+                        if let Kind::Symlink(t) = &mut self.nodes[ino].kind
+                            && *t != e.target
+                        {
+                            release(t.len() as u64);
+                            charge(e.target.len() as u64).ok();
+                            *t = e.target.clone();
+                        }
+                    }
+                    None => match self.new_remote(dir, e, mount, writable) {
+                        Ok(_) => {}
+                        // More than the kernel can hold, even after making
+                        // room: look its names up one at a time instead.
+                        Err(ENOMEM) => {
+                            let r = self.nodes[dir].remote.as_deref_mut().unwrap();
+                            (r.large, r.listed) = (true, false);
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    },
+                }
+            }
+            match last {
+                Some(l) => after = l,
+                None => break,
+            }
+        }
+        let r = self.nodes[dir].remote.as_deref_mut().unwrap();
+        (r.listed, r.listed_at) = (true, crate::time::monotonic_ns());
+        Ok(())
+    }
+
+    /// A node for what the host listed (or just created) in `dir`.
+    fn new_remote(&mut self, dir: Ino, e: &hostfs::Entry, mount: usize, writable: bool) -> Result<Ino, Errno> {
+        let kind = match e.attr.ty {
+            FileType::File => {
+                let c = match self.remote_files.get(&e.id).and_then(Weak::upgrade) {
+                    Some(c) => {
+                        c.lock().set_size(e.attr.size);
+                        c
+                    }
+                    None => {
+                        let c = FileData::remote(e.id, e.attr.size);
+                        self.remote_files.insert(e.id, Arc::downgrade(&c));
+                        c
+                    }
+                };
+                Kind::File(c)
+            }
+            FileType::Dir => Kind::Dir(BTreeMap::new()),
+            FileType::Symlink => Kind::Symlink(e.target.clone()),
+        };
+        let owner = (self.nodes[dir].uid, self.nodes[dir].gid);
+        let mut node = Node::new(kind, e.attr.mode & 0o7777, owner, dir, &e.name, e.attr.mtime_ns);
+        (node.atime, node.ctime) = (e.attr.atime_ns, e.attr.ctime_ns);
+        let fetched = crate::time::monotonic_ns();
+        node.remote = Some(Remote::new(e.id, mount, writable, fetched));
+        let cost = node.cost() + entry_cost(&e.name);
+        self.reclaim();
+        if charge(cost).is_err() {
+            // Make room by forgetting other directories' entries (the host
+            // still has them), then try once more.
+            self.evict(dir);
+            charge(cost).map_err(|_| ENOMEM)?;
+        }
+        let ino = self.alloc_node(node);
+        let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
+        children.insert(e.name.clone(), ino);
+        Ok(ino)
+    }
+
+    /// `name` (node `ino`) is gone from live directory `dir`: removed by the
+    /// program (`removed`, so the host is keeping it open for it) or found
+    /// gone.
+    fn unlink_child(&mut self, dir: Ino, name: &str, ino: Ino, removed: bool) {
+        if removed && let Kind::File(c) = &self.nodes[ino].kind {
+            c.lock().unlinked = true;
+        }
+        self.forget_children(ino);
+        if let Kind::Dir(children) = &mut self.nodes[dir].kind {
+            children.remove(name);
+        }
+        release(entry_cost(name));
+        self.drop_name(ino);
+    }
+
+    /// Drop a live directory's entries from the tree (they're gone, or
+    /// just not needed); it's listed again when next used.
+    fn forget_children(&mut self, dir: Ino) {
+        let Some(r) = self.nodes[dir].remote.as_deref_mut() else { return };
+        r.listed = false;
+        let Kind::Dir(children) = &mut self.nodes[dir].kind else { return };
+        for (name, ino) in core::mem::take(children) {
+            self.forget_children(ino);
+            release(entry_cost(&name));
+            self.drop_name(ino);
+        }
+    }
+
+    /// Forget the entries of live directories nothing is using (no open
+    /// files or working directories in them, nothing listed below), except
+    /// `keep` and its parents.
+    fn evict(&mut self, keep: Ino) {
+        let mut ancestors = Vec::new();
+        let mut a = keep;
+        loop {
+            ancestors.push(a);
+            if a == ROOT {
+                break;
+            }
+            a = self.nodes[a].parent;
+        }
+        let idle = |fs: &Fs, c: Ino| {
+            let c = &fs.nodes[c];
+            Arc::strong_count(&c.pin) == 1 && !c.remote.as_ref().is_some_and(|r| r.listed || r.large)
+        };
+        for ino in 0..self.nodes.len() {
+            let n = &self.nodes[ino];
+            let (Some(r), Kind::Dir(children)) = (n.remote.as_deref(), &n.kind) else { continue };
+            // A large directory's entries are single lookups: any idle one
+            // can go, even from `keep`, but not the way to `keep`.
+            if r.large {
+                let gone: Vec<(String, Ino)> = children
+                    .iter()
+                    .filter(|&(_, &c)| idle(self, c) && !ancestors.contains(&c))
+                    .map(|(k, &c)| (k.clone(), c))
+                    .collect();
+                for (name, c) in gone {
+                    self.unlink_child(ino, &name, c, false);
+                }
+                continue;
+            }
+            if !r.listed || ancestors.contains(&ino) {
+                continue;
+            }
+            if children.values().all(|&c| idle(self, c)) {
+                self.forget_children(ino);
+            }
+        }
+        self.reclaim();
+        self.remote_files.retain(|_, w| w.strong_count() > 0);
+    }
+
+    fn create_remote(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (id, mount, writable) = (r.id, r.mount, r.writable);
+        if !writable {
+            return Err(EROFS);
+        }
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(EEXIST);
+        }
+        self.may_change(dir, None, uid, gid)?;
+        let (ty, target) = match &kind {
+            Kind::File(_) => (FileType::File, ""),
+            Kind::Dir(_) => (FileType::Dir, ""),
+            Kind::Symlink(t) => (FileType::Symlink, t.as_str()),
+            // Device nodes, FIFOs.
+            _ => return Err(EPERM),
+        };
+        if self.find_child(dir, name)?.is_some() {
+            return Err(EEXIST);
+        }
+        let (cid, attr) = match hostfs::create(id, name, ty, perm, target) {
+            Ok(made) => made,
+            Err(e) => {
+                // Made on the host since the last listing, perhaps.
+                if e == EEXIST
+                    && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+                {
+                    r.listed_at = 0;
+                }
+                return Err(e);
+            }
+        };
+        let e = hostfs::Entry { name: name.into(), id: cid, attr, target: target.into() };
+        let ino = match self.new_remote(dir, &e, mount, writable) {
+            Ok(ino) => ino,
+            Err(err) => {
+                // The host has it; the next listing brings it in.
+                if let Some(r) = self.nodes[dir].remote.as_deref_mut() {
+                    r.listed_at = 0;
+                }
+                return Err(err);
+            }
+        };
+        self.nodes[ino].changed = true;
+        self.touch_dir(dir);
+        Ok(ino)
+    }
+
+    /// Before opening a live mount's file: its size and attributes as the
+    /// host has them now (give or take `FRESH_NS`).
+    pub fn revalidate(&mut self, ino: Ino) {
+        let _ = self.refresh(ino);
+    }
+
+    /// Is `ino` in a read-only live mount?
+    pub fn read_only(&self, ino: Ino) -> bool {
+        self.nodes[ino].remote.as_ref().is_some_and(|r| !r.writable)
+    }
+
+    /// chmod and utimensat: the mode and times (None leaves one alone),
+    /// changed on the host first for a live mount's node.
+    pub fn set_attr(
+        &mut self,
+        ino: Ino,
+        mode: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> Result<(), Errno> {
+        if let Some(r) = self.nodes[ino].remote.as_deref() {
+            if !r.writable {
+                return Err(EROFS);
+            }
+            let id = r.id;
+            let attr = hostfs::set_attr(id, mode, atime, mtime)?;
+            self.apply_attr(ino, &attr);
+            return Ok(());
+        }
+        let n = &mut self.nodes[ino];
+        if let Some(m) = mode {
+            n.perm = m & 0o7777;
+        }
+        if let Some(a) = atime {
+            n.atime = a;
+        }
+        if let Some(m) = mtime {
+            n.mtime = m;
+        }
+        if mode.is_some() || atime.is_some() || mtime.is_some() {
+            self.changed(ino);
+        }
+        Ok(())
+    }
+
+    /// `name` in `dir`, for a lookup: in a live directory, as the host has
+    /// it now (give or take `FRESH_NS`).
+    fn find_child(&mut self, dir: Ino, name: &str) -> Result<Option<Ino>, Errno> {
+        self.ensure(dir)?;
+        let child = self.child(dir, name);
+        let Some(r) = self.nodes[dir].remote.as_deref().filter(|r| r.large) else { return Ok(child) };
+        let (id, mount, writable) = (r.id, r.mount, r.writable);
+        let now = crate::time::monotonic_ns();
+        if let Some(c) = child
+            && self.nodes[c].remote.as_ref().is_some_and(|r| now.saturating_sub(r.fetched) < hostfs::FRESH_NS)
+        {
+            return Ok(Some(c));
+        }
+        match hostfs::lookup(id, name) {
+            Ok(e) => {
+                if let Some(c) = child {
+                    let same = self.nodes[c].remote.as_ref().is_some_and(|r| r.id == e.id)
+                        && self.file_type(c) == e.attr.ty
+                        && !matches!(&self.nodes[c].kind, Kind::Symlink(t) if *t != e.target);
+                    if same {
+                        self.apply_attr(c, &e.attr);
+                        return Ok(Some(c));
+                    }
+                    self.unlink_child(dir, name, c, false);
+                }
+                self.new_remote(dir, &e, mount, writable).map(Some)
+            }
+            Err(ENOENT) => {
+                if let Some(c) = child {
+                    self.unlink_child(dir, name, c, false);
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// getdents in a large live directory: the entry after `after`, from
+    /// the host a page at a time.
+    fn large_next(&mut self, dir: Ino, id: u64, after: &str) -> Result<Option<DirItem>, Errno> {
+        let now = crate::time::monotonic_ns();
+        if let Some(p) = &self.page
+            && p.dir == dir
+            && p.from.as_str() <= after
+            && now.saturating_sub(p.at) < hostfs::FRESH_NS
+        {
+            if let Some(item) = p.items.iter().find(|it| it.name.as_str() > after) {
+                return Ok(Some(item.clone()));
+            }
+            if !p.more {
+                return Ok(None);
+            }
+        }
+        let (_, entries, more) = hostfs::list(id, after)?;
+        // What a program reads it usually stats next: keep the page's
+        // entries as nodes too, while there's room (making room by
+        // forgetting idle ones, which are only a cache here).
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (mount, writable) = (r.mount, r.writable);
+        for e in &entries {
+            match self.child(dir, &e.name) {
+                Some(c)
+                    if self.nodes[c].remote.as_ref().is_some_and(|r| r.id == e.id)
+                        && self.file_type(c) == e.attr.ty =>
+                {
+                    self.apply_attr(c, &e.attr)
+                }
+                Some(_) => {}
+                None => {
+                    if self.new_remote(dir, e, mount, writable).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let items: Vec<DirItem> = entries
+            .into_iter()
+            .map(|e| DirItem { name: e.name, ino: REMOTE_INO + e.id, d_type: d_type_of(e.attr.ty) })
+            .collect();
+        let first = items.first().cloned();
+        self.page = Some(Page { dir, from: after.into(), items, more, at: now });
+        Ok(first)
     }
 }

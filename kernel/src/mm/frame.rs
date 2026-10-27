@@ -1,16 +1,22 @@
 //! Physical frame allocator and kernel heap.
 
 use alloc::vec::Vec;
-use linked_list_allocator::LockedHeap;
 use spin::Mutex;
+use talc::{ErrOnOom, Span, Talc, Talck};
 
 use super::{PAGE_SIZE, p2v};
 
+/// talc rather than a first-fit list: the heap holds tens of thousands of
+/// small objects (a live mount's nodes and names), and a list allocator
+/// slows down with every fragment.
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static HEAP: Talck<spin::Mutex<()>, ErrOnOom> = Talc::new(ErrOnOom).lock();
 
 pub fn init_heap(pa: u64, size: u64) {
-    unsafe { HEAP.lock().init(p2v(pa) as *mut u8, size as usize) };
+    // SAFETY: the range is RAM set aside for the heap, mapped and unused.
+    unsafe {
+        HEAP.lock().claim(Span::from_base_size(p2v(pa) as *mut u8, size as usize)).expect("heap");
+    }
 }
 
 struct Frames {

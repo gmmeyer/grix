@@ -274,6 +274,8 @@ pub(crate) struct Outbox {
 struct Queue {
     frames: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// Frames of an urgent answer still at the front.
+    urgent: usize,
     closed: bool,
 }
 
@@ -301,6 +303,24 @@ impl Outbox {
         true
     }
 
+    /// Queue an answer the guest is waiting for (a live mount's), ahead of
+    /// everything else and whatever room there is: it's at most one
+    /// message, and the guest does nothing else until it arrives.
+    pub fn urgent(&self, frames: Vec<Vec<u8>>) {
+        let mut q = self.q.lock().unwrap();
+        // A guest that asks again before reading the last answer is
+        // misbehaving: it gets nothing more until it does.
+        if q.closed || frames.is_empty() || q.urgent > 0 {
+            return;
+        }
+        q.urgent = frames.len();
+        for f in frames.into_iter().rev() {
+            q.bytes += f.len();
+            q.frames.push_front(f);
+        }
+        self.ready.notify_one();
+    }
+
     /// Queue a frame if there's room, or drop it.
     fn offer(&self, frame: Vec<u8>) {
         let q = self.q.lock().unwrap();
@@ -318,6 +338,7 @@ impl Outbox {
             }
             if let Some(f) = q.frames.pop_front() {
                 q.bytes -= f.len();
+                q.urgent = q.urgent.saturating_sub(1);
                 self.room.notify_all();
                 return Some(f);
             }

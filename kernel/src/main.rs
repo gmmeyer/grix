@@ -18,6 +18,7 @@ mod errno;
 mod export;
 mod fd;
 mod fs;
+mod hostfs;
 mod inet;
 mod ipc;
 mod kmem;

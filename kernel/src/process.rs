@@ -502,6 +502,12 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
             signal::fault(p, signal::SIGSEGV, code, fault, access.describe_violation())
         }
         Err(FaultError::OutOfMemory) => p.kill(signal::SIGKILL, far, tf.elr, "out of memory", true),
+        // As Linux does when a mapped file can't be read.
+        Err(FaultError::Io) => {
+            const BUS_ADRERR: i32 = 2;
+            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            signal::fault(p, signal::SIGBUS, BUS_ADRERR, fault, "a mapped file couldn't be read")
+        }
     }
 }
 
@@ -516,7 +522,7 @@ pub fn start(img: Image<'static>) -> ! {
         klog!("exec {}: {}\n", img.exe, reason);
         finish(ExitKind::Exited, code)
     };
-    let mut fs = fs::Fs::build(entries, &img.mounts, img.uid, img.gid);
+    let mut fs = fs::Fs::build(entries, &img.mounts, &img.live_mounts, img.uid, img.gid);
     for m in &img.mounts {
         fs.mark_mount(m);
     }
@@ -585,8 +591,8 @@ pub fn load_program(
     envp: Vec<String>,
 ) -> Result<Program, ExecError> {
     let (exe, ino, src, argv) = {
-        let fs = fs::lock();
-        resolve_interpreters(&fs, base, path, argv)?
+        let mut fs = fs::lock();
+        resolve_interpreters(&mut fs, base, path, argv)?
     };
     let bytes = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
     let args_charge = crate::kmem::Charge::new(bytes)
@@ -597,7 +603,7 @@ pub fn load_program(
     let (entry, interp_base) = match &loaded.interp {
         Some(ipath) => {
             let (isrc, iino) = {
-                let fs = fs::lock();
+                let mut fs = fs::lock();
                 let ino = fs.lookup(p.cwd, ipath, true).map_err(|_| {
                     exec_error(ENOENT, alloc::format!("ELF interpreter {ipath} not found (was it imported?)"))
                 })?;
@@ -677,7 +683,7 @@ impl Program {
 /// `interp [arg] script args...`. Returns the ELF to load (its path, node
 /// and bytes) and the final argv.
 fn resolve_interpreters(
-    fs: &fs::Fs,
+    fs: &mut fs::Fs,
     cwd: Ino,
     path: &str,
     mut argv: Vec<String>,

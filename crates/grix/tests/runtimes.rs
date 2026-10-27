@@ -468,3 +468,36 @@ fn node_needs_threads() {
     assert_ne!(out.status, ExitStatus::Exited(0));
     assert_eq!(out.missing_capabilities(), ["threads"]);
 }
+
+#[test]
+fn python_from_live_mounts() {
+    // Nothing copied in: the interpreter, its loader, shared libraries
+    // (mapped, page by page from the host) and modules all come from
+    // read-only live mounts, and a script writes to a read-write one.
+    let root = runtime("python");
+    let work = std::env::temp_dir().join(format!("grix-py-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("in.json"), r#"{"n": 6}"#).unwrap();
+    let b = Sandbox::builder()
+        .timeout(Duration::from_secs(120))
+        .allow(Capability::Threads)
+        .mount_read_only(root.join("lib"), "/lib")
+        .unwrap()
+        .mount_read_only(root.join("usr"), "/usr")
+        .unwrap()
+        .mount(&work, "/work")
+        .unwrap();
+    let script = "import json, hashlib, sqlite3\n\
+                  n = json.load(open('/work/in.json'))['n']\n\
+                  db = sqlite3.connect('/work/db.sqlite')\n\
+                  db.execute('create table t (x)'); db.execute('insert into t values (?)', (n * 7,)); db.commit()\n\
+                  open('/work/out.txt', 'w').write(hashlib.sha256(str(n).encode()).hexdigest()[:8])\n\
+                  print(db.execute('select x from t').fetchone()[0])";
+    let out = run(b, &["/usr/bin/python3", "-c", script]);
+    assert_eq!(out.stdout_str(), "42\n");
+    assert_eq!(std::fs::read_to_string(work.join("out.txt")).unwrap(), "e7f6c011");
+    let db = std::fs::read(work.join("db.sqlite")).unwrap();
+    assert!(db.starts_with(b"SQLite format 3\0"));
+    std::fs::remove_dir_all(&work).unwrap();
+}

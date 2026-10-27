@@ -30,6 +30,7 @@ pub const ENOSPC: Errno = Errno(28);
 pub const ESPIPE: Errno = Errno(29);
 pub const EROFS: Errno = Errno(30);
 pub const EPIPE: Errno = Errno(32);
+pub const EXDEV: Errno = Errno(18);
 pub const EDOM: Errno = Errno(33);
 pub const ERANGE: Errno = Errno(34);
 pub const ENAMETOOLONG: Errno = Errno(36);

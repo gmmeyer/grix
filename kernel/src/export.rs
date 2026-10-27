@@ -58,7 +58,7 @@ pub fn send() {
     // Not yet built (exec failed early), or the program ended inside a
     // filesystem operation: nothing to read now, and the host reports the
     // exports as incomplete.
-    let Some(fs) = fs::try_lock() else {
+    let Some(mut fs) = fs::try_lock() else {
         klog!("export skipped: the filesystem isn't available\n");
         return;
     };
@@ -140,8 +140,9 @@ impl Walk<'_> {
             *last = Some(name.as_str());
             let parent_len = path.len();
             let node = fs.node(ino);
-            // /dev, /proc and /sys aren't the program's files.
-            if node.system {
+            // /dev, /proc and /sys aren't the program's files, and a live
+            // mount's are on the host already.
+            if node.system || node.remote.is_some() {
                 continue;
             }
             if parent_len + 1 + name.len() > MAX_EXPORT_PATH {

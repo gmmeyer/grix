@@ -268,8 +268,20 @@ Next, in TODO.md order:
   host during the run as a reported conflict. The mount point can't be
   removed or renamed (EBUSY).
 
-Next: live mounts (fetch files from the host on demand), then signals from
-the host.
+- **Live mounts**: `mount` / `mount_read_only` (the earlier kind is now
+  `mount_on_exit`). Nothing goes into the boot image. The kernel asks the
+  host for directory listings, file bytes and changes over the console
+  (`hostfs`, one request at a time, waiting with interrupts masked). The
+  host serves them confined to the mount with `openat`/`O_NOFOLLOW`. Nodes
+  are a cache with a one-second freshness. Eviction forgets idle
+  directories under memory pressure, and directories too big to hold are
+  looked up name by name and read page by page. Python runs entirely from
+  read-only mounts of its `/lib` and `/usr`. 150,000 files walk in about 4
+  s, and a single 50,000-entry directory in about 4 s. That needed a new
+  kernel heap allocator (talc), because `linked_list_allocator` went
+  quadratic with tens of thousands of small objects.
+
+Next: signals from the host.
 
 ### Notes for the next session
 

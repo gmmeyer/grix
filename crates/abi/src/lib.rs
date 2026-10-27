@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod codec;
+pub mod hostfs;
 pub mod image;
 pub mod link;
 pub mod policy;

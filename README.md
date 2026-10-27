@@ -25,8 +25,7 @@ grix: missing /etc/passwd: not imported
 > filesystem. With the matching capabilities it also runs processes
 > (fork/exec) and **networks through the host**: clients, servers on
 > forwarded ports, and DNS, under an allow-list. Host directories can be
-> **mounted read-write**: what the program changes is applied to them when
-> it ends. See
+> **mounted live**, read-write or read-only, without copying them in. See
 > [Compatibility](#compatibility) and [Roadmap](#roadmap).
 
 ## Quick start
@@ -96,36 +95,60 @@ results.write_to("./results")?;             // or recreate it on the host
 
 ### Working on a host directory
 
-`mount` makes a host directory read-write in the sandbox, for a program
-that should change files in place (a formatter, a code generator, a build):
+`mount` makes a host directory live in the sandbox, like a bind mount:
+the program sees it as it is, and what it changes there changes on the
+host at once. Nothing is copied in up front. The kernel asks the host for
+directory listings and file contents as the program needs them, so the
+directory can be any size.
 
 ```rust
 let sandbox = Sandbox::builder()
     .import("./tools/busybox.static", "/bin/busybox")?
-    .mount("./my-project", "/work")?      // grants fs_write
+    .mount("./my-project", "/work")?            // read-write; grants fs_write
+    .mount_read_only("./datasets", "/data")?    // EROFS on any change
     .cwd("/work")
     .build()?;
 let out = sandbox.run(&["/bin/busybox", "sed", "-i", "s/foo/bar/g", "/work/src/main.c"])?;
-let m = &out.mounts[0];                    // state, written, removed, conflicts
 ```
 
-- Each run starts from the directory as it is then, with the host's file
-  times (so `make` and build caches behave).
-- When the program ends (exit, crash, deadlock: not a timeout), only what
-  it changed comes back, and it's applied to the host directory: new and
-  changed files, links and directories, and removals. Untouched files are
-  left alone. If the changes don't all arrive (over `max_export`, or the
-  run was cut off), nothing is applied.
-- Applying never follows a link (a link the program made can't redirect a
-  write outside the directory), and replaces files by renaming new ones
-  into place. Anything that also changed on the host during the run is left
-  as the host has it and listed in `conflicts`.
-- The program can't remove or rename the mount point itself (EBUSY, as on
-  Linux). The directory lives in guest memory during the run, so
-  `memory_mb` bounds its size.
+- **Confined.** The host serves each request by walking down from the
+  mounted directory one checked name at a time, never following a link.
+  A link the program makes (or finds) can't lead it out.
+- **Fresh within a second.** The kernel keeps what the host told it for a
+  second, so changes made on the host during the run show up within one.
+  Its own changes are visible at once, to it and to the host.
+- **Linux semantics**:
+  - files removed while open stay usable;
+  - `O_APPEND` writes go to the host file's end;
+  - `fsync` reaches the host's disk;
+  - the mount point itself can't be removed or renamed (EBUSY);
+  - renames and hard links into or out of the mount fail with EXDEV, and
+    hard links within it with EPERM.
+- **Files' times and modes are the host's.** Ownership shows as the sandbox
+  user's, and `chown` can't change it.
+- **Any size.** Runtimes work from a live mount too: Python runs entirely
+  from read-only mounts of its `/lib` and `/usr`, mapping its shared
+  libraries page by page from the host. A tree or a single directory can be
+  larger than the kernel can hold at once: it forgets entries it's done
+  with and asks again.
+- **Limits:**
+  - A file the host replaces while the program has it open may show the new
+    contents (the host reopens it by name once its descriptor ages out).
+  - On a read-only mount, changes that need `fs_write` are reported as
+    denied (`needs capability fs_write`) when it isn't granted, instead of
+    EROFS.
 
-The CLI has `--mount HOST:GUEST`, and manifests `[[mount]]` tables with
-`host` and `guest`.
+`mount_on_exit` is the other kind of read-write mount: each run imports the
+directory, and what the program changed is applied to the host only when it
+ends, all at once. Only what changed is sent back, and nothing at all is
+applied if the changes don't all arrive (over `max_export`, or the run was
+cut off). Applying never follows a link and replaces files by renaming new
+ones into place. Anything that also changed on the host during the run is
+left as the host has it and listed in `RunOutput::mount_changes[i].conflicts`.
+The directory lives in guest memory, so `memory_mb` bounds it.
+
+The CLI has `--mount HOST:GUEST[:rw|ro|on-exit]`, and manifests `[[mount]]`
+tables with `host`, `guest` and `mode` (`"rw"`, `"ro"` or `"on_exit"`).
 
 An exported directory comes back whenever the program ends (exit, crash,
 deadlock), but not if it times out. If nothing is imported there, it starts
@@ -207,7 +230,7 @@ guest = "/bin/busybox"
 guest = "/out"
 host = "results"         # relative to the manifest; must not exist yet, or be empty
 
-# [[mount]]              # read-write: the program's changes are applied when it ends
+# [[mount]]              # live; mode = "rw" (default), "ro" or "on_exit"
 # host = "../my-project"
 # guest = "/work"
 
@@ -241,7 +264,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 
 | What | Default | How to get more |
 |---|---|---|
-| Files | Only imported paths exist (read-only), plus `/dev/{null,zero,random,urandom}`, `/proc/self/exe`, empty `/tmp` | `import` / `file`; `mount` for a host directory whose changes go back |
+| Files | Only imported paths exist (read-only), plus `/dev/{null,zero,random,urandom}`, `/proc/self/exe`, empty `/tmp` | `import` / `file`; `mount` / `mount_read_only` for a live host directory |
 | Environment | Empty | `env` |
 | Memory, time, randomness, stdout/stderr | Always available | `memory_mb`, `timeout` limit them |
 | Local IPC: pipes, eventfd, epoll, AF_UNIX socket pairs | Always available | — |
@@ -291,6 +314,9 @@ Events tell you what happened:
 - **The VM's devices.** The VM gets RAM, the virtio console, a serial port,
   and nothing else: no network card, no disks, no QEMU monitor, and no
   semihosting (which would expose host files).
+- **Host directories without a disk.** A live mount is served by the host
+  over the console too: the kernel asks for listings and bytes as the
+  program needs them, and sends its changes as it makes them.
 - **Networking without a network card.** The guest kernel turns sockets
   into messages on the console. The host makes the connections (after the
   policy check), forwards ports, and answers DNS. Flow control is by credit
@@ -325,8 +351,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
-| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | Live host mounts (changes visible during the run); exports and mount changes after a timeout |
-| Read-write host directory mounts (`mount`, `--mount`): only the changes go back, applied when the program ends | Mounts larger than guest memory |
+| `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | Exports and `mount_on_exit` changes after a timeout |
+| Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`) | inotify events for host changes |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files. Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
 | Clocks (including per-thread and per-process CPU time), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | x86_64 guests |
@@ -348,10 +374,8 @@ subshells.
 
 1. ~~**Networking**~~: done. Sockets are proxied through the host, which
    enforces the allow-list and forwards ports. The guest has no TCP/IP stack.
-2. ~~**Host directories**~~: read-write mounts whose changes are applied
-   when the program ends are done. Next: live mounts, with files fetched
-   from the host as the program opens them, so a mount can be larger than
-   guest memory and the host sees changes during the run.
+2. ~~**Host directories**~~: done. Live mounts (read-write or read-only,
+   any size) and mounts whose changes are applied when the program ends.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
 4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`

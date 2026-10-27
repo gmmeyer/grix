@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use grix::{Capability, DenyAction, Export, ExportState, Manifest, MountState, RunOutput, Sandbox, Stream};
+use grix::{Capability, DenyAction, Export, ExportState, Manifest, MountMode, MountState, RunOutput, Sandbox, Stream};
 
 #[derive(Parser)]
 #[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
@@ -34,10 +34,11 @@ struct RunArgs {
     /// not exist yet, or be empty). Repeatable.
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
-    /// Mount host directory HOST read-write at GUEST: what the program
-    /// changes there is applied to HOST when it ends. Grants fs_write.
+    /// Mount host directory HOST at GUEST: live and read-write (rw, the
+    /// default, grants fs_write), live and read-only (ro), or with the
+    /// changes applied when the program ends (on-exit, grants fs_write).
     /// Repeatable.
-    #[arg(long = "mount", value_name = "HOST:GUEST")]
+    #[arg(long = "mount", value_name = "HOST:GUEST[:rw|ro|on-exit]")]
     mounts: Vec<String>,
     /// With `net`, only connect to hosts these rules allow (example.com,
     /// *.example.com, 1.2.3.4, 10.0.0.0/8, each optionally :port).
@@ -142,8 +143,15 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     let mut mounted: Vec<PathBuf> = manifest.mounts.iter().filter_map(|m| m.host.canonicalize().ok()).collect();
     for spec in &args.mounts {
-        let (host, guest) = spec.rsplit_once(':').with_context(|| format!("--mount {spec:?} must be HOST:GUEST"))?;
-        b = b.mount(host, guest)?;
+        let (rest, mode) = match spec.rsplit_once(':') {
+            Some((rest, "rw")) => (rest, MountMode::ReadWrite),
+            Some((rest, "ro")) => (rest, MountMode::ReadOnly),
+            Some((rest, "on-exit")) => (rest, MountMode::OnExit),
+            _ => (spec.as_str(), MountMode::ReadWrite),
+        };
+        let (host, guest) =
+            rest.rsplit_once(':').with_context(|| format!("--mount {spec:?} must be HOST:GUEST[:rw|ro|on-exit]"))?;
+        b = b.mount_with(host, guest, mode)?;
         mounted.extend(Path::new(host).canonicalize().ok());
     }
     // Mounts are applied first: one's changes mustn't decide where an
@@ -262,7 +270,7 @@ fn run(args: RunArgs) -> Result<i32> {
 fn report_mounts(out: &RunOutput, quiet: bool) -> bool {
     let ended = matches!(out.status, grix::ExitStatus::Exited(_) | grix::ExitStatus::Signaled(_));
     let mut ok = true;
-    for m in &out.mounts {
+    for m in &out.mount_changes {
         let host = m.host.display();
         let (w, r) = (m.written.len(), m.removed.len());
         match &m.state {

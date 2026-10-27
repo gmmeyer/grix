@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use grix_abi::hostfs::Assembler;
 use grix_abi::wire::{self, Channel, ExitKind, Input, InputDecoder};
 use spin::Mutex;
 
@@ -84,6 +85,12 @@ struct Console {
     stdin: Stdin,
     /// Bumped when output room comes back (for edge-triggered epoll).
     out_version: u64,
+    /// A live mount's answer, as it arrives and once it's all there.
+    fs: Assembler,
+    fs_reply: Option<Vec<u8>>,
+    /// Networking messages that arrived while waiting for an answer, for
+    /// the next `dispatch`.
+    deferred: Vec<Vec<u8>>,
 }
 
 static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
@@ -92,7 +99,8 @@ static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 pub fn init_virtio() {
     let dev = virtio::Console::probe().expect("no virtio console (QEMU must be started with one)");
     let stdin = Stdin { buf: VecDeque::new(), eof: true, decoder: Box::default(), version: 0, owed: 0 };
-    *CONSOLE.lock() = Some(Console { dev, stdin, out_version: 0 });
+    *CONSOLE.lock() =
+        Some(Console { dev, stdin, out_version: 0, fs: Assembler::default(), fs_reply: None, deferred: Vec::new() });
 }
 
 pub fn write(ch: Channel, data: &[u8]) {
@@ -223,14 +231,20 @@ pub fn interrupt(id: u32) -> bool {
 /// out, for `dispatch` once the console lock is released (handling them may
 /// send replies).
 fn drain(c: &mut Console) -> Vec<Vec<u8>> {
-    let Console { dev, stdin, .. } = c;
+    let Console { dev, stdin, fs, fs_reply, deferred, .. } = c;
     let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
-    let mut link = Vec::new();
+    let mut link = core::mem::take(deferred);
     dev.receive(|bytes| {
         for &b in bytes {
             match decoder.push(b) {
                 Some((Input::Link, msg)) => link.push(msg.to_vec()),
+                // Garbled answers are dropped; the request then gets none.
+                Some((Input::Fs, msg)) => {
+                    if let Some(Ok(reply)) = fs.push(msg) {
+                        *fs_reply = Some(reply);
+                    }
+                }
                 // The host keeps within its credit; nothing past it fits.
                 Some((Input::Stdin, data)) if !*eof && buf.len() + data.len() <= STDIN_CAPACITY => {
                     buf.extend(data);
@@ -255,6 +269,43 @@ fn drain(c: &mut Console) -> Vec<Vec<u8>> {
 fn dispatch(link: Vec<Vec<u8>>) {
     for msg in link {
         crate::inet::from_host(&msg);
+    }
+}
+
+/// Send a live mount's request (`grix_abi::hostfs`) and wait for the
+/// host's answer. The kernel does nothing else meanwhile, with interrupts
+/// masked: this keeps file system code synchronous, and the host answers
+/// from its own disk. Networking messages that arrive in the meantime wait
+/// for the console's interrupt, which stays pending until the program runs
+/// again: handling them here could take locks the caller holds.
+pub fn host_request(msg: &[u8]) -> Vec<u8> {
+    {
+        let mut guard = CONSOLE.lock();
+        let c = guard.as_mut().expect("live mounts need the virtio console");
+        c.fs_reply = None;
+        for (more, chunk) in grix_abi::hostfs::frames(msg) {
+            c.dev.send(&[&wire::frame_header(Channel::Fs, chunk.len() + 1), &[more], chunk]);
+        }
+    }
+    loop {
+        let mut guard = CONSOLE.lock();
+        let c = guard.as_mut().unwrap();
+        let link = drain(c);
+        c.deferred = link;
+        if let Some(reply) = c.fs_reply.take() {
+            return reply;
+        }
+        drop(guard);
+        core::hint::spin_loop();
+    }
+}
+
+/// Send a live mount's message that has no answer.
+pub fn host_send(msg: &[u8]) {
+    let mut guard = CONSOLE.lock();
+    let Some(c) = guard.as_mut() else { return };
+    for (more, chunk) in grix_abi::hostfs::frames(msg) {
+        c.dev.send(&[&wire::frame_header(Channel::Fs, chunk.len() + 1), &[more], chunk]);
     }
 }
 

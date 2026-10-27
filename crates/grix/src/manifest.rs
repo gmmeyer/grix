@@ -25,9 +25,10 @@
 //! guest = "/out"
 //! host = "results"           # relative to this manifest; must not exist yet
 //!
-//! [[mount]]                  # read-write: changes go back when the program ends
+//! [[mount]]                  # live and read-write
 //! host = "."                 # relative to this manifest
 //! guest = "/work"
+//! mode = "rw"                # or "ro", or "on_exit" (changes applied when it ends)
 //! ```
 
 use std::collections::BTreeMap;
@@ -38,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::policy::{Capability, DenyAction};
 use serde::Deserialize;
 
-use crate::sandbox::SandboxBuilder;
+use crate::sandbox::{MountMode, SandboxBuilder};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +64,17 @@ pub struct Manifest {
     #[serde(default, rename = "export")]
     pub exports: Vec<ExportTo>,
     #[serde(default, rename = "mount")]
-    pub mounts: Vec<Import>,
+    pub mounts: Vec<MountSpec>,
+}
+
+/// A host directory to mount, and how.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountSpec {
+    pub host: PathBuf,
+    pub guest: String,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -158,7 +169,13 @@ impl Manifest {
             b = b.export(&exp.guest)?;
         }
         for mount in &self.mounts {
-            b = b.mount(&mount.host, &mount.guest)?;
+            let mode = match mount.mode.as_deref() {
+                None | Some("rw") => MountMode::ReadWrite,
+                Some("ro") => MountMode::ReadOnly,
+                Some("on_exit") => MountMode::OnExit,
+                Some(other) => bail!("mount mode must be \"rw\", \"ro\" or \"on_exit\", not {other:?}"),
+            };
+            b = b.mount_with(&mount.host, &mount.guest, mode)?;
         }
         Ok(b)
     }

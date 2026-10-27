@@ -212,7 +212,12 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
                 return Err(EINVAL);
             }
             need_write(p, nr::openat, &path)?;
-            (create_file(p, base, &path, perm, 0)?, true)
+            match create_file(p, base, &path, perm, 0) {
+                Ok(ino) => (ino, true),
+                // Made meanwhile, on a live mount's host: open that one.
+                Err(EEXIST) => (fs::lock().lookup(base, &path, flags & O_NOFOLLOW == 0)?, false),
+                Err(e) => return Err(e),
+            }
         }
         Err(e) => {
             if e == ENOENT {
@@ -230,7 +235,11 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
     }
     let writes = acc != O_RDONLY || flags & O_TRUNC != 0;
     let (content, proc) = {
-        let fs = fs::lock();
+        let mut fs = fs::lock();
+        fs.revalidate(ino);
+        if writes && fs.read_only(ino) && !fs.is_dir(ino) {
+            return Err(EROFS);
+        }
         match &fs.node(ino).kind {
             Kind::Dev(d) => {
                 let file = new_file(FileKind::Dev(*d, ino), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
@@ -240,7 +249,15 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
             }
             Kind::Symlink(_) => return Err(ELOOP), // O_NOFOLLOW on a symlink
             Kind::Dir(_) if writes => return Err(EISDIR),
-            Kind::Dir(_) => (None, None),
+            // Reading a directory needs read permission, as on Linux; a live
+            // mount's must be one the host can list, too.
+            Kind::Dir(_) => {
+                if !fs.permits(ino, p.uid, p.gid, MAY_READ) {
+                    return Err(EACCES);
+                }
+                fs.list_now(ino)?;
+                (None, None)
+            }
             Kind::File(_) | Kind::Unlinked { .. } if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Kind::File(c) => (Some(c.clone()), None),
             Kind::Unlinked { .. } => return Err(ENOENT),
@@ -265,9 +282,11 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         if !fs::lock().permits(ino, p.uid, p.gid, want) {
             return Err(EACCES);
         }
-        if flags & O_TRUNC != 0 && c.lock().len() != 0 {
+        // A live mount's file may have grown on the host since.
+        let remote = c.lock().remote_id().is_some();
+        if flags & O_TRUNC != 0 && (remote || c.lock().len() != 0) {
             note_shared(p, nr::openat, c);
-            c.lock().truncate(0);
+            c.lock().truncate(0)?;
             fs::lock().modified(ino);
         }
     }
@@ -299,6 +318,23 @@ fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32) ->
         return Err(EISDIR);
     }
     fs.create(dir, &name, Kind::File(FileData::new(&[])), perm, p.uid, p.gid)
+}
+
+/// fsync/fdatasync: a live mount's file is synced on the host; everything
+/// else is in memory already.
+pub fn fsync(p: &mut Process, fd: u64) -> SysResult {
+    let file = p.fds.get(fd)?;
+    let f = file.lock();
+    let id = match (&f.content, &f.kind) {
+        (Some(c), _) => c.lock().remote_id(),
+        (None, FileKind::Node(ino)) => fs::lock().remote_id(*ino),
+        _ => None,
+    };
+    drop(f);
+    if let Some(id) = id {
+        crate::hostfs::fsync(id)?;
+    }
+    Ok(0)
 }
 
 pub fn close(p: &mut Process, fd: u64) -> SysResult {
@@ -444,11 +480,23 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
 /// Copy file bytes to user memory through a kernel buffer, so the contents
 /// aren't locked while user pages fault in (they may map this very file).
 fn read_content(p: &mut Process, c: &Content, off: u64, buf: u64, count: u64) -> SysResult {
-    let mut chunk = [0u8; CHUNK];
+    // A live mount's file: a request to the host per buffer, so a big one.
+    let mut big = Vec::new();
+    let mut small = [0u8; CHUNK];
+    let chunk: &mut [u8] = if c.lock().remote_id().is_some() {
+        big.resize(grix_abi::hostfs::IO_MAX, 0);
+        &mut big
+    } else {
+        &mut small
+    };
     let mut done = 0u64;
     while done < count {
-        let want = (count - done).min(CHUNK as u64) as usize;
-        let n = c.lock().read(off.saturating_add(done), &mut chunk[..want]);
+        let want = (count - done).min(chunk.len() as u64) as usize;
+        let n = match c.lock().read_at(off.saturating_add(done), &mut chunk[..want]) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
         if n == 0 {
             break;
         }
@@ -473,22 +521,51 @@ fn note_shared(p: &mut Process, n: u32, c: &Content) {
 const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 
 /// Copy user bytes into a file at `off` (see `read_content`).
-fn write_content(p: &mut Process, c: &Content, ino: Ino, off: u64, buf: u64, count: u64) -> SysResult {
+/// With `append`, at the end of a live mount's file (where the host says
+/// the end is). Returns how much was written, and where.
+fn write_content_at(
+    p: &mut Process,
+    c: &Content,
+    ino: Ino,
+    mut off: u64,
+    append: bool,
+    buf: u64,
+    count: u64,
+) -> Result<(u64, u64), Errno> {
     if off.checked_add(count).is_none_or(|end| end > MAX_FILE_SIZE) {
         return Err(EFBIG);
     }
     c.lock().may_write(off + count)?;
     note_shared(p, nr::write, c);
-    let mut chunk = [0u8; CHUNK];
+    let remote = c.lock().remote_id().is_some();
+    let mut big = Vec::new();
+    let mut small = [0u8; CHUNK];
+    let chunk: &mut [u8] = if remote {
+        big.resize(grix_abi::hostfs::IO_MAX, 0);
+        &mut big
+    } else {
+        &mut small
+    };
     let mut done = 0u64;
     let mut err = None;
     while done < count {
-        let n = (count - done).min(CHUNK as u64) as usize;
+        let n = (count - done).min(chunk.len() as u64) as usize;
         if let Err(e) = copy_in(&mut p.aspace, buf + done, &mut chunk[..n]) {
             err = Some(e);
             break;
         }
-        match c.lock().write(off + done, &chunk[..n]) {
+        let wrote = if remote {
+            let r = c.lock().write_remote(off + done, append && done == 0, &chunk[..n]);
+            r.map(|(k, at)| {
+                if append && done == 0 {
+                    off = at;
+                }
+                k
+            })
+        } else {
+            c.lock().write(off + done, &chunk[..n])
+        };
+        match wrote {
             Ok(k) => done += k as u64,
             Err((k, e)) => {
                 done += k as u64;
@@ -502,7 +579,7 @@ fn write_content(p: &mut Process, c: &Content, ino: Ino, off: u64, buf: u64, cou
     }
     match err {
         Some(e) if done == 0 => Err(e),
-        _ => Ok(done),
+        _ => Ok((done, off)),
     }
 }
 
@@ -520,8 +597,11 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         FileKind::Node(ino) => {
             let ino = *ino;
             let Some(c) = f.content.clone() else { return Err(EBADF) };
-            let off = if f.flags & O_APPEND != 0 { c.lock().len() } else { at.unwrap_or(f.offset) };
-            let n = write_content(p, &c, ino, off, buf, count)?;
+            let append = f.flags & O_APPEND != 0;
+            let off = if append { c.lock().len() } else { at.unwrap_or(f.offset) };
+            // A live mount's file may have grown on the host: its end is
+            // where the host says.
+            let (n, off) = write_content_at(p, &c, ino, off, append, buf, count)?;
             if at.is_none() {
                 f.offset = off + n;
             }
@@ -932,7 +1012,7 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
     let FileKind::Node(dir) = f.kind else { return Err(ENOTDIR) };
-    let fs = fs::lock();
+    let mut fs = fs::lock();
     if !fs.is_dir(dir) {
         return Err(ENOTDIR);
     }
@@ -947,12 +1027,20 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     };
     loop {
         let entry = match pos {
-            0 => Some((String::from("."), dir, 4)),
-            1 => Some((String::from(".."), fs.node(dir).parent, 4)),
-            n if dir == fs.fd_dir => fd_names.get(n as usize - 2).map(|name| (name.clone(), dir, 10)),
+            0 => Some((String::from("."), fs.ino_number(dir), 4)),
+            1 => {
+                let parent = fs.node(dir).parent;
+                Some((String::from(".."), fs.ino_number(parent), 4))
+            }
+            n if dir == fs.fd_dir => fd_names.get(n as usize - 2).map(|name| (name.clone(), fs.ino_number(dir), 10)),
             // Resume after the last name returned: entries may have come and
             // gone since (rm -rf unlinks while it reads).
-            _ => fs.dir_next(dir, cursor.as_deref()).map(|(name, ino)| (name, ino, fs.d_type(ino))),
+            _ => match fs.dir_next(dir, cursor.as_deref()) {
+                Ok(item) => item.map(|it| (it.name, it.ino, it.d_type)),
+                // A live mount's directory the host can't list now.
+                Err(e) if out.is_empty() => return Err(e),
+                Err(_) => None,
+            },
         };
         let Some((name, ino, d_type)) = entry else { break };
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
@@ -963,7 +1051,7 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
             break;
         }
         let start = out.len();
-        out.extend_from_slice(&(ino as u64 + 1).to_le_bytes());
+        out.extend_from_slice(&ino.to_le_bytes());
         out.extend_from_slice(&(pos as i64 + 1).to_le_bytes());
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
         out.push(d_type);
@@ -1062,8 +1150,12 @@ pub fn renameat2(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp:
     }
     let opath = read_cstr(&mut p.aspace, opathp, PATH_MAX)?;
     let npath = read_cstr(&mut p.aspace, npathp, PATH_MAX)?;
+    // Held so a live mount's directories can't be forgotten in between
+    // (looking one up may make room by forgetting others).
     let (odir, oname) = parent_of(p, odirfd, &opath)?;
+    let _opin = fs::lock().pin(odir);
     let (ndir, nname) = parent_of(p, ndirfd, &npath)?;
+    let _npin = fs::lock().pin(ndir);
     let mut fs = fs::lock();
     if [&oname, &nname].iter().any(|n| matches!(n.as_str(), "" | "." | "..")) {
         return Err(EBUSY);
@@ -1083,6 +1175,7 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
     }
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
     let src = at_node(p, odirfd, opathp, (flags & AT_EMPTY_PATH) | follow)?;
+    let _pin = fs::lock().pin(src);
     let npath = read_cstr(&mut p.aspace, npathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, ndirfd, &npath)?;
     fs::lock().link(src, dir, &name, p.uid, p.gid).map(|_| 0)
@@ -1105,7 +1198,7 @@ fn set_len(p: &mut Process, n: u32, c: &Content, ino: Ino, len: u64) -> SysResul
     }
     c.lock().may_resize(len)?;
     note_shared(p, n, c);
-    c.lock().truncate(len);
+    c.lock().truncate(len)?;
     fs::lock().modified(ino);
     Ok(0)
 }
@@ -1171,9 +1264,7 @@ fn set_mode(p: &mut Process, ino: Ino, mode: u64) -> SysResult {
     if n.system || (p.uid != 0 && p.uid != n.uid) {
         return Err(EPERM);
     }
-    fs.node_mut(ino).perm = mode as u32 & 0o7777;
-    fs.changed(ino);
-    Ok(0)
+    fs.set_attr(ino, Some(mode as u32 & 0o7777), None, None).map(|_| 0)
 }
 
 pub fn fchmod(p: &mut Process, fd: u64, mode: u64) -> SysResult {
@@ -1196,6 +1287,17 @@ fn set_owner(p: &mut Process, ino: Ino, uid: u64, gid: u64) -> SysResult {
     let new_gid = if gid == u32::MAX { n.gid } else { gid };
     if n.system || (p.uid != 0 && (n.uid != p.uid || new_uid != n.uid || (new_gid != n.gid && new_gid != p.gid))) {
         return Err(EPERM);
+    }
+    // A live mount's files belong to whoever owns them on the host; the
+    // guest only shows them as the sandbox user's. Only "changes" that
+    // change nothing work.
+    if fs.remote_id(ino).is_some() {
+        if fs.read_only(ino) {
+            return Err(EROFS);
+        }
+        if (new_uid, new_gid) != (n.uid, n.gid) {
+            return Err(EPERM);
+        }
     }
     let n = fs.node_mut(ino);
     (n.uid, n.gid) = (new_uid, new_gid);
@@ -1251,17 +1353,7 @@ pub fn utimensat(p: &mut Process, dirfd: u64, pathp: u64, times: u64, flags: u64
     if !owner && (explicit || !fs.permits(ino, p.uid, p.gid, MAY_WRITE)) {
         return Err(if explicit { EPERM } else { EACCES });
     }
-    let n = fs.node_mut(ino);
-    if let Some(a) = set[0] {
-        n.atime = a;
-    }
-    if let Some(m) = set[1] {
-        n.mtime = m;
-    }
-    if set.iter().any(Option::is_some) {
-        fs.changed(ino);
-    }
-    Ok(0)
+    fs.set_attr(ino, None, set[0], set[1]).map(|_| 0)
 }
 
 /// The contents behind an fd, for sendfile and copy_file_range.
@@ -1288,7 +1380,11 @@ fn copy_contents(src: &Content, mut soff: u64, dst: &Content, dino: Ino, mut dof
     let mut done = 0;
     while done < len {
         let want = (len - done).min(CHUNK as u64) as usize;
-        let n = src.lock().read(soff, &mut chunk[..want]);
+        let n = match src.lock().read_at(soff, &mut chunk[..want]) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
         if n == 0 {
             break;
         }
@@ -1355,7 +1451,11 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
             let mut done = 0;
             while done < count {
                 let want = (count - done).min(console::WRITE_CHUNK as u64) as usize;
-                let n = src.lock().read(start + done, &mut chunk[..want]);
+                let n = match src.lock().read_at(start + done, &mut chunk[..want]) {
+                    Ok(n) => n,
+                    Err(e) if done == 0 => return Err(e),
+                    Err(_) => break,
+                };
                 if n == 0 {
                     break;
                 }

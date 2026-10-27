@@ -73,8 +73,18 @@ pub struct Image<'a> {
     /// gone), after the exports and within the same budget. Their entries
     /// are among `entries`, as the host found them.
     pub mounts: Vec<&'a str>,
+    /// Directories mounted live from the host (`hostfs`): nothing of them is
+    /// in `entries`; the guest asks the host as it goes. The root of
+    /// `live_mounts[i]` has id `i + 1`.
+    pub live_mounts: Vec<LiveMount<'a>>,
     /// Guest ports the host forwards connections to (`link::ToGuest::Incoming`).
     pub forwards: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveMount<'a> {
+    pub path: &'a str,
+    pub writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +134,11 @@ impl<'a> Image<'a> {
         w.strs(&self.exports);
         w.u64(self.export_budget);
         w.strs(&self.mounts);
+        w.u32(self.live_mounts.len() as u32);
+        for m in &self.live_mounts {
+            w.str(m.path);
+            w.u8(m.writable as u8);
+        }
         w.u32(self.forwards.len() as u32);
         for port in &self.forwards {
             w.u32(*port as u32);
@@ -173,6 +188,12 @@ impl<'a> Image<'a> {
         let export_budget = r.u64()?;
         let mounts = r.strs()?;
         let n = r.u32()? as usize;
+        if n > r.remaining() / 9 {
+            return Err(DecodeError);
+        }
+        let live_mounts =
+            (0..n).map(|_| Ok(LiveMount { path: r.str()?, writable: r.u8()? != 0 })).collect::<Result<_, _>>()?;
+        let n = r.u32()? as usize;
         if n > r.remaining() / 4 {
             return Err(DecodeError);
         }
@@ -193,6 +214,7 @@ impl<'a> Image<'a> {
             exports,
             export_budget,
             mounts,
+            live_mounts,
             forwards,
         })
     }
@@ -225,6 +247,7 @@ mod tests {
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,
             mounts: vec!["/work"],
+            live_mounts: vec![LiveMount { path: "/src", writable: false }],
             forwards: vec![8000, 80],
         };
         let bytes = img.encode();
@@ -252,6 +275,7 @@ mod tests {
             exports: vec![],
             export_budget: 0,
             mounts: vec![],
+            live_mounts: vec![],
             forwards: vec![],
         };
         let bytes = img.encode();
