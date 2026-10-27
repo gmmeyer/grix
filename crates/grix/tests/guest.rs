@@ -353,6 +353,19 @@ fn timers() {
 }
 
 #[test]
+fn memfd_signalfd_cpu_clocks_and_more() {
+    let out = run(with("linux").allow(Capability::Threads), &["/bin/linux"]);
+    assert_eq!(out.stdout_str(), "linux ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The fixture tries an unknown prctl option, which must be reported.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { syscall, detail, .. }] if syscall == "prctl" && detail == "option 4242"),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
 fn sigpipe_kills_by_default() {
     let out = run(with("sigpipe"), &["/bin/sigpipe"]);
     assert_eq!(out.status, ExitStatus::Signaled(13));

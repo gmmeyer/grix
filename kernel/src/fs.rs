@@ -104,7 +104,15 @@ pub struct FileData {
     /// MAP_SHARED mappings of this file, which see a copy taken when each
     /// page faulted in (writes don't reach them yet).
     shared_maps: Vec<Weak<()>>,
+    /// memfd seals (F_SEAL_*); `None` for files that can't be sealed.
+    pub seals: Option<u32>,
 }
+
+pub const F_SEAL_SEAL: u32 = 1;
+pub const F_SEAL_SHRINK: u32 = 2;
+pub const F_SEAL_GROW: u32 = 4;
+pub const F_SEAL_WRITE: u32 = 8;
+pub const F_SEAL_FUTURE_WRITE: u32 = 16;
 
 pub type Content = Arc<Mutex<FileData>>;
 
@@ -116,7 +124,13 @@ impl core::fmt::Debug for FileData {
 
 impl FileData {
     pub fn new(base: &'static [u8]) -> Content {
-        Arc::new(Mutex::new(FileData { base, pages: BTreeMap::new(), len: base.len() as u64, shared_maps: Vec::new() }))
+        Arc::new(Mutex::new(FileData {
+            base,
+            pages: BTreeMap::new(),
+            len: base.len() as u64,
+            shared_maps: Vec::new(),
+            seals: None,
+        }))
     }
 
     pub fn len(&self) -> u64 {
@@ -127,6 +141,25 @@ impl FileData {
     /// them directly.
     pub fn image(&self) -> Option<&'static [u8]> {
         (self.pages.is_empty() && self.len == self.base.len() as u64).then_some(self.base)
+    }
+
+    /// May bytes be written up to offset `end`? Seals forbid writing at all,
+    /// or growing.
+    pub fn may_write(&self, end: u64) -> Result<(), Errno> {
+        let seals = self.seals.unwrap_or(0);
+        if seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 || (seals & F_SEAL_GROW != 0 && end > self.len) {
+            return Err(EPERM);
+        }
+        Ok(())
+    }
+
+    /// May the length change to `len`?
+    pub fn may_resize(&self, len: u64) -> Result<(), Errno> {
+        let seals = self.seals.unwrap_or(0);
+        if (seals & F_SEAL_SHRINK != 0 && len < self.len) || (seals & F_SEAL_GROW != 0 && len > self.len) {
+            return Err(EPERM);
+        }
+        Ok(())
     }
 
     /// Register a MAP_SHARED mapping; it lasts as long as the token.
@@ -392,6 +425,38 @@ pub fn lock() -> FsGuard {
     FsGuard(g)
 }
 
+/// A TZif (version 2) file for UTC, the same 114 bytes as zoneinfo's `UTC`:
+/// a header and one zero-offset type named "UTC" for each of the 32- and
+/// 64-bit sections, then the POSIX TZ footer.
+static UTC_TZIF: [u8; 114] = {
+    let mut f = [0u8; 114];
+    let section = 44 + 10;
+    let mut s = 0;
+    while s < 2 {
+        let at = s * section;
+        let magic = *b"TZif2";
+        let mut i = 0;
+        while i < 5 {
+            f[at + i] = magic[i];
+            i += 1;
+        }
+        f[at + 39] = 1; // typecnt
+        f[at + 43] = 4; // charcnt
+        // ttinfo {utoff 0, isdst 0, desigidx 0} is zeros; then the name.
+        f[at + 50] = b'U';
+        f[at + 51] = b'T';
+        f[at + 52] = b'C';
+        s += 1;
+    }
+    let footer = *b"\nUTC0\n";
+    let mut i = 0;
+    while i < 6 {
+        f[108 + i] = footer[i];
+        i += 1;
+    }
+    f
+};
+
 fn leak(s: String) -> &'static [u8] {
     alloc::boxed::Box::leak(s.into_boxed_str()).as_bytes()
 }
@@ -472,6 +537,12 @@ impl Fs {
             let etc = fs.mkdir_p("/etc");
             let group = alloc::format!("root:x:0:\ngrix:x:{gid}:\nnobody:x:65534:\n");
             fs.insert(etc, "group", Kind::File(FileData::new(leak(group))), 0o644);
+        }
+        // No timezone was imported: say UTC explicitly, as musl and glibc
+        // would assume anyway.
+        if fs.lookup(ROOT, "/etc/localtime", false).is_err() {
+            let etc = fs.mkdir_p("/etc");
+            fs.insert(etc, "localtime", Kind::File(FileData::new(&UTC_TZIF)), 0o644);
         }
         if fs.lookup(ROOT, "/etc/mtab", false).is_err() {
             let etc = fs.mkdir_p("/etc");
@@ -855,6 +926,24 @@ impl Fs {
         (node.nlink, node.changed) = (0, true);
         self.reclaim();
         charge(node.cost())?;
+        let ino = self.alloc_node(node);
+        self.orphans.push(ino);
+        Ok((ino, content))
+    }
+
+    /// memfd_create: an anonymous file that only ever lives in descriptors.
+    /// It isn't in the tree, so it needs no directory permission (or
+    /// `fs_write`), but its pages and node count against the same limits.
+    pub fn create_memfd(&mut self, name: &str, seals: u32, uid: u32, gid: u32) -> Result<(Ino, Content), Errno> {
+        let content = FileData::new(&[]);
+        content.lock().seals = Some(seals);
+        let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: false };
+        // /proc/self/fd shows it as Linux does.
+        let label = alloc::format!("memfd:{name} (deleted)");
+        let mut node = Node::new(kind, 0o777, (uid, gid), ROOT, &label, crate::time::realtime_ns());
+        (node.nlink, node.changed) = (0, true);
+        self.reclaim();
+        charge(node.cost() + label.len() as u64)?;
         let ino = self.alloc_node(node);
         self.orphans.push(ino);
         Ok((ino, content))

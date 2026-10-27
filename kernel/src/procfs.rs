@@ -250,7 +250,8 @@ fn status(p: &Process, s: &mut String) {
 
 fn stat(p: &Process, s: &mut String) {
     let (size, rss) = mem_pages(p);
-    let ticks = time::monotonic_ns() / 10_000_000;
+    // utime, in clock ticks (all CPU time counts as user time).
+    let ticks = p.process_cpu_ns() / 10_000_000;
     let _ = writeln!(
         s,
         "{PID} ({}) R 0 {PID} {PID} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
@@ -341,6 +342,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
         FileKind::Inotify(_) => String::from("anon_inode:inotify"),
         FileKind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
+        FileKind::SignalFd(_) => String::from("anon_inode:[signalfd]"),
         FileKind::Netlink(_) | FileKind::UnixUnbound(_) => alloc::format!("socket:[{}]", 0x3000_0000 + fd),
     }
 }

@@ -208,13 +208,21 @@ while len(hits) < 6:
 signal.setitimer(signal.ITIMER_REAL, 0)
 print("periodic", len(hits) >= 6, signal.getitimer(signal.ITIMER_REAL))
 print("alarm", signal.alarm(3), signal.alarm(0))
+# CPU time counts running, not sleeping.
+c0 = time.process_time()
+time.sleep(0.1)
+slept = time.process_time() - c0
+w0 = time.monotonic()
+while time.monotonic() - w0 < 0.1:
+    pass
+print("cpu", slept < 0.05, time.process_time() - c0 > 0.08)
 "#;
 
 #[test]
 fn python_timers() {
     let b = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").file("/data/test.py", PYTHON_TIMERS, 0o644).unwrap();
     let out = run(b, &["/usr/bin/python3", "/data/test.py"]);
-    assert_eq!(out.stdout_str(), "one-shot [14] True\nperiodic True (0.0, 0.0)\nalarm 0 3\n");
+    assert_eq!(out.stdout_str(), "one-shot [14] True\nperiodic True (0.0, 0.0)\nalarm 0 3\ncpu True True\n");
     assert_no_surprises(&out);
 }
 

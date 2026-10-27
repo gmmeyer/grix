@@ -20,6 +20,11 @@ pub const SLICE_NS: u64 = 10_000_000;
 pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     p.resched = false;
     let prev = p.current;
+    // CPU time: prev ran from slice_start until now (not while we idle below).
+    let now = time::monotonic_ns();
+    if let Some(t) = p.threads.get_mut(&prev) {
+        t.cpu_ns += now.saturating_sub(p.slice_start);
+    }
     let prev_alive = match p.threads.get_mut(&prev) {
         Some(t) => {
             t.regs = *tf;

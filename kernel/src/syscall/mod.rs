@@ -147,6 +147,8 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
             p.unimplemented(n, name, "extended attributes", EOPNOTSUPP)
         }
         nr::sendfile => file::sendfile(p, a[0], a[1], a[2], a[3]),
+        nr::memfd_create => file::memfd_create(p, a[0], a[1]),
+        nr::signalfd4 => file::signalfd4(p, a[0], a[1], a[2], a[3]),
         nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sync => Ok(0),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),

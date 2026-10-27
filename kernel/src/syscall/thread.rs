@@ -108,6 +108,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
 
 /// exit(2): end the calling thread only. The process ends with the last thread.
 pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
+    p.exited_cpu_ns += p.thread_cpu_ns(p.current).unwrap_or(0);
     let t = p.threads.remove(&p.current).expect("current thread missing");
     if p.threads.is_empty() {
         process::exit(code);

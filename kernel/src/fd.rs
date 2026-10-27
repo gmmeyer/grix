@@ -39,6 +39,8 @@ pub enum FileKind {
     /// An AF_UNIX socket of this type that isn't bound or connected (binding
     /// to paths isn't implemented yet). Good for interface ioctls.
     UnixUnbound(u64),
+    /// signalfd: reads pending signals in this mask.
+    SignalFd(u64),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -66,6 +68,8 @@ impl FileKind {
             FileKind::Pipe(end) => end.poll(),
             FileKind::Netlink(nl) => nl.poll(),
             FileKind::UnixUnbound(_) => (EPOLLOUT | crate::ipc::EPOLLHUP, 0),
+            // Depends on the reader's pending signals: see file::poll_kind.
+            FileKind::SignalFd(_) => (0, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).

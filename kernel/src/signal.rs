@@ -13,6 +13,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
@@ -234,6 +235,42 @@ fn in_order(mask: u64) -> impl Iterator<Item = u32> {
     [sync, mask & !sync].into_iter().flat_map(|m| (0..64).filter(move |i| m & (1 << i) != 0).map(|i| i + 1))
 }
 
+/// Bumped whenever a signal is queued (signalfd's version for edge-triggered epoll).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+/// Signals pending for thread `tid`: its own and the process's.
+pub fn pending_for(p: &Process, tid: u32) -> u64 {
+    p.threads.get(&tid).map_or(0, |t| t.pending.mask) | p.shared_pending.mask
+}
+
+/// struct signalfd_siginfo for a dequeued signal.
+pub fn signalfd_record(si: &SigInfo) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
+    put(0, &si.signo.to_le_bytes());
+    put(8, &si.code.to_le_bytes());
+    match (si.fault, si.timer) {
+        (Some(f), _) => put(72, &f.addr.to_le_bytes()), // ssi_addr
+        (None, Some(_)) => {
+            put(24, &(si.fields[0] as u32).to_le_bytes()); // ssi_tid: the timer id
+            put(32, &((si.fields[0] >> 32) as u32).to_le_bytes()); // ssi_overrun
+            put(44, &(si.fields[1] as u32).to_le_bytes()); // ssi_int
+            put(48, &si.fields[1].to_le_bytes()); // ssi_ptr
+        }
+        (None, None) => {
+            put(12, &(si.fields[0] as u32).to_le_bytes()); // ssi_pid
+            put(16, &((si.fields[0] >> 32) as u32).to_le_bytes()); // ssi_uid
+            put(44, &(si.fields[1] as u32).to_le_bytes()); // ssi_int (sigqueue value)
+            put(48, &si.fields[1].to_le_bytes()); // ssi_ptr
+        }
+    }
+    b
+}
+
 /// The not-yet-delivered signal from POSIX timer `id`, wherever it is queued.
 pub fn queued_timer_signal(p: &mut Process, id: u32) -> Option<&mut SigInfo> {
     if p.shared_pending.timer_entry(id).is_some() {
@@ -294,6 +331,13 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
     }) {
         Some(tid) => p.threads.get_mut(&tid).ok_or(ESRCH)?.pending.push(info)?,
         None => p.shared_pending.push(info)?,
+    }
+    // signalfd readers (and epoll on them) look at pending signals. Waking
+    // every I/O waiter is only worth it once a signalfd exists (Go sends
+    // SIGURG every few milliseconds).
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    if p.uses_signalfd {
+        crate::ipc::changed();
     }
     if let Some(tid) = receiver {
         notify(p, tid);

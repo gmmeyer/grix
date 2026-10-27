@@ -86,6 +86,8 @@ pub struct Thread {
     /// signal handler runs before the call re-executes, the call may fail
     /// with EINTR instead (see `signal::return_to_user`).
     pub restarting: bool,
+    /// CPU time used (ns), up to its last switch out.
+    pub cpu_ns: u64,
 }
 
 impl Thread {
@@ -104,6 +106,7 @@ impl Thread {
             robust_list: 0,
             restart_deadline: None,
             restarting: false,
+            cpu_ns: 0,
         }
     }
 }
@@ -148,6 +151,14 @@ pub struct Process {
     pub io_seen: u64,
     /// setitimer, POSIX timers and timerfds (see timer.rs).
     pub timers: crate::timer::Timers,
+    /// CPU time of threads that have exited.
+    pub exited_cpu_ns: u64,
+    /// prctl(PR_SET_CHILD_SUBREAPER).
+    pub subreaper: bool,
+    /// membarrier commands registered for (MEMBARRIER_CMD_REGISTER_*).
+    pub membarrier_registered: u64,
+    /// A signalfd was created: queued signals must wake I/O waiters.
+    pub uses_signalfd: bool,
 }
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
@@ -188,7 +199,24 @@ impl Process {
             timer_dirty: true,
             io_seen: 0,
             timers: crate::timer::Timers::default(),
+            exited_cpu_ns: 0,
+            subreaper: false,
+            membarrier_registered: 0,
+            uses_signalfd: false,
         }
+    }
+
+    /// CPU time used by thread `tid` so far (ns). The running thread has
+    /// been on the CPU since `slice_start`.
+    pub fn thread_cpu_ns(&self, tid: u32) -> Option<u64> {
+        let t = self.threads.get(&tid)?;
+        let running =
+            if tid == self.current { crate::time::monotonic_ns().saturating_sub(self.slice_start) } else { 0 };
+        Some(t.cpu_ns + running)
+    }
+
+    pub fn process_cpu_ns(&self) -> u64 {
+        self.exited_cpu_ns + self.threads.keys().filter_map(|&tid| self.thread_cpu_ns(tid)).sum::<u64>()
     }
 
     pub fn cur(&mut self) -> &mut Thread {

@@ -16,12 +16,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 1. ~~**Timers**~~: done (see below).
 2. ~~**Network interface listing**~~: done (see Networking).
-3. **Small Linux gaps**:
-   - `memfd_create`
-   - CPU-time clocks
-   - `membarrier`, `mincore`, more `prctl` options
-   - `signalfd4`
-   - `/etc/localtime`
+3. ~~**Small Linux gaps**~~: done. `memfd_create`, CPU-time clocks,
+   `membarrier`, `mincore`, `prctl`, `signalfd4` and `/etc/localtime` all work.
 4. **stdin from the host**, and output size limits.
 5. **Getting written files back to the host** (the agent's results).
 6. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
@@ -55,8 +51,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       process signals delivered to any thread that doesn't block them.
 - [x] Faults (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) delivered to handlers.
       Needed by the JVM, Go (nil checks become panics), and crash reporters.
-- [~] `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd4`.
-      The first two work, and so do `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks. `signalfd4` is still missing.
+- [x] `rt_sigsuspend`, `rt_sigtimedwait`, `signalfd4`.
+      `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks work too.
 - [ ] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
 - [ ] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT). They are ignored today:
       there is no job control or host to report the stop to.
@@ -72,8 +68,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Signals with values, overruns, SIGEV_THREAD_ID, SIGEV_NONE and absolute times all work. CPU-time clocks are reported as unimplemented.
 - [x] `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (event loops,
       systemd-style services).
-- [ ] Real CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`,
+- [x] Real CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`,
       `getrusage`, `times`). These report wall time today.
+      Per-thread CPU time is accounted by the scheduler. It all counts as user time: system time isn't separated.
+- [ ] CPU-time timers (`ITIMER_VIRTUAL`/`ITIMER_PROF`, timers on CPU clocks). Reported as unimplemented.
 - [ ] vDSO (`AT_SYSINFO_EHDR`) for fast `clock_gettime`; glibc and Go use it
       when present. Performance only.
 
@@ -104,8 +102,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       web servers serving static files.
       `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice` and `tee` are missing.
 - [ ] `openat2`, `name_to_handle_at` (newer tools).
-- [~] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
-      `/dev/shm` is a writable 1777 directory. `memfd_create` is missing.
+- [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
+      `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
 - [ ] `MAP_SHARED` mappings of writable files, `msync`.
       Shared mappings hold a copy taken at fault time. Changing the file, or making the mapping writable, is reported as unimplemented.
 - [ ] Executing files the program wrote (needs execve).
@@ -135,7 +133,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       imported). Python `getpass.getuser()` raises; Node `os.userInfo()` and
       `os.homedir()` throw; `ls -l` and `id` show numbers.
 - [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
-- [ ] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
+- [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
+      A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
 - [ ] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
       bundle in `/etc/ssl/certs`.
 - [ ] Configurable hostname.
@@ -173,8 +172,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] Copy-on-write and shared-page refcounting (needed by fork);
       `MAP_SHARED` anonymous memory across fork.
 - [ ] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
-- [ ] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
-- [ ] `mincore`; accept the remaining `madvise` advice values.
+- [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
+- [~] `mincore`; accept the remaining `madvise` advice values.
+      `mincore` works.
 - [ ] Free empty page-table pages on munmap.
 
 ## Binary compatibility
@@ -186,7 +186,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
 - [ ] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
       and ignore, or implement.
-- [ ] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
+- [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
+      Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
 - [ ] x86_64 guests. Most prebuilt binaries are x86_64.
 

@@ -193,13 +193,13 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS | Network sockets (`net`), stdin from the host |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
-| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair` | `signalfd`; CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
+| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Signals from the host (SIGTERM before the timeout, SIGINT) |
 | `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl` | Getting written files back to the host; host directory mounts |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
-| Clocks, blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR) | x86_64 guests |
+| Clocks (including per-thread and per-process CPU time), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | x86_64 guests |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | Linux/KVM hosts are untested |
 
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static

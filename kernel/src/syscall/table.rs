@@ -69,8 +69,8 @@ syscalls! {
     43 statfs Core;
     44 fstatfs Core;
     45 truncate Cap(FsWrite);
-    46 ftruncate Cap(FsWrite);
-    47 fallocate Cap(FsWrite);
+    46 ftruncate Core; // acts on an fd already opened for writing (which needed fs_write, or is a memfd)
+    47 fallocate Core; // like ftruncate
     48 faccessat Core;
     49 chdir Core;
     50 fchdir Core;
@@ -116,6 +116,7 @@ syscalls! {
     99 set_robust_list Core;
     100 get_robust_list Core;
     101 nanosleep Core;
+    74 signalfd4 Core;
     85 timerfd_create Core;
     86 timerfd_settime Core;
     87 timerfd_gettime Core;

@@ -141,9 +141,11 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         }
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         // anon_inode files have no type bits on Linux.
-        FileKind::EventFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::TimerFd(_) => {
-            anon(0x2000_0000 + fd, 0o600, 0)
-        }
+        FileKind::EventFd(_)
+        | FileKind::Epoll(_)
+        | FileKind::Inotify(_)
+        | FileKind::TimerFd(_)
+        | FileKind::SignalFd(_) => anon(0x2000_0000 + fd, 0o600, 0),
     })
 }
 
@@ -331,6 +333,23 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
         FileKind::Inotify(_) => would_block(p, nonblock),
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
+        FileKind::SignalFd(mask) => {
+            // struct signalfd_siginfo is 128 bytes; read as many as fit.
+            if count < 128 {
+                return Err(EINVAL);
+            }
+            let mask = *mask;
+            let mut done = 0;
+            while done + 128 <= count {
+                let Some(si) = crate::signal::dequeue(p, mask) else { break };
+                copy_out(&mut p.aspace, buf + done, &crate::signal::signalfd_record(&si))?;
+                done += 128;
+            }
+            if done == 0 {
+                return would_block(p, nonblock);
+            }
+            Ok(done)
+        }
         FileKind::Netlink(_) => {
             let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
             super::net::netlink_recv(p, nl, &[(buf, count)], 0, nonblock).map(|(n, _)| n)
@@ -441,6 +460,7 @@ fn write_content(p: &mut Process, c: &Content, ino: Ino, off: u64, buf: u64, cou
     if off.checked_add(count).is_none_or(|end| end > MAX_FILE_SIZE) {
         return Err(EFBIG);
     }
+    c.lock().may_write(off + count)?;
     note_shared(p, nr::write, c);
     let mut chunk = [0u8; CHUNK];
     let mut done = 0u64;
@@ -495,6 +515,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::TimerFd(_) => return Err(EINVAL),
         FileKind::UnixUnbound(_) => return Err(ENOTCONN),
+        FileKind::SignalFd(_) => return Err(EINVAL),
         FileKind::Netlink(_) => {
             let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
             return super::net::netlink_request(p, nl, &[(buf, count)]);
@@ -1017,6 +1038,7 @@ fn set_len(p: &mut Process, n: u32, c: &Content, ino: Ino, len: u64) -> SysResul
     if (len as i64) < 0 {
         return Err(EINVAL);
     }
+    c.lock().may_resize(len)?;
     note_shared(p, n, c);
     c.lock().truncate(len);
     fs::lock().modified(ino);
@@ -1196,6 +1218,7 @@ fn copy_contents(src: &Content, mut soff: u64, dst: &Content, dino: Ino, mut dof
     if doff.checked_add(len).is_none_or(|end| end > MAX_FILE_SIZE) {
         return Err(EFBIG);
     }
+    dst.lock().may_write(doff + len)?;
     let mut chunk = [0u8; CHUNK];
     let mut done = 0;
     while done < len {
@@ -1349,6 +1372,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETLK: u64 = 6;
     const F_SETLKW: u64 = 7;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_ADD_SEALS: u64 = 1033;
+    const F_GET_SEALS: u64 = 1034;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let file = p.fds.get(fd)?;
@@ -1372,7 +1397,85 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             p.fds.get(fd)?;
             copy_out(&mut p.aspace, arg, &2u16.to_le_bytes()).map(|_| 0) // l_type = F_UNLCK
         }
+        // memfd seals: only sealable files (memfds) have them.
+        F_ADD_SEALS | F_GET_SEALS => {
+            let file = p.fds.get(fd)?;
+            let f = file.lock();
+            let writable = f.flags & O_ACCMODE != O_RDONLY;
+            let c = f.content.clone().ok_or(EINVAL)?;
+            drop(f);
+            let mut data = c.lock();
+            let seals = data.seals.ok_or(EINVAL)?;
+            if cmd == F_GET_SEALS {
+                return Ok(seals as u64);
+            }
+            const KNOWN: u32 =
+                fs::F_SEAL_SEAL | fs::F_SEAL_SHRINK | fs::F_SEAL_GROW | fs::F_SEAL_WRITE | fs::F_SEAL_FUTURE_WRITE;
+            if arg as u32 & !KNOWN != 0 {
+                return Err(EINVAL);
+            }
+            if !writable || seals & fs::F_SEAL_SEAL != 0 {
+                return Err(EPERM);
+            }
+            data.seals = Some(seals | arg as u32);
+            Ok(0)
+        }
         _ => Err(EINVAL),
+    }
+}
+
+/// memfd_create: an anonymous file. No `fs_write` needed: it's memory, not
+/// part of the filesystem (but it counts against the same limits).
+pub fn memfd_create(p: &mut Process, namep: u64, flags: u64) -> SysResult {
+    const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
+    const MFD_HUGETLB: u64 = 4;
+    const MFD_NOEXEC_SEAL: u64 = 8;
+    const MFD_EXEC: u64 = 0x10;
+    // Linux's MFD_NAME_MAX_LEN: NAME_MAX minus "memfd:".
+    let name = read_cstr(&mut p.aspace, namep, 250).map_err(|e| if e == ENAMETOOLONG { EINVAL } else { e })?;
+    if flags & MFD_HUGETLB != 0 {
+        return p.unimplemented(nr::memfd_create, "memfd_create", "MFD_HUGETLB", EINVAL);
+    }
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
+        return Err(EINVAL);
+    }
+    let sealable = flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0;
+    let seals = if sealable { 0 } else { fs::F_SEAL_SEAL };
+    let (ino, content) = fs::lock().create_memfd(&name, seals, p.uid, p.gid)?;
+    open_node(p, ino, Some(content), O_RDWR, flags & MFD_CLOEXEC != 0)
+}
+
+/// signalfd4: read pending signals in `mask` as signalfd_siginfo records
+/// (with fd -1, a new signalfd; otherwise change an existing one's mask).
+pub fn signalfd4(p: &mut Process, fd: u64, maskp: u64, size: u64, flags: u64) -> SysResult {
+    const SFD_CLOEXEC: u64 = 0o2000000;
+    const SFD_NONBLOCK: u64 = 0o4000;
+    if size != 8 || flags & !(SFD_CLOEXEC | SFD_NONBLOCK) != 0 {
+        return Err(EINVAL);
+    }
+    let mask = read_u64(&mut p.aspace, maskp)? & !crate::signal::UNBLOCKABLE;
+    if fd as i32 != -1 {
+        let file = p.fds.get(fd)?;
+        let mut f = file.lock();
+        let FileKind::SignalFd(m) = &mut f.kind else { return Err(EINVAL) };
+        *m = mask;
+        return Ok(fd);
+    }
+    let file = new_file(FileKind::SignalFd(mask), O_RDONLY | (flags as u32 & O_NONBLOCK));
+    p.uses_signalfd = true;
+    p.fds.alloc(FdEntry { file, cloexec: flags & SFD_CLOEXEC != 0 }, 0)
+}
+
+/// Readiness of an open file. A signalfd depends on the calling thread's
+/// pending signals, which the file itself can't see.
+pub(super) fn poll_kind(p: &Process, kind: &FileKind) -> (u32, u64) {
+    match kind {
+        FileKind::SignalFd(mask) => {
+            let pending = crate::signal::pending_for(p, p.current) & mask;
+            (if pending != 0 { EPOLLIN } else { 0 }, crate::signal::generation())
+        }
+        k => k.poll(),
     }
 }
 
@@ -1443,7 +1546,7 @@ const POLLRDNORM: u16 = 0x40;
 const POLLWRNORM: u16 = 0x100;
 
 fn readiness(p: &Process, fd: u64) -> Result<u32, Errno> {
-    Ok(p.fds.get(fd)?.lock().kind.poll().0)
+    Ok(poll_kind(p, &p.fds.get(fd)?.lock().kind).0)
 }
 
 /// Relative timeout from a timespec pointer (NULL = forever).
@@ -1664,7 +1767,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
                 dead.push(*fd);
                 continue;
             };
-            let (mask, version) = file.lock().kind.poll();
+            let (mask, version) = poll_kind(p, &file.lock().kind);
             let ready = mask & (reg.events | EPOLLERR | EPOLLHUP);
             if ready == 0 || reg.events & !(EPOLLET | EPOLLONESHOT) == 0 {
                 continue;
