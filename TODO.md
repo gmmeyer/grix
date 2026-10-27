@@ -29,6 +29,19 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 8. ~~**Networking through the host** (`net`)~~: done. TCP clients and
    servers, DNS, loopback, port forwards and an allow-list.
 
+## Images
+
+- [x] `grix build` from a Grixfile or flags: a Docker/OCI image (registry,
+      OCI layout, `docker save`, the Docker daemon) or nothing, copies, files,
+      build steps (shell or argv), settings, and the kernel, in a `.grix` file.
+      `grix run --image`, `SandboxBuilder::image`, `grix inspect`, `grix pull`.
+- [ ] zstd-compressed layers.
+- [ ] Registries that need credentials (only anonymous pulls today).
+- [ ] Multi-image layering without re-reading the base (a cache of applied
+      bases); building is a full re-import every time.
+- [ ] A Docker image of grix itself (`Dockerfile`), from scratch once grix
+      has its own VMM (QEMU needs a distribution's libraries today).
+
 ## Processes and exec
 
 - [x] `#!` scripts for the initial exec and `execve`, including nested

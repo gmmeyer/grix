@@ -140,9 +140,10 @@ impl Walk<'_> {
             *last = Some(name.as_str());
             let parent_len = path.len();
             let node = fs.node(ino);
-            // /dev, /proc and /sys aren't the program's files, and a live
+            // /dev, /proc and /sys aren't the program's files, nor what the
+            // kernel made at boot and the program left alone; and a live
             // mount's are on the host already.
-            if node.system || node.remote.is_some() {
+            if node.system || node.remote.is_some() || untouched_generated(fs, ino) {
                 continue;
             }
             if parent_len + 1 + name.len() > MAX_EXPORT_PATH {
@@ -293,6 +294,21 @@ impl Walk<'_> {
             off += n as u64;
         }
         self.data.flush();
+    }
+}
+
+/// Something the kernel made at boot (`/etc/passwd`, `/tmp`, ...) that the
+/// program left as it was.
+fn untouched_generated(fs: &Fs, ino: Ino) -> bool {
+    let n = fs.node(ino);
+    if !n.generated {
+        return false;
+    }
+    match &n.kind {
+        Kind::File(c) => c.try_lock().is_some_and(|c| c.image().is_some()),
+        Kind::Symlink(_) => true,
+        Kind::Dir(children) => children.values().all(|&c| untouched_generated(fs, c)),
+        _ => false,
     }
 }
 

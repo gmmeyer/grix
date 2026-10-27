@@ -238,6 +238,61 @@ manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host` and
 `guest`. Only TCP and DNS are supported: other UDP, raw sockets and ICMP are
 reported as unsupported.
 
+## Images
+
+A grix image is a file tree, the settings to run it with, and the grix
+kernel, in one file (`.grix`, a gzipped tar) you can copy anywhere grix
+runs. Build one from a Docker/OCI image and your own files, or from
+nothing but the grix kernel and a static program: no other OS needed.
+
+```sh
+# From Docker Hub's python image, with a dependency installed at build time:
+cat > Grixfile <<'TOML'
+from = "python:3.12-alpine"
+command = ["python3", "/app/main.py"]
+capabilities = ["threads"]
+run = ["pip install --no-cache-dir requests"]
+[[copy]]
+host = "app"
+guest = "/app"
+TOML
+grix build -o app.grix
+grix run --image app.grix                 # its command, settings and kernel
+grix run --image app.grix -- python3 -V   # or another command
+
+# Nothing but grix and one static program, without a Grixfile:
+grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
+```
+
+- `from` takes a registry reference (`alpine:3.21`,
+  `ghcr.io/owner/repo:tag`; the linux/arm64 image), `oci:DIR` (an OCI image
+  layout), `docker-archive:FILE` (`docker save` output), `docker:NAME` or
+  `dir:DIR`. Layers are applied with their whiteouts, every blob is checked
+  against its digest, and the image's entrypoint, command, environment and
+  working directory become the grix image's. A command that's a bare name
+  is looked up on the image's `PATH`. `grix pull REF --oci DIR` saves an
+  image for offline builds.
+- Build steps (`run`) run in grix itself, with `fs_write`, `process`,
+  `threads` and `net`. A string runs with `/bin/sh -c`; a list such as
+  `["/bin/setup", "--fast"]` runs as it is, without a shell. The file tree
+  a step leaves is the image's, minus what the kernel makes at boot
+  (`/etc/passwd`, `/tmp`, ...).
+- `grix build` flags (`--from`, `--copy`, `--env`, `--cwd`, `--allow`,
+  `--run`, `--exec`, `--mem`, `-- COMMAND`) add to `./Grixfile`, or make the
+  whole image without one. Like Docker's build context, a Grixfile reads
+  host files only under its own directory; paths given as flags may be
+  anywhere.
+- `grix inspect app.grix` shows the settings. From Rust:
+  `Sandbox::builder().image(&grix::Image::open("app.grix")?)?`, then
+  `sandbox.run(sandbox.command())`. A manifest can say `image = "app.grix"`.
+- An image runs only with a grix of the same ABI version as its kernel
+  (the kernel carries a marker that grix checks). Running it grants the
+  capabilities it lists that stay in the sandbox (`threads`, `process`,
+  `fs_write`). `net` it can only ask for: grant it with `-a net` /
+  `allow(Capability::Net)`. Its kernel runs inside the VM like any other:
+  `net`, the network policy, mounts and exports are checked by the host,
+  whatever the guest kernel does.
+
 ## Manifests
 
 The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
@@ -413,8 +468,8 @@ subshells.
 4. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
    crate with no external dependencies.
-5. **Agent integrations**: an MCP server and Python bindings; prebuilt
-   runtime bundles; snapshots for instant start.
+5. **Agent integrations**: an MCP server and Python bindings; snapshots for
+   instant start. Images (`grix build`) are done.
 6. **SMP and x86_64 guests**.
 
 ## Repository layout

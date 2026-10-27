@@ -60,6 +60,17 @@ and `ExportKind::Removed` for the topmost paths that are gone. The host
 without following links and skips anything that changed on the host during
 the run. Mount points are `Node::mount_point` (EBUSY to remove or rename).
 
+Images (`crates/grix/src/container.rs`, `build.rs`, `oci.rs`): a `.grix`
+file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),
+`kernel` and `rootfs/`. `grix build` assembles one from a Grixfile: a
+Docker/OCI image (`oci.rs` pulls from registries and reads OCI layouts and
+`docker save` archives, applying layers with whiteouts and checking
+digests), copies, files, and build steps. Steps run in grix itself and
+export `/`; nodes the kernel made at boot (`Node::generated`) stay out
+unless the step changed them. An image's kernel is the one that boots it,
+so bump `grix_abi::ABI_VERSION` with any change to the boot image, wire,
+`link` or `hostfs` formats.
+
 Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 `crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):
 the guest has no TCP/IP stack. A TCP connect becomes `link::ToHost::Connect`
@@ -168,7 +179,9 @@ treated as deadlocked.
    (`crates/grix/src/net.rs`) makes every connection after checking the
    policy, so a compromised guest can't reach anything the policy doesn't
    allow. The host never trusts the guest's flow control either: credit,
-   threads, lookups and queued frames all have host-side caps.
+   threads, lookups and queued frames all have host-side caps. Nor its
+   capability checks: the proxy itself refuses everything without `net`,
+   since an image brings its own kernel.
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).

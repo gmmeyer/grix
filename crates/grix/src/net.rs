@@ -146,6 +146,10 @@ fn in_net(ip: IpAddr, net: IpAddr, prefix: u8) -> bool {
 /// `forward`).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NetPolicy {
+    /// The sandbox has the `net` capability. Without it the proxy refuses
+    /// everything itself: the guest kernel (which an image may bring) isn't
+    /// the only check.
+    pub enabled: bool,
     /// None: anywhere but the special addresses below. Some: only these.
     pub allow: Option<Vec<HostRule>>,
     /// Where the host listens, and the guest port it forwards to.
@@ -442,6 +446,19 @@ impl Shared {
         }
     }
 
+    /// Networking without the `net` capability: the guest kernel should
+    /// have refused it already.
+    fn deny_capability(&self, what: &str) {
+        let mut reported = self.reported.lock().unwrap();
+        if reported.insert(format!("no net: {what}")) {
+            self.events.lock().unwrap().push(GuestEvent::Denied {
+                syscall: what.into(),
+                capability: "net".into(),
+                detail: "the sandbox doesn't have the net capability".into(),
+            });
+        }
+    }
+
     fn remember(&self, name: &str, addrs: &[IpAddr]) {
         if !self.name_rules {
             return;
@@ -587,6 +604,12 @@ impl Proxy {
         if id & HOST_ID != 0 || conns.contains_key(&id) {
             return;
         }
+        if !s.policy.enabled {
+            drop(conns);
+            s.deny_capability("connect");
+            s.reply(ToGuest::Failed { id, errno: 1 }); // EPERM
+            return;
+        }
         if conns.len() >= MAX_CONNS {
             drop(conns);
             s.reply(ToGuest::Failed { id, errno: ENOBUFS });
@@ -643,6 +666,10 @@ impl Proxy {
                 s.reply(ToGuest::DnsAnswer { id, answer: &answer });
             }
         };
+        if !s.policy.enabled {
+            s.deny_capability("DNS lookup");
+            return busy(s, &query);
+        }
         if s.lookups.fetch_add(1, Ordering::Relaxed) >= MAX_LOOKUPS {
             s.lookups.fetch_sub(1, Ordering::Relaxed);
             return busy(s, &query);
@@ -860,7 +887,11 @@ mod tests {
     use super::*;
 
     fn policy(rules: &[&str]) -> NetPolicy {
-        NetPolicy { allow: Some(rules.iter().map(|r| HostRule::parse(r).unwrap()).collect()), forwards: vec![] }
+        NetPolicy {
+            enabled: true,
+            allow: Some(rules.iter().map(|r| HostRule::parse(r).unwrap()).collect()),
+            forwards: vec![],
+        }
     }
 
     #[test]

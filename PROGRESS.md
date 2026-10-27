@@ -292,6 +292,15 @@ Next, in TODO.md order:
   settled, and spun with interrupts masked. It now compares with what
   `poll` last settled on.
 
+- **Images**: `grix build` makes a `.grix` file (a file tree, settings,
+  and the kernel) from a Grixfile or flags. The base is a Docker/OCI image
+  (pulled from a registry with anonymous token auth and digest checks, or
+  read from an OCI layout or `docker save` archive) or nothing at all.
+  Build steps run in grix itself. `python:3.12-alpine` with `pip install
+  requests` builds and runs; a from-scratch image of one static program is
+  2.6 MB. The host's network proxy now enforces `net` itself, since an
+  image's kernel isn't trusted to.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

@@ -11,6 +11,10 @@
 
 extern crate alloc;
 
+/// Which ABI this kernel speaks, for hosts to read from the binary.
+#[used]
+static ABI_MARKER: [u8; 13] = grix_abi::abi_marker();
+
 mod arch;
 mod console;
 mod elf;

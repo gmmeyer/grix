@@ -190,6 +190,9 @@ pub(crate) fn run(
             cfg.kernel.display()
         );
     }
+    // A kernel that speaks another ABI would only garble the conversation.
+    let kernel = std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?;
+    crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
     let img = write_temp("img", image)?;
     // Everything for the guest's console input (stdin, networking) goes
     // through one writer, a frame at a time. Forwarded ports are bound

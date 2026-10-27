@@ -45,6 +45,8 @@ use crate::sandbox::{MountMode, SandboxBuilder};
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// A grix image to run (`grix build`), relative to the manifest.
+    pub image: Option<PathBuf>,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
@@ -113,6 +115,11 @@ impl Manifest {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut m = Self::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
         let dir = path.parent().unwrap_or(Path::new("."));
+        if let Some(img) = &mut m.image
+            && img.is_relative()
+        {
+            *img = dir.join(&*img);
+        }
         for imp in &mut m.imports {
             if imp.host.is_relative() {
                 imp.host = dir.join(&imp.host);

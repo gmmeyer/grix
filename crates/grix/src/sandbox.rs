@@ -193,6 +193,8 @@ pub struct SandboxBuilder {
     kernel: PathBuf,
     qemu: PathBuf,
     accel: String,
+    /// What runs when `run` gets no command (an image's).
+    command: Vec<String>,
 }
 
 impl Default for SandboxBuilder {
@@ -224,6 +226,7 @@ impl Default for SandboxBuilder {
             ),
             qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
             accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| default_accel().into()),
+            command: Vec::new(),
         }
     }
 }
@@ -471,6 +474,51 @@ impl SandboxBuilder {
         self
     }
 
+    /// The kernel the sandbox boots.
+    pub fn kernel_path(&self) -> &Path {
+        &self.kernel
+    }
+
+    /// Run grix image `image` (see [`Image`](crate::Image)): its files, its
+    /// environment, working directory and command, enough memory for it,
+    /// and its kernel. Of the capabilities it asks for, those that stay in
+    /// the sandbox (`threads`, `process`, `fs_write`) are granted; `net`,
+    /// which reaches the host and beyond, only by an explicit
+    /// [`allow`](SandboxBuilder::allow). Settings made after this override
+    /// the image's (call it first).
+    pub fn image(mut self, image: &crate::Image) -> Result<Self> {
+        self = self.image_files_only(image)?;
+        let c = &image.config;
+        for e in &c.env {
+            let (k, v) = e.split_once('=').unwrap_or((e, ""));
+            self.env.retain(|(key, _)| key != k);
+            self.env.push((k.to_string(), v.to_string()));
+        }
+        for name in &c.capabilities {
+            let cap = Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?;
+            if cap != Capability::Net {
+                self.policy.grant(cap);
+            }
+        }
+        let (_, bytes) = image.size();
+        let needed = (RESERVED_LOW + bytes + MIN_FREE).div_ceil(1 << 20) + 128;
+        self.memory_mb = self.memory_mb.max(needed).max(c.memory_mb.unwrap_or(0));
+        self.command = c.command.clone();
+        Ok(self)
+    }
+
+    /// An image's files, kernel and working directory.
+    pub(crate) fn image_files_only(mut self, image: &crate::Image) -> Result<Self> {
+        for (path, node) in &image.files {
+            self.files.insert(path.clone(), node.clone());
+        }
+        if let Some(cwd) = &image.config.cwd {
+            self.cwd = cwd.clone();
+        }
+        self.kernel = image.kernel_path()?;
+        Ok(self)
+    }
+
     pub fn qemu(mut self, path: impl Into<PathBuf>) -> Self {
         self.qemu = path.into();
         self
@@ -542,6 +590,12 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn builder() -> SandboxBuilder {
         SandboxBuilder::default()
+    }
+
+    /// The command an image gave (see [`SandboxBuilder::image`]), for
+    /// running it as it is: `sandbox.run(sandbox.command())`.
+    pub fn command(&self) -> &[String] {
+        &self.cfg.command
     }
 
     /// Run `argv[0]` (a path inside the sandbox) and collect its output.
@@ -638,8 +692,10 @@ impl Sandbox {
         .encode();
         let mut exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
 
+        let mut net = cfg.net.clone();
+        net.enabled = cfg.policy.allows(Capability::Net);
         let vm = VmConfig {
-            net: cfg.net.clone(),
+            net,
             control: cfg.control.clone(),
             grace: cfg.grace,
             live: cfg.live.clone(),

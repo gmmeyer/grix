@@ -1,7 +1,7 @@
 //! End-to-end tests: boot the real kernel in QEMU and run the C fixtures.
 //! Needs `make kernel fixtures` (or just `make test`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grix::{
@@ -436,6 +436,98 @@ fn timeout() {
     // `sleep` via clock: ask for far less time than the program needs.
     let out = with("clock").timeout(Duration::from_millis(1)).build().unwrap().run(&["/bin/clock"]).unwrap();
     assert_eq!(out.status, ExitStatus::Timeout);
+}
+
+// ---------------------------------------------------------------- images
+
+#[test]
+fn images_built_from_oci_images() {
+    // From Docker Hub's alpine (pulled into an OCI layout by `make
+    // fixtures`), with files, settings and build steps, through a file, to
+    // a run.
+    let dir = temp_dir("image");
+    std::fs::write(dir.join("hello.sh"), "echo \"$GREETING from $(cat /etc/alpine-release) in $PWD\"\n").unwrap();
+    let grixfile = format!(
+        r#"
+from = "oci:{}"
+command = ["/bin/sh", "/app/hello.sh"]
+cwd = "/app"
+capabilities = ["process"]
+run = ["echo built > /app/stamp", "rm /etc/motd"]
+
+[env]
+GREETING = "hi"
+
+[[copy]]
+host = "hello.sh"
+guest = "/app/hello.sh"
+
+[[file]]
+guest = "/app/note"
+content = "a note"
+"#,
+        fixture("oci/alpine").display()
+    );
+    std::fs::write(dir.join("Grixfile"), &grixfile).unwrap();
+    // A Grixfile reads only from its own directory: the fixture's layout is
+    // outside, so here it's let out, as a path on the command line would be.
+    let err = grix::build::Grixfile::build_file(
+        &dir.join("Grixfile"),
+        grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {} },
+    );
+    assert!(err.err().unwrap().to_string().contains("outside the build context"));
+    let mut g = grix::build::Grixfile::parse(&grixfile).unwrap();
+    g.from_outside_context = true;
+    let mut log = Vec::new();
+    let opts = grix::build::BuildOptions { kernel: None, on_output: &mut |_, d: &[u8]| log.extend_from_slice(d) };
+    let image = g.build(&dir, opts).unwrap();
+    image.write_to(dir.join("hello.grix")).unwrap();
+    let image = grix::Image::open(dir.join("hello.grix")).unwrap();
+    assert_eq!(image.config.command, ["/bin/sh", "/app/hello.sh"]);
+    assert!(image.config.source.as_deref().unwrap().contains("@sha256:"), "{:?}", image.config.source);
+    assert!(image.config.env.contains(&"GREETING=hi".to_string()));
+
+    let sb = Sandbox::builder().image(&image).unwrap().build().unwrap();
+    let out = sb.run(sb.command()).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    let stdout = out.stdout_str();
+    assert!(stdout.starts_with("hi from 3.21.") && stdout.ends_with(" in /app\n"), "{stdout:?}");
+    // What build steps did is in the image, removals too; a bare command
+    // name is found on the image's PATH.
+    let out = sb.run(&["cat", "/app/stamp", "/app/note"]).unwrap();
+    assert_eq!(out.stdout_str(), "built\na note");
+    let out = sb.run(&["ls", "/etc/motd"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn images_with_no_other_os() {
+    // Just the grix kernel and static programs: no base image, and build
+    // steps that need no shell. What the kernel makes at boot (/etc/passwd,
+    // /tmp, ...) stays out of the image.
+    use grix::build::{Copy, Grixfile, Step};
+    let g = Grixfile {
+        command: Some(vec!["/bin/hello".into(), "world".into()]),
+        copies: vec![
+            Copy { host: fixture("hello"), guest: "/bin/hello".into(), outside_context: true },
+            Copy { host: fixture("alpine/bin/busybox.static"), guest: "/bin/busybox".into(), outside_context: true },
+        ],
+        run: vec![
+            Step::Exec(vec!["/bin/busybox".into(), "mkdir".into(), "/data".into()]),
+            Step::Exec(vec!["/bin/busybox".into(), "cp".into(), "/bin/hello".into(), "/data/copy".into()]),
+        ],
+        ..Default::default()
+    };
+    let image = g.build(Path::new("."), grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {} }).unwrap();
+    let (n, _) = image.size();
+    assert_eq!(n, 5, "only what was put in");
+    let sb = Sandbox::builder().image(&image).unwrap().build().unwrap();
+    let out = sb.run(sb.command()).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(7));
+    assert!(out.stdout_str().starts_with("hello from grix! argc=2\n"));
+    let out = sb.run(&["/bin/busybox", "cmp", "/bin/hello", "/data/copy"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
 // ---------------------------------------------------------------- signals from the host

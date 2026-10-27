@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use grix::{
     Capability, DenyAction, Export, ExportState, Manifest, MountMode, MountState, RunControl, RunOutput, Sandbox,
     Stream,
@@ -22,12 +22,75 @@ struct Cli {
 enum Cmd {
     /// Run a program in a fresh sandbox.
     Run(Box<RunArgs>),
+    /// Build a grix image (the files, settings and kernel to run) from a Grixfile.
+    Build(Box<BuildArgs>),
+    /// Pull a Docker/OCI image (linux/arm64) into an OCI image layout directory.
+    Pull {
+        /// e.g. alpine:3.21, python:3.12-alpine, ghcr.io/owner/repo:tag
+        reference: String,
+        /// The layout directory to write.
+        #[arg(long, value_name = "DIR")]
+        oci: PathBuf,
+    },
+    /// Show a grix image's settings and size.
+    Inspect { image: PathBuf },
     /// List the capabilities a sandbox can be granted.
     Caps,
 }
 
+/// The flags add to the Grixfile, or make the whole image without one:
+/// `grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello`
+/// makes an image of just the grix kernel and one program.
+#[derive(Parser)]
+struct BuildArgs {
+    /// The Grixfile (default: ./Grixfile, if there is one).
+    #[arg(short, long)]
+    file: Option<PathBuf>,
+    /// The Docker/OCI image to start from (alpine:3.21, oci:DIR,
+    /// docker-archive:FILE, docker:NAME, dir:DIR). Default: nothing.
+    #[arg(long)]
+    from: Option<String>,
+    /// Put host file or directory HOST at GUEST. Repeatable.
+    #[arg(long = "copy", value_name = "HOST:GUEST")]
+    copies: Vec<String>,
+    /// Set KEY=VALUE in the image's environment. Repeatable.
+    #[arg(short, long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// The image's working directory.
+    #[arg(long)]
+    cwd: Option<String>,
+    /// A capability the image's program needs. Repeatable.
+    #[arg(short = 'a', long = "allow", value_name = "CAP")]
+    allow: Vec<String>,
+    /// A build step: a shell command (needs /bin/sh in the image). Repeatable.
+    #[arg(long = "run", value_name = "COMMAND")]
+    runs: Vec<String>,
+    /// A build step: a program and its arguments, split at spaces (no
+    /// shell needed). Repeatable; steps run in the order given.
+    #[arg(long = "exec", value_name = "PROGRAM ARGS")]
+    execs: Vec<String>,
+    /// Guest memory in MiB for running the image.
+    #[arg(long)]
+    mem: Option<u64>,
+    /// The image's command.
+    #[arg(last = true)]
+    command: Vec<String>,
+    /// The image to write.
+    #[arg(short, long, default_value = "image.grix")]
+    output: PathBuf,
+    /// The grix kernel to put in the image (default: the one grix runs).
+    #[arg(long)]
+    kernel: Option<PathBuf>,
+    /// Don't show build steps' output.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 #[derive(Parser)]
 struct RunArgs {
+    /// Run a grix image (`grix build`): its files, settings, command and kernel.
+    #[arg(long, value_name = "IMAGE")]
+    image: Option<PathBuf>,
     /// TOML manifest describing the sandbox.
     #[arg(short, long)]
     manifest: Option<PathBuf>,
@@ -99,7 +162,8 @@ struct RunArgs {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let result = match cli.cmd {
         Cmd::Caps => {
             for c in Capability::ALL {
@@ -108,6 +172,17 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Cmd::Run(args) => run(*args),
+        Cmd::Build(args) => build(*args, matches.subcommand_matches("build")),
+        Cmd::Pull { reference, oci } => grix::pull(&reference, &oci).map(|digest| {
+            eprintln!("grix: pulled {reference} ({digest}) into {}", oci.display());
+            0
+        }),
+        Cmd::Inspect { image } => grix::Image::open(&image).map(|img| {
+            let (n, bytes) = img.size();
+            let info = serde_json::json!({ "config": img.config, "entries": n, "bytes": bytes });
+            println!("{}", serde_json::to_string_pretty(&info).unwrap());
+            0
+        }),
     };
     match result {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -123,7 +198,17 @@ fn run(args: RunArgs) -> Result<i32> {
         Some(p) => Manifest::load(p)?,
         None => Manifest::default(),
     };
-    let mut b = manifest.apply(Sandbox::builder())?;
+    let mut b = Sandbox::builder();
+    if let Some(path) = args.image.as_ref().or(manifest.image.as_ref()) {
+        let image = grix::Image::open(path)?;
+        // net reaches beyond the sandbox: the image may only ask for it.
+        let granted = args.allow.iter().any(|c| c == "net") || manifest.capabilities.iter().any(|c| c == "net");
+        if image.config.capabilities.iter().any(|c| c == "net") && !granted && !args.quiet {
+            eprintln!("grix: the image asks for net; grant it with `-a net` (and limit it with --allow-host)");
+        }
+        b = b.image(&image)?;
+    }
+    let mut b = manifest.apply(b)?;
     for spec in &args.imports {
         let (host, guest) = match spec.rsplit_once(':') {
             Some((h, g)) if g.starts_with('/') => (h.to_string(), g.to_string()),
@@ -213,13 +298,14 @@ fn run(args: RunArgs) -> Result<i32> {
     if let Some(mb) = args.max_export {
         b = b.max_export(mb << 20);
     }
-    let command = if args.command.is_empty() { manifest.command.clone() } else { args.command.clone() };
-    if command.is_empty() {
-        bail!("no command given (pass it after `--` or set `command` in the manifest)");
-    }
 
     let control = RunControl::new();
     let sandbox = b.control(&control).build()?;
+    let command = [&args.command, &manifest.command, &sandbox.command().to_vec()]
+        .into_iter()
+        .find(|c| !c.is_empty())
+        .cloned()
+        .context("no command given (pass it after `--`, or set `command` in the manifest or image)")?;
     forward_signals(control, args.quiet);
     // Piped or redirected input goes to the program; a terminal doesn't
     // (there's no interactive mode yet), so the program sees end-of-file.
@@ -402,4 +488,78 @@ fn forward_signals(control: RunControl, quiet: bool) {
             pending.retain(|&sig| !control.signal(sig));
         }
     });
+}
+
+fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
+    let quiet = args.quiet;
+    let mut on_output = |stream: Stream, data: &[u8]| {
+        if !quiet {
+            let _ = match stream {
+                Stream::Stdout => std::io::stderr().write_all(data),
+                Stream::Stderr => std::io::stderr().write_all(data),
+            };
+        }
+    };
+    use grix::build::{Copy, Grixfile, Step};
+    let default = Path::new("Grixfile");
+    let file = args.file.clone().or_else(|| default.is_file().then(|| default.to_path_buf()));
+    if args.file.is_none() && file.is_some() && !args.quiet {
+        eprintln!("grix: building from ./Grixfile");
+    }
+    // Paths given here are from the current directory, wherever the Grixfile is.
+    let cwd = std::env::current_dir()?;
+    let here = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { cwd.join(p) };
+    let (mut g, base) = match &file {
+        Some(f) => {
+            let text = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+            let g = Grixfile::parse(&text).with_context(|| format!("parsing {}", f.display()))?;
+            (g, f.parent().unwrap_or(Path::new(".")).to_path_buf())
+        }
+        None => (Grixfile::default(), PathBuf::from(".")),
+    };
+    if let Some(from) = &args.from {
+        let from = ["dir:", "oci:", "docker-archive:"]
+            .iter()
+            .find_map(|p| from.strip_prefix(p).map(|rest| format!("{p}{}", here(rest).display())))
+            .unwrap_or_else(|| from.clone());
+        g.from = Some(from);
+        g.from_outside_context = true;
+    }
+    for spec in &args.copies {
+        let (host, guest) = spec.rsplit_once(':').with_context(|| format!("--copy {spec:?} must be HOST:GUEST"))?;
+        g.copies.push(Copy { host: here(host), guest: guest.to_string(), outside_context: true });
+    }
+    for kv in &args.env {
+        let (k, v) = kv.split_once('=').with_context(|| format!("--env {kv:?} must be KEY=VALUE"))?;
+        g.env.insert(k.to_string(), v.to_string());
+    }
+    if args.cwd.is_some() {
+        g.cwd = args.cwd.clone();
+    }
+    g.capabilities.extend(args.allow.iter().cloned());
+    if args.mem.is_some() {
+        g.memory_mb = args.mem;
+    }
+    if !args.command.is_empty() {
+        g.command = Some(args.command.clone());
+    }
+    // --run and --exec steps, in the order they were given.
+    let at =
+        |id: &str| -> Vec<usize> { matches.and_then(|m| m.indices_of(id)).map(|i| i.collect()).unwrap_or_default() };
+    let mut steps: Vec<(usize, Step)> =
+        at("runs").into_iter().zip(&args.runs).map(|(i, r)| (i, Step::Shell(r.clone()))).collect();
+    steps.extend(
+        at("execs")
+            .into_iter()
+            .zip(&args.execs)
+            .map(|(i, e)| (i, Step::Exec(e.split_whitespace().map(String::from).collect()))),
+    );
+    steps.sort_by_key(|(i, _)| *i);
+    g.run.extend(steps.into_iter().map(|(_, s)| s));
+    let opts = grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output };
+    let image = g.build(&base, opts)?;
+    image.write_to(&args.output)?;
+    let (n, bytes) = image.size();
+    eprintln!("grix: built {} ({n} entries, {} MiB)", args.output.display(), bytes >> 20);
+    Ok(0)
 }

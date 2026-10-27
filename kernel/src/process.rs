@@ -511,6 +511,30 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
     }
 }
 
+/// The program to start: a name without a slash is looked up in the
+/// environment's PATH (as a shell or a container runtime does), the first
+/// regular file there being it. Otherwise, or if none is found, the name as
+/// it is.
+fn search_path(cwd: Ino, exe: &str, envp: &[String]) -> String {
+    if exe.contains('/') {
+        return exe.into();
+    }
+    let path = envp
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    let mut fs = fs::lock();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let candidate = alloc::format!("{}/{exe}", dir.trim_end_matches('/'));
+        if let Ok(ino) = fs.lookup(cwd, &candidate, true)
+            && matches!(fs.node(ino).kind, Kind::File(_))
+        {
+            return candidate;
+        }
+    }
+    exe.into()
+}
+
 /// Load the image's program and jump to it.
 pub fn start(img: Image<'static>) -> ! {
     // Kept for good (this never returns), for comparing mounts at the end.
@@ -541,8 +565,9 @@ pub fn start(img: Image<'static>) -> ! {
     p.cwd_pin = Some(fs::lock().pin(cwd));
     p.running = true;
     let argv = img.argv.iter().map(|s| String::from(*s)).collect();
-    let envp = img.envp.iter().map(|s| String::from(*s)).collect();
-    let program = match load_program(&p, cwd, img.exe, argv, envp) {
+    let envp: Vec<String> = img.envp.iter().map(|s| String::from(*s)).collect();
+    let exe = search_path(cwd, img.exe, &envp);
+    let program = match load_program(&p, cwd, &exe, argv, envp) {
         Ok(program) => program,
         Err(e) => fail(if e.errno == ENOENT { 127 } else { 126 }, &e.reason),
     };

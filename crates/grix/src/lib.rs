@@ -19,6 +19,8 @@
 //! capabilities you grant ([`Capability`]). Anything it tries beyond that is
 //! denied and reported in [`RunOutput::events`].
 
+pub mod build;
+mod container;
 mod control;
 mod dns;
 mod event;
@@ -28,13 +30,16 @@ mod image;
 mod manifest;
 mod mount;
 mod net;
+mod oci;
 mod sandbox;
 mod vmm;
 
+pub use container::{Image, ImageConfig};
 pub use control::RunControl;
 pub use event::GuestEvent;
 pub use export::{Export, ExportContent, ExportEntry, ExportState};
 pub use grix_abi::policy::{Capability, DenyAction};
 pub use manifest::{ExportTo, Manifest};
 pub use mount::{MountChanges, MountState};
+pub use oci::pull_to_layout as pull;
 pub use sandbox::{ExitStatus, MountMode, RunOutput, Sandbox, SandboxBuilder, Stream};

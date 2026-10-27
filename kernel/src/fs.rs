@@ -428,6 +428,8 @@ pub struct Node {
     pub mount_point: bool,
     /// Part of a live mount: the host has it.
     pub remote: Option<Box<Remote>>,
+    /// Made by the kernel at boot, not imported (`/etc/passwd`, `/tmp`, ...).
+    pub generated: bool,
     /// Realtime nanoseconds.
     pub atime: u64,
     pub mtime: u64,
@@ -451,6 +453,7 @@ impl Node {
             system: false,
             mount_point: false,
             remote: None,
+            generated: false,
             atime: time,
             mtime: time,
             ctime: time,
@@ -667,6 +670,8 @@ impl Fs {
                 (n.atime, n.mtime, n.ctime) = (e.mtime_ns, e.mtime_ns, e.mtime_ns);
             }
         }
+        // What comes after the imports is the kernel's own.
+        let imported = fs.nodes.len();
         let dev = fs.mkdir_p("/dev");
         fs.insert(dev, "null", Kind::Dev(Dev::Null), 0o666);
         fs.insert(dev, "zero", Kind::Dev(Dev::Zero), 0o666);
@@ -759,6 +764,9 @@ impl Fs {
         let tmp = fs.mkdir_p("/tmp");
         if fs.nodes[tmp].uid == 0 {
             fs.nodes[tmp].perm = 0o1777;
+        }
+        for n in &mut fs.nodes[imported..] {
+            n.generated = !n.system && n.remote.is_none();
         }
         fs
     }
