@@ -155,7 +155,7 @@ Events tell you what happened:
 │  - encodes policy+argv+env   │  @0x4800_0000     │  - reads image, builds RO fs    │
 │  - starts QEMU               │                   │  - loads ELF (+ interpreter)    │
 │  - decodes framed console    │ ◄───────────────  │  - runs program at EL0          │
-│    stdout/stderr/events/exit │   serial frames   │  - Linux syscall ABI + policy   │
+│    stdout/stderr/events/exit │  virtio frames    │  - Linux syscall ABI + policy   │
 └──────────────────────────────┘                   └─────────────────────────────────┘
 ```
 
@@ -166,11 +166,13 @@ Events tell you what happened:
 - **The filesystem is the import list.** It's built in memory from the boot
   image. File contents aren't copied: they're referenced in place.
 - **Talking to the host.** Everything the guest says (program output, kernel
-  log, events, exit status) travels in length-prefixed frames on the serial
-  port. The host treats this stream as untrusted input.
-- **The VM's devices.** The VM gets RAM, a serial port, and nothing else: no
-  network card, no disks, no QEMU monitor, and no semihosting (which would
-  expose host files).
+  log, events, exit status) travels in length-prefixed frames on a virtio
+  console, and stdin comes back the same way: tens of MB/s, with
+  backpressure in both directions. Early boot messages and panics use the
+  serial port. The host treats both streams as untrusted input.
+- **The VM's devices.** The VM gets RAM, the virtio console, a serial port,
+  and nothing else: no network card, no disks, no QEMU monitor, and no
+  semihosting (which would expose host files).
 
 ### Security model
 
@@ -181,7 +183,7 @@ checks are what make the sandbox *least privilege* and *observable*, but they
 aren't the only wall.
 
 Caveat: the current VMM is QEMU, which is large. A minimal Rust VMM
-(Hypervisor.framework / KVM, serial console only) is on the roadmap and would
+(Hypervisor.framework / KVM, one console device) is on the roadmap and would
 shrink that attack surface substantially. Until then, don't treat this as
 hardened against a determined attacker.
 
@@ -193,7 +195,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Works today | Not yet |
 |---|---|
 | Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`) | Network sockets (`net`); fast stdio (the serial port moves about 100 KB/s out and 25 KB/s in) |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Network sockets (`net`) |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `fork`/`vfork`/`execve`/`wait` (needed by shells running commands) |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
@@ -220,13 +222,13 @@ dereference panics, `os/signal`); busybox `cp -r`, `mv`, `rm -rf`, `tar`,
    guest, proxied to the host, which enforces allow-lists for outbound
    connections and forwards listening ports. The guest needs no TCP/IP stack.
 2. **Results back to the host**: export directories the program wrote (the
-   agent's outputs), and read-write host mounts gated by policy. This needs a
-   faster channel than the serial port first.
+   agent's outputs), and read-write host mounts gated by policy, over the
+   virtio console.
 3. **Signals from the host** (SIGTERM before the timeout, SIGINT from the agent).
 4. **Processes**: fork/vfork/execve/wait with separate address spaces (`process`).
 5. **Own VMM**: a small Rust VMM on Hypervisor.framework / KVM to replace
    QEMU. That means faster boots, a smaller attack surface, and a `grix`
-   crate with no external dependencies. Also faster I/O than the serial port.
+   crate with no external dependencies.
 6. **Agent integrations**: an MCP server and Python bindings; prebuilt
    runtime bundles; snapshots for instant start.
 7. **SMP and x86_64 guests**.

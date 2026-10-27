@@ -12,8 +12,9 @@ hardware virtualization (HVF) and under emulation (TCG).
 
 - Every run boots a fresh VM in QEMU. The VM has no network card, no disk,
   and no access to host files. All guest output (program stdout/stderr,
-  kernel log, events, exit status) comes back as frames on the serial port,
-  and the host treats it as untrusted input.
+  kernel log, events, exit status) comes back as frames on a virtio
+  console (early boot and panics: the serial port), and the host treats it
+  as untrusted input.
 - The guest's filesystem is exactly what the host imported, read-only, plus
   generated `/dev`, `/proc` and `/sys`, and an `/etc/passwd` / `/etc/group`
   describing the sandbox user.

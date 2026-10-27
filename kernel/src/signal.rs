@@ -454,6 +454,13 @@ pub fn interrupt_self(p: &mut Process, tf: &mut TrapFrame) -> bool {
 /// `svc`: fail the syscall with EINTR unless the handler has `SA_RESTART`
 /// and the call is restartable (Linux's -ERESTARTSYS handling in do_signal).
 fn interrupt_syscall(a: &mut AddressSpace, t: &mut Thread, tf: &mut TrapFrame, act: &SigAction) {
+    // A write that got some data out returns that much, restart or not.
+    let done = core::mem::take(&mut t.io_done);
+    if done > 0 {
+        tf.elr += 4;
+        tf.x[0] = done;
+        return;
+    }
     if act.flags & SA_RESTART != 0 && restartable(tf) {
         return;
     }

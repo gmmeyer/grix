@@ -1,4 +1,5 @@
-//! Host <-> guest protocol over the serial console.
+//! Host <-> guest protocol over the console (virtio, or the serial port
+//! before that is up and for panics).
 //!
 //! Every byte the guest sends is part of a frame:
 //! `[FRAME_MAGIC, channel, len_lo, len_hi, payload...]` with `len <= MAX_FRAME`.
@@ -27,9 +28,6 @@ pub enum Channel {
     Event = 4,
     /// Final status; see [`encode_exit`].
     Exit = 5,
-    /// The guest is ready for stdin (see [`Input`]): the host must not send
-    /// any before this, since the guest resets the UART's receiver to get here.
-    Ready = 6,
 }
 
 impl Channel {
@@ -40,7 +38,6 @@ impl Channel {
             3 => Some(Self::Log),
             4 => Some(Self::Event),
             5 => Some(Self::Exit),
-            6 => Some(Self::Ready),
             _ => None,
         }
     }

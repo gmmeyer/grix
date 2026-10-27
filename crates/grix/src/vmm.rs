@@ -1,15 +1,17 @@
 //! VM backend: QEMU `virt` machine.
 //!
-//! The VM gets exactly: RAM, one serial port (the framed channel back to us,
-//! and stdin to it), the kernel, and the boot image. No network card, no
-//! disks, no semihosting (which would expose the host filesystem) and no
-//! QEMU monitor.
+//! The VM gets exactly: RAM, a virtio console (the framed channel back to
+//! us, and stdin to it, on QEMU's stdio), a PL011 serial port on a Unix
+//! socket (early boot and panic messages), the kernel, and the boot image. No
+//! network card, no disks, no semihosting (which would expose the host
+//! filesystem) and no QEMU monitor.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,28 +57,75 @@ impl Drop for TempFile {
     }
 }
 
-fn write_temp(image: &[u8]) -> Result<TempFile> {
+fn temp_path(ext: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("grix-{}-{n}.img", std::process::id()));
+    std::env::temp_dir().join(format!("grix-{}-{n}.{ext}", std::process::id()))
+}
+
+fn write_temp(ext: &str, contents: &[u8]) -> Result<TempFile> {
+    let path = temp_path(ext);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .with_context(|| format!("creating {}", path.display()))?;
     let guard = TempFile(path);
-    f.write_all(image)?;
+    f.write_all(contents)?;
     Ok(guard)
 }
 
-/// Feed `input` to the guest's stdin as frames, then end it, once the guest
-/// says it's ready. The guest stops draining the console when its stdin
-/// buffer is full, so writes here block: that's the backpressure. They fail
-/// once QEMU is gone.
-fn feed_stdin(mut qemu_in: impl Write, mut input: Box<dyn Read + Send>, ready: mpsc::Receiver<()>) {
-    if ready.recv().is_err() {
-        return; // the VM ended first
+/// The most of the serial port's output we keep: the kernel only writes
+/// there before the virtio console is up and when it panics.
+const MAX_UART: usize = 1 << 20;
+
+/// Wait for QEMU to connect to the serial port's socket, which it does
+/// while starting up, before the guest runs. `None` if QEMU exits first.
+fn accept_uart(listener: &UnixListener, child: &mut Child) -> Result<Option<UnixStream>> {
+    listener.set_nonblocking(true)?;
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(Some(stream));
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e).context("accepting QEMU's serial connection"),
+        }
+        if child.try_wait()?.is_some() {
+            return Ok(None);
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            anyhow::bail!("QEMU didn't connect its serial port");
+        }
+        thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Read the serial port until QEMU closes it, keeping at most `MAX_UART`
+/// bytes. Reading on past that keeps QEMU from blocking on it.
+fn read_uart(mut stream: UnixStream) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = (MAX_UART - kept.len()).min(n);
+                kept.extend_from_slice(&buf[..room]);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    kept
+}
+
+/// Feed `input` to the guest's stdin as frames, then end it. QEMU reads
+/// only as much as the guest has buffers for, so writes here block: that's
+/// the backpressure. They fail once QEMU is gone.
+fn feed_stdin(mut qemu_in: &ChildStdin, mut input: Box<dyn Read + Send>) {
     let mut buf = vec![0u8; wire::MAX_FRAME];
     loop {
         let n = match input.read(&mut buf) {
@@ -107,7 +156,11 @@ pub(crate) fn run(
             cfg.kernel.display()
         );
     }
-    let img = write_temp(image)?;
+    let img = write_temp("img", image)?;
+    let uart_path = temp_path("uart");
+    let listener =
+        UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
+    let _uart_path = TempFile(uart_path.clone());
     // Under emulation use QEMU's richest CPU model; with hardware virtualization, the host CPU.
     let cpu = if cfg.accel == "tcg" { "max,pauth-impdef=on" } else { "host" };
     let mut cmd = Command::new(&cfg.qemu);
@@ -115,24 +168,41 @@ pub(crate) fn run(
         .args(["-m", &format!("{}M", cfg.memory_mb)])
         .args(["-accel", &cfg.accel])
         .args(["-nodefaults", "-no-user-config", "-display", "none", "-no-reboot"])
-        .args(["-chardev", "stdio,id=con,signal=off", "-serial", "chardev:con"])
+        .args(["-global", "virtio-mmio.force-legacy=false"])
+        // A serial port, not a `virtconsole`: QEMU drops console output the
+        // host doesn't read fast enough, but holds a port's back. Port 0 is
+        // reserved for consoles, so it's port 1.
+        .args(["-chardev", "stdio,id=con,signal=off", "-device", "virtio-serial-device,max_ports=2"])
+        .args(["-device", "virtserialport,chardev=con,nr=1"])
+        .arg("-chardev")
+        .arg(format!("socket,id=uart,path={}", uart_path.display()))
+        .args(["-serial", "chardev:uart"])
         .arg("-kernel")
         .arg(&cfg.kernel)
         .arg("-device")
         .arg(format!("loader,file={},addr={IMAGE_BASE:#x},force-raw=on", img.0.display()))
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        // Piped even without input: QEMU disconnects the port when its
+        // stdin ends, and then discards what the guest writes.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().with_context(|| format!("starting {}", cfg.qemu.display()))?;
     let mut child = ChildGuard(child);
-    let (ready_tx, ready_rx) = mpsc::channel();
-    if let (Some(input), Some(qemu_in)) = (stdin, child.0.stdin.take()) {
+    let uart = accept_uart(&listener, &mut child.0)?;
+    drop(listener);
+    let uart_thread = thread::spawn(move || uart.map(read_uart).unwrap_or_default());
+    // Kept open until QEMU is gone, after stdin's end frame too.
+    let qemu_in = Arc::new(child.0.stdin.take().unwrap());
+    if let Some(input) = stdin {
+        let qemu_in = qemu_in.clone();
         // Detached: it may be blocked reading `input` when the VM ends.
-        thread::spawn(move || feed_stdin(qemu_in, input, ready_rx));
+        thread::spawn(move || feed_stdin(&qemu_in, input));
     }
 
     let mut stdout = child.0.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Bounded, so a slow `on_frame` holds QEMU back (and through it the
+    // guest) instead of piling output up here.
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
     thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -164,9 +234,6 @@ pub(crate) fn run(
         match rx.recv_timeout(left) {
             Ok(chunk) => decoder.push(&chunk, |ch, payload| match ch {
                 Channel::Exit => exit = exit.or(wire::decode_exit(payload)),
-                Channel::Ready => {
-                    let _ = ready_tx.send(());
-                }
                 _ => on_frame(ch, payload),
             }),
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(VmEnd::Timeout),
@@ -174,6 +241,13 @@ pub(crate) fn run(
         }
     }
     let status = child.0.wait()?;
+    drop(qemu_in);
+    // A panic's message and status come on the serial port.
+    let early = uart_thread.join().unwrap_or_default();
+    FrameDecoder::new().push(&early, |ch, payload| match ch {
+        Channel::Exit => exit = exit.or(wire::decode_exit(payload)),
+        _ => on_frame(ch, payload),
+    });
     let qemu_stderr = stderr_thread.join().unwrap_or_default();
     Ok(match exit {
         Some((kind, code)) => VmEnd::Exited { kind, code },

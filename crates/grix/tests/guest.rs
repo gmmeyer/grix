@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use grix::{Capability, DenyAction, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
+use grix::{Capability, DenyAction, ExitStatus, GuestEvent, RunOutput, Sandbox, SandboxBuilder, Stream};
 
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
@@ -415,6 +415,55 @@ fn stdin_through_busybox() {
     assert_eq!(out.stdout, data);
     let out = sb.run_with_stdin(&["/bin/busybox", "wc", "-l"], b"a\nb\nc\n".to_vec()).unwrap();
     assert_eq!(out.stdout_str().trim(), "3");
+}
+
+#[test]
+fn stdout_backpressure() {
+    // The host stops reading for a while in each of the program's four
+    // phases (at 1, 3, 7 and 11 MiB): long enough for even a slow guest to
+    // fill every buffer in between. Big blocking writes complete in one call,
+    // the program sees EAGAIN and epoll readiness, blocking writes wait
+    // without freezing its other threads, and signals interrupt them without
+    // losing or repeating output (see the fixture).
+    let sb = with("backpressure").allow(Capability::Threads).build().unwrap();
+    let mut seen = 0;
+    let out = sb
+        .run_streaming(&["/bin/backpressure"], |_, bytes| {
+            let crossed = |mib: usize| seen < mib << 20 && seen + bytes.len() >= mib << 20;
+            if crossed(1) || crossed(3) || crossed(7) || crossed(11) {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            seen += bytes.len();
+        })
+        .unwrap();
+    assert_eq!(out.stderr_str(), "full=1 eagain=1 waited=1 ticker_ran=1 interrupted=1\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let want: Vec<u8> = (0..14usize << 20).map(|i| ((i % (1 << 20)) % 251) as u8).collect();
+    assert!(out.stdout == want, "stdout differs ({} bytes)", out.stdout.len());
+}
+
+#[test]
+fn large_transfers_are_lossless() {
+    // Megabytes each way, with a reader that keeps stalling: the guest is
+    // held back, and nothing is dropped or reordered.
+    let sb = busybox_sandbox();
+    let (data, _) = sample(8 << 20);
+    let mut seen = 0;
+    let out = sb
+        .run_streaming_with_stdin(&["/bin/busybox", "cat"], std::io::Cursor::new(data.clone()), |stream, bytes| {
+            assert_eq!(stream, Stream::Stdout);
+            // Long enough, every MiB, for the guest to fill every buffer
+            // between us.
+            if (seen + bytes.len()) >> 20 != seen >> 20 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            seen += bytes.len();
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.kernel_log);
+    assert_eq!(seen, data.len());
+    assert!(out.stdout == data, "stdout differs from stdin");
 }
 
 #[test]

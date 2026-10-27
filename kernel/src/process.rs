@@ -86,6 +86,10 @@ pub struct Thread {
     /// signal handler runs before the call re-executes, the call may fail
     /// with EINTR instead (see `signal::return_to_user`).
     pub restarting: bool,
+    /// Bytes an unfinished write to stdout/stderr already sent before it
+    /// blocked. Its re-run continues after them; a signal handler makes it
+    /// return them instead of EINTR, as Linux returns a partial count.
+    pub io_done: u64,
     /// CPU time used (ns), up to its last switch out.
     pub cpu_ns: u64,
 }
@@ -106,6 +110,7 @@ impl Thread {
             robust_list: 0,
             restart_deadline: None,
             restarting: false,
+            io_done: 0,
             cpu_ns: 0,
         }
     }
@@ -404,7 +409,7 @@ pub fn start(img: Image<'static>) -> ! {
             p.slice_start = crate::time::monotonic_ns();
             *PROCESS.lock() = Some(p);
             arch::irq::init();
-            console::init_stdin(stdin);
+            console::start(stdin);
             arch::enter_user(entry, sp)
         }
         Err((code, reason)) => fail(code, &reason),

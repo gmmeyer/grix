@@ -375,7 +375,7 @@ impl Sandbox {
                 Ok(e) => out.events.push(e.into()),
                 Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
             },
-            Channel::Exit | Channel::Ready => {}
+            Channel::Exit => {}
         })?;
         out.duration = started.elapsed();
         out.status = match end {

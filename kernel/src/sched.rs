@@ -83,27 +83,33 @@ fn wake_expired(p: &mut Process) -> bool {
 fn idle(p: &mut Process) {
     match earliest_deadline(p) {
         Some(deadline) => irq::timer_at(deadline),
-        // Input from the host can still wake whoever waits for it.
+        // The host can still wake whoever waits for I/O.
         None if waiting_for_input(p) => irq::timer_off(),
         None => deadlock(p),
+    }
+    p.timer_dirty = true;
+    // Checking on the host may itself have freed room for a writer.
+    if crate::ipc::generation() != p.io_seen {
+        return;
     }
     if let Some(id) = irq::wait_for_interrupt() {
         handle_interrupt(id);
     }
-    p.timer_dirty = true;
 }
 
-/// A thread is blocked on I/O while the host may still send stdin.
+/// A thread is blocked on I/O while the host may still send stdin or take
+/// output.
 fn waiting_for_input(p: &Process) -> bool {
-    console::stdin_open() && p.threads.values().any(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io))
+    p.threads.values().any(|t| t.wait.is_some_and(|w| w.on == WaitOn::Io)) && console::host_pending()
 }
 
 /// Handle an acknowledged interrupt and signal its end.
 fn handle_interrupt(id: u32) {
     match id {
         irq::TIMER_INTID => irq::timer_off(),
-        irq::UART_INTID => console::rx_interrupt(),
-        _ => {}
+        _ => {
+            console::interrupt(id);
+        }
     }
     irq::eoi(id);
 }

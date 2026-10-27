@@ -36,6 +36,7 @@ pub fn handle(tf: &mut TrapFrame) {
     // already set x0 or rewound to the svc.)
     if result != Err(EBLOCKED) {
         p.cur().restart_deadline = None;
+        p.cur().io_done = 0;
         tf.x[0] = match result {
             Ok(v) => v,
             Err(e) => (-(e.0 as i64)) as u64,

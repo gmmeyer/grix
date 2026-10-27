@@ -16,8 +16,6 @@ const GICR_SGI: u64 = GICR + 0x1_0000;
 
 /// Virtual timer PPI.
 pub const TIMER_INTID: u32 = 27;
-/// The PL011 UART: SPI 1 on QEMU `virt`.
-pub const UART_INTID: u32 = 33;
 const SPURIOUS: u32 = 1023;
 
 fn reg32(addr: u64) -> *mut u32 {
@@ -48,9 +46,10 @@ pub fn init() {
     timer_off();
 }
 
-/// Route the UART's interrupt to this CPU (group 1, mid priority, level).
-pub fn enable_uart() {
-    let n = UART_INTID as u64;
+/// Route shared peripheral interrupt `intid` to this CPU (group 1, mid
+/// priority, level-triggered).
+pub fn enable_spi(intid: u32) {
+    let n = intid as u64;
     // SAFETY: GIC distributor registers, mapped at GICD.
     unsafe {
         let igroupr = reg32(GICD + 0x80 + (n / 32) * 4);

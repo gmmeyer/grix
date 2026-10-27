@@ -42,10 +42,15 @@ the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
 (`elf.rs`, `process.rs`), and drops to EL0.
 After that, every bit of kernel work happens in an exception handler
 (`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
-interrupt in `sched.rs`). Everything the guest says goes out as frames on the
-PL011 UART (`console.rs`, format in `crates/abi/src/wire.rs`). stdin comes
-back the same way, as `wire::Input` frames. The host sends none before the
-guest's `Ready` frame, because the guest resets the UART FIFOs at boot.
+interrupt in `sched.rs`). Everything the guest says goes out as frames
+(`console.rs`, format in `crates/abi/src/wire.rs`) on a virtio console
+(`virtio.rs`: virtio-mmio, port 1 of a `virtio-serial-device`, on QEMU's
+stdio), and stdin comes back on it as `wire::Input` frames. When the host
+reads slowly, program writes to stdout/stderr block like pipe writes (woken
+by the device's interrupt; `Thread::io_done` lets a re-run continue after
+what it already sent) or fail with EAGAIN; the kernel's own messages spin
+until there's room. Before the virtio console is up, and for panics, frames
+go to the PL011 UART, on a Unix socket the host reads (bounded).
 
 Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must
@@ -98,7 +103,10 @@ keeping its deadline (`restart_deadline`).
    code that trusts guest-provided sizes, paths or strings.
 7. **Least privilege at the VM level too.** Don't add QEMU devices (NICs,
    disks, virtio-fs), semihosting, or the monitor unless a capability gates
-   them. Semihosting in particular gives the guest host file access.
+   them. Semihosting in particular gives the guest host file access. The
+   only devices are the PL011 and the virtio console, and both carry
+   nothing but the framed channel to the host; keep it that way (no more
+   ports, no `virtconsole`, which drops output under backpressure).
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).

@@ -4,7 +4,7 @@
 //! Linux program it describes. The program sees only the files the host
 //! imported, and every syscall is checked against the image's capability
 //! policy. Output, denials and the exit status go back to the host as framed
-//! messages on the serial console.
+//! messages on the virtio console.
 
 #![no_std]
 #![no_main]
@@ -30,6 +30,7 @@ mod syscall;
 mod time;
 mod timer;
 mod uaccess;
+mod virtio;
 
 use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};
 
@@ -47,6 +48,7 @@ pub extern "C" fn kernel_main() -> ! {
     let img = Image::decode(bytes).unwrap_or_else(|_| panic!("corrupt boot image"));
 
     time::init(img.boot_time_ns);
+    console::init_virtio();
     rng::init(&img.seed);
     arch::allow_el0_counter();
     klog!("grix kernel: {} MiB RAM, {} imported paths, exec {}\n", img.ram_size >> 20, img.entries.len(), img.exe);

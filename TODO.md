@@ -18,13 +18,14 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 2. ~~**Network interface listing**~~: done (see Networking).
 3. ~~**Small Linux gaps**~~: done. `memfd_create`, CPU-time clocks,
    `membarrier`, `mincore`, `prctl`, `signalfd4` and `/etc/localtime` all work.
-4. ~~**stdin from the host**, and output size limits~~: done. Both
-   directions are slow over the serial port (about 100 KB/s out, 25 KB/s
-   in), so a faster transport comes next.
-5. **Getting written files back to the host** (the agent's results).
-6. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
+4. ~~**stdin from the host**, and output size limits~~: done.
+5. ~~**A fast host transport**~~: done. stdio, events and stdin travel on a
+   virtio console: about 50 MB/s out and 30 MB/s in with HVF, up from
+   100 KB/s and 25 KB/s on the UART.
+6. **Getting written files back to the host** (the agent's results).
+7. **fork/exec/wait**: Python `subprocess`, Node `child_process`, shell
    pipelines and `git commit` (run through `sh`) all stop here.
-7. **Networking through the host** (`net`).
+8. **Networking through the host** (`net`).
 
 ## Processes and exec
 
@@ -159,15 +160,16 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
       datagram and seqpacket pairs, `SCM_RIGHTS` fd passing.
       `socket(AF_UNIX)` works for ioctls. bind, connect and listen on it are reported as unimplemented.
-- [ ] A fast host transport (virtio-vsock or virtio-console). The UART takes
-      one VM exit per byte.
+- [x] A fast host transport. virtio-console (port 1 of a
+      `virtio-serial-device`) carries the framed channel. Networking can
+      add its own frames there, or a second port.
 
 ## stdio and host interaction
 
 - [x] stdin from the host (pipes, interactive sessions). stdin is always EOF today.
       Piped, from the library or the CLI, with backpressure. Interactive sessions come with TTY mode.
-- [ ] Faster output path (same UART problem as networking).
-      The PL011 costs a VM exit per byte. FIFO batching gets about 100 KB/s out and 25 KB/s in. virtio-console would move data through shared memory.
+- [x] Faster output path.
+      virtio-console moves frames through shared 4 KiB buffers: about 50 MB/s out and 30 MB/s in with HVF. A slow host reader blocks the writing thread only (EAGAIN with `O_NONBLOCK`, epoll readiness), never the whole VM.
 - [x] Output size limits with truncation reported.
       `max_output` (64 MiB per stream by default): the program keeps running, and the rest is dropped and reported.
 - [ ] Interactive TTY mode (`grix run -t`).

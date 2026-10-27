@@ -567,17 +567,39 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             return Ok(8);
         }
     };
-    let mut chunk = [0u8; CHUNK];
-    let mut done = 0u64;
-    while done < count {
-        let n = (count - done).min(CHUNK as u64) as usize;
+    stdio_write(p, ch, buf, count, nonblock)
+}
+
+/// A write to stdout or stderr, like Linux's to a pipe. Without O_NONBLOCK
+/// it returns once all of it is sent, waiting whenever the host is slow to
+/// read (`Thread::io_done` carries what's sent across the waits). With it,
+/// it takes what fits, or fails with EAGAIN if nothing does.
+fn stdio_write(p: &mut Process, ch: Channel, buf: u64, count: u64, nonblock: bool) -> SysResult {
+    let mut done = core::mem::take(&mut p.cur().io_done).min(count);
+    if done == count {
+        return Ok(count);
+    }
+    // Wait for room for the rest (as much as fits at once), so a slow host
+    // gets big batches rather than a wakeup per buffer.
+    let need = if nonblock { 1 } else { ((count - done) as usize).min(console::OUTPUT_CAPACITY) };
+    let mut chunk = [0u8; console::WRITE_CHUNK];
+    let mut room = console::output_room(need);
+    while room && done < count {
+        let n = (count - done).min(console::WRITE_CHUNK as u64) as usize;
         if let Err(e) = copy_in(&mut p.aspace, buf + done, &mut chunk[..n]) {
             return if done > 0 { Ok(done) } else { Err(e) };
         }
-        console::write(ch, &chunk[..n]);
-        done += n as u64;
+        room = console::try_write(ch, &chunk[..n]);
+        done += if room { n as u64 } else { 0 };
     }
-    Ok(count)
+    if done == count {
+        Ok(count)
+    } else if nonblock {
+        if done > 0 { Ok(done) } else { Err(EAGAIN) }
+    } else {
+        p.cur().io_done = done;
+        would_block(p, false)
+    }
 }
 
 /// Read from a pipe (or one direction of a socket). `peek` leaves the data in place.
@@ -705,8 +727,19 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
             return Err(EINVAL);
         }
     }
+    // A blocking writev to stdout/stderr resumes after what it sent before
+    // it waited (`Thread::io_done`), like write.
+    let resumes = write && matches!(f.kind, FileKind::Stdout | FileKind::Stderr);
+    let mut skip = if resumes { core::mem::take(&mut p.cur().io_done) } else { 0 };
     let mut total = 0;
     for (base, len) in iovecs(p, iov, cnt)? {
+        let sent = skip.min(len);
+        skip -= sent;
+        total += sent;
+        if sent == len {
+            continue;
+        }
+        let (base, len) = (base + sent, len - sent);
         let pos = at.map(|o| o + total);
         let r = if write { write_from(p, &mut f, base, len, pos) } else { read_into(p, &mut f, base, len, pos) };
         match r {
@@ -717,7 +750,17 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
                 }
             }
             Err(e) if total == 0 => return Err(e),
-            Err(_) => break,
+            Err(EBLOCKED) if resumes => {
+                p.cur().io_done += total;
+                return Err(EBLOCKED);
+            }
+            Err(e) => {
+                // Return what got through instead of waiting for the rest.
+                if e == EBLOCKED {
+                    p.cur().wait = None;
+                }
+                break;
+            }
         }
     }
     Ok(total)
@@ -1290,6 +1333,8 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
     if o.flags & O_ACCMODE == O_RDONLY {
         return Err(EBADF);
     }
+    let nonblock = o.nonblocking();
+    let mut blocked = false;
     let n = match (&o.kind, o.content.clone()) {
         (FileKind::Node(ino), Some(dst)) => {
             let ino = *ino;
@@ -1301,15 +1346,18 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
         }
         (FileKind::Stdout | FileKind::Stderr, _) => {
             let ch = if matches!(o.kind, FileKind::Stdout) { Channel::Stdout } else { Channel::Stderr };
-            let mut chunk = [0u8; CHUNK];
+            let mut chunk = [0u8; console::WRITE_CHUNK];
             let mut done = 0;
             while done < count {
-                let want = (count - done).min(CHUNK as u64) as usize;
+                let want = (count - done).min(console::WRITE_CHUNK as u64) as usize;
                 let n = src.lock().read(start + done, &mut chunk[..want]);
                 if n == 0 {
                     break;
                 }
-                console::write(ch, &chunk[..n]);
+                if !console::try_write(ch, &chunk[..n]) {
+                    blocked = done == 0;
+                    break;
+                }
                 done += n as u64;
             }
             done
@@ -1317,6 +1365,9 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
         _ => return Err(EINVAL),
     };
     drop(o);
+    if blocked {
+        return would_block(p, nonblock);
+    }
     if offp != 0 {
         write_u64(&mut p.aspace, offp, start + n)?;
     } else {
