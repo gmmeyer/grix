@@ -548,6 +548,34 @@ Next, in TODO.md order:
   (Hypervisor.framework then says "denied"); it now uses what `make`
   built there, and only an installation looks beside itself.
 
+- **Snapshots on KVM** (round 2, item 18, done): KVM answers SMCCC calls
+  itself, so grix-vmm installs an SMCCC filter (Linux 6.4+) that forwards
+  `SNAPSHOT_CALL` as `KVM_EXIT_HYPERCALL`. The pause protocol moved to
+  `pause.rs`, shared with Hypervisor.framework; on KVM every vCPU's thread
+  takes part (KVM does PSCI, so an off vCPU waits in KVM_RUN), kicked out
+  with `immediate_exit` plus SIGUSR1 (`tgkill` allowed only to our own
+  process, and only when the run may take a snapshot). Before saving, a
+  vCPU re-enters KVM_RUN with `immediate_exit` set so an MMIO load in
+  flight is finished (KVM's state isn't consistent until then). A vCPU is
+  every register KVM lists and its MP state; the vGIC is its distributor,
+  redistributor, CPU interface and line-level attributes in one fixed
+  order. A restore sets every vCPU from the main thread before any runs,
+  then the GIC, then the counter once (it's the VM's offset). The format
+  (version 3) names its hypervisor. One trap on the way: confining before
+  spawning the vCPU threads broke every multi-CPU run, since the seccomp
+  filter allows no new threads; they now wait at a barrier until grix-vmm
+  is confined. `make test-kvm` takes snapshots with one and two CPUs.
+  Also fixed: the guest's time of day lagged by however long it took from
+  the host making the boot image to the kernel's `time::init` (about
+  0.1 s, seconds on a loaded host, which made a snapshot test's ±1 s check
+  fail under the stress loop). grix-vmm now writes the time into the
+  loaded image (`image::BOOT_TIME_OFFSET`) just before the first vCPU
+  runs; QEMU still starts from the image's. And from the review: the
+  console's threads now wait until grix-vmm is confined (`Console::go`),
+  since a restored device's queues come from the snapshot file and input
+  arrives at once; the physical counter isn't restored (writing it would
+  make KVM trap physical timer accesses on hosts without ECV).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

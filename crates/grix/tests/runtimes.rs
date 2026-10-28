@@ -643,8 +643,8 @@ fn python_from_live_mounts() {
 #[test]
 fn python_from_a_snapshot() {
     let b = sandbox("python").cpus(1);
-    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
-        return; // Only grix-vmm on macOS can (the guest tests check the others say so).
+    if b.vmm_path().is_none() {
+        return; // Only grix-vmm can (the guest tests check QEMU says so).
     }
     let dir = std::env::temp_dir().join(format!("grix-pysnap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

@@ -45,8 +45,8 @@ class Common:
         self.assertEqual(r.events, [])
 
     def test_snapshots(self):
-        if sys.platform != "darwin":
-            self.skipTest("snapshots need grix-vmm on macOS")
+        if sys.platform != "darwin" and not os.path.exists("/dev/kvm"):
+            self.skipTest("snapshots need grix-vmm (macOS, or Linux with KVM)")
         with tempfile.TemporaryDirectory() as tmp:
             sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
             snap = sb.snapshot(Path(tmp) / "sh.snap", ["/bin/busybox", "sh", "-c", 'read x; echo "got $x"'])

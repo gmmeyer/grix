@@ -971,8 +971,10 @@ impl Sandbox {
     pub fn snapshot<S: AsRef<str>>(&self, argv: &[S], path: impl AsRef<Path>) -> Result<crate::Snapshot> {
         let cfg = &self.cfg;
         let path = path.as_ref();
-        if cfg.vmm.is_none() || !cfg!(target_os = "macos") {
-            bail!("snapshots need grix's own VMM on macOS 15+ (Hypervisor.framework), not QEMU or KVM");
+        if cfg.vmm.is_none() {
+            bail!(
+                "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU"
+            );
         }
         if !cfg.mounts.is_empty() {
             bail!("a sandbox with on-exit mounts can't be snapshotted: what the host holds for them isn't saved");
@@ -1141,9 +1143,6 @@ pub(crate) fn run_snapshot(
     stdin: Box<dyn Read + Send>,
     on_output: impl FnMut(Stream, &[u8]),
 ) -> Result<RunOutput> {
-    if !cfg!(target_os = "macos") {
-        bail!("snapshots need grix's own VMM on macOS 15+ (Hypervisor.framework)");
-    }
     let s = &snap.settings;
     let file = std::fs::File::open(snap.path()).with_context(|| format!("opening {}", snap.path().display()))?;
     let mut net = NetPolicy {
@@ -1169,7 +1168,9 @@ pub(crate) fn run_snapshot(
         kernel: PathBuf::new(),
         memory_mb: s.memory_mb,
         accel: String::new(),
-        vmm: Some(snap.vmm.clone().context("snapshots need grix's own VMM (grix-vmm, on macOS 15+)")?),
+        vmm: Some(snap.vmm.clone().context(
+            "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU",
+        )?),
         cpus: s.cpus,
         snapshot: Some(SnapshotFile::Restore(file)),
         fs_state,

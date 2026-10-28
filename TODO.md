@@ -88,8 +88,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     of any process; three busy processes on four CPUs use 2.5 CPUs'
     worth, one at a time before). Left: finer locking than one kernel
     lock.
-18. [~] **Snapshots**: in TTY mode, with live mounts (each run gives
-    their host directories again), with more CPUs. Left: on KVM.
+18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
+    their host directories again), with more CPUs, and on KVM.
 19. **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
 20. **An outside security review** (after the above).
 
@@ -351,7 +351,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       per run. `make test-kvm` tests KVM from a Mac.
 - [x] Snapshots for instant start (`grix snapshot`, `Sandbox::snapshot`,
       MCP, Python): grix-vmm on macOS.
-- [ ] Snapshots on KVM (vCPU and vGIC state through KVM's device
+- [x] Snapshots on KVM (vCPU and vGIC state through KVM's device
       attributes, and an SMCCC filter to forward the call).
 - [x] Snapshots with live mounts (each run gives them host directories
       again; the host's ids and lazy imports' first views are saved).

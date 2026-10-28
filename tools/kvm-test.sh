@@ -47,6 +47,15 @@ grix run -a threads -i /fixtures/threads:/bin/threads -- /bin/threads | busybox 
 grix run --cpus 2 -a threads -a process -i /fixtures/smp:/bin/smp -- /bin/smp
 grix run --cpus 2 -a threads -a process -i /fixtures/smp:/bin/smp -- /bin/smp exec
 grix run -a process --timeout 5 -i /bin/busybox:/bin/busybox -- /bin/busybox sh -c '/bin/busybox sleep 1; echo slept'
+# Snapshots: a shell waiting for a line, and two CPUs with threads on both
+# before and after.
+grix snapshot -o /tmp/sh.snap -a process -i /bin/busybox:/bin/busybox -- \
+    /bin/busybox sh -c 'read line; echo "snap got $line"; /bin/busybox head -c 4 /dev/urandom | /bin/busybox od -An -tx1'
+echo one | grix run --snapshot /tmp/sh.snap
+echo two | grix run --snapshot /tmp/sh.snap
+grix snapshot -o /tmp/smp.snap --cpus 2 -a threads -a process -i /bin/busybox:/bin/busybox -i /fixtures/smp:/bin/smp -- \
+    /bin/busybox sh -c '/bin/smp >/dev/null; read line; echo "smp snap got $line"; /bin/smp'
+echo three | grix run --snapshot /tmp/smp.snap
 echo KVM-TEST-DONE
 busybox poweroff -f
 EOF
@@ -71,6 +80,10 @@ check "threads ok counter=160000"
 check "smp ok cpus=2"
 check "exec ok"
 check "slept"
+check "snap got one"
+check "snap got two"
+check "smp snap got three"
+[ "$(grep -c "smp ok cpus=2" "$LOG")" = 2 ] && echo "ok: smp ok cpus=2 after a restore" || { echo "MISSING: smp after a restore"; fail=1; }
 check "KVM-TEST-DONE"
 [ $fail = 0 ] || { echo "--- $LOG"; tail -40 "$LOG"; exit 1; }
 echo "grix on KVM: all good"

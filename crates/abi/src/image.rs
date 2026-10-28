@@ -12,6 +12,10 @@ use crate::policy::{DenyAction, Policy};
 
 pub const MAGIC: [u8; 8] = *b"GRIXIMG1";
 pub const HEADER_LEN: usize = 32;
+/// Where `Image::boot_time_ns` is in an encoded image: a VMM that starts
+/// the machine well after the image was made (grix-vmm) writes the time
+/// again there, just before the first vCPU runs.
+pub const BOOT_TIME_OFFSET: usize = HEADER_LEN;
 
 /// Guest physical memory layout (QEMU `virt` machine).
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -51,7 +55,9 @@ pub struct Image<'a> {
     /// The GIC redistributors' base (`machine::GICR_QEMU` or
     /// `machine::GICR_GRIX_VMM`): the one thing that differs between VMMs.
     pub gicr: u64,
-    /// Host wall-clock time when the image was built, in ns since the Unix epoch.
+    /// Host wall-clock time when the image was built, in ns since the Unix
+    /// epoch (or when the machine started: `BOOT_TIME_OFFSET`). The kernel
+    /// pairs it with its counter at boot.
     pub boot_time_ns: u64,
     /// Entropy for the guest CSPRNG.
     pub seed: [u8; 32],

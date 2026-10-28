@@ -204,7 +204,9 @@ pub(crate) fn run(
 ) -> Result<VmRun> {
     let restore = matches!(cfg.snapshot, Some(SnapshotFile::Restore(_)));
     if cfg.snapshot.is_some() && cfg.vmm.is_none() {
-        anyhow::bail!("snapshots need grix's own VMM (grix-vmm, on macOS 15+), not QEMU");
+        anyhow::bail!(
+            "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU"
+        );
     }
     // A restored run's kernel is in the snapshot (whose ABI the caller checked).
     let img = if restore {

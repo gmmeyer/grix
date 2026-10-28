@@ -59,12 +59,12 @@ pub fn take_if_wanted() {
             crate::rng::reseed(&entropy);
             crate::time::resumed_after(x5);
             crate::fs::lock().forget_live();
-            klog!("restored from a snapshot\n");
+            klog!("restored from a snapshot taken {} ms ago\n", x5 / 1_000_000);
         }
         // Input arrived as it was being taken: next time.
         SNAPSHOT_RETRY => {}
         SNAPSHOT_TAKEN => WANTED.store(false, Ordering::Relaxed),
-        _ => refuse("this VMM can't take snapshots (grix-vmm on macOS can)"),
+        _ => refuse("this VMM can't take snapshots (grix-vmm can)"),
     }
 }
 

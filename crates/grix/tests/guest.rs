@@ -1907,7 +1907,7 @@ fn snapshots_in_tty_mode() {
         .env("PS1", "$ ")
         .timeout(Duration::from_secs(30))
         .tty(24, 80);
-    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+    if b.vmm_path().is_none() {
         return; // snapshots_resume_where_the_program_waited checks the error
     }
     let dir = temp_dir("ttysnap");
@@ -1954,7 +1954,7 @@ fn snapshots_with_live_mounts() {
         .import_lazy(&lazy, "/lazy")
         .unwrap()
         .timeout(Duration::from_secs(30));
-    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+    if b.vmm_path().is_none() {
         return; // snapshots_resume_where_the_program_waited checks the error
     }
     let script = "/bin/busybox cat /work/a.txt; /bin/busybox ls /lazy; read line; \
@@ -1987,11 +1987,11 @@ fn snapshots_resume_where_the_program_waited() {
         .unwrap()
         .allow(Capability::Process)
         .timeout(Duration::from_secs(30));
-    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+    if b.vmm_path().is_none() {
         // QEMU and KVM can't: say so clearly.
         let err =
             b.clone().build().unwrap().snapshot(&["/bin/busybox", "true"], temp_dir("nosnap").join("s")).unwrap_err();
-        assert!(err.to_string().contains("grix's own VMM on macOS"), "{err}");
+        assert!(err.to_string().contains("grix's own VMM"), "{err}");
         return;
     }
     let dir = temp_dir("snapshot");
@@ -2017,7 +2017,11 @@ fn snapshots_resume_where_the_program_waited() {
         randoms.push(lines[1].to_string());
         // The clock ran on while the snapshot sat there (2 s and more).
         let guest_time: u64 = lines[2].trim().parse().unwrap();
-        assert!((before - 1..=after + 1).contains(&guest_time), "guest time {guest_time}, host {before}..{after}");
+        assert!(
+            (before - 1..=after + 1).contains(&guest_time),
+            "guest time {guest_time}, host {before}..{after}\n{}",
+            out.kernel_log
+        );
         assert!(out.events.is_empty(), "{:?}", out.events);
     }
     assert_ne!(randoms[0], randoms[1], "every run from a snapshot draws its own randomness");
@@ -2064,7 +2068,7 @@ fn snapshots_with_more_cpus() {
         .allow(Capability::Threads)
         .allow(Capability::Process)
         .timeout(Duration::from_secs(60));
-    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+    if b.vmm_path().is_none() {
         return;
     }
     let dir = temp_dir("snapshot-cpus");

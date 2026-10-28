@@ -31,8 +31,14 @@ mod hvf;
 mod kvm;
 #[cfg(supported)]
 mod mem;
-#[cfg(all(supported, target_os = "macos"))]
+#[cfg(supported)]
+mod pause;
+#[cfg(supported)]
 mod snapshot;
+#[cfg(all(supported, target_os = "macos"))]
+mod snapshot_hvf;
+#[cfg(all(supported, target_os = "linux"))]
+mod snapshot_kvm;
 #[cfg(supported)]
 mod vm;
 

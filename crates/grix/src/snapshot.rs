@@ -17,7 +17,9 @@
 //! lazy imports); each run gives them their host directories again
 //! ([`Snapshot::mount`]).
 //!
-//! Snapshots need grix's own VMM on macOS (Hypervisor.framework).
+//! Snapshots need grix's own VMM (Hypervisor.framework on macOS 15+, KVM
+//! on Linux 6.4+), and a snapshot runs only on the kind of host that took
+//! it.
 //!
 //! File: what `grix-vmm` writes (machine state, then RAM), then the host's
 //! settings for a restored run as JSON, its length (u64 LE), and

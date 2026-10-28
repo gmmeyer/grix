@@ -19,7 +19,6 @@ use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-#[cfg(target_os = "macos")]
 use grix_abi::codec::{Reader, Writer};
 use grix_abi::machine::{CONSOLE_RX, CONSOLE_TX};
 
@@ -74,7 +73,6 @@ struct State {
     input_pending: bool,
 }
 
-#[cfg(target_os = "macos")]
 impl State {
     /// The device as the driver set it up, for a snapshot.
     fn save(&self) -> Vec<u8> {
@@ -138,6 +136,10 @@ pub struct Console {
     rx_buffers: Condvar,
     line: Line,
     to_stdout: SyncSender<(u64, Vec<Chain>)>,
+    /// The threads move nothing until the VMM has confined itself (`go`):
+    /// a restored device's queues are a snapshot file's.
+    started: Mutex<bool>,
+    start: Condvar,
 }
 
 impl Console {
@@ -148,7 +150,6 @@ impl Console {
     }
 
     /// The device as `save` left it, for a run restored from a snapshot.
-    #[cfg(target_os = "macos")]
     pub fn restore(mem: Arc<GuestMemory>, line: Line, saved: &[u8]) -> Result<Arc<Console>, String> {
         let state = State::load(saved).ok_or("the snapshot's console state is malformed")?;
         let raised = state.interrupt_status != 0;
@@ -161,7 +162,6 @@ impl Console {
     /// moves through the device (the lock keeps the reader and writer from
     /// touching guest memory). `None` if something is on its way (output,
     /// or input the guest hasn't seen: try again later).
-    #[cfg(target_os = "macos")]
     pub fn save_with<R>(&self, f: impl FnOnce(Vec<u8>) -> R) -> Option<R> {
         let s = self.lock();
         if s.tx_in_flight != 0 || s.input_pending || s.interrupt_status != 0 {
@@ -175,12 +175,39 @@ impl Console {
         // A transmit queue's worth of batches; the guest has only as many
         // buffers anyway.
         let (to_stdout, batches) = sync_channel(QUEUE_MAX as usize);
-        let console = Arc::new(Console { mem, state: Mutex::new(state), rx_buffers: Condvar::new(), line, to_stdout });
+        let console = Arc::new(Console {
+            mem,
+            state: Mutex::new(state),
+            rx_buffers: Condvar::new(),
+            line,
+            to_stdout,
+            started: Mutex::new(false),
+            start: Condvar::new(),
+        });
         let c = console.clone();
-        std::thread::spawn(move || c.write_out(batches));
+        std::thread::spawn(move || {
+            c.wait_go();
+            c.write_out(batches)
+        });
         let c = console.clone();
-        std::thread::spawn(move || c.read_in());
+        std::thread::spawn(move || {
+            c.wait_go();
+            c.read_in()
+        });
         console
+    }
+
+    /// Let the threads move data: the VMM is confined.
+    pub fn go(&self) {
+        *self.started.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.start.notify_all();
+    }
+
+    fn wait_go(&self) {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        while !*started {
+            started = self.start.wait(started).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

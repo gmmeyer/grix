@@ -238,14 +238,23 @@ stdin empty (`console::stdin_waited`) and with nothing open through the
 host (`inet::host_state`), the kernel flushes the console, takes whatever
 the host sent (`console::take_all_input`: anything there means not now)
 and makes `SNAPSHOT_CALL` (an HVC in SMCCC's OEM range: Hypervisor.framework
-answers the vendor-hypervisor range itself). grix-vmm stops every other
-vCPU that's on between exits (`take_snapshot`, `pause_point`: each saves
-its own registers, as only its thread may), then, holding the console's
-lock so its threads can't touch guest memory, writes the vCPUs, GIC,
-console device and RAM to its fd 3 and exits, or answers
-`SNAPSHOT_RETRY` if input is on its way and lets them all go on. A
-restore makes every vCPU, puts the GIC back before the console can raise
-its interrupt, then each vCPU on its own thread. A `--restore` run maps that RAM
+answers the vendor-hypervisor range itself; KVM forwards it only because
+grix-vmm installs an SMCCC filter, `kvm::Vm::forward`, Linux 6.4+).
+grix-vmm stops every other vCPU between exits (`pause.rs`: each saves its
+own registers, as only its thread may on Hypervisor.framework; on KVM a
+kick is `immediate_exit` plus a signal, and a vCPU first finishes its last
+exit with a `KVM_RUN` that runs nothing, `kvm::Cpu::complete`), then,
+holding the console's lock so its threads can't touch guest memory, writes
+the vCPUs, GIC, console device and RAM to its fd 3 and exits, or answers
+`SNAPSHOT_RETRY` if input is on its way and lets them all go on. What a
+vCPU's and the GIC's state are is the hypervisor's (`snapshot_hvf.rs`; on
+KVM, `snapshot_kvm.rs`: every register `KVM_GET_REG_LIST` names and the
+power state, and the vGIC's attributes in one fixed order, so a file only
+supplies values), and a snapshot runs only where it was taken. A restore
+makes every vCPU, puts the GIC back before the console can raise its
+interrupt, and confines grix-vmm before any vCPU runs or the console's
+threads touch the device (`Console::go`): its queues are the file's. On
+KVM the counter is set last, once for the VM. A `--restore` run maps that RAM
 copy-on-write, puts the rest back with the guest's counter continuous (as
 after a suspend), and returns `SNAPSHOT_RESTORED`, fresh entropy
 (`rng::reseed`) and the time since, which moves the kernel's time of day

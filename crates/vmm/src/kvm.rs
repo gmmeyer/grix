@@ -1,9 +1,11 @@
-//! KVM (Linux on arm64): the VM, its memory, the in-kernel GICv3 and one
-//! vCPU. KVM handles WFI, the timer and PSCI itself; what comes back to us
-//! is MMIO to our devices and the guest powering off.
+//! KVM (Linux on arm64): the VM, its memory, the in-kernel GICv3 and its
+//! vCPUs. KVM handles WFI, the timer and PSCI itself; what comes back to
+//! us is MMIO to our devices, the guest powering off, and (for a snapshot)
+//! the one SMCCC call we ask KVM to forward.
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 const KVMIO: u64 = 0xae;
 
@@ -27,7 +29,12 @@ const KVM_CREATE_VCPU: u64 = io(0x41);
 const KVM_SET_USER_MEMORY_REGION: u64 = iow(0x46, 32);
 const KVM_IRQ_LINE: u64 = iow(0x61, 8);
 const KVM_RUN: u64 = io(0x80);
+const KVM_GET_ONE_REG: u64 = iow(0xab, 16);
 const KVM_SET_ONE_REG: u64 = iow(0xac, 16);
+const KVM_GET_REG_LIST: u64 = iowr(0xb0, 8);
+const KVM_GET_MP_STATE: u64 = ior(0x98, 4);
+const KVM_SET_MP_STATE: u64 = iow(0x99, 4);
+const KVM_GET_DEVICE_ATTR: u64 = iow(0xe2, 24);
 const KVM_ARM_VCPU_INIT: u64 = iow(0xae, 32);
 const KVM_ARM_PREFERRED_TARGET: u64 = ior(0xaf, 32);
 const KVM_CREATE_DEVICE: u64 = iowr(0xe0, 12);
@@ -43,7 +50,11 @@ const KVM_DEV_ARM_VGIC_CTRL_INIT: u64 = 0;
 const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
 const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
 const KVM_ARM_IRQ_TYPE_SPI: u32 = 1;
+const KVM_ARM_VM_SMCCC_CTRL: u32 = 0;
+const KVM_ARM_VM_SMCCC_FILTER: u64 = 0;
+const KVM_SMCCC_FILTER_FWD_TO_USER: u8 = 2;
 
+pub const EXIT_HYPERCALL: u32 = 3;
 pub const EXIT_MMIO: u32 = 6;
 pub const EXIT_INTR: u32 = 10;
 pub const EXIT_SYSTEM_EVENT: u32 = 24;
@@ -55,6 +66,26 @@ const fn core_reg(offset_bytes: u64) -> u64 {
 }
 pub const REG_PC: u64 = core_reg(32 * 8);
 pub const REG_PSTATE: u64 = core_reg(33 * 8);
+
+/// General-purpose register `n` (x0..x30).
+pub const fn reg_x(n: u64) -> u64 {
+    core_reg(n * 8)
+}
+
+/// The guest's virtual counter (CNTVCT_EL0, whose id KVM swapped with
+/// CNTV_CVAL's): writing it sets the VM's counter offset.
+pub const REG_TIMER_CNT: u64 = 0x6030_0000_0013_df1a;
+/// The physical counter (CNTPCT_EL0, `KVM_REG_ARM_PTIMER_CNT`).
+pub const REG_PTIMER_CNT: u64 = 0x6030_0000_0013_df01;
+
+/// A register's size in bytes, from its id.
+pub fn reg_size(id: u64) -> usize {
+    1 << ((id >> 52) & 0xf)
+}
+
+/// A vCPU's PSCI power state (`KVM_GET_MP_STATE`): running or off.
+pub const MP_STATE_RUNNABLE: u32 = 0;
+pub const MP_STATE_STOPPED: u32 = 5;
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -92,7 +123,7 @@ struct DeviceAttr {
 
 pub struct Vm {
     vm: OwnedFd,
-    _gic: OwnedFd,
+    gic: OwnedFd,
 }
 
 /// A vCPU and its shared `kvm_run` page, for the thread that runs it.
@@ -183,7 +214,31 @@ impl Vm {
         set(KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT, std::ptr::null())?;
         vcpus[0].set_reg(REG_PC, pc)?;
         vcpus[0].set_reg(REG_PSTATE, 0x3c5)?; // EL1h, interrupts masked
-        Ok((Vm { vm, _gic: gic }, vcpus))
+        Ok((Vm { vm, gic }, vcpus))
+    }
+
+    /// Have SMCCC function `function` come back to us as an
+    /// `Exit::Hypercall` (before any vCPU runs).
+    pub fn forward(&self, function: u32) -> Result<(), Error> {
+        // struct kvm_smccc_filter: base, nr_functions, action, pad.
+        let mut filter = [0u8; 24];
+        filter[..4].copy_from_slice(&function.to_le_bytes());
+        filter[4..8].copy_from_slice(&1u32.to_le_bytes());
+        filter[8] = KVM_SMCCC_FILTER_FWD_TO_USER;
+        let a = DeviceAttr {
+            flags: 0,
+            group: KVM_ARM_VM_SMCCC_CTRL,
+            attr: KVM_ARM_VM_SMCCC_FILTER,
+            addr: filter.as_ptr() as u64,
+        };
+        ioctl(self.vm.as_raw_fd(), KVM_SET_DEVICE_ATTR, &a as *const DeviceAttr as u64)
+            .map(|_| ())
+            .map_err(|e| Error(format!("snapshots on KVM need Linux 6.4 or later (its SMCCC filter): {e}")))
+    }
+
+    /// The in-kernel GIC, whose state is its device attributes.
+    pub fn gic_fd(&self) -> RawFd {
+        self.gic.as_raw_fd()
     }
 
     /// The handle device threads use to drive interrupt lines.
@@ -211,15 +266,84 @@ pub enum Exit {
     },
     /// The guest powered off (or reset).
     Shutdown,
-    /// A signal interrupted the run.
+    /// A signal interrupted the run (or a kick).
     Interrupted,
+    /// An SMCCC call we asked for (`Vm::create`'s `forward`), with its
+    /// function id; the PC is past the HVC.
+    Hypercall {
+        function: u64,
+    },
     Other(u32),
 }
 
 impl Cpu {
     pub fn set_reg(&mut self, id: u64, value: u64) -> Result<(), Error> {
-        let reg: [u64; 2] = [id, &value as *const u64 as u64];
+        self.set_raw(id, &value.to_le_bytes()[..reg_size(id).min(8)])
+    }
+
+    /// A register of any size (`reg_size`), as bytes.
+    pub fn get_raw(&self, id: u64, value: &mut [u8]) -> Result<(), Error> {
+        if value.len() != reg_size(id) {
+            return Err(Error(format!("register {id:#x} isn't {} bytes", value.len())));
+        }
+        let reg: [u64; 2] = [id, value.as_mut_ptr() as u64];
+        ioctl(self.fd.as_raw_fd(), KVM_GET_ONE_REG, reg.as_ptr() as u64).map(|_| ())
+    }
+
+    pub fn set_raw(&mut self, id: u64, value: &[u8]) -> Result<(), Error> {
+        if value.len() != reg_size(id) {
+            return Err(Error(format!("register {id:#x} isn't {} bytes", value.len())));
+        }
+        let reg: [u64; 2] = [id, value.as_ptr() as u64];
         ioctl(self.fd.as_raw_fd(), KVM_SET_ONE_REG, reg.as_ptr() as u64).map(|_| ())
+    }
+
+    /// Every register KVM has for this vCPU.
+    pub fn reg_list(&self) -> Result<Vec<u64>, Error> {
+        // struct kvm_reg_list: n, then n ids. KVM says how many with E2BIG.
+        let mut list = vec![0u64; 1];
+        let _ = ioctl(self.fd.as_raw_fd(), KVM_GET_REG_LIST, list.as_mut_ptr() as u64);
+        let n = list[0] as usize;
+        if n == 0 || n > 1 << 16 {
+            return Err(Error(format!("KVM_GET_REG_LIST says {n} registers")));
+        }
+        list = vec![0u64; 1 + n];
+        list[0] = n as u64;
+        ioctl(self.fd.as_raw_fd(), KVM_GET_REG_LIST, list.as_mut_ptr() as u64)?;
+        let n = (list[0] as usize).min(n);
+        Ok(list[1..1 + n].to_vec())
+    }
+
+    pub fn mp_state(&self) -> Result<u32, Error> {
+        let mut state = 0u32;
+        ioctl(self.fd.as_raw_fd(), KVM_GET_MP_STATE, &mut state as *mut u32 as u64)?;
+        Ok(state)
+    }
+
+    pub fn set_mp_state(&mut self, state: u32) -> Result<(), Error> {
+        ioctl(self.fd.as_raw_fd(), KVM_SET_MP_STATE, &state as *const u32 as u64).map(|_| ())
+    }
+
+    /// Finish what the last exit left (an MMIO load's value, ...): the
+    /// state isn't consistent until KVM_RUN has seen it. With
+    /// `immediate_exit` set, KVM does that and runs nothing.
+    pub fn complete(&mut self) -> Result<(), Error> {
+        self.immediate_exit().store(1, Ordering::SeqCst);
+        match self.run()? {
+            Exit::Interrupted => Ok(()),
+            _ => Err(Error("KVM_RUN with immediate_exit ran the guest".into())),
+        }
+    }
+
+    fn immediate_exit(&self) -> &AtomicU8 {
+        // SAFETY: kvm_run's immediate_exit, a byte at 1, in a page mapped
+        // for as long as the process lives.
+        unsafe { &*(self.run.add(1) as *const AtomicU8) }
+    }
+
+    /// What makes this vCPU's thread leave KVM_RUN, for other threads.
+    pub fn kick(&self) -> Kick {
+        Kick { immediate_exit: self.immediate_exit() as *const AtomicU8, tid: AtomicI32::new(0) }
     }
 
     pub fn run(&mut self) -> Result<Exit, Error> {
@@ -246,6 +370,7 @@ impl Cpu {
                 }
                 EXIT_SYSTEM_EVENT => Exit::Shutdown,
                 EXIT_INTR => Exit::Interrupted,
+                EXIT_HYPERCALL => Exit::Hypercall { function: (self.run.add(32) as *const u64).read_volatile() },
                 r => Exit::Other(r),
             })
         }
@@ -259,15 +384,92 @@ impl Cpu {
     }
 }
 
+/// Read attribute `attr` of `group` from device `fd` (the GIC): 32 or 64
+/// bits, as the attribute is.
+pub fn device_attr(fd: RawFd, group: u32, attr: u64) -> Result<u64, Error> {
+    let mut value = 0u64;
+    let a = DeviceAttr { flags: 0, group, attr, addr: &mut value as *mut u64 as u64 };
+    ioctl(fd, KVM_GET_DEVICE_ATTR, &a as *const DeviceAttr as u64)?;
+    Ok(value)
+}
+
+/// Set attribute `attr` of `group` on device `fd` (its low 32 bits, for a
+/// 32-bit one: little-endian).
+pub fn set_device_attr(fd: RawFd, group: u32, attr: u64, value: u64) -> Result<(), Error> {
+    let a = DeviceAttr { flags: 0, group, attr, addr: &value as *const u64 as u64 };
+    ioctl(fd, KVM_SET_DEVICE_ATTR, &a as *const DeviceAttr as u64).map(|_| ())
+}
+
+/// The signal that kicks a vCPU's thread out of KVM_RUN.
+const KICK_SIGNAL: i32 = libc::SIGUSR1;
+
+/// Make a vCPU's thread leave KVM_RUN: `immediate_exit` for a run about to
+/// start, a signal for one under way (KVM_RUN returns EINTR either way).
+pub struct Kick {
+    immediate_exit: *const AtomicU8,
+    tid: AtomicI32,
+}
+
+// SAFETY: `immediate_exit` points into a kvm_run page that's never
+// unmapped, and is only used atomically.
+unsafe impl Send for Kick {}
+unsafe impl Sync for Kick {}
+
+impl Kick {
+    /// On the vCPU's thread, before it first runs.
+    pub fn bind(&self) {
+        // SAFETY: gettid has no arguments.
+        self.tid.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Ordering::SeqCst);
+    }
+
+    /// On the vCPU's thread, before each run, then look for what a kick
+    /// wants: a kick after this stops the run.
+    pub fn clear(&self) {
+        // SAFETY: see the type.
+        unsafe { &*self.immediate_exit }.store(0, Ordering::SeqCst);
+    }
+
+    /// From any thread of this process.
+    pub fn kick(&self) {
+        // SAFETY: see the type.
+        unsafe { &*self.immediate_exit }.store(1, Ordering::SeqCst);
+        let tid = self.tid.load(Ordering::SeqCst);
+        if tid != 0 {
+            // SAFETY: a signal to one of our own threads, whose handler
+            // does nothing.
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, KICK_SIGNAL) };
+        }
+    }
+}
+
+/// The kick signal's handler: nothing (without SA_RESTART, so it
+/// interrupts KVM_RUN).
+pub fn handle_kicks() -> Result<(), String> {
+    extern "C" fn nothing(_: libc::c_int) {}
+    // SAFETY: a handler that does nothing, installed before any vCPU runs.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = nothing as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(KICK_SIGNAL, &action, std::ptr::null_mut()) != 0 {
+            return Err(format!("sigaction: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 /// Give up everything but running the VM, in every thread: a seccomp
 /// filter allows only the system calls the vCPU loop and the device
 /// threads make on what's already open (no open, socket, exec, signals to
 /// anyone, ...), and of ioctls only running the vCPU and driving an
 /// interrupt line. Anything else fails with EPERM. If guest input ever
-/// found a bug in this process, that's all it would have.
-pub fn confine() -> Result<(), String> {
+/// found a bug in this process, that's all it would have. A run that may
+/// take a `snapshot` also reads its own vCPUs' and GIC's state, kicks its
+/// own threads, and writes the snapshot file it holds.
+pub fn confine(snapshot: bool) -> Result<(), String> {
     // aarch64 system call numbers.
     const IOCTL: u32 = 29;
+    const TGKILL: u32 = 131;
     const ALLOWED: &[u32] = &[
         57,  // close
         63,  // read
@@ -294,6 +496,16 @@ pub fn confine() -> Result<(), String> {
         233, // madvise
         278, // getrandom
     ];
+    const SNAPSHOT_ALLOWED: &[u32] = &[
+        46, // ftruncate
+        68, // pwrite64
+    ];
+    let mut ioctls = vec![KVM_RUN, KVM_IRQ_LINE];
+    let mut allowed = ALLOWED.to_vec();
+    if snapshot {
+        ioctls.extend([KVM_GET_ONE_REG, KVM_SET_ONE_REG, KVM_GET_REG_LIST, KVM_GET_MP_STATE, KVM_GET_DEVICE_ATTR]);
+        allowed.extend(SNAPSHOT_ALLOWED);
+    }
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
@@ -310,17 +522,32 @@ pub fn confine() -> Result<(), String> {
         stmt(LD_W_ABS, 0), // seccomp_data.nr
         // ioctl: only these requests (the low word of args[1]: musl passes
         // an int).
-        jeq(IOCTL, 0, 5),
+        jeq(IOCTL, 0, ioctls.len() as u8 + 3),
         stmt(LD_W_ABS, 24),
-        jeq(KVM_RUN as u32, 2, 0),
-        jeq(KVM_IRQ_LINE as u32, 1, 0),
-        stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
-        stmt(RET_K, RET_ALLOW),
-        // Everything else, by number (the accumulator still holds it).
     ];
-    for (i, &nr) in ALLOWED.iter().enumerate() {
+    for (i, &req) in ioctls.iter().enumerate() {
+        // Matched: past the rest and the deny, to the allow.
+        prog.push(jeq(req as u32, (ioctls.len() - i) as u8, 0));
+    }
+    prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
+    prog.push(stmt(RET_K, RET_ALLOW));
+    // Not ioctl (the accumulator still holds the number). tgkill, for a
+    // snapshot's kicks: only to our own threads (args[0], the process).
+    if snapshot {
+        // SAFETY: getpid has no arguments.
+        let pid = unsafe { libc::getpid() } as u32;
+        prog.extend([
+            jeq(TGKILL, 0, 4),
+            stmt(LD_W_ABS, 16),
+            jeq(pid, 1, 0),
+            stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
+            stmt(RET_K, RET_ALLOW),
+        ]);
+    }
+    // Everything else, by number.
+    for (i, &nr) in allowed.iter().enumerate() {
         // Matched: jump past the rest of the list and the deny to the allow.
-        let rest = (ALLOWED.len() - i - 1) as u8;
+        let rest = (allowed.len() - i - 1) as u8;
         prog.push(jeq(nr, rest + 1, 0));
     }
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));

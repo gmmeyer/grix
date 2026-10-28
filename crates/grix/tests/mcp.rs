@@ -187,7 +187,7 @@ fn a_writable_server_builds_images_and_writes_mounts() {
             "output": dir.join("sh.snap"),
         }),
     );
-    if grix::Sandbox::builder().vmm_path().is_some() && cfg!(target_os = "macos") {
+    if grix::Sandbox::builder().vmm_path().is_some() {
         assert_eq!(r["isError"], false, "{r}");
         for who in ["agent", "again"] {
             let r = server.tool("run", json!({"snapshot": dir.join("sh.snap"), "stdin": format!("{who}\n")}));

@@ -418,7 +418,9 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   mounts can't take one.
 - The file holds the program's memory, so it's created readable only by
   you, and written fully before it replaces the old one.
-- Snapshots need grix-vmm on macOS (Hypervisor.framework). Runs from a
+- Snapshots need grix-vmm: Hypervisor.framework on macOS 15+, or KVM on
+  Linux 6.4+ (for its SMCCC filter). A snapshot runs only on the kind of
+  host that took it. Runs from a
   snapshot get the sandbox's network policy as it was. Over MCP they get
   the server's, whoever wrote the file.
 
@@ -679,7 +681,7 @@ subshells.
    SIGTERM and a grace period on timeout).
 4. ~~**Own VMM**~~: `grix-vmm` on Hypervisor.framework and KVM is done
    (the default where it runs: about twice as fast to start as QEMU, and
-   confined), with snapshots on macOS.
+   confined), with snapshots.
 5. ~~**Agent integrations**~~: images (`grix build`), the MCP server,
    Python bindings and snapshots for instant start are done.
 6. ~~**SMP and x86_64 guests**~~: more CPUs (`--cpus N`, threads of a
