@@ -148,7 +148,10 @@ Every way a process ends goes through `Process::terminate`: for init (pid
 1, the program) that ends the sandbox; any other process is marked, and
 `procs::finalize` (run from `schedule`, which `return_to_user` calls for an
 ended process) closes its files, leaves a zombie, gives its children to
-init and sends the exit signal. `execve` loads the new program into a fresh
+init and sends the exit signal. Each process has a `/proc/<pid>`
+(`Fs::proc_add` at fork, `fs::proc_gone` at its end; `/proc/self` is
+`process::current_pid`); a pidfd (`FileKind::PidFd`) is just the pid,
+which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
 caller running. Credentials: `Process::uid`/`gid` are the effective ids
 (permission checks, new files); `Process::ids` keeps the real and saved
@@ -166,7 +169,12 @@ another thread's state into the trap frame. I/O waits are *restarted*: when
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
 Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
 the scheduler programs the CPU timer for the earliest one and calls
-`timer::fire` from the timer interrupt and the idle loop.
+`timer::fire` from the timer interrupt and the idle loop. A CPU-time
+timer's deadline is in CPU time, a wake-up only while its threads run
+(`timer::cpu_deadline`). The vDSO (`vdso.rs`, a page every process
+shares) reads the clocks without a system call from a page only the
+kernel writes (`vdso::publish`); the kernel's clock uses the same
+`(ticks * mult) >> 32`, so keep the two in step.
 
 More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
 is still the single-CPU kernel, made safe by a big kernel lock that every

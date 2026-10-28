@@ -431,6 +431,34 @@ Next, in TODO.md order:
   EPERM if refused, with the usual `Denied` event), and only those
   destinations' replies come back. ABI 7.
 
+- **Smaller syscalls** (round 2, item 14):
+  - `/proc/<pid>` for every process, made at fork (kernel nodes that
+    reuse slots and count against the metadata budget) and gone when it
+    ends; `/proc/self` resolves to the running process
+    (`process::current_pid`). Another process's files come from its
+    kernel state only, never its memory, and its `fd/` links need the
+    same user or root (`procs::may_inspect`). busybox `ps` lists
+    everything.
+  - pidfds (`FileKind::PidFd`, pids aren't reused): `pidfd_open`,
+    `pidfd_send_signal` (a siginfo from the caller is checked as Linux
+    does), `pidfd_getfd`, `CLONE_PIDFD` for clone and clone3,
+    `waitid(P_PIDFD)` (EAGAIN when non-blocking), readable once the
+    process ends. Go's `os/exec` now takes its pidfd path.
+  - CPU-time timers: ITIMER_VIRTUAL/ITIMER_PROF and POSIX timers on the
+    process's or a thread's CPU clock keep deadlines in CPU time; the
+    scheduler wakes for one only while the threads it counts run
+    (`timer::cpu_deadline`, assuming they all keep running, so it may
+    wake early but never late).
+  - The stack is sized from RLIMIT_STACK at exec (at least the arguments
+    plus 128 KiB, at most 4 GiB) and mmap starts 128 MiB below it.
+  - A vDSO (`vdso.rs`): an ELF object assembled in the kernel with
+    Linux's arm64 symbols (`__kernel_clock_gettime` & co, LINUX_2.6.39),
+    in a page every process shares, reading the counter and the clock's
+    parameters from a seqlocked page only the kernel writes (updated when
+    a restored snapshot moves the time of day on). The kernel's clock
+    computes nanoseconds the same way (`(ticks * mult) >> 32`), so the
+    vDSO and the system calls agree to the nanosecond.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

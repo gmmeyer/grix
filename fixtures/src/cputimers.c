@@ -88,11 +88,12 @@ int main(void) {
     CHECK(prof == seen);
 
     // ITIMER_VIRTUAL doesn't run while the program sleeps.
-    struct itimerval once = {{0, 0}, {0, 50000}};
+    // (Generous margins: under emulation, even a little work takes a while.)
+    struct itimerval once = {{0, 0}, {0, 300000}};
     CHECK(setitimer(ITIMER_VIRTUAL, &once, NULL) == 0);
     sleep_ms(200);
     CHECK(vt == 0);
-    CHECK(left_ms(ITIMER_VIRTUAL) > 30);
+    CHECK(left_ms(ITIMER_VIRTUAL) > 200);
     spin(CLOCK_PROCESS_CPUTIME_ID, 2000, &vt);
     CHECK(vt == 1);
     CHECK(left_ms(ITIMER_VIRTUAL) == 0);
@@ -115,13 +116,13 @@ int main(void) {
     ev.sigev_signo = SIGUSR1;
     timer_t t;
     CHECK(timer_create(CLOCK_PROCESS_CPUTIME_ID, &ev, &t) == 0);
-    struct itimerspec in20 = {{0, 0}, {0, 20000000}};
-    CHECK(timer_settime(t, 0, &in20, NULL) == 0);
+    struct itimerspec in20 = {{0, 0}, {0, 20000000}}, in300 = {{0, 0}, {0, 300000000}};
+    CHECK(timer_settime(t, 0, &in300, NULL) == 0);
     sleep_ms(100);
     CHECK(usr1 == 0);
     struct itimerspec cur;
     CHECK(timer_gettime(t, &cur) == 0);
-    CHECK(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0 && cur.it_value.tv_nsec <= 20000000);
+    CHECK(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0 && cur.it_value.tv_nsec <= 300000000);
     long start = cpu_ms(CLOCK_PROCESS_CPUTIME_ID);
     spin(CLOCK_PROCESS_CPUTIME_ID, 2000, &usr1);
     CHECK(usr1 == 1);
@@ -136,7 +137,7 @@ int main(void) {
     // A thread's CPU time: another thread spinning doesn't count.
     ev.sigev_signo = SIGUSR2;
     CHECK(timer_create(CLOCK_THREAD_CPUTIME_ID, &ev, &t) == 0);
-    CHECK(timer_settime(t, 0, &in20, NULL) == 0);
+    CHECK(timer_settime(t, 0, &in300, NULL) == 0);
     pthread_t th;
     CHECK(pthread_create(&th, NULL, spinner, NULL) == 0);
     sleep_ms(150);

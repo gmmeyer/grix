@@ -303,7 +303,8 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         let data = match proc_pid {
             Some(pid) => {
                 let procs = crate::procs::PROCS.lock();
-                let q = procs.others.get(&pid).ok_or(ESRCH)?;
+                // Ended just now: its directory is on its way out.
+                let q = procs.others.get(&pid).ok_or(ENOENT)?;
                 procfs::generate(q, f)
             }
             None => procfs::generate(p, f),

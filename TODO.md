@@ -67,9 +67,14 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     bound to paths, abstract names, datagrams, seqpackets and SCM_RIGHTS.
     Left: UDP port forwarding, datagrams over one frame (~4 KiB),
     SO_PASSCRED.
-14. **Smaller syscalls**: pidfd, CPU-time timers, a vDSO for fast
-    `clock_gettime`, stack growth and guard pages, `/proc/<pid>` for every
-    process (`ps`).
+14. [x] **Smaller syscalls**: `/proc/<pid>` for every process (`ps`),
+    pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
+    `CLONE_PIDFD`, `waitid(P_PIDFD)`, polling), CPU-time timers
+    (`ITIMER_VIRTUAL`/`ITIMER_PROF`, POSIX timers on CPU clocks), a stack
+    sized by `RLIMIT_STACK` at exec with mmap kept clear of it, and a vDSO
+    (`clock_gettime` and `gettimeofday` without a system call). Left:
+    `MAP_GROWSDOWN`; another process's CPU clock as a timer's clock;
+    `/proc/<pid>` of zombies; `PIDFD_THREAD`.
 15. **Images**: zstd layers, registries that need a login, a cache of
     applied base layers.
 16. **Agents**: MCP progress/streaming and cancellation; native Python
@@ -120,11 +125,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       `SIGCHLD` (`SIG_IGN`/`SA_NOCLDWAIT` reap at once), orphans go to init.
 - [x] Process groups and sessions (`setpgid`, `setsid`, `kill(-pgid)`, `kill(-1)`).
       Init (the program) ignores signals from other processes it has no handler for, as in a pid namespace.
-- [ ] `pidfd_open`/`pidfd_send_signal`/`CLONE_PIDFD` (newer Python, Go, systemd).
-      Go probes it, reports it unimplemented, and falls back.
+- [x] `pidfd_open`/`pidfd_send_signal`/`pidfd_getfd`/`CLONE_PIDFD`/`waitid(P_PIDFD)`
+      (newer Python, Go's `os/exec`, systemd), pollable for the process's end.
 - [ ] `CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` without `CLONE_THREAD`, `CLONE_PARENT` (reported).
-- [ ] `/proc/<pid>/…` for every process; `ps` lists nothing today. `/proc/self` shows the
-      calling process's status, stat and fds, but `readlink /proc/self` and `/proc/self/exe` are init's.
+- [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
+      `/proc/self` is the caller's. Another process's descriptors need its user (or root).
 - [ ] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
 
 ## Signals
@@ -154,17 +159,17 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 - [x] `alarm`/`setitimer`/`getitimer` (SIGALRM). Python `signal.alarm`
       reports "unsupported setitimer" today.
-      ITIMER_REAL works. ITIMER_VIRTUAL/PROF count CPU time and are reported as unimplemented.
+      ITIMER_VIRTUAL and ITIMER_PROF count the process's CPU time (all of it user time).
 - [x] POSIX timers: `timer_create`/`timer_settime`/`timer_gettime`/`timer_delete`.
-      Signals with values, overruns, SIGEV_THREAD_ID, SIGEV_NONE and absolute times all work. CPU-time clocks are reported as unimplemented.
+      Signals with values, overruns, SIGEV_THREAD_ID, SIGEV_NONE and absolute times all work, on CPU-time clocks too
+      (the process's or a thread's; another process's is reported as unimplemented).
 - [x] `timerfd_create`/`timerfd_settime`/`timerfd_gettime` (event loops,
       systemd-style services).
 - [x] Real CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`,
       `getrusage`, `times`). These report wall time today.
       Per-thread CPU time is accounted by the scheduler. It all counts as user time: system time isn't separated.
-- [ ] CPU-time timers (`ITIMER_VIRTUAL`/`ITIMER_PROF`, timers on CPU clocks). Reported as unimplemented.
-- [ ] vDSO (`AT_SYSINFO_EHDR`) for fast `clock_gettime`; glibc and Go use it
-      when present. Performance only.
+- [x] CPU-time timers (`ITIMER_VIRTUAL`/`ITIMER_PROF`, timers on CPU clocks).
+- [x] vDSO (`AT_SYSINFO_EHDR`) for fast `clock_gettime`/`gettimeofday`; musl, glibc and Go use it.
 
 ## Filesystem
 
@@ -289,7 +294,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 - [x] Copy-on-write and shared-page refcounting (needed by fork).
 - [x] `MAP_SHARED` anonymous memory (and `/dev/zero`) shared across fork.
-- [ ] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
+- [~] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
+      exec sizes the stack from `RLIMIT_STACK` (up to 4 GiB), and mmap stays 128 MiB below it
+      (a hint, 1 MiB). `MAP_GROWSDOWN` mappings don't grow.
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
 - [~] `mincore`; accept the remaining `madvise` advice values.
       `mincore` works.

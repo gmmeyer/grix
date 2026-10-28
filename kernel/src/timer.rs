@@ -353,8 +353,8 @@ pub fn resync(p: &mut Process) {
         p.timers.real_pending = false;
         p.timer_dirty = true;
     }
-    for i in 0..2 {
-        if p.timers.cpu_pending[i] && signal::queued_timer_signal(p, CPU_ITIMERS[i]).is_none() {
+    for (i, id) in CPU_ITIMERS.into_iter().enumerate() {
+        if p.timers.cpu_pending[i] && signal::queued_timer_signal(p, id).is_none() {
             p.timers.cpu_pending[i] = false;
             p.timer_dirty = true;
         }
