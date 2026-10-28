@@ -79,7 +79,8 @@ class Sandbox:
     ``imports`` maps host paths to sandbox paths (copied in); ``files`` maps
     sandbox paths to contents (str or bytes). ``mounts`` lists
     ``(host, guest)`` or ``(host, guest, mode)`` with mode ``"rw"`` (live,
-    the default), ``"ro"`` or ``"on-exit"``. ``exports`` maps sandbox
+    the default), ``"ro"``, ``"on-exit"`` or ``"lazy"`` (imported without
+    copying it in; changes stay in the sandbox). ``exports`` maps sandbox
     directories to host directories (which must not exist yet, or be empty)
     to write them to when the program ends.
     """

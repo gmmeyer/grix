@@ -141,10 +141,12 @@ struct RunArgs {
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
     /// Mount host directory HOST at GUEST: live and read-write (rw, the
-    /// default, grants fs_write), live and read-only (ro), or with the
-    /// changes applied when the program ends (on-exit, grants fs_write).
+    /// default, grants fs_write), live and read-only (ro), with the
+    /// changes applied when the program ends (on-exit, grants fs_write), or
+    /// as a lazy import (lazy: read from the host as it's used, never
+    /// written there; changes, with fs_write, stay in the sandbox).
     /// Repeatable.
-    #[arg(long = "mount", value_name = "HOST:GUEST[:rw|ro|on-exit]")]
+    #[arg(long = "mount", value_name = "HOST:GUEST[:rw|ro|on-exit|lazy]")]
     mounts: Vec<String>,
     /// With `net`, only connect to hosts these rules allow (example.com,
     /// *.example.com, 1.2.3.4, 10.0.0.0/8, each optionally :port).
@@ -475,10 +477,12 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
             Some((rest, "rw")) => (rest, MountMode::ReadWrite),
             Some((rest, "ro")) => (rest, MountMode::ReadOnly),
             Some((rest, "on-exit")) => (rest, MountMode::OnExit),
+            Some((rest, "lazy")) => (rest, MountMode::Lazy),
             _ => (spec.as_str(), MountMode::ReadWrite),
         };
-        let (host, guest) =
-            rest.rsplit_once(':').with_context(|| format!("--mount {spec:?} must be HOST:GUEST[:rw|ro|on-exit]"))?;
+        let (host, guest) = rest
+            .rsplit_once(':')
+            .with_context(|| format!("--mount {spec:?} must be HOST:GUEST[:rw|ro|on-exit|lazy]"))?;
         b = b.mount_with(host, guest, mode)?;
         mounted.extend(Path::new(host).canonicalize().ok());
     }

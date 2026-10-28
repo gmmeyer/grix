@@ -23,6 +23,10 @@ pub(crate) struct LiveMount {
     pub host: PathBuf,
     pub guest: String,
     pub writable: bool,
+    /// A lazy import: read-only here, and each file's bytes must stay what
+    /// they were when the guest first saw it (size and modification time),
+    /// or reading it fails with EIO rather than mixing old and new.
+    pub lazy: bool,
 }
 
 // Linux errnos, as the guest wants them.
@@ -38,6 +42,8 @@ const ESTALE: u16 = 116;
 
 /// Ids the host keeps track of (everything listed or created).
 const MAX_IDS: usize = 1_000_000;
+/// Directory entries of lazy imports kept as first listed.
+const MAX_FROZEN: usize = 4_000_000;
 /// Files kept open between requests.
 const OPEN_FILES: usize = 32;
 /// Files the guest removed while it may still have them open.
@@ -186,6 +192,31 @@ fn read_dir(dir: RawFd) -> io::Result<Vec<CString>> {
     Ok(names)
 }
 
+/// A directory's entries the guest can see, sorted: (name, attributes,
+/// link target).
+fn read_entries(d: RawFd) -> Result<Vec<(String, Attr, String)>, u16> {
+    let mut entries = Vec::new();
+    for name in read_dir(d).map_err(err)? {
+        // Names the guest can't hold, and things it can't see, are left out.
+        let Ok(s) = name.to_str() else { continue };
+        if s.len() > 255 {
+            continue;
+        }
+        let Ok(st) = stat_at(d, &name) else { continue };
+        let Some(attr) = attr_of(&st) else { continue };
+        let target = match attr.ty {
+            FileType::Symlink => match readlink_at(d, &name).map(String::from_utf8) {
+                Ok(Ok(t)) if !t.is_empty() => t,
+                _ => continue,
+            },
+            _ => String::new(),
+        };
+        entries.push((s.to_string(), attr, target));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
 struct Node {
     parent: u64,
     name: String,
@@ -202,6 +233,13 @@ pub(crate) struct Server {
     /// Each mount's directory, and whether it's writable. Mount i's root
     /// has id i + 1.
     roots: Vec<(OwnedFd, bool)>,
+    /// Which mounts are lazy imports, and what the guest first saw of
+    /// them: each node's attributes, and each directory's entries (up to
+    /// `MAX_FROZEN` in all, beyond which directories are read as they are).
+    lazy: Vec<bool>,
+    attrs: HashMap<u64, Attr>,
+    frozen: HashMap<u64, Vec<(String, Attr, String)>>,
+    frozen_entries: usize,
     nodes: HashMap<u64, Node>,
     by_name: HashMap<(u64, String), u64>,
     next_id: u64,
@@ -222,11 +260,15 @@ impl Server {
             let path = CString::new(m.host.as_os_str().as_encoded_bytes())?;
             let fd = openat(libc::AT_FDCWD, &path, libc::O_RDONLY | libc::O_DIRECTORY, 0)
                 .with_context(|| format!("mounting {}", m.host.display()))?;
-            roots.push((fd, m.writable));
+            roots.push((fd, m.writable && !m.lazy));
         }
         Ok(Server {
             next_id: roots.len() as u64 + 1,
             roots,
+            lazy: mounts.iter().map(|m| m.lazy).collect(),
+            attrs: HashMap::new(),
+            frozen: HashMap::new(),
+            frozen_entries: 0,
             nodes: HashMap::new(),
             by_name: HashMap::new(),
             files: Vec::new(),
@@ -276,9 +318,13 @@ impl Server {
         let ok = |r: Reply| Ok(r.encode(0));
         match req {
             Request::List { dir, after } => self.list(dir, after),
-            Request::Stat { id } => ok(Reply::Attr(self.stat(id)?)),
+            Request::Stat { id } => {
+                let attr = self.stat(id)?;
+                ok(Reply::Attr(self.saw(id, &attr)))
+            }
             Request::Read { id, off, len } => {
                 let fd = self.file(id, false)?;
+                self.unchanged(id, fd)?;
                 let mut buf = vec![0u8; (len as usize).min(IO_MAX)];
                 let mut done = 0;
                 while done < buf.len() {
@@ -361,6 +407,7 @@ impl Server {
                 }
                 let attr = stat_at(d.as_raw_fd(), &c).map_err(err).and_then(|st| attr_of(&st).ok_or(EIO))?;
                 let id = self.id(dir, name)?;
+                self.saw(id, &attr);
                 ok(Reply::Created { id, attr })
             }
             Request::Remove { dir, name, is_dir } => {
@@ -424,6 +471,24 @@ impl Server {
                     check(unsafe { libc::fsync(fd) }).map_err(err)?;
                 }
                 ok(Reply::Done)
+            }
+            // A lazy import's: from its directory as first listed.
+            Request::Lookup { dir, name } if self.is_lazy(dir) => {
+                cname(name)?;
+                let find = |entries: &[(String, Attr, String)]| {
+                    let i = entries.binary_search_by(|e| e.0.as_str().cmp(name)).map_err(|_| 2u16)?;
+                    Ok::<_, u16>((entries[i].1, entries[i].2.clone()))
+                };
+                let (attr, target) = match self.frozen.get(&dir) {
+                    Some(entries) => find(entries)?,
+                    None => {
+                        let d = self.dir(dir)?;
+                        find(&self.entries(dir, d.as_raw_fd())?)?
+                    }
+                };
+                let id = self.id(dir, name)?;
+                let attr = self.saw(id, &attr);
+                ok(Reply::Found { id, attr, target: &target })
             }
             Request::Lookup { dir, name } => {
                 let c = cname(name)?;
@@ -577,6 +642,43 @@ impl Server {
         Ok(self.files.last().unwrap().2.as_raw_fd())
     }
 
+    fn is_lazy(&self, id: u64) -> bool {
+        self.mount_of(id).is_ok_and(|m| self.lazy[m])
+    }
+
+    /// A lazy import's node, as the guest first saw it: what it's told of
+    /// it from now on.
+    fn saw(&mut self, id: u64, attr: &Attr) -> Attr {
+        if !self.is_lazy(id) {
+            return *attr;
+        }
+        *self.attrs.entry(id).or_insert(*attr)
+    }
+
+    /// A lazy import's file must still be what the guest first saw.
+    fn unchanged(&mut self, id: u64, fd: RawFd) -> Result<(), u16> {
+        if !self.is_lazy(id) {
+            return Ok(());
+        }
+        let now = stat_fd(fd).map_err(err).and_then(|st| attr_of(&st).ok_or(EIO))?;
+        let first = self.saw(id, &now);
+        if (first.size, first.mtime_ns) == (now.size, now.mtime_ns) { Ok(()) } else { Err(EIO) }
+    }
+
+    /// The entries of directory `dir`, sorted: as first listed, for a lazy
+    /// import's (while there's room to keep them).
+    fn entries(&mut self, dir: u64, d: RawFd) -> Result<Vec<(String, Attr, String)>, u16> {
+        if let Some(e) = self.frozen.get(&dir) {
+            return Ok(e.clone());
+        }
+        let entries = read_entries(d)?;
+        if self.is_lazy(dir) && self.frozen_entries + entries.len() <= MAX_FROZEN {
+            self.frozen_entries += entries.len();
+            self.frozen.insert(dir, entries.clone());
+        }
+        Ok(entries)
+    }
+
     /// The id of `name` in `dir`, given out now if it has none.
     fn id(&mut self, dir: u64, name: &str) -> Result<u64, u16> {
         if let Some(&id) = self.by_name.get(&(dir, name.to_string())) {
@@ -605,27 +707,10 @@ impl Server {
     fn list(&mut self, dir: u64, after: &str) -> Result<Vec<u8>, u16> {
         let d = self.dir(dir)?;
         let dir_attr = stat_fd(d.as_raw_fd()).map_err(err).and_then(|st| attr_of(&st).ok_or(EIO))?;
+        let dir_attr = self.saw(dir, &dir_attr);
         // A new listing starts at "": read the directory then.
         if after.is_empty() || self.listing.as_ref().is_none_or(|l| l.dir != dir) {
-            let mut entries = Vec::new();
-            for name in read_dir(d.as_raw_fd()).map_err(err)? {
-                // Names the guest can't hold, and things it can't see, are left out.
-                let Ok(s) = name.to_str() else { continue };
-                if s.len() > 255 {
-                    continue;
-                }
-                let Ok(st) = stat_at(d.as_raw_fd(), &name) else { continue };
-                let Some(attr) = attr_of(&st) else { continue };
-                let target = match attr.ty {
-                    FileType::Symlink => match readlink_at(d.as_raw_fd(), &name).map(String::from_utf8) {
-                        Ok(Ok(t)) if !t.is_empty() => t,
-                        _ => continue,
-                    },
-                    _ => String::new(),
-                };
-                entries.push((s.to_string(), attr, target));
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let entries = self.entries(dir, d.as_raw_fd())?;
             self.listing = Some(Listing { dir, entries });
         }
         let listing = self.listing.take().unwrap();
@@ -641,13 +726,17 @@ impl Server {
             end += 1;
         }
         let mut ids = Vec::with_capacity(end - start);
-        for (name, ..) in &listing.entries[start..end] {
-            ids.push(self.id(dir, name)?);
+        let mut attrs = Vec::with_capacity(end - start);
+        for (name, attr, _) in &listing.entries[start..end] {
+            let id = self.id(dir, name)?;
+            attrs.push(self.saw(id, attr));
+            ids.push(id);
         }
         let entries = listing.entries[start..end]
             .iter()
             .zip(ids)
-            .map(|((name, attr, target), id)| ListEntry { name, id, attr: *attr, target })
+            .zip(attrs)
+            .map(|(((name, _, target), id), attr)| ListEntry { name, id, attr, target })
             .collect();
         let more = end < listing.entries.len();
         let bytes = Reply::Listed { dir: dir_attr, entries, more }.encode(0);
@@ -712,7 +801,8 @@ mod tests {
         std::fs::write(root.join("m/a.txt"), "hello").unwrap();
         std::fs::write(root.join("secret"), "no").unwrap();
         std::os::unix::fs::symlink(root.join("secret"), root.join("m/out")).unwrap();
-        let m = LiveMount { host: root.join("m").canonicalize().unwrap(), guest: "/m".into(), writable: true };
+        let m =
+            LiveMount { host: root.join("m").canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
         let mut s = Server::new(&[m]).unwrap();
 
         let r = req(&mut s, Request::List { dir: 1, after: "" });
@@ -760,10 +850,48 @@ mod tests {
         assert!(!root.join("m/renamed").exists());
 
         // A read-only mount refuses changes.
-        let ro = LiveMount { host: root.join("m").canonicalize().unwrap(), guest: "/m".into(), writable: false };
+        let ro = LiveMount {
+            host: root.join("m").canonicalize().unwrap(),
+            guest: "/m".into(),
+            writable: false,
+            lazy: false,
+        };
         let mut s = Server::new(&[ro]).unwrap();
         let r = req(&mut s, Request::Create { dir: 1, name: "x", ty: FileType::Dir, mode: 0o755, target: "" });
         assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EROFS));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lazy_imports_stay_as_first_seen() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), "first").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: false, lazy: true };
+        let mut s = Server::new(&[m]).unwrap();
+        let names = |s: &mut Server| match Reply::decode(&req(s, Request::List { dir: 1, after: "" })).unwrap().1 {
+            Reply::Listed { entries, .. } => {
+                entries.iter().map(|e| (e.name.to_string(), e.id, e.attr.size)).collect::<Vec<_>>()
+            }
+            r => panic!("{r:?}"),
+        };
+        let first = names(&mut s);
+        assert_eq!(first.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), ["a"]);
+        let a = first[0].1;
+        // Never written there.
+        let r = req(&mut s, Request::Write { id: a, off: 0, append: false, data: b"x" });
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EROFS));
+        // Changes on the host don't show; a changed file reads as EIO.
+        std::fs::write(root.join("b"), "new").unwrap();
+        std::fs::write(root.join("a"), "changed!").unwrap();
+        assert_eq!(names(&mut s), first);
+        let r = req(&mut s, Request::Lookup { dir: 1, name: "b" });
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(2));
+        let r = req(&mut s, Request::Stat { id: a });
+        assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(attr) if attr.size == 5));
+        let r = req(&mut s, Request::Read { id: a, off: 0, len: 100 });
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EIO));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -233,9 +233,10 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                         "description": "Files to create, with these contents."},
                     "mounts": {"type": "array", "items": {"type": "object", "properties": {
                         "host": {"type": "string"}, "guest": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["rw", "ro", "on_exit"]}}, "required": ["host", "guest"]},
+                        "mode": {"type": "string", "enum": ["rw", "ro", "on_exit", "lazy"]}}, "required": ["host", "guest"]},
                         "description": "Host directories to mount (rw: changes reach the host at once; on_exit: when the program ends; \
-                                        both only if the server is writable)."},
+                                        both only if the server is writable; lazy: imported without copying, read as used, changes \
+                                        stay in the sandbox)."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                     "cwd": {"type": "string"},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
@@ -385,9 +386,12 @@ fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
             "rw" => MountMode::ReadWrite,
             "ro" => MountMode::ReadOnly,
             "on_exit" => MountMode::OnExit,
+            "lazy" => MountMode::Lazy,
             other => bail!("mount mode {other:?} isn't rw, ro or on_exit"),
         };
-        if mode != MountMode::ReadOnly && !(config.writable && config.capabilities.contains(&Capability::FsWrite)) {
+        if !matches!(mode, MountMode::ReadOnly | MountMode::Lazy)
+            && !(config.writable && config.capabilities.contains(&Capability::FsWrite))
+        {
             bail!("this server doesn't allow writable mounts (only \"ro\")");
         }
         b = b.mount_with(host, m["guest"].as_str().context("mount without guest")?, mode)?;

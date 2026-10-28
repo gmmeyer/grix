@@ -295,6 +295,10 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         if !fs::lock().permits(ino, p.uid, p.gid, want) {
             return Err(EACCES);
         }
+        // A lazy import's file is the sandbox's before it changes.
+        if writes {
+            fs::lock().copy_up(ino)?;
+        }
         // A live mount's file may have grown on the host since.
         let remote = c.lock().remote_id().is_some();
         if flags & O_TRUNC != 0 && (remote || c.lock().len() != 0) {
@@ -1262,10 +1266,13 @@ pub fn truncate(p: &mut Process, pathp: u64, len: u64) -> SysResult {
     if fs.is_dir(ino) {
         return Err(EISDIR);
     }
-    let c = fs.content(ino).ok_or(EINVAL)?;
     if !fs.permits(ino, p.uid, p.gid, MAY_WRITE) {
         return Err(EACCES);
     }
+    drop(fs);
+    let mut fs = fs::lock();
+    fs.copy_up(ino)?;
+    let c = fs.content(ino).ok_or(EINVAL)?;
     drop(fs);
     set_len(p, nr::truncate, &c, ino, len)
 }
@@ -1340,9 +1347,13 @@ fn set_owner(p: &mut Process, ino: Ino, uid: u64, gid: u64) -> SysResult {
     if n.system || (p.uid != 0 && (n.uid != p.uid || new_uid != n.uid || (new_gid != n.gid && new_gid != p.gid))) {
         return Err(EPERM);
     }
-    // A live mount's files belong to whoever owns them on the host; the
-    // guest only shows them as the sandbox user's. Only "changes" that
-    // change nothing work.
+    // A lazy import's node becomes the sandbox's. A live mount's files
+    // belong to whoever owns them on the host; the guest only shows them as
+    // the sandbox user's. Only "changes" that change nothing work.
+    if (new_uid, new_gid) != (n.uid, n.gid) {
+        fs.copy_up(ino)?;
+    }
+    let n = fs.node(ino);
     if fs.remote_id(ino).is_some() {
         if fs.read_only(ino) {
             return Err(EROFS);

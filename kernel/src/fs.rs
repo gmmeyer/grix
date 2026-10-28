@@ -130,6 +130,10 @@ pub struct FileData {
     /// A live mount's file the program removed (or replaced) while it had
     /// it: the host keeps it open until this goes.
     pub unlinked: bool,
+    /// A lazy import's file copied up: the sandbox's now, its bytes still
+    /// read from the host until the first write or truncate brings them in
+    /// (`make_local`).
+    cow: bool,
 }
 
 pub const F_SEAL_SEAL: u32 = 1;
@@ -159,6 +163,7 @@ impl FileData {
             seals: None,
             remote: None,
             unlinked: false,
+            cow: false,
         }))
     }
 
@@ -175,11 +180,19 @@ impl FileData {
             seals: None,
             remote: Some(id),
             unlinked: false,
+            cow: false,
         }))
     }
 
+    /// The host's id for a live mount's file (not a copied-up one's: that
+    /// is the sandbox's, though its bytes may still be read from there).
     pub fn remote_id(&self) -> Option<u64> {
-        self.remote
+        self.remote.filter(|_| !self.cow)
+    }
+
+    /// A lazy import's file is copied up: the sandbox's from now on.
+    pub fn adopt(&mut self) {
+        self.cow = self.remote.is_some();
     }
 
     pub fn len(&self) -> u64 {
@@ -311,8 +324,11 @@ impl FileData {
     /// file there's none (SIGBUS); a live mount's file has no frames.
     pub fn shared_frame(&mut self, idx: u64, write: bool) -> Result<Option<u64>, crate::mm::aspace::FaultError> {
         use crate::mm::aspace::FaultError;
-        if self.remote.is_some() || idx.saturating_mul(PAGE_SIZE) >= self.len {
+        if (self.remote.is_some() && !self.cow) || idx.saturating_mul(PAGE_SIZE) >= self.len {
             return Err(FaultError::PastEnd);
+        }
+        if write && self.cow {
+            self.make_local(u64::MAX).map_err(|_| FaultError::Io)?;
         }
         match self.pages.get(&idx) {
             Some(&pa) => Ok(Some(pa)),
@@ -347,7 +363,10 @@ impl FileData {
     /// been written; the error carries how much.
     pub fn write(&mut self, off: u64, data: &[u8]) -> Result<usize, (usize, Errno)> {
         if self.remote.is_some() {
-            return self.write_remote(off, false, data).map(|(n, _)| n);
+            if !self.cow {
+                return self.write_remote(off, false, data).map(|(n, _)| n);
+            }
+            self.make_local(u64::MAX).map_err(|e| (0, e))?;
         }
         let mut done = 0;
         while done < data.len() {
@@ -391,9 +410,48 @@ impl FileData {
         Ok((done, start))
     }
 
+    /// A lazy import's file becomes the sandbox's: its bytes read in from
+    /// the host (the first `keep` of them). On failure it stays as it was.
+    pub fn make_local(&mut self, keep: u64) -> Result<(), Errno> {
+        let Some(id) = self.remote else { return Ok(()) };
+        let (old_len, len) = (self.len, self.len.min(keep));
+        self.remote = None;
+        self.cow = false;
+        self.base = &[];
+        let mut buf = alloc::vec![0u8; grix_abi::hostfs::IO_MAX];
+        let mut off = 0;
+        let result = loop {
+            if off >= len {
+                break Ok(());
+            }
+            let want = ((len - off) as usize).min(buf.len());
+            match hostfs::read(id, off, &mut buf[..want]) {
+                Ok(0) => break Ok(()),
+                Ok(n) => match self.write(off, &buf[..n]) {
+                    Ok(_) => off += n as u64,
+                    Err((_, e)) => break Err(e),
+                },
+                Err(e) => break Err(e),
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.len = off;
+                Ok(())
+            }
+            Err(e) => {
+                for (_, pa) in core::mem::take(&mut self.pages) {
+                    free_page(pa);
+                }
+                (self.remote, self.len, self.cow) = (Some(id), old_len, true);
+                Err(e)
+            }
+        }
+    }
+
     /// The size the host says a live mount's file has.
     pub fn set_size(&mut self, size: u64) {
-        if self.remote.is_some() {
+        if self.remote.is_some() && !self.cow {
             self.len = size;
         }
     }
@@ -406,9 +464,13 @@ impl FileData {
         let keep = len.div_ceil(PAGE_SIZE);
         let _ = self.copied.split_off(&keep);
         if let Some(id) = self.remote {
-            hostfs::set_len(id, len)?;
-            self.len = len;
-            return Ok(());
+            if !self.cow {
+                hostfs::set_len(id, len)?;
+                self.len = len;
+                return Ok(());
+            }
+            // Only what stays is read in.
+            self.make_local(len)?;
         }
         if len < self.len {
             let keep = len.div_ceil(PAGE_SIZE);
@@ -525,6 +587,9 @@ pub struct Node {
     pub remote: Option<Box<Remote>>,
     /// Made by the kernel at boot, not imported (`/etc/passwd`, `/tmp`, ...).
     pub generated: bool,
+    /// A lazy import's node copied into the sandbox: the inode number it
+    /// had as the host's (so it doesn't change).
+    pub host_ino: u64,
     /// Realtime nanoseconds.
     pub atime: u64,
     pub mtime: u64,
@@ -549,6 +614,7 @@ impl Node {
             mount_point: false,
             remote: None,
             generated: false,
+            host_ino: 0,
             atime: time,
             mtime: time,
             ctime: time,
@@ -655,6 +721,8 @@ pub struct Fs {
     /// a file (after the kernel forgot it) shares what open descriptors and
     /// mappings still hold.
     remote_files: BTreeMap<u64, Weak<Mutex<FileData>>>,
+    /// Which live mounts are lazy imports (`LiveMount::lazy`).
+    lazy: Vec<bool>,
 }
 
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
@@ -746,6 +814,7 @@ impl Fs {
             pts_nodes: BTreeMap::new(),
             page: None,
             remote_files: BTreeMap::new(),
+            lazy: Vec::new(),
         };
         for e in entries {
             let path = e.path.trim_end_matches('/');
@@ -817,7 +886,8 @@ impl Fs {
             let ino = fs.mkdir_owned(m.path, (uid, gid));
             let n = &mut fs.nodes[ino];
             n.mount_point = true;
-            n.remote = Some(Remote::new(i as u64 + 1, i, m.writable, 0));
+            n.remote = Some(Remote::new(i as u64 + 1, i, m.writable && !m.lazy, 0));
+            fs.lazy.push(m.lazy);
         }
         // Describe the sandbox user unless the host imported its own files.
         if !mounted("/etc/passwd") && fs.lookup(ROOT, "/etc/passwd", false).is_err() {
@@ -1181,7 +1251,12 @@ impl Fs {
     /// node has the host's id, which stays the same while the kernel
     /// forgets and finds it again.
     pub fn ino_number(&self, ino: Ino) -> u64 {
-        self.nodes[ino].remote.as_ref().map_or(ino as u64 + 1, |r| REMOTE_INO + r.id)
+        let n = &self.nodes[ino];
+        match &n.remote {
+            Some(r) => REMOTE_INO + r.id,
+            None if n.host_ino != 0 => n.host_ino,
+            None => ino as u64 + 1,
+        }
     }
 
     /// The host id of a live mount's node.
@@ -1259,7 +1334,7 @@ impl Fs {
         // nor in /dev/pts, whose entries come and go with pseudo-terminals.
         let gap = |fs: &Fs, ino: Ino| {
             let n = &fs.nodes[ino];
-            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none() && ino != fs.pts_dir
+            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none() && n.host_ino == 0 && ino != fs.pts_dir
         };
         let mut p = path.trim_end_matches('/');
         loop {
@@ -1313,6 +1388,15 @@ impl Fs {
     pub fn create(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
         if self.nodes[dir].nlink == 0 {
             return Err(ENOENT); // the directory was removed
+        }
+        // A lazy import's directory: what would fail fails before anything
+        // is copied up.
+        if self.is_lazy(dir) {
+            if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
+                return Err(EEXIST);
+            }
+            self.may_change(dir, None, uid, gid)?;
+            self.copy_up(dir)?;
         }
         if self.nodes[dir].remote.is_some() {
             return self.create_remote(dir, name, kind, perm, uid, gid);
@@ -1390,7 +1474,25 @@ impl Fs {
 
     /// unlink / rmdir `name` in `dir`.
     pub fn remove(&mut self, dir: Ino, name: &str, rmdir: bool, uid: u32, gid: u32) -> Result<(), Errno> {
+        if self.is_lazy(dir) {
+            let ino = self.find_child(dir, name)?.ok_or(ENOENT)?;
+            match (self.is_dir(ino), rmdir) {
+                (true, false) => return Err(EISDIR),
+                (false, true) => return Err(ENOTDIR),
+                _ => {}
+            }
+            self.may_change(dir, Some(ino), uid, gid)?;
+            if rmdir && self.is_lazy(ino) && !self.lazy_dir_empty(ino)? {
+                return Err(ENOTEMPTY);
+            }
+            self.copy_up(dir)?;
+        }
         let ino = self.find_child(dir, name)?.ok_or(ENOENT)?;
+        // A lazy import's directory in a directory already copied up: its
+        // entries may not all be known here.
+        if rmdir && self.is_lazy(ino) && !self.lazy_dir_empty(ino)? {
+            return Err(ENOTEMPTY);
+        }
         let remote = self.nodes[dir].remote.as_ref().map(|r| (r.id, r.writable));
         match (&self.nodes[ino].kind, rmdir) {
             // The host knows whether a live mount's directory is empty.
@@ -1422,6 +1524,14 @@ impl Fs {
     pub fn link(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
         if self.is_dir(ino) {
             return Err(EPERM);
+        }
+        if self.is_lazy(dir) || self.is_lazy(ino) {
+            if self.find_child(dir, name)?.is_some() {
+                return Err(EEXIST);
+            }
+            self.may_change(dir, None, uid, gid)?;
+            self.copy_up(dir)?;
+            self.copy_up(ino)?;
         }
         // Live mounts don't do hard links (EPERM, as on Linux for a
         // filesystem that can't), and nothing links across a mount.
@@ -1477,10 +1587,32 @@ impl Fs {
         uid: u32,
         gid: u32,
     ) -> Result<(), Errno> {
+        if self.is_lazy(odir) || self.is_lazy(ndir) {
+            let src = self.find_child(odir, oname)?.ok_or(ENOENT)?;
+            let _src = self.pin(src);
+            let dst = self.find_child(ndir, nname)?;
+            self.may_change(odir, Some(src), uid, gid)?;
+            self.may_change(ndir, dst, uid, gid)?;
+            // Replacing a lazy import's directory: only an empty one.
+            if let Some(d) = dst.filter(|&d| self.is_dir(d) && self.is_lazy(d))
+                && self.is_dir(src)
+                && !self.lazy_dir_empty(d)?
+            {
+                return Err(ENOTEMPTY);
+            }
+            self.copy_up(odir)?;
+            self.copy_up(ndir)?;
+        }
         let src = self.find_child(odir, oname)?.ok_or(ENOENT)?;
         // Finding the destination may make room by forgetting idle nodes.
         let _src = self.pin(src);
         let dst = self.find_child(ndir, nname)?;
+        if let Some(d) = dst.filter(|&d| self.is_dir(d) && self.is_lazy(d))
+            && self.is_dir(src)
+            && !self.lazy_dir_empty(d)?
+        {
+            return Err(ENOTEMPTY);
+        }
         if self.nodes[ndir].nlink == 0 {
             return Err(ENOENT);
         }
@@ -1599,7 +1731,9 @@ impl Fs {
     fn ensure(&mut self, dir: Ino) -> Result<(), Errno> {
         let n = &self.nodes[dir];
         let Some(r) = n.remote.as_deref() else { return Ok(()) };
-        let fresh = r.listed && crate::time::monotonic_ns().saturating_sub(r.listed_at) < hostfs::FRESH_NS;
+        // A lazy import's directory, once listed, stays as it was.
+        let fresh = r.listed
+            && (self.lazy[r.mount] || crate::time::monotonic_ns().saturating_sub(r.listed_at) < hostfs::FRESH_NS);
         if fresh || r.large || n.nlink == 0 || !matches!(n.kind, Kind::Dir(_)) {
             return Ok(());
         }
@@ -1613,7 +1747,9 @@ impl Fs {
         if self.is_dir(ino) {
             return self.ensure(ino);
         }
-        if crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS || self.nodes[ino].nlink == 0 {
+        let frozen = self.lazy[r.mount] && r.fetched != 0;
+        if frozen || crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS || self.nodes[ino].nlink == 0
+        {
             return Ok(());
         }
         let id = r.id;
@@ -1885,9 +2021,73 @@ impl Fs {
         let _ = self.refresh(ino);
     }
 
-    /// Is `ino` in a read-only live mount?
+    /// Is `ino` in a read-only live mount? (A lazy import's can be
+    /// written, once copied up.)
     pub fn read_only(&self, ino: Ino) -> bool {
-        self.nodes[ino].remote.as_ref().is_some_and(|r| !r.writable)
+        self.nodes[ino].remote.as_ref().is_some_and(|r| !r.writable && !self.lazy[r.mount])
+    }
+
+    /// Is `ino` still the host's, in a lazy import?
+    fn is_lazy(&self, ino: Ino) -> bool {
+        self.nodes[ino].remote.as_ref().is_some_and(|r| self.lazy[r.mount])
+    }
+
+    /// Before the program changes `ino` (or, for a directory, what's in
+    /// it): if it's still a lazy import's, make it the sandbox's own, and
+    /// every directory above it up to the mount. A file's bytes are read
+    /// in when it's first written (they count as written data; a truncate
+    /// reads only what stays), a directory's entries all listed (their
+    /// nodes stay the host's until changed). From then on the changes stay
+    /// in the sandbox, as for imports.
+    pub fn copy_up(&mut self, ino: Ino) -> Result<(), Errno> {
+        let mut chain = Vec::new();
+        let mut n = ino;
+        while self.is_lazy(n) {
+            chain.push(n);
+            if self.nodes[n].mount_point {
+                break;
+            }
+            n = self.nodes[n].parent;
+        }
+        for &n in chain.iter().rev() {
+            let _busy = self.pin(n);
+            let id = self.nodes[n].remote.as_ref().unwrap().id;
+            match &self.nodes[n].kind {
+                Kind::Dir(_) => {
+                    self.ensure(n)?;
+                    // Too many entries to hold them all.
+                    if self.nodes[n].remote.as_ref().is_some_and(|r| r.large || !r.listed) {
+                        return Err(ENOSPC);
+                    }
+                }
+                // Its bytes come in when it's written (or truncated).
+                Kind::File(c) => {
+                    c.lock().adopt();
+                    self.remote_files.remove(&id);
+                }
+                _ => {}
+            }
+            let node = &mut self.nodes[n];
+            node.remote = None;
+            node.host_ino = REMOTE_INO + id;
+            // What `new_remote` charged for the host's side (a mount's root
+            // never was).
+            if !node.mount_point {
+                release(REMOTE_COST);
+            }
+        }
+        Ok(())
+    }
+
+    /// Is a lazy import's directory empty (on the host, as first seen)?
+    fn lazy_dir_empty(&mut self, dir: Ino) -> Result<bool, Errno> {
+        self.ensure(dir)?;
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        if r.large || !r.listed {
+            let (_, entries, _) = hostfs::list(r.id, "")?;
+            return Ok(entries.is_empty());
+        }
+        Ok(matches!(&self.nodes[dir].kind, Kind::Dir(c) if c.is_empty()))
     }
 
     /// chmod and utimensat: the mode and times (None leaves one alone),
@@ -1899,6 +2099,10 @@ impl Fs {
         atime: Option<u64>,
         mtime: Option<u64>,
     ) -> Result<(), Errno> {
+        if mode.is_none() && atime.is_none() && mtime.is_none() {
+            return Ok(());
+        }
+        self.copy_up(ino)?;
         if let Some(r) = self.nodes[ino].remote.as_deref() {
             if !r.writable {
                 return Err(EROFS);
@@ -1932,8 +2136,9 @@ impl Fs {
         let Some(r) = self.nodes[dir].remote.as_deref().filter(|r| r.large) else { return Ok(child) };
         let (id, mount, writable) = (r.id, r.mount, r.writable);
         let now = crate::time::monotonic_ns();
+        let lazy = self.lazy[mount];
         if let Some(c) = child
-            && self.nodes[c].remote.as_ref().is_some_and(|r| now.saturating_sub(r.fetched) < hostfs::FRESH_NS)
+            && self.nodes[c].remote.as_ref().is_some_and(|r| lazy || now.saturating_sub(r.fetched) < hostfs::FRESH_NS)
         {
             return Ok(Some(c));
         }
@@ -1985,11 +2190,14 @@ impl Fs {
         let (mount, writable) = (r.mount, r.writable);
         for e in &entries {
             match self.child(dir, &e.name) {
+                // (A lazy import's nodes stay as first seen.)
                 Some(c)
                     if self.nodes[c].remote.as_ref().is_some_and(|r| r.id == e.id)
                         && self.file_type(c) == e.attr.ty =>
                 {
-                    self.apply_attr(c, &e.attr)
+                    if !self.lazy[mount] {
+                        self.apply_attr(c, &e.attr)
+                    }
                 }
                 Some(_) => {}
                 None => {

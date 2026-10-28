@@ -54,8 +54,14 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     files still map as copies (a writable shared mapping of one is
     unimplemented); locks are the sandbox's own (the host doesn't see
     them).
-12. **Big imports without copying them into RAM**: a lazily read,
-    read-only disk for large runtimes and datasets.
+12. [x] **Big imports without copying them into RAM**: lazy imports
+    (`import_lazy`, `--mount HOST:GUEST:lazy`), read from the host as
+    they're used, frozen as the program first saw them, with changes
+    copied into the sandbox. Python runs from lazy imports of its own
+    /lib and /usr and installs into them. Left: an image's root served
+    lazily (needs its layers unpacked on the host: item 15's cache);
+    reading is about 30 MB/s (one 64 KiB request at a time); copying up a
+    directory too large to hold fails with ENOSPC.
 13. **Networking**: UDP beyond DNS; AF_UNIX sockets bound to paths.
 14. **Smaller syscalls**: pidfd, CPU-time timers, a vDSO for fast
     `clock_gettime`, stack growth and guard pages, `/proc/<pid>` for every

@@ -410,6 +410,18 @@ Next, in TODO.md order:
   locks, at most `MAX_LOCKS` (ENOLCK). Four processes writing SQLite in
   WAL mode agree.
 
+- **Lazy imports** (round 2, item 12): a read-only live mount the guest
+  never refreshes and the host checks against what the guest first saw
+  (size and mtime; EIO otherwise; listings and lookups as first answered),
+  with copy-up: before anything in it changes, the node (and every
+  directory above it, up to the mount) is made the sandbox's own, a
+  directory listed in full, keeping its inode number; a file's bytes are
+  read in at its first write (a truncate reads only what stays, so
+  emptying a 1 GiB file reads nothing). A 400 MB file hashes in a 256 MB
+  guest (14 s); Python runs from lazy imports of its /lib and /usr and
+  writes its own site-packages without touching the host. ABI 6 (the
+  live mount's flags).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
@@ -418,9 +430,10 @@ Next, in TODO.md order:
   the PATH that `make` sees: `export PATH="$HOME/.cargo/bin:$PATH"`.
 - `make fixtures` now also needs Go (cross-compiles `fixtures/go/*`).
 - Tests that time things can fail under the full suite's load, mostly on
-  TCG: `timers` (an itimer's remaining time), `stdout_backpressure`, and
-  once `snapshots_resume_where_the_program_waited` (its third restore
-  didn't answer `read -t 2` in time). Rerun them alone before suspecting
+  TCG: `timers` (an itimer's remaining time), `stdout_backpressure`,
+  `serving_through_a_forwarded_port` and `signals_from_the_host` (TCG
+  under load), and once `snapshots_resume_where_the_program_waited` (its
+  third restore didn't answer `read -t 2` in time). Rerun them alone before suspecting
   a change.
 - `make test` builds the kernel and fixtures (it downloads the Alpine
   runtimes, cached in `~/.cache/grix/alpine`) and runs everything.

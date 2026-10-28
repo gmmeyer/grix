@@ -543,6 +543,33 @@ fn node_needs_threads() {
     assert_eq!(out.missing_capabilities(), ["threads"]);
 }
 
+/// Python from lazy imports of its /lib and /usr: nothing copied in at
+/// start, and with fs_write it installs a module into its own
+/// site-packages and writes bytecode caches, which stay in the sandbox.
+#[test]
+fn python_from_lazy_imports() {
+    let root = runtime("python");
+    let site = root.join("usr/lib/python3.12/site-packages");
+    let before: Vec<_> = std::fs::read_dir(&site).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let b = Sandbox::builder()
+        .timeout(Duration::from_secs(120))
+        .allow(Capability::Threads)
+        .allow(Capability::FsWrite)
+        .import_lazy(root.join("lib"), "/lib")
+        .unwrap()
+        .import_lazy(root.join("usr"), "/usr")
+        .unwrap();
+    let script = "import json, os, sys\n\
+                  site = '/usr/lib/python3.12/site-packages'\n\
+                  open(site + '/grixmod.py', 'w').write('def six(): return 6\\n')\n\
+                  import grixmod, importlib\n\
+                  print(grixmod.six() * 7, os.path.exists(site + '/__pycache__'))";
+    let out = run(b, &["/usr/bin/python3", "-c", script]);
+    assert_eq!(out.stdout_str(), "42 True\n");
+    let after: Vec<_> = std::fs::read_dir(&site).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(before, after, "the host's directory changed");
+}
+
 #[test]
 fn python_from_live_mounts() {
     // Nothing copied in: the interpreter, its loader, shared libraries

@@ -29,7 +29,8 @@
 //! [[mount]]                  # live and read-write
 //! host = "."                 # relative to this manifest
 //! guest = "/work"
-//! mode = "rw"                # or "ro", or "on_exit" (changes applied when it ends)
+//! mode = "rw"                # or "ro", "on_exit" (changes applied when it ends),
+//!                            # or "lazy" (imported without copying it in)
 //! ```
 
 use std::collections::BTreeMap;
@@ -186,6 +187,7 @@ impl Manifest {
                 None | Some("rw") => MountMode::ReadWrite,
                 Some("ro") => MountMode::ReadOnly,
                 Some("on_exit") => MountMode::OnExit,
+                Some("lazy") => MountMode::Lazy,
                 Some(other) => bail!("mount mode must be \"rw\", \"ro\" or \"on_exit\", not {other:?}"),
             };
             b = b.mount_with(&mount.host, &mount.guest, mode)?;

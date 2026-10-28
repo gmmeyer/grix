@@ -15,7 +15,7 @@ extern crate alloc;
 /// image, the wire format, `link` and `hostfs`. A grix image carries the
 /// kernel it was built with, and runs only with a host of the same
 /// version. Bump it with any change the other side couldn't read.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// The kernel says which ABI it speaks with these bytes in its binary
 /// (`MARK` then `ABI_VERSION`, little-endian), so a host can tell before

@@ -192,6 +192,18 @@ let sandbox = Sandbox::builder()
 let out = sandbox.run(&["/bin/busybox", "sed", "-i", "s/foo/bar/g", "/work/src/main.c"])?;
 ```
 
+`import_lazy` (`--mount HOST:GUEST:lazy`, a manifest's `mode = "lazy"`)
+is an import that isn't copied in: the guest reads the files from the
+host as the program uses them, so a runtime or dataset can be larger than
+`memory_mb` (a 400 MB file hashes in 256 MB). Otherwise it is an import:
+the host's directory never changes, and with `fs_write` whatever the
+program changes (a file it writes, a directory it adds to) becomes the
+sandbox's and stays there, as for imports: a file's bytes are read in when
+it's first written (a truncate reads only what stays). The program sees
+the directory as it found it, even after the guest forgets and asks
+again; a file changed on the host after it first saw it reads as EIO
+rather than a mixture. Exports skip what is still the host's.
+
 - **Confined.** The host serves each request by walking down from the
   mounted directory one checked name at a time, never following a link.
   A link the program makes (or finds) can't lead it out.

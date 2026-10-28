@@ -111,7 +111,17 @@ directory too big to hold is `Remote::large`: names are looked up one at a
 time and getdents pages through the host. Each request waits for the
 host's answer in `console::host_request`. The host walks every path down
 from the mount's root fd with `openat`/`O_NOFOLLOW`, so nothing the guest
-says can lead outside the mount.
+says can lead outside the mount. Lazy imports (`LiveMount::lazy`) are
+read-only live mounts that the guest never refreshes (`Fs::is_lazy`: once
+listed or fetched, a node stays as it was) and the host checks against
+what the guest first saw: listings, attributes and lookups come from the
+first answer (`Server::entries`, `saw`), and a file whose bytes changed
+reads as EIO (`unchanged`). Any change first makes the node the
+sandbox's (`Fs::copy_up`: a directory fully listed, and every directory
+above it up to the mount), after which it's an ordinary node keeping its
+inode number (`Node::host_ino`); a file's bytes stay the host's until
+the first write or truncate reads them in (`FileData::adopt`,
+`make_local`).
 
 Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
 process is in `PROCESS`; every other one, and zombies, are in

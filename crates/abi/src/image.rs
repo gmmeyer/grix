@@ -118,6 +118,10 @@ pub const SNAPSHOT_RETRY: u64 = 2;
 pub struct LiveMount<'a> {
     pub path: &'a str,
     pub writable: bool,
+    /// A lazy import: the host's files as the run found them, read as
+    /// they're used and never written there. With `fs_write`, what the
+    /// program changes is copied into the sandbox first, as for imports.
+    pub lazy: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +177,7 @@ impl<'a> Image<'a> {
         w.u32(self.live_mounts.len() as u32);
         for m in &self.live_mounts {
             w.str(m.path);
-            w.u8(m.writable as u8);
+            w.u8(m.writable as u8 | (m.lazy as u8) << 1);
         }
         w.u32(self.forwards.len() as u32);
         for port in &self.forwards {
@@ -233,8 +237,7 @@ impl<'a> Image<'a> {
         if n > r.remaining() / 9 {
             return Err(DecodeError);
         }
-        let live_mounts =
-            (0..n).map(|_| Ok(LiveMount { path: r.str()?, writable: r.u8()? != 0 })).collect::<Result<_, _>>()?;
+        let live_mounts = (0..n).map(|_| live_mount(&mut r)).collect::<Result<_, _>>()?;
         let n = r.u32()? as usize;
         if n > r.remaining() / 4 {
             return Err(DecodeError);
@@ -276,6 +279,12 @@ impl<'a> Image<'a> {
     }
 }
 
+fn live_mount<'a>(r: &mut Reader<'a>) -> Result<LiveMount<'a>, DecodeError> {
+    let path = r.str()?;
+    let flags = r.u8()?;
+    Ok(LiveMount { path, writable: flags & 1 != 0, lazy: flags & 2 != 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +313,10 @@ mod tests {
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,
             mounts: vec!["/work"],
-            live_mounts: vec![LiveMount { path: "/src", writable: false }],
+            live_mounts: vec![
+                LiveMount { path: "/src", writable: false, lazy: false },
+                LiveMount { path: "/big", writable: false, lazy: true },
+            ],
             forwards: vec![8000, 80],
             snapshot: true,
             cpus: 4,

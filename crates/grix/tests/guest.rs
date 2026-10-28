@@ -1458,6 +1458,70 @@ fn shared_file_mappings_and_locks() {
 }
 
 #[test]
+fn lazy_imports() {
+    // Read from the host as used; what the program changes is copied into
+    // the sandbox first and stays there; the host's directory never changes.
+    let host = temp_dir("lazy");
+    std::fs::create_dir(host.join("sub")).unwrap();
+    std::fs::write(host.join("a.txt"), "hello\n").unwrap();
+    std::fs::write(host.join("sub/b.txt"), "bee\n").unwrap();
+    std::fs::create_dir(host.join("full")).unwrap();
+    std::fs::write(host.join("full/x"), "x").unwrap();
+    // Too big to copy in: emptying or truncating them reads none of it.
+    for name in ["huge", "huge2"] {
+        std::fs::File::create(host.join(name)).unwrap().set_len(1 << 30).unwrap();
+    }
+    let b = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .import_lazy(&host, "/data")
+        .unwrap();
+    let script = "b() { /bin/busybox \"$@\"; }; cd /data; i=$(b stat -c %i a.txt); b cat a.txt sub/b.txt; \
+                  echo more >> a.txt; echo new > sub/c.txt; b rm sub/b.txt; b mv a.txt sub/a2.txt; \
+                  b chmod 600 sub/a2.txt; b ls sub; b cat sub/a2.txt; [ \"$i\" = \"$(b stat -c %i sub/a2.txt)\" ] && echo same; \
+                  [ -e sub/nope ] || [ -e nope ] || echo absent; b rm -f nonexistent && b mkdir -p sub && echo fine; \
+                  b rmdir full 2>&1; echo hi > huge; b cat huge; b truncate -s 4 huge2; b wc -c < huge2";
+    let out = run(b.clone().allow(Capability::FsWrite), &["/bin/busybox", "sh", "-c", script]);
+    assert_eq!(
+        out.stdout_str(),
+        "hello\nbee\na2.txt\nc.txt\nhello\nmore\nsame\nabsent\nfine\nrmdir: 'full': Directory not empty\nhi\n4\n",
+        "{}",
+        out.stderr_str()
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert_eq!(std::fs::read_to_string(host.join("a.txt")).unwrap(), "hello\n");
+    assert_eq!(std::fs::read_to_string(host.join("sub/b.txt")).unwrap(), "bee\n");
+    assert!(!host.join("sub/c.txt").exists());
+    // Without fs_write, as for imports: denied.
+    let out = run(b.clone(), &["/bin/busybox", "sh", "-c", "echo x >> /data/a.txt"]);
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { capability, .. }] if capability == "fs_write"),
+        "{:?}",
+        out.events
+    );
+
+    // A file changed on the host after the program saw it reads as EIO,
+    // not as a mixture.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let path = host.join("a.txt");
+    let sb = b.build().unwrap();
+    let script = "/bin/busybox cat /data/a.txt; echo ready; read x; /bin/busybox cat /data/a.txt || echo failed";
+    let out = sb
+        .run_streaming_with_stdin(&["/bin/busybox", "sh", "-c", script], Typed(rx, Vec::new()), |_, data| {
+            if data.windows(5).any(|w| w == b"ready") {
+                std::fs::write(&path, "changed!\n").unwrap();
+                tx.send(b"go\n".to_vec()).unwrap();
+            }
+        })
+        .unwrap();
+    assert_eq!(out.stdout_str(), "hello\nready\nfailed\n", "{}", out.stderr_str());
+    assert!(out.stderr_str().contains("I/O error"), "{}", out.stderr_str());
+}
+
+#[test]
 fn shebang_scripts() {
     let b = Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")

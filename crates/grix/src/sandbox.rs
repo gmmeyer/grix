@@ -228,6 +228,8 @@ pub enum MountMode {
     ReadOnly,
     /// Changes applied when the program ends ([`SandboxBuilder::mount_on_exit`]).
     OnExit,
+    /// A lazy import ([`SandboxBuilder::import_lazy`]).
+    Lazy,
 }
 
 /// Configure a [`Sandbox`]: what the program can see and do.
@@ -481,6 +483,19 @@ impl SandboxBuilder {
         self.mount_with(host, guest, MountMode::OnExit)
     }
 
+    /// Import directory `host` at `guest` without copying it in: the guest
+    /// reads its files from the host as the program uses them, so its size
+    /// isn't bounded by `memory_mb` (large runtimes and datasets). It
+    /// behaves as an import otherwise: the host's directory never changes
+    /// (with [`Capability::FsWrite`], whatever the program changes is
+    /// copied into the sandbox first, and stays there), and what the
+    /// program sees is the directory as it found it. A file changed on the
+    /// host after the program first saw it reads as EIO rather than a
+    /// mixture. Exports skip what is still the host's.
+    pub fn import_lazy(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, MountMode::Lazy)
+    }
+
     /// Mount `host` at `guest` in `mode`.
     pub fn mount_with(mut self, host: impl AsRef<Path>, guest: &str, mode: MountMode) -> Result<Self> {
         let host = host.as_ref();
@@ -509,9 +524,14 @@ impl SandboxBuilder {
         }
         match mode {
             MountMode::OnExit => self.mounts.push(Mount { host: canonical, guest }),
-            _ => self.live.push(LiveMount { host: canonical, guest, writable: mode == MountMode::ReadWrite }),
+            _ => self.live.push(LiveMount {
+                host: canonical,
+                guest,
+                writable: mode == MountMode::ReadWrite,
+                lazy: mode == MountMode::Lazy,
+            }),
         }
-        if mode != MountMode::ReadOnly {
+        if matches!(mode, MountMode::ReadWrite | MountMode::OnExit) {
             self.policy.grant(Capability::FsWrite);
         }
         Ok(self)
@@ -843,7 +863,7 @@ impl Sandbox {
             live_mounts: cfg
                 .live
                 .iter()
-                .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable })
+                .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable, lazy: m.lazy })
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
             snapshot: take.is_some(),
