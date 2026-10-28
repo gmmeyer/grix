@@ -499,7 +499,7 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                                "description": "Run x86_64 Linux programs with this translator (a host file: an arm64 \
                                                qemu-x86_64 in user mode (needs threads); box64 untested)."},
                     "cpus": {"type": "integer", "minimum": 1,
-                             "description": "CPUs for the program's threads (default 1; a snapshot has 1)."}
+                             "description": "CPUs for the program's threads (default 1; a run from a snapshot has the snapshot's)."}
                 }
     })
 }
@@ -562,6 +562,9 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
                     snap.memory_mb(),
                     config.max_memory_mb
                 );
+            }
+            if snap.cpus() > config.max_cpus {
+                bail!("the snapshot has {} CPUs; the server allows at most {}", snap.cpus(), config.max_cpus);
             }
             let t = timeout(config, args, snap.default_timeout())?;
             snap.timeout(t).control(control).run_streaming(std::io::Cursor::new(stdin), |s, d| progress.output(s, d))?

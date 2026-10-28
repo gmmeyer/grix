@@ -19,8 +19,9 @@
 //!
 //! `grix-vmm --kernel FILE --image FILE --mem MIB [--cpus N] [--uart SOCKET] [--snapshot]`
 //! boots the kernel; with `--snapshot`, fd 3 is where to save the machine
-//! when the kernel asks (`snapshot.rs`). `grix-vmm --restore [--uart
-//! SOCKET]` runs the snapshot on fd 3 instead.
+//! when the kernel asks (`snapshot.rs`). `grix-vmm --restore [--cpus N]
+//! [--uart SOCKET]` runs the snapshot on fd 3 instead (of N vCPUs, as it
+//! says).
 
 #[cfg(supported)]
 mod console;
@@ -90,7 +91,7 @@ fn parse() -> Result<Args, String> {
             uart,
             snapshot: false,
             restore,
-            cpus: 1,
+            cpus,
         });
     }
     Ok(Args {
@@ -109,8 +110,8 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
-                "grix-vmm: {e}\nusage: grix-vmm --kernel FILE --image FILE --mem MIB [--uart SOCKET] [--snapshot]\n       \
-                 grix-vmm --restore [--uart SOCKET]   (the snapshot on fd 3)"
+                "grix-vmm: {e}\nusage: grix-vmm --kernel FILE --image FILE --mem MIB [--cpus N] [--uart SOCKET] [--snapshot]\n       \
+                 grix-vmm --restore [--cpus N] [--uart SOCKET]   (the snapshot on fd 3)"
             );
             return ExitCode::from(2);
         }

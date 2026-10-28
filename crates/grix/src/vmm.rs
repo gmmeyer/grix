@@ -243,7 +243,7 @@ pub(crate) fn run(
                     cmd.args(["--mem", &cfg.memory_mb.to_string(), "--cpus", &cfg.cpus.to_string()]);
                 }
                 None => {
-                    cmd.arg("--restore");
+                    cmd.args(["--restore", "--cpus", &cfg.cpus.to_string()]);
                 }
             }
             if matches!(cfg.snapshot, Some(SnapshotFile::Take(_))) {

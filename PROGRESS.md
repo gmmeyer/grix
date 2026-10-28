@@ -532,6 +532,22 @@ Next, in TODO.md order:
   fresh its view of them was (`Fs::forget_live`: monotonic time didn't
   count the time the snapshot sat there).
 
+- **Snapshots with more CPUs** (round 2, item 18): on `SNAPSHOT_CALL`
+  grix-vmm stops every other vCPU that's on. Each vCPU checks between
+  exits (`pause_point`, an atomic flag first) and saves its own registers,
+  since Hypervisor.framework lets only a vCPU's thread touch it; power
+  (off, starting, on) and the pause share one lock, so a snapshot sees
+  every vCPU CPU_ON started. Format version 2 holds each vCPU (or "never
+  started") and which one asked; only that one returns RESTORED. A
+  restore makes every vCPU, puts the GIC back, and only then starts the
+  console: input already waiting would otherwise raise an interrupt the
+  GIC state then cleared, and the run hung. The settings record the CPU
+  count, which each run uses.
+  Also fixed: a build of the source tree used the grix-vmm beside the
+  running program first, which for a debug grix is cargo's unsigned one
+  (Hypervisor.framework then says "denied"); it now uses what `make`
+  built there, and only an installation looks beside itself.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

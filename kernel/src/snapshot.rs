@@ -5,9 +5,10 @@
 //!
 //! What the host held for this run doesn't come along, so the snapshot
 //! waits while any of it is in use (connections and DNS lookups through the
-//! host), and is put off if input arrived while it was being taken. (The
-//! host refuses live mounts, and stdin hasn't been touched: nothing has been
-//! sent yet.)
+//! host), and is put off if input arrived while it was being taken. (Live
+//! mounts' host side is saved by the host, and what this kernel knew of
+//! them is fetched again; stdin hasn't been touched: nothing has been sent
+//! yet.) It's taken with every other CPU idle, and the VMM stops them all.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -159,7 +159,8 @@ pub use hvf_loop::run;
 
 #[cfg(target_os = "macos")]
 mod hvf_loop {
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::time::Duration;
 
     use grix_abi::machine::GICR_GRIX_VMM_END;
@@ -231,12 +232,29 @@ mod hvf_loop {
     const PSCI_INVALID_PARAMETERS: u64 = -2i64 as u64;
     const PSCI_ALREADY_ON: u64 = -4i64 as u64;
 
-    /// A secondary vCPU, off until PSCI CPU_ON gives it an entry point and
-    /// its x0.
-    #[derive(Default)]
-    struct Start {
-        go: Mutex<Option<(u64, u64)>>,
-        started: Condvar,
+    /// A vCPU's power: a secondary is off until PSCI CPU_ON gives it an
+    /// entry point and its x0, or a restored run its saved registers.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Power {
+        Off,
+        Start(u64, u64),
+        Restore,
+        On,
+    }
+
+    /// The vCPUs' power, and a snapshot being taken, under one lock: a
+    /// snapshot waits for every vCPU that's on to stop, and only one that's
+    /// on can turn another on.
+    struct Cpus {
+        power: Vec<Power>,
+        pause: Option<Pause>,
+        pauses: u64,
+    }
+
+    /// A snapshot being taken: each vCPU's registers once it has stopped.
+    struct Pause {
+        id: u64,
+        saved: Vec<Option<Vec<u8>>>,
     }
 
     /// What every vCPU's thread shares.
@@ -244,23 +262,40 @@ mod hvf_loop {
         m: Machine,
         console: Arc<Console>,
         wakes: Vec<Arc<Wake>>,
-        starts: Vec<Start>,
+        cpus: Mutex<Cpus>,
+        cpus_changed: Condvar,
+        /// A pause is wanted or on: each vCPU looks between exits.
+        pausing: AtomicBool,
         snapshot: bool,
+        /// A restored run's state, which each vCPU's thread puts back.
+        restored: Option<snapshot::State>,
+    }
+
+    impl Shared {
+        fn cpus(&self) -> MutexGuard<'_, Cpus> {
+            self.cpus.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn wait<'a>(&self, g: MutexGuard<'a, Cpus>) -> MutexGuard<'a, Cpus> {
+            self.cpus_changed.wait(g).unwrap_or_else(|e| e.into_inner())
+        }
     }
 
     pub fn run(args: &Args) -> Result<(), String> {
         hvf::check_version()?;
-        if args.cpus > 1 && (args.snapshot || args.restore) {
-            return Err("snapshots are of one vCPU".into());
-        }
         let saved = if args.restore { Some(snapshot::open()?) } else { None };
-        let (m, saved) = match saved {
+        let (m, restored) = match saved {
             Some(s) => {
                 let (mem, rest) = s.split();
                 (Machine::with_memory(args, mem)?, Some(rest))
             }
             None => (Machine::new(args)?, None),
         };
+        if let Some(s) = &restored
+            && s.cpus() != args.cpus as usize
+        {
+            return Err(format!("the snapshot is of {} vCPUs, not {}", s.cpus(), args.cpus));
+        }
         // The framework reserves redistributor room for every vCPU the
         // machine could have; it must stay clear of the devices and RAM.
         let room = hvf::redistributor_region_size().map_err(|e| e.to_string())?;
@@ -279,35 +314,26 @@ mod hvf_loop {
         cpu.set_sys_reg(hvf::SYS_MPIDR_EL1, 1 << 31).map_err(|e| e.to_string())?;
         cpu.set_reg(hvf::REG_PC, m.entry);
         cpu.set_reg(hvf::REG_CPSR, 0x3c5); // EL1h, interrupts masked
+        if let Some(s) = &restored {
+            cpu.set_vtimer_offset(s.vtimer_offset()).map_err(|e| e.to_string())?;
+        }
         *wakes[0].vcpu.lock().unwrap() = Some(cpu.id);
-        let w = wakes[0].clone();
-        let line: Line = Box::new(move |level| {
-            hvf::set_spi(CONSOLE_IRQ, level);
-            if level {
-                w.notify();
-            }
-        });
-        let console = match &saved {
-            Some(s) => Console::restore(m.mem.clone(), line, &s.restore(&mut cpu)?)?,
-            None => Console::start(m.mem.clone(), line),
-        };
-        let shared = Arc::new(Shared {
-            m,
-            console,
-            wakes,
-            starts: (0..cpus).map(|_| Start::default()).collect(),
-            snapshot: args.snapshot,
-        });
         // Every vCPU exists before any runs (the GIC's topology is fixed
         // then), each made on the thread that runs it, all with one
         // counter.
         let offset = cpu.vtimer_offset();
+        let mut machine = Vec::new();
         // One after another, so the framework numbers them in order.
         for n in 1..cpus {
             let (made_tx, made_rx) = std::sync::mpsc::channel();
-            let shared = shared.clone();
+            let (shared_tx, shared_rx) = std::sync::mpsc::channel::<Arc<Shared>>();
             std::thread::spawn(move || {
-                let result = secondary(n, &shared, offset, made_tx);
+                let made = make_secondary(n, offset);
+                let _ = made_tx.send(made.as_ref().map(|_| ()).map_err(Clone::clone));
+                // Then the machine, once it's all made (if it is).
+                let Ok(cpu) = made else { return };
+                let Ok(shared) = shared_rx.recv() else { return };
+                let result = secondary(n, cpu, &shared);
                 // A vCPU's end is the machine's.
                 if let Err(e) = &result {
                     eprintln!("grix-vmm: vCPU {n}: {e}");
@@ -315,61 +341,154 @@ mod hvf_loop {
                 std::process::exit(if result.is_ok() { 0 } else { 1 });
             });
             made_rx.recv().map_err(|_| format!("vCPU {n} didn't start"))??;
+            machine.push(shared_tx);
         }
+        // A restored machine: the GIC once every vCPU exists, and before
+        // the console can raise its interrupt (input may be there at once);
+        // then each vCPU that was on, on its own thread.
+        if let Some(s) = &restored {
+            s.restore_gic()?;
+            s.restore_cpu(0, &mut cpu)?;
+        }
+        let w = wakes[0].clone();
+        let line: Line = Box::new(move |level| {
+            hvf::set_spi(CONSOLE_IRQ, level);
+            if level {
+                w.notify();
+            }
+        });
+        let console = match &restored {
+            Some(s) => Console::restore(m.mem.clone(), line, s.console())?,
+            None => Console::start(m.mem.clone(), line),
+        };
+        let power = (0..cpus)
+            .map(|n| match &restored {
+                _ if n == 0 => Power::On,
+                Some(s) if s.started(n) => Power::Restore,
+                _ => Power::Off,
+            })
+            .collect();
+        let shared = Arc::new(Shared {
+            m,
+            console,
+            wakes,
+            cpus: Mutex::new(Cpus { power, pause: None, pauses: 0 }),
+            cpus_changed: Condvar::new(),
+            pausing: AtomicBool::new(false),
+            snapshot: args.snapshot,
+            restored,
+        });
+        // Confined before any guest code runs: a restored machine's other
+        // vCPUs run as soon as they have it.
         hvf::confine()?;
+        for tx in machine {
+            let _ = tx.send(shared.clone());
+        }
         vcpu_loop(0, cpu, &shared)
     }
 
-    /// vCPU `n`: made now, run once CPU_ON says where.
-    fn secondary(
-        n: usize,
-        shared: &Shared,
-        offset: u64,
-        made: std::sync::mpsc::Sender<Result<(), String>>,
-    ) -> Result<(), String> {
-        let setup = || -> Result<Cpu, String> {
-            let mut cpu = Cpu::create().map_err(|e| e.to_string())?;
-            cpu.set_sys_reg(hvf::SYS_MPIDR_EL1, 1 << 31 | n as u64).map_err(|e| e.to_string())?;
-            cpu.set_vtimer_offset(offset).map_err(|e| e.to_string())?;
-            Ok(cpu)
-        };
-        let mut cpu = match setup() {
-            Ok(cpu) => {
-                let _ = made.send(Ok(()));
-                cpu
-            }
-            Err(e) => {
-                let _ = made.send(Err(e.clone()));
-                return Err(e);
-            }
-        };
-        drop(made);
-        let start = &shared.starts[n];
-        let mut go = start.go.lock().unwrap_or_else(|e| e.into_inner());
-        while go.is_none() {
-            go = start.started.wait(go).unwrap_or_else(|e| e.into_inner());
+    /// vCPU `n`, made on the thread that runs it.
+    fn make_secondary(n: usize, offset: u64) -> Result<Cpu, String> {
+        let mut cpu = Cpu::create().map_err(|e| e.to_string())?;
+        cpu.set_sys_reg(hvf::SYS_MPIDR_EL1, 1 << 31 | n as u64).map_err(|e| e.to_string())?;
+        cpu.set_vtimer_offset(offset).map_err(|e| e.to_string())?;
+        Ok(cpu)
+    }
+
+    /// Run vCPU `n` once CPU_ON says where (or it's restored).
+    fn secondary(n: usize, mut cpu: Cpu, shared: &Shared) -> Result<(), String> {
+        let mut c = shared.cpus();
+        while let Power::Off | Power::On = c.power[n] {
+            c = shared.wait(c);
         }
-        let (entry, context) = go.unwrap();
-        drop(go);
-        cpu.set_reg(hvf::REG_PC, entry);
-        cpu.set_reg(0, context);
-        cpu.set_reg(hvf::REG_CPSR, 0x3c5);
+        let power = std::mem::replace(&mut c.power[n], Power::On);
+        drop(c);
+        match power {
+            Power::Start(entry, context) => {
+                cpu.set_reg(hvf::REG_PC, entry);
+                cpu.set_reg(0, context);
+                cpu.set_reg(hvf::REG_CPSR, 0x3c5);
+            }
+            _ => shared.restored.as_ref().ok_or("no snapshot to restore")?.restore_cpu(n, &mut cpu)?,
+        }
         *shared.wakes[n].vcpu.lock().unwrap_or_else(|e| e.into_inner()) = Some(cpu.id);
         vcpu_loop(n, cpu, shared)
     }
 
     /// PSCI CPU_ON: start vCPU `target` at `entry` with x0 = `context`.
     fn cpu_on(shared: &Shared, target: u64, entry: u64, context: u64) -> u64 {
-        let Some(start) = shared.starts.get(target as usize).filter(|_| target != 0) else {
-            return if target == 0 { PSCI_ALREADY_ON } else { PSCI_INVALID_PARAMETERS };
-        };
-        let mut go = start.go.lock().unwrap_or_else(|e| e.into_inner());
-        if go.is_some() {
-            return PSCI_ALREADY_ON;
+        let mut c = shared.cpus();
+        match c.power.get_mut(target as usize) {
+            None => PSCI_INVALID_PARAMETERS,
+            Some(p) if *p == Power::Off => {
+                *p = Power::Start(entry, context);
+                shared.cpus_changed.notify_all();
+                0
+            }
+            Some(_) => PSCI_ALREADY_ON,
         }
-        *go = Some((entry, context));
-        start.started.notify_all();
-        0
+    }
+
+    /// A snapshot being taken stops this vCPU here, between exits, with its
+    /// registers saved, until it's taken (the process ends) or put off.
+    fn pause_point(n: usize, cpu: &Cpu, shared: &Shared) -> Result<(), String> {
+        if !shared.pausing.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut c = shared.cpus();
+        while let Some(p) = &mut c.pause {
+            if p.saved[n].is_none() {
+                p.saved[n] = Some(snapshot::cpu_state(cpu)?);
+                shared.cpus_changed.notify_all();
+            }
+            let id = p.id;
+            while c.pause.as_ref().is_some_and(|p| p.id == id) {
+                c = shared.wait(c);
+            }
+        }
+        Ok(())
+    }
+
+    /// `SNAPSHOT_CALL` from vCPU `n`: stop every other vCPU that's on, then
+    /// save the machine. True once it's saved (this run ends there); false
+    /// to put it off (input is on its way), every vCPU going on.
+    fn take_snapshot(n: usize, cpu: &Cpu, shared: &Shared) -> Result<bool, String> {
+        let mut c = shared.cpus();
+        // Another vCPU is taking one (the kernel's lock makes that its bug).
+        if c.pause.is_some() {
+            return Ok(false);
+        }
+        c.pauses += 1;
+        let mut saved = vec![None; c.power.len()];
+        saved[n] = Some(snapshot::cpu_state(cpu)?);
+        c.pause = Some(Pause { id: c.pauses, saved });
+        shared.pausing.store(true, Ordering::SeqCst);
+        drop(c);
+        for (m, w) in shared.wakes.iter().enumerate() {
+            if m != n {
+                w.notify();
+            }
+        }
+        let mut c = shared.cpus();
+        let stopped = |c: &Cpus| {
+            c.pause
+                .as_ref()
+                .is_some_and(|p| c.power.iter().zip(&p.saved).all(|(on, s)| *on == Power::Off || s.is_some()))
+        };
+        while !stopped(&c) {
+            c = shared.wait(c);
+        }
+        let counter = hvf::now().wrapping_sub(cpu.vtimer_offset());
+        let saved = &c.pause.as_ref().expect("a pause").saved;
+        match shared.console.save_with(|state| snapshot::save(n, saved, counter, &shared.m.mem, state)) {
+            Some(result) => result.map(|()| true),
+            None => {
+                c.pause = None;
+                shared.pausing.store(false, Ordering::SeqCst);
+                shared.cpus_changed.notify_all();
+                Ok(false)
+            }
+        }
     }
 
     /// Run vCPU `n` until the machine powers off.
@@ -377,6 +496,7 @@ mod hvf_loop {
         let (m, console, wake) = (&shared.m, &*shared.console, &shared.wakes[n]);
         let mut warned_sysreg = false;
         loop {
+            pause_point(n, &cpu, shared)?;
             let seen = wake.generation();
             let exit = cpu.run().map_err(|e| e.to_string())?;
             let (reason, syndrome, ipa) = (exit.reason, exit.syndrome, exit.physical_address);
@@ -439,10 +559,10 @@ mod hvf_loop {
                         }
                         // Saved, this run ends there; restored runs go on.
                         grix_abi::image::SNAPSHOT_CALL if shared.snapshot && ec == EC_HVC => {
-                            match console.save_with(|state| snapshot::save(&cpu, &m.mem, state)) {
-                                Some(saved) => return saved,
-                                None => cpu.set_reg(0, grix_abi::image::SNAPSHOT_RETRY),
+                            if take_snapshot(n, &cpu, shared)? {
+                                return Ok(());
                             }
+                            cpu.set_reg(0, grix_abi::image::SNAPSHOT_RETRY);
                         }
                         PSCI_VERSION => cpu.set_reg(0, 0x1_0000),
                         _ => cpu.set_reg(0, PSCI_NOT_SUPPORTED),

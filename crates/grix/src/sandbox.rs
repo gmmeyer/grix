@@ -196,20 +196,18 @@ fn macos_major() -> Option<u32> {
 /// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
 /// means QEMU.
 pub(crate) fn default_vmm() -> Option<PathBuf> {
-    if !vmm_runs_here() {
-        return None;
-    }
-    match std::env::var_os("GRIX_VMM") {
-        Some(v) if v == "qemu" => return None,
-        Some(v) => return Some(v.into()),
-        None => {}
-    }
-    vmm_in(exe_dir().as_deref())
+    vmm_in(home_dir("target/release/grix-vmm").as_deref())
 }
 
-/// The running program's directory: a release unpacks grix, grix-vmm and
-/// the kernel together.
-fn exe_dir() -> Option<PathBuf> {
+/// Where an installation's `file` is: beside the running program (a
+/// release unpacks grix, grix-vmm and the kernel together). None for a
+/// build of this source tree that has `built` (relative to it): that's
+/// what `make` built, where cargo leaves an unsigned grix-vmm beside a
+/// debug grix.
+fn home_dir(built: &str) -> Option<PathBuf> {
+    if SOURCE_TREE.is_some_and(|t| Path::new(t).join(built).is_file()) {
+        return None;
+    }
     std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf()))
 }
 
@@ -254,7 +252,7 @@ fn kernel_in(dir: Option<&Path>) -> PathBuf {
 /// The grix kernel: `GRIX_KERNEL`, beside the running program (as a
 /// release unpacks), or this source tree's build.
 fn default_kernel() -> PathBuf {
-    kernel_in(exe_dir().as_deref())
+    kernel_in(home_dir("kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel").as_deref())
 }
 
 /// Does grix-vmm run here, unless told otherwise (`GRIX_ACCEL`)?
@@ -979,9 +977,6 @@ impl Sandbox {
         if !cfg.mounts.is_empty() {
             bail!("a sandbox with on-exit mounts can't be snapshotted: what the host holds for them isn't saved");
         }
-        if cfg.cpus != 1 {
-            bail!("a sandbox with more than one CPU can't be snapshotted yet");
-        }
         let mut forwards = Vec::new();
         for (from, port) in &cfg.net.forwards {
             match from {
@@ -1000,6 +995,7 @@ impl Sandbox {
             timeout_ms: cfg.timeout.as_millis() as u64,
             grace_ms: cfg.grace.as_millis() as u64,
             memory_mb: cfg.memory_mb,
+            cpus: cfg.cpus,
             tty: cfg.tty.is_some(),
             live: cfg
                 .live
@@ -1174,7 +1170,7 @@ pub(crate) fn run_snapshot(
         memory_mb: s.memory_mb,
         accel: String::new(),
         vmm: Some(snap.vmm.clone().context("snapshots need grix's own VMM (grix-vmm, on macOS 15+)")?),
-        cpus: 1,
+        cpus: s.cpus,
         snapshot: Some(SnapshotFile::Restore(file)),
         fs_state,
     };

@@ -1,10 +1,11 @@
 //! Snapshots of the whole machine (Hypervisor.framework).
 //!
 //! The kernel asks for one with `SNAPSHOT_CALL` when the program first
-//! sits idle waiting for input. We save the vCPU (registers, system
-//! registers, FP/SIMD, the GIC's CPU interface), the GIC, the console
-//! device and RAM to the file the host gave us as fd 3, and end the
-//! process. A restored run maps that RAM copy-on-write straight from the
+//! sits idle waiting for input. Every vCPU stops (each saves its own
+//! registers, system registers, FP/SIMD and GIC CPU interface: the
+//! framework only lets a vCPU's thread touch it), and we save them, the
+//! GIC, the console device and RAM to the file the host gave us as fd 3,
+//! and end the process. A restored run maps that RAM copy-on-write straight from the
 //! file, so it starts in milliseconds however big the runtime is, puts the
 //! rest back, and returns from the call with `SNAPSHOT_RESTORED` and fresh
 //! entropy.
@@ -31,7 +32,7 @@ use crate::hvf::{self, Cpu};
 use crate::mem::GuestMemory;
 
 pub const MAGIC: [u8; 8] = *b"GRIXSNP1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER: u64 = 40;
 const PAGE: usize = 16 * 1024;
 
@@ -97,10 +98,9 @@ fn snapshot_file() -> File {
     unsafe { File::from_raw_fd(FD) }
 }
 
-/// Save the machine to fd 3. `cpu` is stopped at the kernel's call, its PC
-/// past the HVC; `console` is the device's saved state.
-pub fn save(cpu: &Cpu, mem: &GuestMemory, console: Vec<u8>) -> Result<(), String> {
-    let file = std::mem::ManuallyDrop::new(snapshot_file());
+/// One vCPU's registers, read on its own thread: general purpose,
+/// system, FP/SIMD, and its GIC CPU interface.
+pub fn cpu_state(cpu: &Cpu) -> Result<Vec<u8>, String> {
     let mut w = Writer::new();
     for r in 0..GP_REGS {
         w.u64(cpu.reg(r));
@@ -114,10 +114,37 @@ pub fn save(cpu: &Cpu, mem: &GuestMemory, console: Vec<u8>) -> Result<(), String
     for &r in ICC_REGS {
         w.u64(cpu.icc_reg(r).map_err(|e| e.to_string())?);
     }
+    Ok(w.buf)
+}
+
+/// Save the machine to fd 3. vCPU `caller` asked, stopped at its call
+/// with its PC past the HVC; `cpus` holds each vCPU's `cpu_state` (none
+/// for one that was never started), all stopped; `counter` is the guest's
+/// counter now; `console` the device's saved state.
+pub fn save(
+    caller: usize,
+    cpus: &[Option<Vec<u8>>],
+    counter: u64,
+    mem: &GuestMemory,
+    console: Vec<u8>,
+) -> Result<(), String> {
+    let file = std::mem::ManuallyDrop::new(snapshot_file());
+    let mut w = Writer::new();
+    w.u32(caller as u32);
+    w.u32(cpus.len() as u32);
+    for c in cpus {
+        match c {
+            Some(state) => {
+                w.u8(1);
+                w.bytes(state);
+            }
+            None => w.u8(0),
+        }
+    }
     w.bytes(&hvf::gic_state().map_err(|e| e.to_string())?);
     // The guest's counter, and when: a restored one runs on from there by
     // however long it's been.
-    w.u64(hvf::now().wrapping_sub(cpu.vtimer_offset()));
+    w.u64(counter);
     w.u64(now_ns());
     w.bytes(&console);
     let state = w.buf;
@@ -151,18 +178,26 @@ pub fn save(cpu: &Cpu, mem: &GuestMemory, console: Vec<u8>) -> Result<(), String
 /// A snapshot read back: RAM mapped from the file, and what to restore.
 pub struct Saved {
     mem: GuestMemory,
-    state: Vec<u8>,
+    state: State,
 }
 
 /// The rest of a snapshot, once its memory is the machine's.
 pub struct State {
-    state: Vec<u8>,
+    caller: usize,
+    cpus: Vec<Option<Vec<u8>>>,
+    gic: Vec<u8>,
+    counter: u64,
+    then: u64,
+    console: Vec<u8>,
+    /// Fresh entropy for the restored kernel (drawn now: the vCPU that
+    /// asked may be put back after `confine`).
+    entropy: [u8; 32],
 }
 
 /// Map fd 3's snapshot.
 pub fn open() -> Result<Saved, String> {
     let file = std::mem::ManuallyDrop::new(snapshot_file());
-    let bad = || "not a complete grix snapshot".to_string();
+    let bad = || "not a complete grix snapshot (or one from another grix: take it again)".to_string();
     let mut header = [0u8; HEADER as usize];
     file.read_exact_at(&mut header, 0).map_err(|e| format!("reading the snapshot: {e}"))?;
     let u64_at = |o: usize| u64::from_le_bytes(header[o..o + 8].try_into().unwrap());
@@ -180,25 +215,79 @@ pub fn open() -> Result<Saved, String> {
     {
         return Err(bad());
     }
-    let mut state = vec![0u8; state_len as usize];
-    file.read_exact_at(&mut state, HEADER).map_err(|e| format!("reading the snapshot: {e}"))?;
+    let mut raw = vec![0u8; state_len as usize];
+    file.read_exact_at(&mut raw, HEADER).map_err(|e| format!("reading the snapshot: {e}"))?;
+    let malformed = |_| "the snapshot's state is malformed".to_string();
+    let mut r = Reader::new(&raw);
+    let caller = r.u32().map_err(malformed)? as usize;
+    let n = r.u32().map_err(malformed)? as usize;
+    if n == 0 || n > grix_abi::machine::MAX_CPUS as usize || caller >= n {
+        return Err("the snapshot's state is malformed".into());
+    }
+    let mut cpus = Vec::with_capacity(n);
+    for _ in 0..n {
+        cpus.push(match r.u8().map_err(malformed)? {
+            0 => None,
+            _ => Some(r.bytes().map_err(malformed)?.to_vec()),
+        });
+    }
+    if cpus[caller].is_none() {
+        return Err("the snapshot's state is malformed".into());
+    }
+    let gic = r.bytes().map_err(malformed)?.to_vec();
+    let (counter, then) = (r.u64().map_err(malformed)?, r.u64().map_err(malformed)?);
+    let console = r.bytes().map_err(malformed)?.to_vec();
     let mem = GuestMemory::map_file(file.as_raw_fd(), ram_offset, grix_abi::image::RAM_BASE, ram_size as usize)
         .map_err(|e| format!("mapping the snapshot's memory: {e}"))?;
-    Ok(Saved { mem, state })
+    let mut entropy = [0u8; 32];
+    // SAFETY: a buffer of the size given.
+    if unsafe { libc::getentropy(entropy.as_mut_ptr().cast(), entropy.len()) } != 0 {
+        return Err("getentropy failed".into());
+    }
+    Ok(Saved { mem, state: State { caller, cpus, gic, counter, then, console, entropy } })
 }
 
 impl Saved {
     pub fn split(self) -> (GuestMemory, State) {
-        (self.mem, State { state: self.state })
+        (self.mem, self.state)
     }
 }
 
 impl State {
-    /// Put the vCPU and GIC back (after the GIC and vCPU exist, before
-    /// the vCPU runs). Returns the console's saved state.
-    pub fn restore(&self, cpu: &mut Cpu) -> Result<Vec<u8>, String> {
+    /// How many vCPUs the machine had.
+    pub fn cpus(&self) -> usize {
+        self.cpus.len()
+    }
+
+    /// Had vCPU `n` been started (PSCI CPU_ON)?
+    pub fn started(&self, n: usize) -> bool {
+        self.cpus.get(n).is_some_and(Option::is_some)
+    }
+
+    /// The vCPU timer offset that makes the guest's counter go on from
+    /// where it was, as after a suspend (the kernel moves its time of day
+    /// on by the time since).
+    pub fn vtimer_offset(&self) -> u64 {
+        hvf::now().wrapping_sub(self.counter)
+    }
+
+    /// The device's saved state.
+    pub fn console(&self) -> &[u8] {
+        &self.console
+    }
+
+    /// Put the GIC back, once every vCPU exists and before any runs.
+    pub fn restore_gic(&self) -> Result<(), String> {
+        hvf::set_gic_state(&self.gic).map_err(|e| e.to_string())
+    }
+
+    /// Put vCPU `n` back (on its own thread, after the GIC). The one that
+    /// asked returns from its call: restored, with fresh entropy and the
+    /// time since.
+    pub fn restore_cpu(&self, n: usize, cpu: &mut Cpu) -> Result<(), String> {
         let bad = |_| "the snapshot's state is malformed".to_string();
-        let mut r = Reader::new(&self.state);
+        let Some(Some(state)) = self.cpus.get(n) else { return Err("restoring a vCPU that wasn't saved".into()) };
+        let mut r = Reader::new(state);
         for reg in 0..GP_REGS {
             cpu.set_reg(reg, r.u64().map_err(bad)?);
         }
@@ -209,30 +298,16 @@ impl State {
             let v: [u8; 16] = r.take(16).map_err(bad)?.try_into().unwrap();
             cpu.set_simd_reg(q, v).map_err(|e| e.to_string())?;
         }
-        let mut icc = Vec::new();
         for &reg in ICC_REGS {
-            icc.push((reg, r.u64().map_err(bad)?));
+            cpu.set_icc_reg(reg, r.u64().map_err(bad)?).map_err(|e| e.to_string())?;
         }
-        hvf::set_gic_state(r.bytes().map_err(bad)?).map_err(|e| e.to_string())?;
-        for (reg, v) in icc {
-            cpu.set_icc_reg(reg, v).map_err(|e| e.to_string())?;
+        if n == self.caller {
+            cpu.set_reg(5, now_ns().saturating_sub(self.then));
+            cpu.set_reg(0, grix_abi::image::SNAPSHOT_RESTORED);
+            for (i, word) in self.entropy.as_chunks::<8>().0.iter().enumerate() {
+                cpu.set_reg(1 + i as u32, u64::from_le_bytes(*word));
+            }
         }
-        // The guest's counter goes on from where it was, as after a
-        // suspend; the kernel moves its time of day on by the time since.
-        let (counter, then) = (r.u64().map_err(bad)?, r.u64().map_err(bad)?);
-        cpu.set_vtimer_offset(hvf::now().wrapping_sub(counter)).map_err(|e| e.to_string())?;
-        cpu.set_reg(5, now_ns().saturating_sub(then));
-        let console = r.bytes().map_err(bad)?.to_vec();
-        // The kernel's call returns: restored, with fresh entropy.
-        let mut entropy = [0u8; 32];
-        // SAFETY: a buffer of the size given.
-        if unsafe { libc::getentropy(entropy.as_mut_ptr().cast(), entropy.len()) } != 0 {
-            return Err("getentropy failed".into());
-        }
-        cpu.set_reg(0, grix_abi::image::SNAPSHOT_RESTORED);
-        for i in 0..4 {
-            cpu.set_reg(1 + i as u32, u64::from_le_bytes(entropy[i * 8..i * 8 + 8].try_into().unwrap()));
-        }
-        Ok(console)
+        Ok(())
     }
 }

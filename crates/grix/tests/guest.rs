@@ -1980,7 +1980,7 @@ fn snapshots_with_live_mounts() {
 
 #[test]
 fn snapshots_resume_where_the_program_waited() {
-    // Snapshots are of one CPU (whatever GRIX_CPUS says).
+    // One CPU, whatever GRIX_CPUS says (`snapshots_with_more_cpus` has more).
     let b = Sandbox::builder()
         .cpus(1)
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
@@ -2052,6 +2052,46 @@ fn snapshots_resume_where_the_program_waited() {
     let err = b.build().unwrap().snapshot(&["/bin/busybox", "true"], dir.join("none")).unwrap_err();
     assert!(err.to_string().contains("didn't wait for input"), "{err}");
     assert!(!dir.join("none").exists());
+}
+
+/// A machine with more CPUs is saved whole: every CPU stops, and runs
+/// from the snapshot have them all, running threads in parallel again.
+#[test]
+fn snapshots_with_more_cpus() {
+    let b = with("smp")
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Threads)
+        .allow(Capability::Process)
+        .timeout(Duration::from_secs(60));
+    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+        return;
+    }
+    let dir = temp_dir("snapshot-cpus");
+    // Threads on every CPU before the snapshot, and after it.
+    let script = "/bin/smp >/dev/null; read line; echo \"got $line\"; /bin/smp; \
+                  /bin/busybox head -c 8 /dev/urandom | /bin/busybox od -An -tx1";
+    for cpus in [2, 4] {
+        let path = dir.join(format!("smp{cpus}.snap"));
+        let snap =
+            b.clone().cpus(cpus).build().unwrap().snapshot(&["/bin/busybox", "sh", "-c", script], &path).unwrap();
+        assert_eq!(snap.cpus(), cpus);
+        let mut randoms = Vec::new();
+        for word in ["one", "two"] {
+            let out = snap.run(format!("{word}\n")).unwrap();
+            assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+            let stdout = out.stdout_str();
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines[0], format!("got {word}"), "{stdout}");
+            assert!(lines[1].starts_with(&format!("smp ok cpus={cpus} ")), "{stdout}");
+            let used: u32 = lines[1].rsplit("cpus_used=").next().unwrap().trim().parse().unwrap();
+            assert!(used >= 2, "{stdout}");
+            randoms.push(lines[2].to_string());
+            assert!(out.events.is_empty(), "{:?}", out.events);
+        }
+        assert_ne!(randoms[0], randoms[1]);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// More CPUs: programs see them, threads run in parallel on them, and

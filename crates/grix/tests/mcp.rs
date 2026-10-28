@@ -193,6 +193,17 @@ fn a_writable_server_builds_images_and_writes_mounts() {
             let r = server.tool("run", json!({"snapshot": dir.join("sh.snap"), "stdin": format!("{who}\n")}));
             assert_eq!(r["structuredContent"]["stdout"], format!("hello {who}\n"), "{r}");
         }
+        // One with two CPUs, for the server below that allows one.
+        let r = server.tool(
+            "snapshot",
+            json!({
+                "imports": [{"host": busybox, "guest": "/bin/busybox"}],
+                "command": ["/bin/busybox", "sh", "-c", "read line; echo \"hello $line\""],
+                "output": dir.join("sh2.snap"),
+                "cpus": 2,
+            }),
+        );
+        assert_eq!(r["isError"], false, "{r}");
     } else {
         assert!(text(&r).contains("grix's own VMM"), "{}", text(&r));
     }
@@ -203,7 +214,12 @@ fn a_writable_server_builds_images_and_writes_mounts() {
     )
     .unwrap();
     server.end();
-    let mut server = Server::start(&["--writable", "-a", "process", "-a", "fs_write"], &[&dir]);
+    let mut server = Server::start(&["--writable", "-a", "process", "-a", "fs_write", "--max-cpus", "1"], &[&dir]);
+    // A snapshot's CPUs are capped like a sandbox's.
+    if dir.join("sh2.snap").exists() {
+        let r = server.tool("run", json!({"snapshot": dir.join("sh2.snap"), "stdin": "x\n"}));
+        assert!(text(&r).contains("the server allows at most 1"), "{}", text(&r));
+    }
     let r = server.tool("build_image", json!({"grixfile": dir.join("ctx/Grixfile"), "output": dir.join("y.grix")}));
     assert_eq!(r["isError"], false, "{r}");
     let r = server.tool("run", json!({"image": dir.join("y.grix")}));

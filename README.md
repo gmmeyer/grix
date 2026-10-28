@@ -396,7 +396,8 @@ let out = snap.run("print(6 * 7)")?;                       // or grix::Snapshot:
 Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
 (`Sandbox.snapshot()`, `Snapshot.run()`).
 
-- The VMM saves the vCPU, the GIC, the console device and RAM. A run maps
+- The VMM saves every vCPU (a sandbox with more CPUs has them all in each
+  run), the GIC, the console device and RAM. A run maps
   that RAM copy-on-write from the file, so runs never see each other's
   changes, and only what a run touches is read. The file is sparse: 80 MB
   on disk for that Python.

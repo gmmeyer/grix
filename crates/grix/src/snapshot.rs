@@ -57,6 +57,9 @@ pub(crate) struct Settings {
     pub timeout_ms: u64,
     pub grace_ms: u64,
     pub memory_mb: u64,
+    /// The machine's CPUs (each run has as many).
+    #[serde(default = "one_cpu")]
+    pub cpus: u32,
     /// Taken in TTY mode: the program's stdio is a terminal.
     #[serde(default)]
     pub tty: bool,
@@ -66,6 +69,10 @@ pub(crate) struct Settings {
     pub live: Vec<SavedMount>,
     #[serde(default)]
     pub fs_state: String,
+}
+
+fn one_cpu() -> u32 {
+    1
 }
 
 /// A live mount a snapshot has, which each run gives a host directory.
@@ -95,6 +102,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("path", &self.path)
             .field("memory_mb", &self.memory_mb())
+            .field("cpus", &self.cpus())
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -135,6 +143,9 @@ impl Snapshot {
                 grix_abi::ABI_VERSION
             );
         }
+        if settings.cpus == 0 || settings.cpus > grix_abi::machine::MAX_CPUS {
+            bail!("{} says it has {} CPUs", path.display(), settings.cpus);
+        }
         let timeout = Duration::from_millis(settings.timeout_ms);
         Ok(Snapshot {
             path,
@@ -154,6 +165,11 @@ impl Snapshot {
     /// The guest's memory, in MiB.
     pub fn memory_mb(&self) -> u64 {
         self.ram_size >> 20
+    }
+
+    /// The machine's CPUs.
+    pub fn cpus(&self) -> u32 {
+        self.settings.cpus
     }
 
     /// The time limit runs get unless [`timeout`](Snapshot::timeout) says.
@@ -339,6 +355,7 @@ mod tests {
             timeout_ms: 1000,
             grace_ms: u64::MAX,
             memory_mb: 512,
+            cpus: 1,
             tty: false,
             live: vec![],
             fs_state: String::new(),
