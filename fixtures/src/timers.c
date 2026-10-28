@@ -68,7 +68,7 @@ static int test_itimer(void) {
     CHECK(alarms == seen);
     // alarm() reports what was left.
     CHECK(alarm(5) == 0 && alarm(0) == 5);
-    CHECK(setitimer(ITIMER_VIRTUAL, &it, 0) == -1 && errno == EINVAL);
+    CHECK(setitimer(3, &it, 0) == -1 && errno == EINVAL);
     return 0;
 }
 

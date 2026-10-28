@@ -43,6 +43,7 @@ mod timer;
 mod tty;
 mod uaccess;
 mod unix;
+mod vdso;
 mod virtio;
 
 use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};
@@ -61,6 +62,7 @@ pub extern "C" fn kernel_main() -> ! {
     let img = Image::decode(bytes).unwrap_or_else(|_| panic!("corrupt boot image"));
 
     time::init(img.boot_time_ns);
+    vdso::init();
     console::init_virtio();
     rng::init(&img.seed);
     snapshot::init(img.snapshot);

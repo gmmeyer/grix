@@ -9,7 +9,7 @@ use core::fmt::Write;
 use crate::arch;
 use crate::fd::FileKind;
 use crate::fs;
-use crate::mm::aspace::{Backing, STACK_TOP};
+use crate::mm::aspace::{Backing, STACK_TOP, VVAR};
 use crate::mm::frame;
 use crate::process::Process;
 use crate::time;
@@ -238,6 +238,8 @@ fn maps(p: &Process, s: &mut String) {
             Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
             // What Linux calls the page holding the signal-return code on arm32.
             Backing::Sigpage => (0, 0, "[sigpage]".into()),
+            Backing::KernelPage(_) if v.start == VVAR => (0, 0, "[vvar]".into()),
+            Backing::KernelPage(_) => (0, 0, "[vdso]".into()),
             Backing::Anon => (0, 0, String::new()),
             Backing::Shared { index, .. } => (index * 4096, 0, "/dev/zero (deleted)".into()),
         };

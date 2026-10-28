@@ -27,6 +27,9 @@ const STACK_GAP: u64 = 128 << 20;
 const STACK_GUARD: u64 = 1 << 20;
 /// The signal-return trampoline page, above the stack.
 pub const SIGPAGE: u64 = STACK_TOP + 0x1_0000;
+/// The vDSO's clock parameters, and the vDSO just after (vdso.rs).
+pub const VVAR: u64 = SIGPAGE + 0x2000;
+pub const VDSO: u64 = VVAR + PAGE_SIZE;
 /// At most this many mappings (Linux's vm.max_map_count is 65530): each
 /// takes kernel heap, so a program mapping page after page gets ENOMEM.
 pub const MAX_VMAS: usize = 32768;
@@ -76,6 +79,9 @@ pub enum Backing {
     /// was open for writing (mprotect may add PROT_WRITE). `token` counts
     /// it among the file's shared mappings (`FileData::mapped_shared`).
     SharedFile { data: Content, offset: u64, ino: Ino, may_write: bool, token: Arc<()> },
+    /// A page of the kernel's that every process shares, read-only (the
+    /// vDSO's): the frame at `pa`, which the kernel holds a reference to.
+    KernelPage(u64),
 }
 
 /// The pages of a MAP_SHARED anonymous mapping, made as they're first
@@ -114,6 +120,7 @@ impl Vma {
                 Backing::Data { data: data.clone(), offset: offset + skip, end, ino, shared: shared.clone() }
             }
             Backing::Sigpage => Backing::Sigpage,
+            Backing::KernelPage(pa) => Backing::KernelPage(pa),
             Backing::Shared { ref pages, index } => {
                 Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
             }
@@ -139,7 +146,7 @@ impl Vma {
 
     /// Never copy-on-write: its pages are the same for everyone.
     fn shared_pages(&self) -> bool {
-        matches!(self.backing, Backing::Shared { .. } | Backing::SharedFile { .. })
+        matches!(self.backing, Backing::Shared { .. } | Backing::SharedFile { .. } | Backing::KernelPage(_))
     }
 
     pub fn allows(&self, access: Access) -> bool {
@@ -419,9 +426,11 @@ impl AddressSpace {
     }
 
     /// Does `[start, end)` overlap a shared mapping of a file whose fd
-    /// wasn't open for writing (mprotect can't make that writable)?
+    /// wasn't open for writing, or a page of the kernel's (mprotect can't
+    /// make those writable)?
     pub fn has_read_only_shared_file(&self, start: u64, end: u64) -> bool {
-        self.overlapping(start, end).any(|v| matches!(v.backing, Backing::SharedFile { may_write: false, .. }))
+        self.overlapping(start, end)
+            .any(|v| matches!(v.backing, Backing::SharedFile { may_write: false, .. } | Backing::KernelPage(_)))
     }
 
     /// Pages that got a frame since this address space's shared mappings
@@ -596,6 +605,14 @@ impl AddressSpace {
                 _ => self.unshare(page, pte, vma.prot),
             };
         }
+        if let Backing::KernelPage(pa) = vma.backing {
+            frame::share(pa);
+            if self.pt.map(page, pa, vma.prot.pte_flags()).is_none() {
+                frame::free(pa);
+                return Err(FaultError::OutOfMemory);
+            }
+            return Ok(());
+        }
         if let Backing::Shared { ref pages, index } = vma.backing {
             let idx = index + (page - vma.start) / PAGE_SIZE;
             let mut pages = pages.0.lock();
@@ -662,7 +679,9 @@ impl AddressSpace {
                 &[]
             }
             Backing::Sigpage => &crate::signal::TRAMPOLINE,
-            Backing::Shared { .. } | Backing::SharedFile { .. } => unreachable!("handled above"),
+            Backing::Shared { .. } | Backing::SharedFile { .. } | Backing::KernelPage(_) => {
+                unreachable!("handled above")
+            }
             Backing::File { data, offset, filesz, .. } => {
                 let o = page - vma.start;
                 let n = filesz.saturating_sub(o).min(PAGE_SIZE);

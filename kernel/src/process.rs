@@ -19,7 +19,9 @@ use crate::fd::FdTable;
 use crate::fs::{self, Ino, Kind, ROOT};
 use crate::mm::PAGE_SIZE;
 pub use crate::mm::aspace::Access;
-use crate::mm::aspace::{AddressSpace, Backing, FaultError, MAX_STACK, SIGPAGE, STACK_SIZE, STACK_TOP, Vma};
+use crate::mm::aspace::{
+    AddressSpace, Backing, FaultError, MAX_STACK, SIGPAGE, STACK_SIZE, STACK_TOP, VDSO, VVAR, Vma,
+};
 use crate::mm::paging::Prot;
 use crate::rng;
 use crate::signal::{self, AltStack, SigQueue};
@@ -776,8 +778,17 @@ pub fn load_program(
     aspace.brk = loaded.end;
     aspace.map(Vma::anon(aspace.stack_bottom(), STACK_TOP, Prot::RW));
     aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
+    let (vvar, vdso) = crate::vdso::frames();
+    aspace.map(Vma {
+        start: VVAR,
+        end: VVAR + PAGE_SIZE,
+        prot: Prot { read: true, write: false, exec: false },
+        backing: Backing::KernelPage(vvar),
+    });
+    aspace.map(Vma { start: VDSO, end: VDSO + PAGE_SIZE, prot: Prot::RX, backing: Backing::KernelPage(vdso) });
 
     let auxv = [
+        (33, VDSO),              // AT_SYSINFO_EHDR
         (3, loaded.phdr),        // AT_PHDR
         (4, 56),                 // AT_PHENT
         (5, loaded.phnum),       // AT_PHNUM
