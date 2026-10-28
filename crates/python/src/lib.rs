@@ -45,8 +45,9 @@ struct Config {
     mounts: Vec<(PathBuf, String, String)>,
     exports: Vec<(String, PathBuf)>,
     max_output_mb: Option<usize>,
-    /// The `grix` command's directory, for its kernel and grix-vmm.
-    grix_dir: Option<PathBuf>,
+    /// Where grix is installed (its kernel and grix-vmm): never beside the
+    /// Python interpreter, which is what "the running program" is here.
+    install_dir: PathBuf,
 }
 
 fn seconds(what: &str, s: f64) -> anyhow::Result<Duration> {
@@ -55,10 +56,7 @@ fn seconds(what: &str, s: f64) -> anyhow::Result<Duration> {
 
 impl Config {
     fn builder(&self) -> anyhow::Result<SandboxBuilder> {
-        let mut b = Sandbox::builder();
-        if let Some(dir) = &self.grix_dir {
-            b = b.install_dir(dir);
-        }
+        let mut b = Sandbox::builder().install_dir(&self.install_dir);
         if let Some(image) = &self.image {
             b = b.image(&grix::Image::open(image)?)?;
         }
@@ -113,8 +111,7 @@ impl Config {
             };
             b = b.mount_with(host, guest, mode)?;
         }
-        for (guest, host) in &self.exports {
-            grix::Export::check_destination(host)?;
+        for (guest, _) in &self.exports {
             b = b.export(guest)?;
         }
         if let Some(mb) = self.max_output_mb {
@@ -198,9 +195,15 @@ fn wait<T: Send + 'static>(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Err(e) = py.check_signals() {
-                    control.stop();
-                    let _ = py.detach(|| rx.lock().unwrap().recv());
-                    return Err(e);
+                    // Stopped as soon as it has started (it may not have
+                    // yet), however long that takes.
+                    loop {
+                        control.stop();
+                        match py.detach(|| rx.lock().unwrap().recv_timeout(Duration::from_millis(100))) {
+                            Err(RecvTimeoutError::Timeout) => {}
+                            _ => return Err(e),
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Err(Error::new_err("the run ended without a result")),
@@ -208,11 +211,17 @@ fn wait<T: Send + 'static>(
     }
 }
 
-/// `grix run --json`'s answer, and the exit code it would have.
-fn result(out: &RunOutput) -> PyResult<String> {
+/// `grix run --json`'s answer, and the exit code `grix run` would have:
+/// 125 if exports or mount changes didn't reach the host, with what
+/// happened in `messages`.
+fn result(out: &RunOutput, exports: &grix::results::Destinations) -> PyResult<String> {
+    let mut notes = Vec::new();
+    let wrote = exports.write(out, true, &mut notes);
+    let applied = grix::results::report_mounts(out, true, &mut notes);
     let mut v = serde_json::to_value(out).map_err(|e| err(e.into()))?;
     v["missing_capabilities"] = serde_json::json!(out.missing_capabilities());
-    v["exit_code"] = serde_json::json!(out.status.code());
+    v["exit_code"] = serde_json::json!(if wrote && applied { out.status.code() } else { 125 });
+    v["messages"] = serde_json::json!(notes.iter().map(|n| format!("grix: {n}\n")).collect::<String>());
     Ok(v.to_string())
 }
 
@@ -229,6 +238,9 @@ fn run(
 ) -> PyResult<String> {
     let control = control.map(|c| c.inner.clone()).unwrap_or_default();
     let sandbox = config.builder().and_then(|b| b.control(&control).build()).map_err(err)?;
+    // As `grix run` checks them: mounts are applied first.
+    let mounted: Vec<PathBuf> = config.mounts.iter().map(|(host, _, _)| host.clone()).collect();
+    let exports = grix::results::check_destinations(&config.exports, &mounted).map_err(err)?;
     let command = command.filter(|c| !c.is_empty()).unwrap_or_else(|| sandbox.command().to_vec());
     if command.is_empty() {
         return Err(Error::new_err("no command given (and the image has none)"));
@@ -237,12 +249,7 @@ fn run(
         Some(data) => sandbox.run_streaming_with_stdin(&command, Cursor::new(data), forward),
         None => sandbox.run_streaming(&command, forward),
     })?;
-    for (guest, host) in &config.exports {
-        if let Some(e) = out.export(guest) {
-            e.write_to(host).map_err(err)?;
-        }
-    }
-    result(&out)
+    result(&out, &exports)
 }
 
 /// Start `command` (or the image's) and save the machine to `path` when it
@@ -261,30 +268,25 @@ fn snapshot(py: Python<'_>, config: Config, path: PathBuf, command: Option<Vec<S
 
 /// Run from a snapshot, with this stdin.
 #[pyfunction]
-#[pyo3(signature = (path, stdin=None, timeout=None, on_output=None, control=None, grix_dir=None))]
+#[pyo3(signature = (path, install_dir, stdin=None, timeout=None, on_output=None, control=None))]
 fn snapshot_run(
     py: Python<'_>,
     path: PathBuf,
+    install_dir: PathBuf,
     stdin: Option<Vec<u8>>,
     timeout: Option<f64>,
     on_output: Option<Py<PyAny>>,
     control: Option<PyRef<'_, Control>>,
-    grix_dir: Option<PathBuf>,
 ) -> PyResult<String> {
     let control = control.map(|c| c.inner.clone()).unwrap_or_default();
-    let mut snap = grix::Snapshot::open(path).map_err(err)?.control(&control);
-    // A snapshot runs only in grix-vmm.
-    if let Some(vmm) =
-        grix_dir.map(|d| d.join("grix-vmm")).filter(|v| std::env::var_os("GRIX_VMM").is_none() && v.is_file())
-    {
-        snap = snap.vmm(vmm);
-    }
+    let mut snap = grix::Snapshot::open(path).map_err(err)?.install_dir(install_dir).control(&control);
     if let Some(s) = timeout {
         snap = snap.timeout(seconds("timeout", s).map_err(err)?);
     }
     let input = stdin.unwrap_or_default();
     let out = wait(py, &control, on_output, move |forward| snap.run_streaming(Cursor::new(input), forward))?;
-    result(&out)
+    // What a snapshot exports comes back in the result.
+    result(&out, &grix::results::check_destinations(&[], &[]).map_err(err)?)
 }
 
 #[pymodule]

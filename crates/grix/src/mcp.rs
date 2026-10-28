@@ -113,6 +113,8 @@ const EXPORT_MAX: usize = 1 << 20;
 const EXPORT_LIMIT: usize = 256 << 20;
 /// The longest message read (inline files and stdin come in them).
 const MESSAGE_MAX: usize = 64 << 20;
+/// How many tool calls may wait for a turn, besides those running.
+const QUEUE_MAX: usize = 8;
 /// The most of a call's output streamed as progress, and how often.
 const STREAM_MAX: usize = OUTPUT_MAX * 4;
 const STREAM_EVERY: Duration = Duration::from_millis(250);
@@ -177,14 +179,32 @@ fn serve_with_limit(config: &McpConfig, mut input: impl BufRead, output: impl Wr
                             send(&error(id, -32600, "a request with this id is still in progress"));
                             continue;
                         }
+                        // Each call waiting its turn holds its message (up to
+                        // MESSAGE_MAX) and a thread: only so many wait.
+                        if calls.len() >= config.max_parallel.max(1) + QUEUE_MAX {
+                            send(&error(id, -32000, "too many tool calls in progress: wait for some to finish"));
+                            continue;
+                        }
                         calls.insert(key.clone(), (control.clone(), false));
                     }
                     let (calls, slots) = (&calls, &slots);
-                    scope.spawn(move || {
+                    let reply_id = id.clone();
+                    let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
                         let token = msg["params"]["_meta"]["progressToken"].clone();
-                        let mut progress = Progress::new(send, token);
-                        let reply = match slots.take(&control, &mut progress) {
-                            Some(_slot) => call_tool(config, &msg, id, &control, &mut progress),
+                        let progress = Progress::new(send, token);
+                        let reply = match slots.take(&control, &progress) {
+                            Some(_slot) => {
+                                let work = || call_tool(config, &msg, id.clone(), &control, &progress);
+                                // A bug in a tool is that call's error, not the server's end.
+                                match progress.ticking(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)))
+                                {
+                                    Ok(reply) => reply,
+                                    Err(_) => {
+                                        control.cancel();
+                                        Some(error(id, -32603, "internal error"))
+                                    }
+                                }
+                            }
                             None => Some(error(id, -32800, "cancelled")),
                         };
                         let withdrawn = calls.lock().unwrap().remove(&key).is_some_and(|(_, w)| w);
@@ -195,6 +215,10 @@ fn serve_with_limit(config: &McpConfig, mut input: impl BufRead, output: impl Wr
                             send(&reply);
                         }
                     });
+                    if let Err(e) = spawned {
+                        calls.lock().unwrap().remove(&reply_id.to_string());
+                        send(&error(reply_id, -32000, &format!("can't start the call: {e}")));
+                    }
                 }
                 _ => {
                     if let Some(reply) = handle(config, &msg) {
@@ -227,7 +251,7 @@ impl Drop for Slot<'_> {
 
 impl Slots {
     /// Wait for a turn, unless the call is cancelled meanwhile.
-    fn take(&self, control: &RunControl, progress: &mut Progress) -> Option<Slot<'_>> {
+    fn take(&self, control: &RunControl, progress: &Progress) -> Option<Slot<'_>> {
         let mut free = self.free.lock().unwrap();
         let mut said = false;
         loop {
@@ -248,63 +272,103 @@ impl Slots {
 }
 
 /// A call's progress notifications: its output as it comes, a few times a
-/// second, up to `STREAM_MAX` (the answer has the output too).
+/// second (`ticking` sends what waits even when no more comes), up to
+/// `STREAM_MAX` (the answer has the output too).
 struct Progress<'a> {
     send: Sender<'a>,
     token: Value,
+    state: Mutex<Streamed>,
+}
+
+#[derive(Default)]
+struct Streamed {
     count: u64,
-    streamed: usize,
+    bytes: usize,
     pending: [Vec<u8>; 2],
-    last: Instant,
+    last: Option<Instant>,
 }
 
 impl<'a> Progress<'a> {
     fn new(send: Sender<'a>, token: Value) -> Progress<'a> {
-        Progress { send, token, count: 0, streamed: 0, pending: [Vec::new(), Vec::new()], last: Instant::now() }
+        Progress { send, token, state: Mutex::default() }
     }
 
     fn wanted(&self) -> bool {
         self.token.is_string() || self.token.is_number()
     }
 
-    fn notify(&mut self, message: &str) {
-        self.count += 1;
+    fn notify(&self, s: &mut Streamed, message: &str) {
+        s.count += 1;
         (self.send)(&json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
-            "progressToken": self.token, "progress": self.count, "message": message}}));
+            "progressToken": self.token, "progress": s.count, "message": message}}));
     }
 
     /// Something the server has to say.
-    fn note(&mut self, message: &str) {
+    fn note(&self, message: &str) {
         if self.wanted() {
-            self.flush();
-            self.notify(message);
+            let mut s = self.state.lock().unwrap();
+            self.send_pending(&mut s);
+            self.notify(&mut s, message);
         }
     }
 
-    fn output(&mut self, stream: Stream, data: &[u8]) {
-        if !self.wanted() || self.streamed >= STREAM_MAX {
+    fn output(&self, stream: Stream, data: &[u8]) {
+        if !self.wanted() {
             return;
         }
-        let take = data.len().min(STREAM_MAX - self.streamed);
-        self.streamed += take;
-        self.pending[(stream == Stream::Stderr) as usize].extend_from_slice(&data[..take]);
-        let waiting = self.pending.iter().map(Vec::len).sum::<usize>();
-        if waiting >= STREAM_CHUNK || self.last.elapsed() >= STREAM_EVERY {
-            self.flush();
+        let mut s = self.state.lock().unwrap();
+        if s.bytes >= STREAM_MAX {
+            return;
         }
-        if self.streamed >= STREAM_MAX {
-            self.note(&format!("[output past {} KiB isn't streamed; the answer has what fits]", STREAM_MAX >> 10));
+        let take = data.len().min(STREAM_MAX - s.bytes);
+        s.bytes += take;
+        s.pending[(stream == Stream::Stderr) as usize].extend_from_slice(&data[..take]);
+        let waiting = s.pending.iter().map(Vec::len).sum::<usize>();
+        if waiting >= STREAM_CHUNK || s.last.is_none_or(|t| t.elapsed() >= STREAM_EVERY) {
+            self.send_pending(&mut s);
+        }
+        if s.bytes >= STREAM_MAX {
+            self.send_pending(&mut s);
+            let note = format!("[output past {} KiB isn't streamed; the answer has what fits]", STREAM_MAX >> 10);
+            self.notify(&mut s, &note);
         }
     }
 
-    fn flush(&mut self) {
-        self.last = Instant::now();
+    fn flush(&self) {
+        let mut s = self.state.lock().unwrap();
+        self.send_pending(&mut s);
+    }
+
+    fn send_pending(&self, s: &mut Streamed) {
+        s.last = Some(Instant::now());
         for (i, prefix) in [(0, ""), (1, "[stderr] ")] {
-            if !self.pending[i].is_empty() {
-                let text = format!("{prefix}{}", String::from_utf8_lossy(&std::mem::take(&mut self.pending[i])));
-                self.notify(&text);
+            if !s.pending[i].is_empty() {
+                let text = format!("{prefix}{}", String::from_utf8_lossy(&std::mem::take(&mut s.pending[i])));
+                self.notify(s, &text);
             }
         }
+    }
+
+    /// Do `work`, sending what output waits every `STREAM_EVERY` meanwhile.
+    fn ticking<T>(&self, work: impl FnOnce() -> T) -> T {
+        if !self.wanted() {
+            return work();
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let mut s = self.state.lock().unwrap();
+                    if s.last.is_none_or(|t| t.elapsed() >= STREAM_EVERY) {
+                        self.send_pending(&mut s);
+                    }
+                }
+            });
+            let out = work();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            out
+        })
     }
 }
 
@@ -313,13 +377,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// A tool call's answer.
-fn call_tool(
-    config: &McpConfig,
-    msg: &Value,
-    id: Value,
-    control: &RunControl,
-    progress: &mut Progress,
-) -> Option<Value> {
+fn call_tool(config: &McpConfig, msg: &Value, id: Value, control: &RunControl, progress: &Progress) -> Option<Value> {
     let name = msg["params"]["name"].as_str().unwrap_or("");
     let args = &msg["params"]["arguments"];
     let outcome = match name {
@@ -472,12 +530,7 @@ fn timeout(config: &McpConfig, args: &Value, default: Duration) -> Result<Durati
     Ok(t.min(config.max_timeout))
 }
 
-fn run(
-    config: &McpConfig,
-    args: &Value,
-    control: &RunControl,
-    progress: &mut Progress,
-) -> Result<(String, Value, bool)> {
+fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progress) -> Result<(String, Value, bool)> {
     let stdin = args["stdin"].as_str().unwrap_or("").as_bytes().to_vec();
     let out = match args["snapshot"].as_str() {
         Some(path) => {
@@ -722,7 +775,7 @@ fn build_image(
     config: &McpConfig,
     args: &Value,
     control: &RunControl,
-    progress: &mut Progress,
+    progress: &Progress,
 ) -> Result<(String, Value, bool)> {
     if !config.writable {
         bail!("this server doesn't write host files (it isn't --writable), so it can't build images");

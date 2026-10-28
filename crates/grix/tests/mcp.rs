@@ -250,6 +250,22 @@ fn progress_and_cancellation() {
     assert_eq!(reply["id"], 11, "{reply}");
     assert_eq!(reply["result"]["structuredContent"]["stdout"], "one\nthree\n");
     assert!(messages.contains("one\n") && messages.contains("[stderr] two\n"), "{messages:?}");
+    // Output that waits is sent even when no more comes.
+    server.send(call(13, json!("tick"), "echo a; /bin/busybox usleep 50000; echo b; /bin/busybox sleep 3; echo c"));
+    let mut b_at = None;
+    let reply = loop {
+        let v = server.read();
+        if v["method"] == "notifications/progress" {
+            if v["params"]["message"].as_str().unwrap().contains('b') {
+                b_at.get_or_insert(std::time::Instant::now());
+            }
+        } else {
+            break v;
+        }
+    };
+    assert_eq!(reply["id"], 13, "{reply}");
+    let b_at = b_at.expect("b was streamed");
+    assert!(b_at.elapsed() > std::time::Duration::from_secs(1), "b came during the sleep, not with the answer");
     // Withdrawn: it stops, and only the ping is answered.
     server.send(
         json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 10, "reason": "test"}}),

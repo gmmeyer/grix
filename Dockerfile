@@ -9,6 +9,9 @@
 # grix needs nothing from the container but /tmp: no shell, no libc, no QEMU.
 
 FROM rust:1-alpine AS build
+# Set for releases: no paths from the build machine in the binaries.
+ARG GRIX_RELEASE_BUILD
+ENV GRIX_RELEASE_BUILD=$GRIX_RELEASE_BUILD
 RUN apk add --no-cache build-base \
     && rustup target add aarch64-unknown-none-softfloat
 WORKDIR /src

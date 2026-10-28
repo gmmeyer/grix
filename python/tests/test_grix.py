@@ -85,6 +85,17 @@ class Common:
         with self.assertRaises(grix.GrixError):
             grix.Sandbox(imports={"/no/such/file": "/x"}).run(["/x"])
 
+    def test_exports_where_mounts_could_lead_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            (work / "res").mkdir(parents=True)
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, mounts=[(work, "/work", "ro")], exports={"/out": work / "res" / "out"})
+            with self.assertRaisesRegex(grix.GrixError, "inside mounted"):
+                sb.run(["/bin/busybox", "true"])
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, exports={"/out": Path(tmp) / "out", "/o2": Path(tmp) / "out"})
+            with self.assertRaisesRegex(grix.GrixError, "two exports"):
+                sb.run(["/bin/busybox", "true"])
+
     def test_output_as_it_comes(self):
         seen = []
         sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
@@ -126,6 +137,21 @@ class NativeTest(Common, unittest.TestCase):
         control.cancel()
         r = sb.run(["/bin/busybox", "sleep", "30"], control=control)
         self.assertEqual(r.status["kind"], "stopped", r)
+
+    def test_exports_that_fail_say_so(self):
+        # The destination is taken during the run: 125, and why.
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "out"
+
+            def on_output(stream, data):
+                dest.mkdir(exist_ok=True)
+                (dest / "taken").write_text("x")
+
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["fs_write"], exports={"/out": dest})
+            r = sb.run(["/bin/busybox", "sh", "-c", "echo hi > /out/f; echo go"], on_output=on_output)
+            self.assertEqual(r.exit_code, 125, r)
+            self.assertFalse(r.ok)
+            self.assertIn("exporting /out", r.messages)
 
     def test_runs_in_parallel_threads(self):
         import threading

@@ -53,11 +53,19 @@ def native(grix: Optional[PathLike] = None) -> bool:
     return _native is not None and grix is None and os.environ.get("GRIX_PYTHON") != "cli"
 
 
-def _grix_dir() -> Optional[str]:
-    """The ``grix`` command's directory, if there is one: a release has the
-    kernel and grix-vmm there."""
-    path = os.environ.get("GRIX_BIN") or shutil.which("grix")
-    return os.fspath(Path(path).resolve().parent) if path else None
+def _install_dir() -> str:
+    """Where grix's kernel and grix-vmm are: beside this package in a
+    release (``python/grix`` in it), or beside the ``grix`` command
+    (``GRIX_BIN``, or on the PATH). Never the Python interpreter's
+    directory."""
+    release = Path(__file__).resolve().parents[2]
+    if (release / "grix-kernel").is_file():
+        return os.fspath(release)
+    command = os.environ.get("GRIX_BIN")
+    if command and os.sep not in command:
+        command = shutil.which(command)
+    command = command or shutil.which("grix")
+    return os.fspath(Path(command).resolve().parent if command else release)
 
 
 class Control:
@@ -214,7 +222,7 @@ class Sandbox:
             "mounts": [(os.fspath(m[0]), m[1], m[2] if len(m) > 2 else "rw") for m in self.mounts],
             "exports": [(g, os.fspath(h)) for g, h in self.exports.items()],
             "max_output_mb": num(self.max_output_mb or None, int),
-            "grix_dir": _grix_dir(),
+            "install_dir": _install_dir(),
         }
 
     def run(
@@ -283,7 +291,7 @@ class Snapshot:
             data = stdin.encode() if isinstance(stdin, str) else stdin
             inner = control._inner if control is not None else None
             return _native_result(
-                _native.snapshot_run, os.fspath(self.path), data, self.timeout, on_output, inner, _grix_dir()
+                _native.snapshot_run, os.fspath(self.path), _install_dir(), data, self.timeout, on_output, inner
             )
         if control is not None:
             raise GrixError("Control needs grix's native module (make python)")
@@ -300,7 +308,7 @@ def _native_result(fn, *args) -> Result:
         out = json.loads(fn(*args))
     except _native.Error as e:
         raise GrixError(str(e)) from None
-    return _result(out, out["exit_code"], "")
+    return _result(out, out["exit_code"], out["messages"])
 
 
 def _run(argv: list, stdin: Union[str, bytes, None], on_output: Optional[OnOutput] = None) -> Result:

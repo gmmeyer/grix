@@ -498,6 +498,17 @@ Next, in TODO.md order:
   command (`SandboxBuilder::install_dir`). The Python tests run everything
   both ways. Releases carry the package with the module built.
 
+- **Review fixes** (0.0.4): exports and mount reports are the library's
+  (`results.rs`), so the native module checks destinations as the CLI
+  does (none inside a mount, none twice, its directory unchanged after
+  the run) and reports failures as 125 with messages. Ctrl-C keeps
+  stopping until the run ends. MCP waits for at most `max_parallel + 8`
+  calls (more are refused), a call that can't get a thread or panics is
+  answered with an error, and waiting output is flushed every 250 ms.
+  Release builds (`GRIX_RELEASE_BUILD`) look for the kernel and grix-vmm
+  only where they're installed; the Python module never beside the
+  interpreter.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

@@ -6,10 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use grix::{
-    Capability, DenyAction, Export, ExportState, GuestEvent, Manifest, MountMode, MountState, RunControl, RunOutput,
-    Sandbox, Stream,
-};
+use grix::{Capability, DenyAction, GuestEvent, Manifest, MountMode, RunControl, RunOutput, Sandbox, Stream};
 
 #[derive(Parser)]
 #[command(name = "grix", version, about = "Run Linux programs in a capability-scoped unikernel")]
@@ -303,7 +300,7 @@ fn main() -> ExitCode {
 struct Prepared {
     sandbox: Sandbox,
     command: Vec<String>,
-    exports: Vec<(String, PathBuf)>,
+    exports: grix::results::Destinations,
     control: RunControl,
 }
 
@@ -340,12 +337,12 @@ fn run(args: RunArgs) -> Result<i32> {
                 Ok((g.to_string(), PathBuf::from(h)))
             })
             .collect::<Result<_>>()?;
-        for (guest, host) in &exports {
+        for (guest, _) in &exports {
             if !snap.exports().contains(guest) {
                 bail!("the snapshot doesn't export {guest} (it exports {:?})", snap.exports());
             }
-            Export::check_destination(host).context("export destination")?;
         }
+        let exports = grix::results::check_destinations(&exports, &[])?;
         let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
         let input: Box<dyn std::io::Read + Send> =
             if stdin { Box::new(std::io::stdin()) } else { Box::new(std::io::empty()) };
@@ -502,14 +499,7 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
         b = b.export(guest)?;
         exports.push((guest.to_string(), PathBuf::from(host)));
     }
-    // Before the run, so its results have somewhere to go.
-    for (i, (_, host)) in exports.iter().enumerate() {
-        Export::check_destination(host).context("export destination")?;
-        if exports[..i].iter().any(|(_, h)| h == host) {
-            bail!("{} is the destination of two exports", host.display());
-        }
-    }
-    let mut mounted: Vec<PathBuf> = manifest.mounts.iter().filter_map(|m| m.host.canonicalize().ok()).collect();
+    let mut mounted: Vec<PathBuf> = manifest.mounts.iter().map(|m| m.host.clone()).collect();
     for spec in &args.mounts {
         let (rest, mode) = match spec.rsplit_once(':') {
             Some((rest, "rw")) => (rest, MountMode::ReadWrite),
@@ -522,18 +512,10 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
             .rsplit_once(':')
             .with_context(|| format!("--mount {spec:?} must be HOST:GUEST[:rw|ro|on-exit|lazy]"))?;
         b = b.mount_with(host, guest, mode)?;
-        mounted.extend(Path::new(host).canonicalize().ok());
+        mounted.push(PathBuf::from(host));
     }
-    // Mounts are applied first: one's changes mustn't decide where an
-    // export goes.
-    for (_, dest) in &exports {
-        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        if let Ok(parent) = parent.canonicalize()
-            && let Some(m) = mounted.iter().find(|m| parent.starts_with(m))
-        {
-            bail!("export destination {} is inside mounted {}", dest.display(), m.display());
-        }
-    }
+    // Before the run, so its results have somewhere to go.
+    let exports = grix::results::check_destinations(&exports, &mounted)?;
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }
@@ -597,13 +579,20 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
 }
 
 /// What a run did, for the user; the exit code.
-fn report(args: &RunArgs, out: RunOutput, exports: &[(String, PathBuf)]) -> Result<i32> {
+fn report(args: &RunArgs, out: RunOutput, exports: &grix::results::Destinations) -> Result<i32> {
+    let mut notes = Vec::new();
+    let say = |notes: &mut Vec<String>| {
+        for n in notes.drain(..) {
+            eprintln!("grix: {n}");
+        }
+    };
     if args.json {
         let mut json = serde_json::to_value(&out)?;
         json["missing_capabilities"] = serde_json::json!(out.missing_capabilities());
         println!("{}", serde_json::to_string_pretty(&json)?);
-        let wrote = write_exports(&out, exports, args.quiet);
-        let applied = report_mounts(&out, true);
+        let wrote = exports.write(&out, args.quiet, &mut notes);
+        let applied = grix::results::report_mounts(&out, true, &mut notes);
+        say(&mut notes);
         return Ok(if wrote && applied { out.status.code() } else { 125 });
     }
     let _ = std::io::stdout().flush();
@@ -635,82 +624,10 @@ fn report(args: &RunArgs, out: RunOutput, exports: &[(String, PathBuf)]) -> Resu
         grix::ExitStatus::VmFailed(why) => eprintln!("grix: {why}"),
         _ => {}
     }
-    let wrote = write_exports(&out, exports, args.quiet);
-    let applied = report_mounts(&out, args.quiet);
+    let wrote = exports.write(&out, args.quiet, &mut notes);
+    let applied = grix::results::report_mounts(&out, args.quiet, &mut notes);
+    say(&mut notes);
     Ok(if wrote && applied { out.status.code() } else { 125 })
-}
-
-/// Say what happened to each mount. False if a program that ended
-/// normally didn't get its changes applied.
-fn report_mounts(out: &RunOutput, quiet: bool) -> bool {
-    let ended = matches!(out.status, grix::ExitStatus::Exited(_) | grix::ExitStatus::Signaled(_));
-    let mut ok = true;
-    for m in &out.mount_changes {
-        let host = m.host.display();
-        let (w, r) = (m.written.len(), m.removed.len());
-        match &m.state {
-            MountState::Applied if quiet || w + r == 0 => {}
-            MountState::Applied => eprintln!("grix: applied the changes to {host}: {w} written, {r} removed"),
-            MountState::NotApplied if ended => {
-                eprintln!(
-                    "grix: the changes to {host} weren't applied: they didn't all arrive \
-                     (over --max-export, or paths nested deeper than 4096 bytes)"
-                );
-                ok = false;
-            }
-            MountState::NotApplied => eprintln!("grix: the changes to {host} weren't applied"),
-            MountState::Failed(why) => {
-                eprintln!("grix: applying the changes to {host} failed after {w} written, {r} removed: {why}");
-                ok = false;
-            }
-        }
-        if !m.conflicts.is_empty() {
-            let n = m.conflicts.len();
-            let shown: Vec<&str> = m.conflicts.iter().take(10).map(String::as_str).collect();
-            let more = if n > 10 { format!(" and {} more", n - 10) } else { String::new() };
-            eprintln!(
-                "grix: {n} path(s) in {host} changed on the host during the run too and were left as they are: {}{more}",
-                shown.join(", ")
-            );
-        }
-    }
-    ok
-}
-
-/// Write each exported directory to its host path, saying what happened.
-/// Partial exports are written too, with a warning. False if any couldn't
-/// be written.
-fn write_exports(out: &RunOutput, exports: &[(String, PathBuf)], quiet: bool) -> bool {
-    let mut ok = true;
-    for (guest, host) in exports {
-        let Some(export) = out.export(guest) else { continue };
-        let note = match export.state {
-            ExportState::Complete => "",
-            ExportState::Missing => {
-                eprintln!("grix: {guest} didn't exist when the program ended; nothing exported");
-                continue;
-            }
-            ExportState::Truncated => " (cut off at the export limit)",
-            ExportState::Incomplete => " (incomplete: the run ended before all of it arrived)",
-        };
-        if export.entries.is_empty() && !note.is_empty() {
-            eprintln!("grix: nothing of {guest} was exported{note}");
-            continue;
-        }
-        match export.write_to(host) {
-            Ok(()) if quiet && note.is_empty() => {}
-            Ok(()) => {
-                let n = export.entries.len();
-                let s = if n == 1 { "entry" } else { "entries" };
-                eprintln!("grix: exported {guest} to {} ({n} {s}){note}", host.display())
-            }
-            Err(e) => {
-                eprintln!("grix: exporting {guest} to {}: {e:#}", host.display());
-                ok = false;
-            }
-        }
-    }
-    ok
 }
 
 /// Host signals caught and not forwarded yet, as a bit per signal number.

@@ -33,6 +33,7 @@ pub mod mcp;
 mod mount;
 mod net;
 mod oci;
+pub mod results;
 mod sandbox;
 pub mod snapshot;
 mod treecache;

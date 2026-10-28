@@ -14,6 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Release builds look for the kernel and grix-vmm only where they're
+  # installed, never at paths from this machine (sandbox.rs SOURCE_TREE).
+  GRIX_RELEASE_BUILD: "1"
 
 jobs:
   kernel:
@@ -46,7 +49,7 @@ jobs:
       # The Dockerfile's build stage: static grix and grix-vmm (musl).
       - name: Build grix and grix-vmm
         run: |
-          docker build --platform linux/arm64 --target build -t grix-build .
+          docker build --platform linux/arm64 --target build --build-arg GRIX_RELEASE_BUILD=1 -t grix-build .
           id=$(docker create grix-build)
           docker cp "$id:/out/bin" out-bin
           docker rm "$id"

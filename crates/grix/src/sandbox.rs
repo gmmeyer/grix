@@ -204,23 +204,57 @@ pub(crate) fn default_vmm() -> Option<PathBuf> {
         Some(v) => return Some(v.into()),
         None => {}
     }
-    let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("grix-vmm")));
-    let built = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/grix-vmm"));
-    beside.into_iter().chain([built]).find(|p| p.is_file())
+    vmm_in(exe_dir().as_deref())
+}
+
+/// The running program's directory: a release unpacks grix, grix-vmm and
+/// the kernel together.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf()))
+}
+
+/// This source tree, for a build of it (where `make` puts the kernel and
+/// grix-vmm). Release builds (`GRIX_RELEASE_BUILD` set when compiling)
+/// have none: a path from the machine that built them means nothing on
+/// another, and anyone there could put files at it.
+const SOURCE_TREE: Option<&str> = if option_env!("GRIX_RELEASE_BUILD").is_some() {
+    None
+} else {
+    Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+};
+
+/// grix-vmm in `dir` (an installation), or this source tree's build, unless
+/// `GRIX_VMM` says otherwise. None where it doesn't run.
+pub(crate) fn vmm_in(dir: Option<&Path>) -> Option<PathBuf> {
+    if !vmm_runs_here() {
+        return None;
+    }
+    match std::env::var_os("GRIX_VMM") {
+        Some(v) if v == "qemu" => return None,
+        Some(v) => return Some(v.into()),
+        None => {}
+    }
+    let built = SOURCE_TREE.map(|t| Path::new(t).join("target/release/grix-vmm"));
+    dir.map(|d| d.join("grix-vmm")).into_iter().chain(built).find(|p| p.is_file())
+}
+
+/// The kernel in `dir` (an installation), or this source tree's build,
+/// unless `GRIX_KERNEL` says otherwise.
+fn kernel_in(dir: Option<&Path>) -> PathBuf {
+    if let Some(k) = std::env::var_os("GRIX_KERNEL") {
+        return k.into();
+    }
+    let built =
+        SOURCE_TREE.map(|t| Path::new(t).join("kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"));
+    let candidates: Vec<PathBuf> = dir.map(|d| d.join("grix-kernel")).into_iter().chain(built).collect();
+    // The first that's there; if none is, the one an error should name.
+    candidates.iter().find(|p| p.is_file()).or(candidates.first()).cloned().unwrap_or_else(|| "grix-kernel".into())
 }
 
 /// The grix kernel: `GRIX_KERNEL`, beside the running program (as a
 /// release unpacks), or this source tree's build.
 fn default_kernel() -> PathBuf {
-    if let Some(k) = std::env::var_os("GRIX_KERNEL") {
-        return k.into();
-    }
-    let built = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"
-    ));
-    let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("grix-kernel")));
-    beside.filter(|p| p.is_file()).unwrap_or(built)
+    kernel_in(exe_dir().as_deref())
 }
 
 /// Does grix-vmm run here, unless told otherwise (`GRIX_ACCEL`)?
@@ -624,19 +658,13 @@ impl SandboxBuilder {
 
     /// Where grix is installed (as a release unpacks: `grix`, `grix-vmm`
     /// and `grix-kernel` together), for programs that aren't `grix`
-    /// themselves (the Python module): its kernel and grix-vmm are used,
-    /// unless `GRIX_KERNEL` or `GRIX_VMM` say otherwise or grix-vmm can't
-    /// run here.
+    /// themselves (the Python module): the kernel and grix-vmm are looked
+    /// for there instead of beside the running program, unless
+    /// `GRIX_KERNEL` or `GRIX_VMM` say otherwise.
     pub fn install_dir(mut self, dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref();
-        let kernel = dir.join("grix-kernel");
-        if std::env::var_os("GRIX_KERNEL").is_none() && kernel.is_file() {
-            self.kernel = kernel;
-        }
-        let vmm = dir.join("grix-vmm");
-        if std::env::var_os("GRIX_VMM").is_none() && vmm_runs_here() && vmm.is_file() {
-            self.vmm = Some(vmm);
-        }
+        self.kernel = kernel_in(Some(dir));
+        self.vmm = vmm_in(Some(dir));
         self
     }
 

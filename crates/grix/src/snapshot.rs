@@ -174,6 +174,14 @@ impl Snapshot {
     }
 
     /// Run in this `grix-vmm`.
+    /// Look for grix-vmm in `dir`, where grix is installed, instead of
+    /// beside the running program (see
+    /// [`SandboxBuilder::install_dir`](crate::SandboxBuilder::install_dir)).
+    pub fn install_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
+        self.vmm = crate::sandbox::vmm_in(Some(dir.as_ref()));
+        self
+    }
+
     pub fn vmm(mut self, path: impl Into<PathBuf>) -> Self {
         self.vmm = Some(path.into());
         self
