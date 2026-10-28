@@ -313,9 +313,11 @@ impl Collector {
                 let path_len = path_len as usize;
                 let data_len = usize::try_from(data_len).ok()?;
                 let empty = matches!(kind, ExportKind::Dir | ExportKind::Removed);
+                // (A length no entry can have, and the sums below can't wrap.)
                 if self.exports[cur].state == ExportState::Missing
                     || path_len == 0
                     || path_len > MAX_EXPORT_PATH
+                    || path_len.checked_add(data_len).is_none()
                     || (empty && data_len != 0)
                     || (kind == ExportKind::Removed && cur < self.first_mount)
                 {
@@ -565,6 +567,16 @@ mod tests {
                 .encode(),
         ];
         assert_eq!(collect(&["/out"], 1 << 20, &huge)[0].state, ExportState::Incomplete);
+        // Lengths whose sum wraps (a panic, in a debug build).
+        let wraps = stream(vec![
+            vec![ExportMsg::Root { index: 0, found: true }.encode()],
+            vec![
+                ExportMsg::Entry { kind: ExportKind::File, mode: 0, mtime_ns: 0, path_len: 1, data_len: u64::MAX }
+                    .encode(),
+            ],
+            vec![ExportMsg::Data(b"ab").encode()],
+        ]);
+        assert_eq!(collect(&["/out"], 1 << 20, &wraps)[0].state, ExportState::Incomplete);
         let early = vec![ExportMsg::Data(b"x").encode(), ExportMsg::Root { index: 5, found: true }.encode()];
         assert_eq!(collect(&["/out"], 1 << 20, &early)[0].state, ExportState::Incomplete);
         let mut x: u32 = 1;

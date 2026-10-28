@@ -408,6 +408,7 @@ impl<'a> Event<'a> {
             6 => Event::Continued,
             _ => return Err(DecodeError),
         };
+        r.done()?;
         Ok(ev)
     }
 }
@@ -491,6 +492,10 @@ mod tests {
         ];
         for e in evs {
             assert_eq!(Event::decode(&e.encode()).unwrap(), e);
+            // Anything after it is garbage, as for every other message.
+            let mut more = e.encode();
+            more.push(0);
+            assert!(Event::decode(&more).is_err(), "{e:?}");
         }
     }
 }

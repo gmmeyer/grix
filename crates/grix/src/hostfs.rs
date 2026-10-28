@@ -42,12 +42,17 @@ const ENAMETOOLONG: u16 = 36;
 const EOPNOTSUPP: u16 = 95;
 const ESTALE: u16 = 116;
 
-/// Ids the host keeps track of (everything listed or created).
+/// Ids the host keeps track of (everything listed or created), and their
+/// names' bytes (each name is kept twice): a tree of long names reaches
+/// the second first, so the host's memory is bounded either way.
 const MAX_IDS: usize = 1_000_000;
+const MAX_ID_BYTES: usize = 64 << 20;
 /// `Server::save`'s format.
 const STATE_VERSION: u32 = 1;
-/// Directory entries of lazy imports kept as first listed.
+/// Directory entries of lazy imports kept as first listed, and their names'
+/// and link targets' bytes.
 const MAX_FROZEN: usize = 4_000_000;
+const MAX_FROZEN_BYTES: usize = 64 << 20;
 /// Files kept open between requests.
 const OPEN_FILES: usize = 32;
 /// Files the guest removed while it may still have them open.
@@ -179,7 +184,10 @@ pub(crate) struct Server {
     attrs: HashMap<u64, Attr>,
     frozen: HashMap<u64, Vec<(String, Attr, String)>>,
     frozen_entries: usize,
+    frozen_bytes: usize,
     nodes: HashMap<u64, Node>,
+    /// Bytes of `nodes`' names.
+    id_bytes: usize,
     by_name: HashMap<(u64, String), u64>,
     next_id: u64,
     /// (id, writable, descriptor), most recently used last.
@@ -208,7 +216,9 @@ impl Server {
             attrs: HashMap::new(),
             frozen: HashMap::new(),
             frozen_entries: 0,
+            frozen_bytes: 0,
             nodes: HashMap::new(),
+            id_bytes: 0,
             by_name: HashMap::new(),
             files: Vec::new(),
             kept: VecDeque::new(),
@@ -291,6 +301,10 @@ impl Server {
             if parent == 0 || s.by_name.insert((parent, name.to_string()), id).is_some() {
                 return Err(bad("a parent"));
             }
+            s.id_bytes += name.len();
+            if s.id_bytes > MAX_ID_BYTES {
+                return Err(bad("too many ids"));
+            }
             s.nodes.insert(id, Node { parent, name: name.to_string() });
             last = id;
         }
@@ -321,6 +335,10 @@ impl Server {
                 cname(name).map_err(|_| bad("a listed name"))?;
                 let attr = Attr::get(&mut r).map_err(d)?;
                 let target = r.str().map_err(d)?;
+                s.frozen_bytes += name.len() + target.len();
+                if s.frozen_bytes > MAX_FROZEN_BYTES {
+                    return Err(bad("a listing"));
+                }
                 entries.push((name.to_string(), attr, target.to_string()));
             }
             s.frozen_entries += count;
@@ -486,6 +504,7 @@ impl Server {
                 self.keep(keep);
                 self.forget(to_dir, to);
                 if let Some(id) = self.by_name.remove(&(from_dir, from.to_string())) {
+                    self.id_bytes = (self.id_bytes + to.len()).saturating_sub(from.len());
                     self.nodes.insert(id, Node { parent: to_dir, name: to.to_string() });
                     self.by_name.insert((to_dir, to.to_string()), id);
                 }
@@ -724,8 +743,13 @@ impl Server {
             return Ok(e.clone());
         }
         let entries = read_entries(d)?;
-        if self.is_lazy(dir) && self.frozen_entries + entries.len() <= MAX_FROZEN {
+        let bytes: usize = entries.iter().map(|(name, _, target)| name.len() + target.len()).sum();
+        if self.is_lazy(dir)
+            && self.frozen_entries + entries.len() <= MAX_FROZEN
+            && self.frozen_bytes + bytes <= MAX_FROZEN_BYTES
+        {
             self.frozen_entries += entries.len();
+            self.frozen_bytes += bytes;
             self.frozen.insert(dir, entries.clone());
         }
         Ok(entries)
@@ -736,11 +760,12 @@ impl Server {
         if let Some(&id) = self.by_name.get(&(dir, name.to_string())) {
             return Ok(id);
         }
-        if self.nodes.len() >= MAX_IDS {
+        if self.nodes.len() >= MAX_IDS || self.id_bytes + name.len() > MAX_ID_BYTES {
             return Err(ENOMEM);
         }
         let id = self.next_id;
         self.next_id += 1;
+        self.id_bytes += name.len();
         self.nodes.insert(id, Node { parent: dir, name: name.to_string() });
         self.by_name.insert((dir, name.to_string()), id);
         Ok(id)
@@ -750,6 +775,7 @@ impl Server {
     fn forget(&mut self, dir: u64, name: &str) {
         if let Some(id) = self.by_name.remove(&(dir, name.to_string())) {
             self.nodes.remove(&id);
+            self.id_bytes = self.id_bytes.saturating_sub(name.len());
         }
         if self.listing.as_ref().is_some_and(|l| l.dir == dir) {
             self.listing = None;
@@ -818,6 +844,27 @@ mod tests {
             }
         }
         out.expect("a reply")
+    }
+
+    /// Long names run out of room before the count does: what the host
+    /// keeps for the guest is bounded in bytes.
+    #[test]
+    fn ids_are_bounded_in_bytes() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        let long = |i: usize| format!("{i:0>255}");
+        let mut n = 0;
+        while s.id(1, &long(n)).is_ok() {
+            n += 1;
+        }
+        assert!(n < MAX_IDS && n == MAX_ID_BYTES / 255, "{n}");
+        assert_eq!(s.id(1, &long(n)), Err(ENOMEM));
+        s.forget(1, &long(0));
+        assert!(s.id(1, &long(n)).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

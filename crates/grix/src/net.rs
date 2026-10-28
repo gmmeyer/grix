@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -428,8 +427,11 @@ impl Outbox {
 
 /// One connection, made for the guest or forwarded to it.
 struct Conn {
-    /// Messages for the writer thread; None once the guest closed it.
-    to_peer: Mutex<Option<Sender<ToPeer>>>,
+    /// What the guest sent for the peer, for the writer thread: bytes, not
+    /// messages, so what's held is at most the window however the guest
+    /// cuts it up.
+    to_peer: Mutex<ToPeer>,
+    to_peer_ready: Condvar,
     /// What we may send the guest (it returns credit as it reads).
     credit: Mutex<u32>,
     wake: Condvar,
@@ -439,15 +441,22 @@ struct Conn {
     closed: AtomicBool,
 }
 
-enum ToPeer {
-    Data(Vec<u8>),
-    Shutdown,
+#[derive(Default)]
+struct ToPeer {
+    data: Vec<u8>,
+    /// The writer is running: the connection is up.
+    open: bool,
+    /// The guest shut its side for writing (the peer's goes once `data` is out).
+    shutdown: bool,
+    /// The guest closed it: the writer sends what's left, and ends.
+    closed: bool,
 }
 
 impl Conn {
     fn new() -> Arc<Conn> {
         Arc::new(Conn {
-            to_peer: Mutex::new(None),
+            to_peer: Mutex::new(ToPeer::default()),
+            to_peer_ready: Condvar::new(),
             credit: Mutex::new(WINDOW),
             wake: Condvar::new(),
             window: Mutex::new(WINDOW),
@@ -462,7 +471,8 @@ impl Conn {
         self.closed.store(true, Ordering::Relaxed);
         drop(credit);
         self.wake.notify_all();
-        *self.to_peer.lock().unwrap() = None;
+        self.to_peer.lock().unwrap().closed = true;
+        self.to_peer_ready.notify_all();
     }
 }
 
@@ -616,6 +626,8 @@ impl Proxy {
         let s = &self.shared;
         match msg {
             ToHost::Connect { id, addr, port } => self.connect(id, ip_of(addr), port),
+            // An empty one says nothing.
+            ToHost::Data { data: [], .. } => {}
             ToHost::Data { id, data } => {
                 let Some(c) = s.conns.lock().unwrap().get(&id).cloned() else { return };
                 let mut window = c.window.lock().unwrap();
@@ -626,9 +638,11 @@ impl Proxy {
                     s.reply(ToGuest::Failed { id, errno: 104 });
                     return;
                 }
-                *window -= data.len() as u32;
-                if let Some(tx) = c.to_peer.lock().unwrap().as_ref() {
-                    let _ = tx.send(ToPeer::Data(data.to_vec()));
+                let mut to_peer = c.to_peer.lock().unwrap();
+                if to_peer.open && !to_peer.shutdown && !to_peer.closed {
+                    *window -= data.len() as u32;
+                    to_peer.data.extend_from_slice(data);
+                    c.to_peer_ready.notify_all();
                 }
             }
             ToHost::Credit { id, bytes } => {
@@ -639,10 +653,9 @@ impl Proxy {
                 }
             }
             ToHost::Shutdown { id } => {
-                if let Some(c) = s.conns.lock().unwrap().get(&id)
-                    && let Some(tx) = c.to_peer.lock().unwrap().as_ref()
-                {
-                    let _ = tx.send(ToPeer::Shutdown);
+                if let Some(c) = s.conns.lock().unwrap().get(&id) {
+                    c.to_peer.lock().unwrap().shutdown = true;
+                    c.to_peer_ready.notify_all();
                 }
             }
             ToHost::Close { id } => self.close(id),
@@ -979,20 +992,18 @@ fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &A
 /// the guest about it once it's ready for the guest's data.
 fn run_conn(s: &Arc<Shared>, id: u32, c: &Arc<Conn>, stream: TcpStream, announce: ToGuest) {
     let _ = stream.set_nodelay(true);
-    let (tx, rx) = mpsc::channel();
     let threads = stream.try_clone().ok().zip(stream.try_clone().ok());
     *c.stream.lock().unwrap() = Some(stream);
-    *c.to_peer.lock().unwrap() = Some(tx);
+    c.to_peer.lock().unwrap().open = true;
     // The guest closed it meanwhile (or the run ended): it hears nothing.
     if c.closed.load(Ordering::Relaxed) {
-        *c.to_peer.lock().unwrap() = None;
         return;
     }
     let (shared, conn) = (s.clone(), c.clone());
     let Some((reader, writer)) = threads else {
         return fail(s, id, ENOBUFS);
     };
-    if thread::Builder::new().spawn(move || write_loop(&shared, id, &conn, writer, rx)).is_err() {
+    if thread::Builder::new().spawn(move || write_loop(&shared, id, &conn, writer)).is_err() {
         return fail(s, id, ENOBUFS);
     }
     s.send(announce);
@@ -1051,20 +1062,30 @@ fn read_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
     }
 }
 
-fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream, rx: Receiver<ToPeer>) {
-    for msg in rx {
-        match msg {
-            ToPeer::Data(data) => {
-                if let Err(e) = stream.write_all(&data) {
-                    s.send(ToGuest::Failed { id, errno: errno(&e) });
-                    break;
-                }
-                *c.window.lock().unwrap() += data.len() as u32;
-                s.send(ToGuest::Credit { id, bytes: data.len() as u32 });
+fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
+    let mut shut = false;
+    loop {
+        let (data, shutdown, closed) = {
+            let mut to_peer = c.to_peer.lock().unwrap();
+            while to_peer.data.is_empty() && to_peer.shutdown == shut && !to_peer.closed {
+                to_peer = c.to_peer_ready.wait(to_peer).unwrap();
             }
-            ToPeer::Shutdown => {
-                let _ = stream.shutdown(Shutdown::Write);
+            (std::mem::take(&mut to_peer.data), to_peer.shutdown, to_peer.closed)
+        };
+        if !data.is_empty() {
+            if let Err(e) = stream.write_all(&data) {
+                s.send(ToGuest::Failed { id, errno: errno(&e) });
+                break;
             }
+            *c.window.lock().unwrap() += data.len() as u32;
+            s.send(ToGuest::Credit { id, bytes: data.len() as u32 });
+        }
+        if shutdown && !shut {
+            let _ = stream.shutdown(Shutdown::Write);
+            shut = true;
+        }
+        if closed && data.is_empty() {
+            break;
         }
     }
     // The guest closed it (and everything it sent went out first).
@@ -1130,6 +1151,48 @@ mod tests {
         assert!(
             open.check(ip_of(Addr::V6("::ffff:10.0.2.2".parse::<Ipv6Addr>().unwrap().octets())), 80, None).is_err()
         );
+    }
+
+    /// What the guest sends a connection's peer is bytes, however it cuts
+    /// them up: the host holds at most the window, and an empty message or
+    /// a shutdown again holds nothing.
+    #[test]
+    fn data_for_the_peer_is_bytes_within_the_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = Proxy::start(policy(&["127.0.0.1"]), Outbox::new()).unwrap();
+        proxy.handle(&ToHost::Connect { id: 1, addr: Addr::V4([127, 0, 0, 1]), port }.encode());
+        let (mut peer, _) = listener.accept().unwrap();
+        let conn = loop {
+            if let Some(c) = proxy.shared.conns.lock().unwrap().get(&1).cloned()
+                && c.to_peer.lock().unwrap().open
+            {
+                break c;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        for _ in 0..100_000 {
+            proxy.handle(&ToHost::Data { id: 1, data: &[] }.encode());
+        }
+        assert_eq!(conn.to_peer.lock().unwrap().data.capacity(), 0);
+        assert_eq!(*conn.window.lock().unwrap(), WINDOW);
+        // A byte at a time, then a shutdown (many times): the peer gets the
+        // bytes, then end-of-file.
+        for b in b"hello" {
+            proxy.handle(&ToHost::Data { id: 1, data: &[*b] }.encode());
+            assert!(conn.to_peer.lock().unwrap().data.len() as u32 <= WINDOW);
+        }
+        for _ in 0..1000 {
+            proxy.handle(&ToHost::Shutdown { id: 1 }.encode());
+        }
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut got = Vec::new();
+        peer.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hello");
+        // Nothing more is taken for a peer that's been shut.
+        proxy.handle(&ToHost::Data { id: 1, data: b"more" }.encode());
+        assert!(conn.to_peer.lock().unwrap().data.is_empty());
+        proxy.stop();
     }
 
     #[test]

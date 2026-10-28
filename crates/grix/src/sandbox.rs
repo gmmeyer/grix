@@ -1203,6 +1203,7 @@ fn execute(
         *truncated |= room < payload.len();
         room
     };
+    let mut event_bytes = 0usize;
     let run = vmm::run(vm, image, timeout, stdin, |ch, payload| match ch {
         Channel::Stdout => {
             let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
@@ -1212,17 +1213,26 @@ fn execute(
             let n = keep(&mut out.stderr, &mut out.stderr_truncated, payload);
             on_output(Stream::Stderr, &payload[..n]);
         }
-        Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
-        Channel::Event => match Event::decode(payload) {
-            Ok(e) => {
-                let e: GuestEvent = e.into();
-                if let Some(c) = &vm.control {
-                    c.event(&e);
+        Channel::Log => add_log(&mut out.kernel_log, &String::from_utf8_lossy(payload)),
+        Channel::Event => {
+            event_bytes = event_bytes.saturating_add(payload.len());
+            if event_bytes > MAX_EVENT_BYTES {
+                if event_bytes - payload.len() <= MAX_EVENT_BYTES {
+                    add_log(&mut out.kernel_log, "[grix] over 4 MiB of events from the guest: the rest are dropped\n");
                 }
-                out.events.push(e);
+                return;
             }
-            Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
-        },
+            match Event::decode(payload) {
+                Ok(e) => {
+                    let e: GuestEvent = e.into();
+                    if let Some(c) = &vm.control {
+                        c.event(&e);
+                    }
+                    out.events.push(e);
+                }
+                Err(_) => add_log(&mut out.kernel_log, "[grix] undecodable event from guest\n"),
+            }
+        }
         Channel::Export => exports.push(payload),
         Channel::Exit | Channel::Link | Channel::Fs => {}
     })?;
@@ -1252,6 +1262,28 @@ fn execute(
         )),
     };
     Ok((out, changes, taken))
+}
+
+/// What's kept of the kernel's log, and of its events (each one a frame,
+/// at most `wire::MAX_FRAME`): a guest that floods them mustn't take the
+/// host's memory, as `max_output` bounds the program's own output.
+const MAX_KERNEL_LOG: usize = 4 << 20;
+const MAX_EVENT_BYTES: usize = 4 << 20;
+
+/// Add `text` to the kernel's log, up to MAX_KERNEL_LOG, and say once if
+/// the rest is dropped.
+fn add_log(log: &mut String, text: &str) {
+    let Some(room) = MAX_KERNEL_LOG.checked_sub(log.len()) else { return };
+    if text.len() <= room {
+        log.push_str(text);
+        return;
+    }
+    let mut cut = room;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    log.push_str(&text[..cut]);
+    log.push_str("\n[grix] over 4 MiB of kernel log: the rest is dropped\n");
 }
 
 /// A run restored from `snap`, with `stdin`.
@@ -1295,4 +1327,23 @@ pub(crate) fn run_snapshot(
     };
     let exports = Collector::new(&s.exports, &[], s.max_export as u64);
     Ok(execute(&vm, &[], snap.timeout, Some(stdin), exports, s.max_output, on_output)?.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_kernel_log_is_bounded() {
+        let mut log = String::new();
+        // Multi-byte characters: cut at a boundary.
+        let line = "é".repeat(1000);
+        while log.len() < MAX_KERNEL_LOG {
+            add_log(&mut log, &line);
+        }
+        let len = log.len();
+        assert!(len <= MAX_KERNEL_LOG + 100 && log.ends_with("the rest is dropped\n"), "{len}");
+        add_log(&mut log, "more");
+        assert_eq!(log.len(), len);
+    }
 }
