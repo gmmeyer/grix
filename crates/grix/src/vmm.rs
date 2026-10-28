@@ -77,30 +77,56 @@ impl Drop for ChildGuard {
     }
 }
 
-struct TempFile(PathBuf);
+/// A run's own directory, for its boot image (the program's arguments and
+/// environment, and what it imported) and its serial port's socket:
+/// private (0700), and new, never one someone else made, by a name nobody
+/// can take first. It goes, with what's in it, when the run ends.
+struct RunDir(PathBuf);
 
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl RunDir {
+    fn new() -> Result<RunDir> {
+        use std::hash::{BuildHasher, Hasher};
+        use std::os::unix::fs::DirBuilderExt;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir();
+        for _ in 0..16 {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let r = std::collections::hash_map::RandomState::new().build_hasher().finish() as u32;
+            // Short: the socket's path must fit a sockaddr_un (104 bytes on
+            // macOS, whose temporary directory is long already).
+            let path = tmp.join(format!("grix-{}-{n}-{r:08x}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(RunDir(path)),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            }
+        }
+        anyhow::bail!("couldn't make a directory of our own in {}", tmp.display())
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
+    /// Write `contents` to a new file `name` only we can read.
+    fn write(&self, name: &str, contents: &[u8]) -> Result<PathBuf> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.file(name);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(contents)?;
+        Ok(path)
     }
 }
 
-fn temp_path(ext: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("grix-{}-{n}.{ext}", std::process::id()))
-}
-
-fn write_temp(ext: &str, contents: &[u8]) -> Result<TempFile> {
-    let path = temp_path(ext);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    let guard = TempFile(path);
-    f.write_all(contents)?;
-    Ok(guard)
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// How long the guest gets, after the program ends, to send its exports
@@ -208,6 +234,7 @@ pub(crate) fn run(
             "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU"
         );
     }
+    let dir = RunDir::new()?;
     // A restored run's kernel is in the snapshot (whose ABI the caller checked).
     let img = if restore {
         None
@@ -221,7 +248,7 @@ pub(crate) fn run(
         // A kernel that speaks another ABI would only garble the conversation.
         let kernel = std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?;
         crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
-        Some(write_temp("img", image)?)
+        Some(dir.write("image", image)?)
     };
     // Everything for the guest's console input (stdin, networking) goes
     // through one writer, a frame at a time. Forwarded ports are bound
@@ -232,16 +259,15 @@ pub(crate) fn run(
         Some(state) => crate::hostfs::Server::restore(&cfg.live, state)?,
         None => crate::hostfs::Server::new(&cfg.live)?,
     };
-    let uart_path = temp_path("uart");
+    let uart_path = dir.file("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
-    let _uart_path = TempFile(uart_path.clone());
     let mut cmd = match (&cfg.vmm, &img) {
         (Some(vmm), _) => {
             let mut cmd = Command::new(vmm);
             match &img {
                 Some(img) => {
-                    cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(&img.0);
+                    cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(img);
                     cmd.args(["--mem", &cfg.memory_mb.to_string(), "--cpus", &cfg.cpus.to_string()]);
                 }
                 None => {
@@ -254,7 +280,7 @@ pub(crate) fn run(
             cmd.arg("--uart").arg(&uart_path);
             cmd
         }
-        (None, Some(img)) => qemu_command(cfg, &uart_path, &img.0),
+        (None, Some(img)) => qemu_command(cfg, &uart_path, img),
         (None, None) => unreachable!("checked above"),
     };
     // The snapshot file is the VMM's fd 3 (which it can still use once it
