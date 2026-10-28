@@ -19,7 +19,7 @@ use crate::fd::FdTable;
 use crate::fs::{self, Ino, Kind, ROOT};
 use crate::mm::PAGE_SIZE;
 pub use crate::mm::aspace::Access;
-use crate::mm::aspace::{AddressSpace, Backing, FaultError, SIGPAGE, STACK_SIZE, STACK_TOP, Vma};
+use crate::mm::aspace::{AddressSpace, Backing, FaultError, MAX_STACK, SIGPAGE, STACK_SIZE, STACK_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::rng;
 use crate::signal::{self, AltStack, SigQueue};
@@ -738,6 +738,11 @@ pub fn load_program(
     let args_charge = crate::kmem::Charge::new(bytes)
         .map_err(|e| exec_error(e, "no kernel memory left for argv and environment".into()))?;
     let mut aspace = AddressSpace::new().ok_or_else(|| exec_error(ENOMEM, "out of memory".into()))?;
+    // The stack is as big as RLIMIT_STACK lets it grow on Linux, with room
+    // for the arguments (and their pointers) at least.
+    let strings = (argv.len() + envp.len()) as u64;
+    let need = bytes + strings * 8 + (128 << 10);
+    aspace.set_stack(crate::mm::page_up(p.rlimits[3].0.min(MAX_STACK).max(need)).unwrap_or(MAX_STACK));
     let loaded = elf::load(&mut aspace, &src, ino, Some(elf::DYN_BASE))
         .map_err(|e| exec_error(ENOEXEC, alloc::format!("{exe}: {e}")))?;
     let (entry, interp_base) = match &loaded.interp {
@@ -769,7 +774,7 @@ pub fn load_program(
 
     aspace.brk_start = loaded.end;
     aspace.brk = loaded.end;
-    aspace.map(Vma::anon(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW));
+    aspace.map(Vma::anon(aspace.stack_bottom(), STACK_TOP, Prot::RW));
     aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
 
     let auxv = [

@@ -137,7 +137,10 @@ fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing:
             return Err(EEXIST);
         }
         addr
-    } else if addr != 0 && aligned(addr) && addr.checked_add(len).is_some_and(|e| a.is_free(addr, e)) {
+    } else if addr != 0
+        && aligned(addr)
+        && addr.checked_add(len).is_some_and(|e| a.is_free(addr, e) && a.clear_of_stack(e))
+    {
         addr
     } else {
         a.find_free(len).ok_or(ENOMEM)?

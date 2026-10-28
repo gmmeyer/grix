@@ -1366,6 +1366,23 @@ fn cpu_time_timers() {
 }
 
 #[test]
+fn stack_follows_rlimit() {
+    // RLIMIT_STACK at exec sizes the stack: 32 MiB of it only works with a
+    // bigger limit than the default 8 MiB.
+    let b = with("stack").import(fixture("alpine/bin/busybox.static"), "/bin/sh").unwrap().allow(Capability::Process);
+    let sb = b.build().unwrap();
+    let out = sb.run(&["/bin/sh", "-c", "ulimit -s 65536 && exec /bin/stack 32"]).unwrap();
+    assert_eq!(out.stdout_str(), "depth 32\n", "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let out = sb.run(&["/bin/sh", "-c", "ulimit -s unlimited && exec /bin/stack 64"]).unwrap();
+    assert_eq!(out.stdout_str(), "depth 64\n", "{}{}", out.stderr_str(), out.kernel_log);
+    let out = sb.run(&["/bin/stack", "32"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Signaled(11), "{}", out.stdout_str());
+    assert!(matches!(&out.events[..], [GuestEvent::Fault { signal: 11, .. }]), "{:?}", out.events);
+}
+
+#[test]
 fn pseudo_terminals() {
     // The line discipline, controlling terminals and their signals.
     let out = run(with("pty").allow(Capability::Process), &["/bin/pty"]);

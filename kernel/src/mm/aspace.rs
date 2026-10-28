@@ -16,7 +16,15 @@ use crate::fs::{Content, Ino};
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = 1 << 48;
 pub const STACK_TOP: u64 = 0x0000_ffff_fffe_0000;
+/// RLIMIT_STACK's default, as on Linux.
 pub const STACK_SIZE: u64 = 8 << 20;
+/// The biggest stack exec makes (for an unlimited RLIMIT_STACK too). It's
+/// only address space until touched.
+pub const MAX_STACK: u64 = 4 << 30;
+/// No mmap without a hint comes closer to the stack than this, nor one
+/// with a hint closer than Linux's stack_guard_gap.
+const STACK_GAP: u64 = 128 << 20;
+const STACK_GUARD: u64 = 1 << 20;
 /// The signal-return trampoline page, above the stack.
 pub const SIGPAGE: u64 = STACK_TOP + 0x1_0000;
 /// At most this many mappings (Linux's vm.max_map_count is 65530): each
@@ -26,8 +34,6 @@ pub const MAX_VMAS: usize = 32768;
 /// per-process limit alone doesn't bound kernel memory.
 pub const MAX_VMAS_TOTAL: usize = 65536;
 static VMAS_TOTAL: AtomicUsize = AtomicUsize::new(0);
-/// mmap allocates top-down from here, leaving a gap below the stack.
-pub const MMAP_TOP: u64 = STACK_TOP - STACK_SIZE - (128 << 20);
 pub const MMAP_BOTTOM: u64 = 1 << 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +169,10 @@ pub struct AddressSpace {
     counted: usize,
     pub brk_start: u64,
     pub brk: u64,
+    /// The stack is [STACK_TOP - stack_size, STACK_TOP); mmap allocates
+    /// top-down from `mmap_top`, a gap below it.
+    stack_size: u64,
+    mmap_top: u64,
 }
 
 impl Drop for AddressSpace {
@@ -179,7 +189,34 @@ impl Drop for AddressSpace {
 
 impl AddressSpace {
     pub fn new() -> Option<Self> {
-        Some(Self { pt: PageTable::new()?, vmas: BTreeMap::new(), counted: 0, brk_start: 0, brk: 0 })
+        let mut a = Self {
+            pt: PageTable::new()?,
+            vmas: BTreeMap::new(),
+            counted: 0,
+            brk_start: 0,
+            brk: 0,
+            stack_size: 0,
+            mmap_top: 0,
+        };
+        a.set_stack(STACK_SIZE);
+        Some(a)
+    }
+
+    /// Where the stack goes (exec maps it), and so where mmap starts.
+    pub fn set_stack(&mut self, size: u64) {
+        self.stack_size = size;
+        self.mmap_top = STACK_TOP - size - STACK_GAP;
+    }
+
+    /// The stack's lowest address.
+    pub fn stack_bottom(&self) -> u64 {
+        STACK_TOP - self.stack_size
+    }
+
+    /// May a mapping end at `end` without a MAP_FIXED? Not within the
+    /// stack's guard gap, or above it.
+    pub fn clear_of_stack(&self, end: u64) -> bool {
+        end <= self.stack_bottom() - STACK_GUARD
     }
 
     /// Bring VMAS_TOTAL up to date after the mappings changed.
@@ -202,6 +239,7 @@ impl AddressSpace {
         child.recount();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
+        child.set_stack(self.stack_size);
         let mut out_of_memory = false;
         for v in self.vmas.values() {
             let cow = v.prot.write && !v.shared_pages();
@@ -313,10 +351,10 @@ impl AddressSpace {
         start < end && end <= USER_TOP && self.vmas.range(..end).next_back().is_none_or(|(_, v)| v.end <= start)
     }
 
-    /// Highest free `len`-byte range below MMAP_TOP.
+    /// Highest free `len`-byte range below `mmap_top`.
     pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut end = MMAP_TOP;
-        for (_, v) in self.vmas.range(..MMAP_TOP).rev() {
+        let mut end = self.mmap_top;
+        for (_, v) in self.vmas.range(..self.mmap_top).rev() {
             if v.end <= end && end - v.end >= len {
                 return Some(end - len);
             }
