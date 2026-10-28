@@ -689,7 +689,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
             }
             break;
         };
-        if crate::timer::delivered(&mut p.timers, &mut info) {
+        if crate::timer::delivered(p, &mut info) {
             p.timer_dirty = true;
         }
         let act = p.sigactions[info.signo as usize];
@@ -705,6 +705,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
             stop(p, info.signo);
             return;
         }
+        let Some(t) = p.threads.get_mut(&tid) else { return };
         if core::mem::take(&mut t.restarting) {
             interrupt_syscall(&mut p.aspace, t, tf, &act);
         }
@@ -895,7 +896,7 @@ pub fn dequeue(p: &mut Process, set: u64) -> Option<SigInfo> {
         None => in_order(p.shared_pending.mask & set).next().and_then(|sig| p.shared_pending.take(sig)),
     }?;
     let mut info = info;
-    if crate::timer::delivered(&mut p.timers, &mut info) {
+    if crate::timer::delivered(p, &mut info) {
         p.timer_dirty = true;
     }
     Some(info)

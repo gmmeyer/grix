@@ -9,24 +9,41 @@ use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, O_NONBLOCK, O_RDONLY, new_file};
 use crate::process::Process;
 use crate::time;
-use crate::timer::{Interval, MAX_POSIX_TIMERS, Notify, PosixTimer, SIGALRM, TimerFd};
+use crate::timer::{CpuClock, Interval, MAX_POSIX_TIMERS, MAX_TIMER_ID, Notify, PosixTimer, SIGALRM, TimerFd};
 use crate::uaccess::*;
 
 const NS: u64 = 1_000_000_000;
 const TIMER_ABSTIME: u64 = 1;
 
-/// The clocks timers can run on. CPU-time clocks aren't tracked (the
-/// CPU-time clocks report wall time), so their timers are unimplemented.
-fn clock_ok(p: &mut Process, n: u32, clock: u64) -> Result<(), Errno> {
-    match clock as i32 {
-        0 | 1 | 7 | 11 => Ok(()), // REALTIME, MONOTONIC, BOOTTIME, TAI
-        8 | 9 => Err(EPERM),      // *_ALARM: need CAP_WAKE_ALARM
-        2 | 3 => {
-            let (name, _) = super::table::info(n);
-            p.unimplemented(n, name, "CPU-time clock timers", EINVAL).map(|_| ())
+/// The clocks timers can run on: wall-clock ones (None) and, for POSIX
+/// timers, the CPU time of the process or one of its threads.
+fn timer_clock(p: &mut Process, n: u32, clock: u64, cpu_ok: bool) -> Result<Option<CpuClock>, Errno> {
+    let cpu = match clock as i32 {
+        0 | 1 | 7 | 11 => return Ok(None), // REALTIME, MONOTONIC, BOOTTIME, TAI
+        8 | 9 => return Err(EPERM),        // *_ALARM: need CAP_WAKE_ALARM
+        2 => CpuClock::Process,            // PROCESS_CPUTIME_ID
+        3 => CpuClock::Thread(p.current),  // THREAD_CPUTIME_ID
+        // clock_getcpuclockid/pthread_getcpuclockid: ~id << 3, bit 2 for a
+        // thread, and the kind of CPU time in the low bits (3 isn't one).
+        c if c < 0 && c & 3 != 3 => {
+            let id = !(c >> 3) as u32;
+            if c & 4 != 0 {
+                let tid = if id == 0 { p.current } else { id };
+                if !p.threads.contains_key(&tid) {
+                    return Err(EINVAL);
+                }
+                CpuClock::Thread(tid)
+            } else if id == 0 || id == p.pid {
+                CpuClock::Process
+            } else {
+                let (name, _) = super::table::info(n);
+                return p.unimplemented(n, name, "timers on another process's CPU-time clock", EINVAL).map(|_| None);
+            }
         }
-        _ => Err(EINVAL),
-    }
+        _ => return Err(EINVAL),
+    };
+    // timerfds only run on wall clocks, as on Linux.
+    if cpu_ok { Ok(Some(cpu)) } else { Err(EINVAL) }
 }
 
 /// An absolute time on `clock` as a monotonic deadline.
@@ -44,20 +61,26 @@ fn read_itimerspec(p: &mut Process, ptr: u64) -> Result<(u64, u64), Errno> {
     Ok((interval, value))
 }
 
-fn write_itimerspec(p: &mut Process, ptr: u64, t: &Interval) -> Result<(), Errno> {
+/// `now` is the time on the timer's clock.
+fn write_itimerspec(p: &mut Process, ptr: u64, t: &Interval, now: u64) -> Result<(), Errno> {
     write_timespec(&mut p.aspace, ptr, t.period)?;
-    write_timespec(&mut p.aspace, ptr + 16, t.remaining(time::monotonic_ns()))
+    write_timespec(&mut p.aspace, ptr + 16, t.remaining(now))
+}
+
+/// The time a timer runs on: its CPU-time clock's, or the monotonic one.
+fn timer_now(p: &Process, cpu: Option<CpuClock>) -> u64 {
+    cpu.map_or_else(time::monotonic_ns, |c| c.now(p).unwrap_or(0))
 }
 
 /// Arm (or, with a zero value, disarm) a timer from an itimerspec.
-fn arm(clock: u64, flags: u64, interval: u64, value: u64) -> Interval {
+fn arm(p: &Process, clock: u64, cpu: Option<CpuClock>, flags: u64, interval: u64, value: u64) -> Interval {
     if value == 0 {
         return Interval::default();
     }
-    let next = if flags & TIMER_ABSTIME != 0 {
-        absolute_to_monotonic(clock, value)
-    } else {
-        time::monotonic_ns().saturating_add(value)
+    let next = match (flags & TIMER_ABSTIME != 0, cpu) {
+        (true, Some(_)) => value,
+        (true, None) => absolute_to_monotonic(clock, value),
+        (false, cpu) => timer_now(p, cpu).saturating_add(value),
     };
     Interval { next: Some(next), period: interval }
 }
@@ -74,44 +97,46 @@ fn read_timeval_ns(p: &mut Process, ptr: u64) -> Result<u64, Errno> {
     Ok((sec as u64).saturating_mul(NS).saturating_add(usec as u64 * 1000))
 }
 
-fn write_itimerval(p: &mut Process, ptr: u64, t: &Interval) -> Result<(), Errno> {
+fn write_itimerval(p: &mut Process, ptr: u64, t: &Interval, now: u64) -> Result<(), Errno> {
     // Round up, as Linux does, so an armed timer never reads as disarmed.
     let us = |ns: u64| ns.div_ceil(1000);
     let mut b = [0u8; 32];
-    for (i, ns) in [t.period, t.remaining(time::monotonic_ns())].into_iter().enumerate() {
+    for (i, ns) in [t.period, t.remaining(now)].into_iter().enumerate() {
         b[i * 16..i * 16 + 8].copy_from_slice(&(us(ns) / 1_000_000).to_le_bytes());
         b[i * 16 + 8..i * 16 + 16].copy_from_slice(&(us(ns) % 1_000_000).to_le_bytes());
     }
     copy_out(&mut p.aspace, ptr, &b)
 }
 
-/// ITIMER_REAL only: the virtual and profiling timers count CPU time, which isn't tracked.
-fn real_only(p: &mut Process, n: u32, which: u64) -> Result<(), Errno> {
+/// ITIMER_REAL (wall time), ITIMER_VIRTUAL or ITIMER_PROF (the process's
+/// CPU time, which is all user time here, so the two run alike), and the
+/// time on its clock.
+fn itimer(p: &mut Process, which: u64) -> Result<(&mut Interval, Option<CpuClock>), Errno> {
     match which {
-        0 => Ok(()),
-        1 | 2 => {
-            let (name, _) = super::table::info(n);
-            p.unimplemented(n, name, "ITIMER_VIRTUAL/ITIMER_PROF (CPU-time timers)", EINVAL).map(|_| ())
-        }
+        0 => Ok((&mut p.timers.real, None)),
+        1 | 2 => Ok((&mut p.timers.cpu_itimers[which as usize - 1], Some(CpuClock::Process))),
         _ => Err(EINVAL),
     }
 }
 
 pub fn getitimer(p: &mut Process, which: u64, curr: u64) -> SysResult {
-    real_only(p, nr::getitimer, which)?;
-    let t = p.timers.real;
-    write_itimerval(p, curr, &t).map(|_| 0)
+    let (t, cpu) = itimer(p, which)?;
+    let t = *t;
+    let now = timer_now(p, cpu);
+    write_itimerval(p, curr, &t, now).map(|_| 0)
 }
 
 pub fn setitimer(p: &mut Process, which: u64, new: u64, old: u64) -> SysResult {
-    real_only(p, nr::setitimer, which)?;
+    let cpu = itimer(p, which)?.1;
     // A NULL new value disarms (an old Linux quirk that alarm(0) relies on).
     let (interval, value) = if new == 0 { (0, 0) } else { (read_timeval_ns(p, new)?, read_timeval_ns(p, new + 16)?) };
-    let prev = p.timers.real;
+    let prev = *itimer(p, which)?.0;
     if old != 0 {
-        write_itimerval(p, old, &prev)?;
+        let now = timer_now(p, cpu);
+        write_itimerval(p, old, &prev, now)?;
     }
-    p.timers.real = arm(1, 0, interval, value);
+    let timing = arm(p, 1, cpu, 0, interval, value);
+    *itimer(p, which)?.0 = timing;
     p.timer_dirty = true;
     Ok(0)
 }
@@ -122,11 +147,15 @@ pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResu
     const SIGEV_SIGNAL: u32 = 0;
     const SIGEV_NONE: u32 = 1;
     const SIGEV_THREAD_ID: u32 = 4;
-    clock_ok(p, nr::timer_create, clock)?;
+    let cpu = timer_clock(p, nr::timer_create, clock, true)?;
     if p.timers.posix.len() >= MAX_POSIX_TIMERS {
         return Err(EAGAIN);
     }
-    let id = p.timers.next_id;
+    // The next id not in use (ids wrap, below the itimers' own).
+    let mut id = p.timers.next_id;
+    while p.timers.posix.contains_key(&id) || id > MAX_TIMER_ID {
+        id = if id >= MAX_TIMER_ID { 0 } else { id + 1 };
+    }
     // struct sigevent: sigev_value, sigev_signo, sigev_notify, then the tid.
     let notify = if sevp == 0 {
         Notify::Signal { signo: SIGALRM, value: id as u64, thread: None }
@@ -148,7 +177,8 @@ pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResu
     };
     write_u32(&mut p.aspace, idp, id)?;
     p.timers.next_id = id.wrapping_add(1);
-    p.timers.posix.insert(id, PosixTimer { timing: Interval::default(), notify, overrun: 0, clock, pending: false });
+    let timer = PosixTimer { timing: Interval::default(), notify, overrun: 0, clock, cpu, pending: false };
+    p.timers.posix.insert(id, timer);
     Ok(0)
 }
 
@@ -157,22 +187,29 @@ fn posix_timer(p: &mut Process, id: u64) -> Result<&mut PosixTimer, Errno> {
 }
 
 pub fn timer_settime(p: &mut Process, id: u64, flags: u64, new: u64, old: u64) -> SysResult {
-    posix_timer(p, id)?;
+    let (clock, cpu) = {
+        let t = posix_timer(p, id)?;
+        (t.clock, t.cpu)
+    };
     let (interval, value) = read_itimerspec(p, new)?;
+    let now = timer_now(p, cpu);
+    let timing = arm(p, clock, cpu, flags, interval, value);
     let t = posix_timer(p, id)?;
     let prev = t.timing;
-    t.timing = arm(t.clock, flags, interval, value);
+    t.timing = timing;
     t.overrun = 0;
     p.timer_dirty = true;
     if old != 0 {
-        write_itimerspec(p, old, &prev)?;
+        write_itimerspec(p, old, &prev, now)?;
     }
     Ok(0)
 }
 
 pub fn timer_gettime(p: &mut Process, id: u64, curr: u64) -> SysResult {
-    let t = posix_timer(p, id)?.timing;
-    write_itimerspec(p, curr, &t).map(|_| 0)
+    let t = posix_timer(p, id)?;
+    let (timing, cpu) = (t.timing, t.cpu);
+    let now = timer_now(p, cpu);
+    write_itimerspec(p, curr, &timing, now).map(|_| 0)
 }
 
 pub fn timer_getoverrun(p: &mut Process, id: u64) -> SysResult {
@@ -194,7 +231,7 @@ pub fn timerfd_create(p: &mut Process, clock: u64, flags: u64) -> SysResult {
     if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
         return Err(EINVAL);
     }
-    clock_ok(p, nr::timerfd_create, clock)?;
+    timer_clock(p, nr::timerfd_create, clock, false)?;
     let tfd = Arc::new(Mutex::new(TimerFd { clock, ..TimerFd::default() }));
     p.timers.add_fd(&tfd);
     let file = new_file(FileKind::TimerFd(tfd), O_RDONLY | (flags as u32 & O_NONBLOCK));
@@ -219,7 +256,7 @@ pub fn timerfd_settime(p: &mut Process, fd: u64, flags: u64, new: u64, old: u64)
         let mut t = tfd.lock();
         let prev = t.timing;
         // The clock is never set inside the sandbox, so CANCEL_ON_SET never fires.
-        t.timing = arm(t.clock, flags, interval, value);
+        t.timing = arm(p, t.clock, None, flags, interval, value);
         t.expirations = 0;
         t.version += 1;
         prev
@@ -227,7 +264,7 @@ pub fn timerfd_settime(p: &mut Process, fd: u64, flags: u64, new: u64, old: u64)
     p.timer_dirty = true;
     crate::ipc::changed();
     if old != 0 {
-        write_itimerspec(p, old, &prev)?;
+        write_itimerspec(p, old, &prev, time::monotonic_ns())?;
     }
     Ok(0)
 }
@@ -239,5 +276,5 @@ pub fn timerfd_gettime(p: &mut Process, fd: u64, curr: u64) -> SysResult {
         t.update(time::monotonic_ns());
         t.timing
     };
-    write_itimerspec(p, curr, &t).map(|_| 0)
+    write_itimerspec(p, curr, &t, time::monotonic_ns()).map(|_| 0)
 }

@@ -1,8 +1,10 @@
-//! Timers: setitimer(ITIMER_REAL), POSIX timers (timer_create) and
-//! timerfds. Each has a monotonic deadline. The scheduler programs the CPU
-//! timer for the earliest one (together with sleeping threads' deadlines)
-//! and calls `fire` once it has passed: signal timers queue their signal,
-//! timerfds count the expiration and wake I/O waiters.
+//! Timers: setitimer, POSIX timers (timer_create) and timerfds. Each has a
+//! monotonic deadline, or for ITIMER_VIRTUAL/ITIMER_PROF and timers on
+//! CPU-time clocks, one in the process's or a thread's CPU time. The
+//! scheduler programs the CPU timer for the earliest one (together with
+//! sleeping threads' deadlines; a CPU-time one only while its threads run,
+//! `cpu_deadline`) and calls `fire` once it has passed: signal timers queue
+//! their signal, timerfds count the expiration and wake I/O waiters.
 //!
 //! Like Linux, a timer only re-arms once its last expiry has been consumed:
 //! while its signal is still queued, or its timerfd still readable, it drops
@@ -21,6 +23,8 @@ use crate::signal::{self, SigInfo, Target};
 use crate::time;
 
 pub const SIGALRM: u32 = 14;
+const SIGVTALRM: u32 = 26;
+const SIGPROF: u32 = 27;
 const SI_KERNEL: i32 = 0x80;
 const SI_TIMER: i32 = -2;
 /// timer_create's per-process limit (Linux's is RLIMIT_SIGPENDING-sized);
@@ -28,6 +32,10 @@ const SI_TIMER: i32 = -2;
 pub const MAX_POSIX_TIMERS: usize = 1024;
 /// `SigInfo::timer` for ITIMER_REAL's SIGALRM.
 const REAL_TIMER: u32 = u32::MAX;
+/// `SigInfo::timer` for ITIMER_VIRTUAL's and ITIMER_PROF's signals.
+const CPU_ITIMERS: [u32; 2] = [u32::MAX - 1, u32::MAX - 2];
+/// The highest id timer_create hands out (the rest are the itimers').
+pub const MAX_TIMER_ID: u32 = u32::MAX - 3;
 /// A periodic timer whose signal is ignored still wakes the CPU; Linux backs
 /// those off too ("posix-timers: Prevent softirq starvation by small
 /// intervals and SIG_IGN").
@@ -72,10 +80,29 @@ pub enum Notify {
     Signal { signo: u32, value: u64, thread: Option<u32> },
 }
 
+/// Whose CPU time a timer counts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CpuClock {
+    Process,
+    Thread(u32),
+}
+
+impl CpuClock {
+    /// The time on this clock (None: the thread is gone).
+    pub fn now(self, p: &Process) -> Option<u64> {
+        match self {
+            CpuClock::Process => Some(p.process_cpu_ns()),
+            CpuClock::Thread(tid) => p.thread_cpu_ns(tid),
+        }
+    }
+}
+
 pub struct PosixTimer {
+    /// In CPU time, for a CPU-time clock's.
     pub timing: Interval,
     /// The clock absolute times (TIMER_ABSTIME) are on.
     pub clock: u64,
+    pub cpu: Option<CpuClock>,
     pub notify: Notify,
     /// The overrun count of the last signal taken (timer_getoverrun).
     pub overrun: u32,
@@ -114,6 +141,10 @@ pub struct Timers {
     pub real: Interval,
     /// ITIMER_REAL's SIGALRM is queued and hasn't been taken yet.
     pub real_pending: bool,
+    /// ITIMER_VIRTUAL and ITIMER_PROF, in the process's CPU time (all of
+    /// it is counted as user time), and whether their signals are queued.
+    pub cpu_itimers: [Interval; 2],
+    pub cpu_pending: [bool; 2],
     pub posix: BTreeMap<u32, PosixTimer>,
     pub next_id: u32,
     /// Every timerfd still open, so the scheduler wakes up for them.
@@ -129,7 +160,7 @@ impl Timers {
         let posix = self
             .posix
             .values()
-            .filter(|t| !t.pending && matches!(t.notify, Notify::Signal { .. }))
+            .filter(|t| t.cpu.is_none() && !t.pending && matches!(t.notify, Notify::Signal { .. }))
             .filter_map(|t| t.timing.next);
         let fds = self.fds.iter().filter_map(|w| w.upgrade()).filter_map(|t| {
             let t = t.lock();
@@ -138,10 +169,60 @@ impl Timers {
         real.into_iter().chain(posix).chain(fds).min()
     }
 
+    /// The timing of timer `id` (a POSIX timer's or an itimer's).
+    fn timing(&mut self, id: u32) -> Option<&mut Interval> {
+        match id {
+            REAL_TIMER => Some(&mut self.real),
+            id if id == CPU_ITIMERS[0] => Some(&mut self.cpu_itimers[0]),
+            id if id == CPU_ITIMERS[1] => Some(&mut self.cpu_itimers[1]),
+            id => self.posix.get_mut(&id).map(|t| &mut t.timing),
+        }
+    }
+
     pub fn add_fd(&mut self, fd: &Arc<Mutex<TimerFd>>) {
         self.fds.retain(|w| w.strong_count() > 0);
         self.fds.push(Arc::downgrade(fd));
     }
+}
+
+/// The time on timer `id`'s clock.
+fn clock_of(p: &Process, id: u32) -> u64 {
+    let cpu = match id {
+        id if CPU_ITIMERS.contains(&id) => Some(CpuClock::Process),
+        id => p.timers.posix.get(&id).and_then(|t| t.cpu),
+    };
+    match cpu {
+        Some(c) => c.now(p).unwrap_or(0),
+        None => time::monotonic_ns(),
+    }
+}
+
+/// When a CPU-time timer of `p`'s can next be due, on the monotonic
+/// clock: only while its threads run, and soonest if they all keep
+/// running (the CPU time of n threads goes n times as fast). Firing early
+/// costs nothing: `fire` checks the CPU time.
+pub fn cpu_deadline(p: &Process) -> Option<u64> {
+    let now = time::monotonic_ns();
+    let running = |tid: u32| (p.running && tid == p.current) || crate::smp::running_since(tid).is_some();
+    let threads = p.threads.keys().filter(|&&tid| running(tid)).count() as u64;
+    if threads == 0 {
+        return None;
+    }
+    let left = |next: u64, cpu_now: u64| next.saturating_sub(cpu_now);
+    let process_now = p.process_cpu_ns();
+    let itimers = (0..2)
+        .filter(|&i| !p.timers.cpu_pending[i])
+        .filter_map(|i| p.timers.cpu_itimers[i].next)
+        .map(|next| left(next, process_now) / threads);
+    let posix =
+        p.timers.posix.values().filter(|t| !t.pending && matches!(t.notify, Notify::Signal { .. })).filter_map(|t| {
+            match (t.cpu?, t.timing.next?) {
+                (CpuClock::Process, next) => Some(left(next, process_now) / threads),
+                (c @ CpuClock::Thread(tid), next) if running(tid) => Some(left(next, c.now(p)?)),
+                _ => None,
+            }
+        });
+    itimers.chain(posix).min().map(|wait| now.saturating_add(wait))
 }
 
 /// Queue a timer's signal. Returns whether it was queued; an ignored one
@@ -151,9 +232,11 @@ fn send_timer_signal(p: &mut Process, target: Target, info: SigInfo, id: u32) ->
     if signal::queued_timer_signal(p, id).is_some() {
         return true;
     }
-    let timing = if id == REAL_TIMER { &mut p.timers.real } else { &mut p.timers.posix.get_mut(&id).unwrap().timing };
-    if let Some(next) = timing.next {
-        timing.next = Some(next.max(time::monotonic_ns().saturating_add(IGNORED_MIN_PERIOD)));
+    let now = clock_of(p, id);
+    if let Some(timing) = p.timers.timing(id)
+        && let Some(next) = timing.next
+    {
+        timing.next = Some(next.max(now.saturating_add(IGNORED_MIN_PERIOD)));
     }
     false
 }
@@ -171,12 +254,32 @@ pub fn fire(p: &mut Process) -> bool {
         p.timers.real_pending = send_timer_signal(p, Target::Process, info, REAL_TIMER);
         fired = true;
     }
-    let due: Vec<(u32, u64)> = p
+    let cpu_now = p.process_cpu_ns();
+    for (i, (signo, why)) in [
+        (SIGVTALRM, "SIGVTALRM: the virtual interval timer (setitimer ITIMER_VIRTUAL) expired"),
+        (SIGPROF, "SIGPROF: the profiling interval timer (setitimer ITIMER_PROF) expired"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !p.timers.cpu_pending[i] && p.timers.cpu_itimers[i].expire(cpu_now) > 0 {
+            let mut info = SigInfo::sent(signo, SI_KERNEL, 0, 0, why);
+            info.fields = [0; 4];
+            info.timer = Some(CPU_ITIMERS[i]);
+            p.timers.cpu_pending[i] = send_timer_signal(p, Target::Process, info, CPU_ITIMERS[i]);
+            fired = true;
+        }
+    }
+    let clocks: Vec<(u32, u64)> = p
         .timers
         .posix
-        .iter_mut()
-        .filter(|(_, t)| !t.pending)
-        .filter_map(|(&id, t)| Some((id, t.timing.expire(now))).filter(|&(_, n)| n > 0))
+        .iter()
+        .filter(|(_, t)| !t.pending && t.timing.next.is_some())
+        .filter_map(|(&id, t)| Some((id, t.cpu.map_or(Some(now), |c| c.now(p))?)))
+        .collect();
+    let due: Vec<(u32, u64)> = clocks
+        .into_iter()
+        .filter_map(|(id, at)| Some((id, p.timers.posix.get_mut(&id)?.timing.expire(at))).filter(|&(_, n)| n > 0))
         .collect();
     for (id, n) in due {
         fired = true;
@@ -208,15 +311,23 @@ pub fn fire(p: &mut Process) -> bool {
 /// A timer's signal was taken (delivered, or dequeued by sigtimedwait or a
 /// signalfd): count the periods that passed meanwhile as overruns and let
 /// the timer re-arm. Returns whether its deadline must be programmed again.
-pub fn delivered(timers: &mut Timers, info: &mut SigInfo) -> bool {
-    let now = time::monotonic_ns();
-    match info.timer {
-        Some(REAL_TIMER) => {
+pub fn delivered(p: &mut Process, info: &mut SigInfo) -> bool {
+    let Some(id) = info.timer else { return false };
+    let now = clock_of(p, id);
+    let timers = &mut p.timers;
+    match id {
+        REAL_TIMER => {
             timers.real_pending = false;
-            timers.real.expire(now); // ITIMER_REAL has no overrun count
+            timers.real.expire(now); // the itimers have no overrun count
             true
         }
-        Some(id) => {
+        id if CPU_ITIMERS.contains(&id) => {
+            let i = if id == CPU_ITIMERS[0] { 0 } else { 1 };
+            timers.cpu_pending[i] = false;
+            timers.cpu_itimers[i].expire(now);
+            true
+        }
+        id => {
             let Some(t) = timers.posix.get_mut(&id) else { return false };
             let missed = t.timing.expire(now);
             let overrun = ((info.fields[0] >> 32) + missed).min(i32::MAX as u64);
@@ -225,7 +336,6 @@ pub fn delivered(timers: &mut Timers, info: &mut SigInfo) -> bool {
             t.pending = false;
             true
         }
-        None => false,
     }
 }
 
@@ -242,5 +352,11 @@ pub fn resync(p: &mut Process) {
     if p.timers.real_pending && signal::queued_timer_signal(p, REAL_TIMER).is_none() {
         p.timers.real_pending = false;
         p.timer_dirty = true;
+    }
+    for i in 0..2 {
+        if p.timers.cpu_pending[i] && signal::queued_timer_signal(p, CPU_ITIMERS[i]).is_none() {
+            p.timers.cpu_pending[i] = false;
+            p.timer_dirty = true;
+        }
     }
 }

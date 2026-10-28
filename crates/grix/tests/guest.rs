@@ -1357,6 +1357,15 @@ fn pidfds() {
 }
 
 #[test]
+fn cpu_time_timers() {
+    let b = with("cputimers").allow(Capability::Process).allow(Capability::Threads);
+    let out = run(b, &["/bin/cputimers"]);
+    assert_eq!(out.stdout_str(), "cputimers ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn pseudo_terminals() {
     // The line discipline, controlling terminals and their signals.
     let out = run(with("pty").allow(Capability::Process), &["/bin/pty"]);

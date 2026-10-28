@@ -257,7 +257,7 @@ fn earliest_deadline(p: &mut Process, procs: &mut Procs) -> Option<u64> {
         .all(p)
         .filter_map(|q| {
             let sleepers = q.threads.values().filter_map(|t| t.wait?.deadline);
-            sleepers.chain(q.timers.next_deadline()).min()
+            sleepers.chain(q.timers.next_deadline()).chain(crate::timer::cpu_deadline(q)).min()
         })
         .min()
 }
