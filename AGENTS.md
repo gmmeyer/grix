@@ -299,8 +299,9 @@ after a suspend), and returns `SNAPSHOT_RESTORED`, fresh entropy
 (`rng::reseed`) and the time since, which moves the kernel's time of day
 on (`time::resumed_after`). The host writes the file privately and renames
 it into place, and appends its settings for restored runs (network
-policy, exports, limits) as JSON: a file may come from anyone, so MCP
-replaces the network policy and caps the limits. Of what the host held,
+policy, exports, limits) as JSON: a file may come from anyone, so
+`Snapshot::open` drops its network policy and forwards (runs get only
+what the caller allows: `allow_net`, `forward`) and caps its limits. Of what the host held,
 only live mounts' state is saved (`hostfs::Server::save`, validated by
 `restore`: names, ids, limits); each run gives them host directories
 again (`Snapshot::mount`), and the kernel fetches what it knew of them

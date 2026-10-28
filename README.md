@@ -425,9 +425,14 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   you, and written fully before it replaces the old one.
 - Snapshots need grix-vmm: Hypervisor.framework on macOS 15+, or KVM on
   Linux 6.4+ (for its SMCCC filter). A snapshot runs only on the kind of
-  host that took it. Runs from a
-  snapshot get the sandbox's network policy as it was. Over MCP they get
-  the server's, whoever wrote the file.
+  host that took it. A file may be
+  anyone's, so runs from it get the network only as an image's program
+  does: with `-a net` (and `--allow-host`, `--publish` as for any run;
+  `Snapshot::allow_net`, `forward`), never the file's own rules or
+  forwarded ports. Over MCP they get the server's. Output, export and
+  grace limits are a sandbox's defaults (or the file's, if lower) unless
+  set, and never more than the file's; the time limit is the file's or
+  the default's, whichever is shorter, unless `--timeout` says.
 
 ## Images
 

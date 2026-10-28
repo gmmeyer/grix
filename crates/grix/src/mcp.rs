@@ -537,9 +537,14 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
         Some(path) => {
             // Whoever wrote the file, runs from it get only the network
             // this server allows.
-            let mut snap = crate::Snapshot::open(config.host_path(path)?)?
-                .restrict_net(config.capabilities.contains(&Capability::Net), &config.allow_hosts)?
-                .limits(OUTPUT_MAX * 4, EXPORT_LIMIT, Duration::from_secs(5));
+            let mut snap = crate::Snapshot::open(config.host_path(path)?)?.limits(
+                OUTPUT_MAX * 4,
+                EXPORT_LIMIT,
+                Duration::from_secs(5),
+            );
+            if config.capabilities.contains(&Capability::Net) {
+                snap = snap.allow_net(&config.allow_hosts)?;
+            }
             // Its live mounts' host directories, under the roots; writable
             // only if this server lets agents change host files.
             for m in args["mounts"].as_array().into_iter().flatten() {

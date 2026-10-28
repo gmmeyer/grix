@@ -86,10 +86,19 @@ pub(crate) struct SavedMount {
 }
 
 /// A saved machine to run from (see the module docs).
+///
+/// A file may be anyone's, so what it says of the host side is only what
+/// it asks for: runs from it get no network unless the caller allows it
+/// ([`allow_net`](Snapshot::allow_net)), never the file's host rules or
+/// forwarded ports, and the limits of a sandbox's defaults (or the file's,
+/// if lower) unless the caller sets others, never above the file's.
 #[derive(Clone)]
 pub struct Snapshot {
     path: PathBuf,
+    /// What runs get (the file's, restricted as above).
     pub(crate) settings: Settings,
+    /// What the file asks for.
+    asked: Asked,
     pub(crate) timeout: Duration,
     pub(crate) vmm: Option<PathBuf>,
     pub(crate) control: Option<crate::RunControl>,
@@ -97,6 +106,14 @@ pub struct Snapshot {
     ram_size: u64,
     /// Host directories for its live mounts: (host, guest, read-only).
     mounts: Vec<(PathBuf, String, bool)>,
+}
+
+#[derive(Clone, Debug)]
+struct Asked {
+    net: bool,
+    max_output: usize,
+    max_export: usize,
+    grace_ms: u64,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -148,16 +165,32 @@ impl Snapshot {
         if settings.cpus == 0 || settings.cpus > grix_abi::machine::MAX_CPUS {
             bail!("{} says it has {} CPUs", path.display(), settings.cpus);
         }
-        let timeout = Duration::from_millis(settings.timeout_ms);
-        Ok(Snapshot {
+        let asked = Asked {
+            net: settings.net,
+            max_output: settings.max_output,
+            max_export: settings.max_export,
+            grace_ms: settings.grace_ms,
+        };
+        let mut settings = settings;
+        settings.net = false;
+        settings.allow_hosts = None;
+        settings.forwards.clear();
+        let timeout = Duration::from_millis(settings.timeout_ms).min(crate::sandbox::DEFAULT_TIMEOUT);
+        let snap = Snapshot {
             path,
             settings,
+            asked,
             timeout,
             vmm: crate::sandbox::default_vmm(),
             control: None,
             ram_size,
             mounts: Vec::new(),
-        })
+        };
+        Ok(snap.limits(
+            crate::sandbox::DEFAULT_MAX_OUTPUT,
+            crate::sandbox::DEFAULT_MAX_EXPORT,
+            crate::sandbox::DEFAULT_GRACE,
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -174,34 +207,68 @@ impl Snapshot {
         self.settings.cpus
     }
 
-    /// The time limit runs get unless [`timeout`](Snapshot::timeout) says.
+    /// The time limit the snapshot's sandbox had. Runs get it, or a
+    /// sandbox's default if that's shorter, unless
+    /// [`timeout`](Snapshot::timeout) says.
     pub fn default_timeout(&self) -> Duration {
         Duration::from_millis(self.settings.timeout_ms)
     }
 
-    /// Only what this allows of the network, whatever the file says (for
-    /// snapshots someone else wrote): no `net` unless `allowed`, then only
-    /// to `allow_hosts` if there are any, and no forwarded ports.
-    pub fn restrict_net(mut self, allowed: bool, allow_hosts: &[String]) -> Result<Self> {
+    /// Did the snapshot's sandbox have `net` (its program may expect it)?
+    pub fn asks_for_net(&self) -> bool {
+        self.asked.net
+    }
+
+    /// Let runs from here use the network, if the snapshot's sandbox could:
+    /// only to `allow_hosts`, if there are any, or anywhere but the host's
+    /// own and other special addresses, as for a sandbox. The file's own
+    /// rules are never used (they could name the host).
+    pub fn allow_net(mut self, allow_hosts: &[String]) -> Result<Self> {
         for rule in allow_hosts {
             crate::net::HostRule::parse(rule)?;
         }
-        self.settings.net &= allowed;
-        // The caller's rules only: none means anywhere but the special
-        // addresses, as for a sandbox (the file's could name the host).
+        self.settings.net = self.asked.net;
         self.settings.allow_hosts = (!allow_hosts.is_empty()).then(|| allow_hosts.to_vec());
-        self.settings.forwards.clear();
+        Ok(self)
+    }
+
+    /// Forward connections to `host` to `guest_port` in runs from here (see
+    /// [`SandboxBuilder::forward`](crate::SandboxBuilder::forward)); the
+    /// file's forwarded ports aren't.
+    pub fn forward(mut self, host: &str, guest_port: u16) -> Result<Self> {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
+            .with_context(|| format!("forward address {host:?}"))?
+            .next()
+            .with_context(|| format!("forward address {host:?} resolves to nothing"))?;
+        if guest_port == 0 {
+            bail!("forwarding {host} needs a guest port");
+        }
+        self.settings.forwards.push((addr.to_string(), guest_port));
         Ok(self)
     }
 
     /// At most this much of each of stdout and stderr is kept, and at most
-    /// this much exported (or less, if the snapshot says so); and at most
-    /// this long between the SIGTERM at the time limit and the stop.
-    pub fn limits(mut self, max_output: usize, max_export: usize, grace: Duration) -> Self {
-        let s = &mut self.settings;
-        s.max_output = s.max_output.min(max_output);
-        s.max_export = s.max_export.min(max_export);
-        s.grace_ms = s.grace_ms.min(grace.as_millis() as u64);
+    /// this much exported; and at most this long between the SIGTERM at the
+    /// time limit and the stop. Never more than the snapshot's sandbox had.
+    pub fn limits(self, max_output: usize, max_export: usize, grace: Duration) -> Self {
+        self.max_output(max_output).max_export(max_export).grace(grace)
+    }
+
+    /// See [`limits`](Snapshot::limits).
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.settings.max_output = self.asked.max_output.min(bytes);
+        self
+    }
+
+    /// See [`limits`](Snapshot::limits).
+    pub fn max_export(mut self, bytes: usize) -> Self {
+        self.settings.max_export = self.asked.max_export.min(bytes);
+        self
+    }
+
+    /// See [`limits`](Snapshot::limits).
+    pub fn grace(mut self, grace: Duration) -> Self {
+        self.settings.grace_ms = self.asked.grace_ms.min(grace.as_millis().try_into().unwrap_or(u64::MAX));
         self
     }
 
@@ -349,16 +416,19 @@ pub(crate) fn finish(file: &mut File, settings: &Settings) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn snap(allow_hosts: Option<Vec<String>>, forwards: Vec<(String, u16)>) -> Snapshot {
+    /// A snapshot file whose settings ask for everything: the network
+    /// with the host's own loopback, a forwarded port on every address, no
+    /// limits.
+    fn crafted() -> Snapshot {
         let settings = Settings {
             abi: grix_abi::ABI_VERSION,
             net: true,
-            allow_hosts,
-            forwards,
+            allow_hosts: Some(vec!["host.grix.internal".into(), "127.0.0.0/8".into()]),
+            forwards: vec![("0.0.0.0:8080".into(), 80)],
             exports: vec![],
             max_export: usize::MAX,
             max_output: usize::MAX,
-            timeout_ms: 1000,
+            timeout_ms: u64::MAX,
             grace_ms: u64::MAX,
             memory_mb: 512,
             cpus: 1,
@@ -366,28 +436,38 @@ mod tests {
             live: vec![],
             fs_state: String::new(),
         };
-        Snapshot {
-            path: "x".into(),
-            settings,
-            timeout: Duration::ZERO,
-            vmm: None,
-            control: None,
-            ram_size: 0,
-            mounts: vec![],
-        }
+        let path = std::env::temp_dir().join(format!("grix-snapshot-test-{}", std::process::id()));
+        let mut f = File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        f.write_all(VMM_MAGIC).unwrap();
+        f.write_all(&[0; 8]).unwrap();
+        f.write_all(&(512u64 << 20).to_le_bytes()).unwrap();
+        finish(&mut f, &settings).unwrap();
+        let snap = Snapshot::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        snap
     }
 
-    /// Whatever the file says, a caller's network policy and limits win.
+    /// Whatever the file says, runs get the caller's network policy and
+    /// limits: by default no network, and a sandbox's default limits.
     #[test]
     fn the_callers_policy_wins() {
-        let crafted = || snap(Some(vec!["host.grix.internal".into()]), vec![("127.0.0.1:22".into(), 22)]);
-        let s = crafted().restrict_net(true, &[]).unwrap();
-        assert_eq!(s.settings.allow_hosts, None, "the file's rules are dropped");
-        assert!(s.settings.forwards.is_empty());
-        let s = crafted().restrict_net(true, &["pypi.org".into()]).unwrap();
+        let s = crafted();
+        assert!(s.asks_for_net());
+        assert!(!s.settings.net && s.settings.allow_hosts.is_none() && s.settings.forwards.is_empty());
+        assert_eq!(s.settings.max_output, crate::sandbox::DEFAULT_MAX_OUTPUT);
+        assert_eq!(s.settings.max_export, crate::sandbox::DEFAULT_MAX_EXPORT);
+        assert_eq!(s.settings.grace_ms, crate::sandbox::DEFAULT_GRACE.as_millis() as u64);
+        assert_eq!(s.timeout, crate::sandbox::DEFAULT_TIMEOUT);
+        // Allowed, the network has the caller's rules only.
+        let s = crafted().allow_net(&[]).unwrap();
+        assert!(s.settings.net && s.settings.allow_hosts.is_none() && s.settings.forwards.is_empty());
+        let s = crafted().allow_net(&["pypi.org".into()]).unwrap().forward("127.0.0.1:0", 80).unwrap();
         assert_eq!(s.settings.allow_hosts, Some(vec!["pypi.org".to_string()]));
-        assert!(!crafted().restrict_net(false, &[]).unwrap().settings.net);
-        let s = crafted().limits(10, 20, Duration::from_secs(5));
-        assert_eq!((s.settings.max_output, s.settings.max_export, s.settings.grace_ms), (10, 20, 5000));
+        assert_eq!(s.settings.forwards, [("127.0.0.1:0".to_string(), 80)]);
+        // Limits are the caller's, up to the file's.
+        let s = crafted().limits(10, 20, Duration::from_secs(1));
+        assert_eq!((s.settings.max_output, s.settings.max_export, s.settings.grace_ms), (10, 20, 1000));
+        let s = crafted().max_output(1 << 30);
+        assert_eq!(s.settings.max_output, 1 << 30);
     }
 }

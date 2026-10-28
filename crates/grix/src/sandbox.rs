@@ -24,11 +24,12 @@ const RESERVED_LOW: u64 = IMAGE_BASE - RAM_BASE;
 /// Minimum RAM left for the program above the boot image.
 const MIN_FREE: u64 = 64 << 20;
 /// Output kept per stream unless `max_output` says otherwise.
-const DEFAULT_MAX_OUTPUT: usize = 64 << 20;
+pub(crate) const DEFAULT_MAX_OUTPUT: usize = 64 << 20;
 /// Exported bytes kept unless `max_export` says otherwise.
-const DEFAULT_MAX_EXPORT: usize = 256 << 20;
+pub(crate) const DEFAULT_MAX_EXPORT: usize = 256 << 20;
 /// How long a program has to end after the SIGTERM a timeout sends.
-const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,7 +402,7 @@ impl Default for SandboxBuilder {
             env: Vec::new(),
             cwd: "/".into(),
             memory_mb: 512,
-            timeout: Duration::from_secs(60),
+            timeout: DEFAULT_TIMEOUT,
             max_output: DEFAULT_MAX_OUTPUT,
             exports: Vec::new(),
             max_export: DEFAULT_MAX_EXPORT,

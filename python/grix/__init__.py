@@ -277,12 +277,16 @@ class Snapshot:
     """A machine :meth:`Sandbox.snapshot` saved: each :meth:`run` goes on
     from where the program waited for input, with its own stdin. Its live
     mounts need their host directories again: ``mounts`` lists ``(host,
-    guest)`` or ``(host, guest, "ro")``."""
+    guest)`` or ``(host, guest, "ro")``. Whoever wrote the file, runs get
+    the network only with ``allow_net`` (and only to ``allow_hosts``, if
+    any), never the file's own rules."""
 
     path: PathLike
     timeout: Optional[float] = None
     grix: Optional[PathLike] = None
     mounts: Sequence[tuple] = ()
+    allow_net: bool = False
+    allow_hosts: Sequence[str] = ()
 
     def run(
         self,
@@ -296,7 +300,16 @@ class Snapshot:
             inner = control._inner if control is not None else None
             mounts = [(os.fspath(m[0]), m[1], m[2] if len(m) > 2 else "rw") for m in self.mounts]
             return _native_result(
-                _native.snapshot_run, os.fspath(self.path), _install_dir(), data, self.timeout, on_output, inner, mounts
+                _native.snapshot_run,
+                os.fspath(self.path),
+                _install_dir(),
+                data,
+                self.timeout,
+                on_output,
+                inner,
+                mounts,
+                self.allow_net,
+                list(self.allow_hosts),
             )
         if control is not None:
             raise GrixError("Control needs grix's native module (make python)")
@@ -306,6 +319,10 @@ class Snapshot:
             argv += ["--mount", f"{os.fspath(host)}:{guest}" + (f":{mode[0]}" if mode else "")]
         if self.timeout is not None:
             argv += ["--timeout", str(max(1, int(round(self.timeout))))]
+        if self.allow_net:
+            argv += ["-a", "net"]
+            for rule in self.allow_hosts:
+                argv += ["--allow-host", rule]
         if stdin is None:
             argv.append("--no-stdin")
         return _run(argv, stdin, on_output)
