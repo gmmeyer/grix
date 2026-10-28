@@ -71,6 +71,11 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         }
         match (&f.kind, &f.content) {
             (FileKind::Node(ino), Some(c)) => {
+                // As Linux's file_mmap_ok: no file offset in the mapping
+                // past MAX_LFS_FILESIZE (so none wraps, either).
+                if off.checked_add(len).is_none_or(|end| end > i64::MAX as u64) {
+                    return Err(EOVERFLOW);
+                }
                 let ino = *ino;
                 let rdwr = f.flags & O_ACCMODE == O_RDWR;
                 if shared && prot.write && !rdwr {
@@ -121,7 +126,8 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
 }
 
 /// Place a new mapping: at `addr` with MAP_FIXED, there if it's free and
-/// asked for, or wherever there's room.
+/// asked for (and not below MMAP_MIN_ADDR, as for MAP_FIXED), or wherever
+/// there's room.
 fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing: Backing) -> SysResult {
     let a = &mut p.aspace;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
@@ -137,7 +143,7 @@ fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing:
             return Err(EEXIST);
         }
         addr
-    } else if addr != 0
+    } else if addr >= MMAP_MIN_ADDR
         && aligned(addr)
         && addr.checked_add(len).is_some_and(|e| a.is_free(addr, e) && a.clear_of_stack(e))
     {

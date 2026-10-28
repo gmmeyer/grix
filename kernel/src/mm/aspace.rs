@@ -117,7 +117,7 @@ impl Vma {
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
             Backing::Data { ref data, offset, end, ino, ref shared } => {
-                Backing::Data { data: data.clone(), offset: offset + skip, end, ino, shared: shared.clone() }
+                Backing::Data { data: data.clone(), offset: offset.saturating_add(skip), end, ino, shared: shared.clone() }
             }
             Backing::Sigpage => Backing::Sigpage,
             Backing::KernelPage(pa) => Backing::KernelPage(pa),
@@ -125,11 +125,11 @@ impl Vma {
                 Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
             }
             Backing::SharedFile { ref data, offset, ino, may_write, ref token } => {
-                Backing::SharedFile { data: data.clone(), offset: offset + skip, ino, may_write, token: token.clone() }
+                Backing::SharedFile { data: data.clone(), offset: offset.saturating_add(skip), ino, may_write, token: token.clone() }
             }
             Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
                 data,
-                offset: offset + skip,
+                offset: offset.saturating_add(skip),
                 filesz: filesz.saturating_sub(skip),
                 ino,
                 shared: shared.clone(),
@@ -256,7 +256,10 @@ impl AddressSpace {
                 }
                 let shared = if cow { paging::read_only(*pte) } else { *pte };
                 let pa = shared & ADDR_MASK;
-                frame::share(pa);
+                if !frame::share(pa) {
+                    out_of_memory = true;
+                    return;
+                }
                 if child.pt.map(va, pa, shared & !ADDR_MASK).is_none() {
                     frame::free(pa);
                     out_of_memory = true;
@@ -584,11 +587,11 @@ impl AddressSpace {
                 // Writing a page it has a read-only copy of: the file's frame
                 // replaces it.
                 Backing::SharedFile { ref data, offset, .. } => {
-                    let idx = (offset + (page - vma.start)) / PAGE_SIZE;
+                    let idx = offset.saturating_add(page - vma.start) / PAGE_SIZE;
                     let pa = data.lock().shared_frame(idx, true)?.expect("a frame for a write");
                     let old = pte & ADDR_MASK;
-                    if old != pa {
-                        frame::share(pa);
+                    if old != pa && !frame::share(pa) {
+                        return Err(FaultError::OutOfMemory);
                     }
                     self.pt.map(page, pa, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
                     arch::flush_tlb();
@@ -606,7 +609,9 @@ impl AddressSpace {
             };
         }
         if let Backing::KernelPage(pa) = vma.backing {
-            frame::share(pa);
+            if !frame::share(pa) {
+                return Err(FaultError::OutOfMemory);
+            }
             if self.pt.map(page, pa, vma.prot.pte_flags()).is_none() {
                 frame::free(pa);
                 return Err(FaultError::OutOfMemory);
@@ -627,7 +632,9 @@ impl AddressSpace {
             if vma.prot.exec {
                 arch::sync_icache(p2v(pa), PAGE_SIZE);
             }
-            frame::share(pa);
+            if !frame::share(pa) {
+                return Err(FaultError::OutOfMemory);
+            }
             if self.pt.map(page, pa, vma.prot.pte_flags()).is_none() {
                 frame::free(pa);
                 return Err(FaultError::OutOfMemory);
@@ -635,12 +642,14 @@ impl AddressSpace {
             return Ok(());
         }
         if let Backing::SharedFile { ref data, offset, .. } = vma.backing {
-            let idx = (offset + (page - vma.start)) / PAGE_SIZE;
+            let idx = offset.saturating_add(page - vma.start) / PAGE_SIZE;
             let mut d = data.lock();
             let (pa, flags) = match d.shared_frame(idx, access == Access::Write)? {
                 // The mapping's own reference; the file keeps its.
                 Some(pa) => {
-                    frame::share(pa);
+                    if !frame::share(pa) {
+                        return Err(FaultError::OutOfMemory);
+                    }
                     (pa, vma.prot.pte_flags())
                 }
                 // A read-only copy, until someone writes the page.
@@ -670,7 +679,7 @@ impl AddressSpace {
             Backing::Data { ref data, offset, end, .. } => {
                 // SAFETY: `pa` is the frame just allocated, mapped linearly.
                 let dst = unsafe { core::slice::from_raw_parts_mut(p2v(pa) as *mut u8, PAGE_SIZE as usize) };
-                let at = offset + (page - vma.start);
+                let at = offset.saturating_add(page - vma.start);
                 let n = end.saturating_sub(at).min(PAGE_SIZE) as usize;
                 if data.lock().read_at(at, &mut dst[..n]).is_err() {
                     frame::free(pa);
@@ -685,7 +694,7 @@ impl AddressSpace {
             Backing::File { data, offset, filesz, .. } => {
                 let o = page - vma.start;
                 let n = filesz.saturating_sub(o).min(PAGE_SIZE);
-                let src = (offset + o).min(data.len() as u64);
+                let src = offset.saturating_add(o).min(data.len() as u64);
                 let avail = (data.len() as u64 - src).min(n);
                 &data[src as usize..(src + avail) as usize]
             }

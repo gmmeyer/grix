@@ -89,11 +89,23 @@ pub fn free(pa: u64) {
     }
 }
 
-/// Another mapping of a frame (fork shares pages copy-on-write).
-pub fn share(pa: u64) {
+/// Another mapping of a frame (fork shares pages copy-on-write). False,
+/// and no reference taken, if the frame has as many as its count holds:
+/// the caller fails with ENOMEM. A program can come close (one page mapped
+/// in every mapping of every process, `MAX_VMAS_TOTAL` of them, is 2^16),
+/// and a count that wrapped would free a frame still mapped.
+#[must_use]
+pub fn share(pa: u64) -> bool {
     let mut guard = FRAMES.lock();
     let f = guard.as_mut().expect("frame allocator not initialised");
-    *f.refs(pa) += 1;
+    let refs = f.refs(pa);
+    match refs.checked_add(1) {
+        Some(n) => {
+            *refs = n;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Is a frame mapped more than once (so writing it needs a copy)?

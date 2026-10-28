@@ -1,4 +1,6 @@
 // Exercise malloc (brk + mmap paths), realloc (mremap), mmap/mprotect/munmap, madvise.
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +55,24 @@ int main(void) {
     CHECK(b1 == b0 + (1 << 20));
     ((volatile char *)b0)[(1 << 20) - 1] = 7;
     CHECK(syscall(SYS_brk, b0) == (long)b0);
+
+    // A hint below mmap_min_addr isn't taken, as MAP_FIXED there isn't.
+    void *low = mmap((void *)0x1000, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(low != MAP_FAILED && (uintptr_t)low >= 0x10000);
+    CHECK(munmap(low, 4096) == 0);
+    CHECK(mmap((void *)0x1000, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED);
+
+    // A file mapping's offsets stop at the largest file size (Linux's
+    // MAX_LFS_FILESIZE), so none wraps.
+    int fd = open("/bin/mem", O_RDONLY);
+    CHECK(fd >= 0);
+    long r = syscall(SYS_mmap, 0, 8192, PROT_READ, MAP_PRIVATE, fd, 0x7ffffffffffff000L);
+    CHECK(r == -1 && errno == EOVERFLOW);
+    r = syscall(SYS_mmap, 0, 8192, PROT_READ, MAP_PRIVATE, fd, (long)0xfffffffffffff000UL);
+    CHECK(r == -1 && errno == EOVERFLOW);
+    unsigned char *head = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(head != MAP_FAILED && head[0] == 0x7f && head[1] == 'E');
+    CHECK(munmap(head, 4096) == 0 && close(fd) == 0);
 
     printf("mem ok\n");
     return 0;

@@ -798,11 +798,22 @@ pub(super) fn pipe_read_rights(
             n = n.min((pos - at) as usize);
         }
     }
-    let (a, b) = pipe.buf.as_slices();
-    let first = n.min(a.len());
-    copy_out(&mut p.aspace, buf, &a[..first])?;
-    copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
+    // Through a kernel buffer, so the pipe isn't locked while user pages
+    // fault in (as `read_content`). Under the kernel lock nothing else
+    // reads or writes it meanwhile.
+    drop(pipe);
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0;
+    while done < n {
+        let k = (n - done).min(CHUNK);
+        for (d, s) in chunk[..k].iter_mut().zip(end.pipe.lock().buf.range(done..done + k)) {
+            *d = *s;
+        }
+        copy_out(&mut p.aspace, buf + done as u64, &chunk[..k])?;
+        done += k;
+    }
     if !peek {
+        let mut pipe = end.pipe.lock();
         pipe.buf.drain(..n);
         pipe.read += n as u64;
         pipe.drained();
@@ -1121,9 +1132,14 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
         Some(pid) if pid == p.pid => {
             (0..p.fds.len() as u64).filter(|&fd| p.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
         }
-        Some(pid) => crate::procs::PROCS.lock().others.get(&pid).map_or_else(Vec::new, |q| {
-            (0..q.fds.len() as u64).filter(|&fd| q.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
-        }),
+        // Another process's, if the caller may look at them (`with_other`).
+        Some(pid) => match crate::procs::PROCS.lock().others.get(&pid) {
+            Some(q) if !crate::procs::may_inspect(p, q, false) => return Err(EACCES),
+            Some(q) => {
+                (0..q.fds.len() as u64).filter(|&fd| q.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
+            }
+            None => Vec::new(),
+        },
         None => Vec::new(),
     };
     loop {
@@ -1144,6 +1160,13 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
             },
         };
         let Some((name, ino, d_type)) = entry else { break };
+        // Only a live mount's host could have a longer name: it couldn't be
+        // looked up, and its record length wouldn't fit in d_reclen.
+        if name.len() > fs::NAME_MAX {
+            pos += 1;
+            cursor = Some(name);
+            continue;
+        }
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > count as usize {
             if out.is_empty() {
