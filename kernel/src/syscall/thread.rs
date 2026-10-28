@@ -87,11 +87,12 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
 
     let tid = process::new_tid();
-    // The child resumes right after the svc with the parent's registers, x0 = 0.
+    // The child resumes right after the system call with the parent's
+    // registers, returning 0.
     let mut regs = *tf;
-    regs.x[0] = 0;
+    regs.set_return(0);
     if args.stack != 0 {
-        regs.sp_el0 = args.stack;
+        regs.set_sp(args.stack);
     }
     let mut fp = FpState::default();
     arch::save_fp(&mut fp);
@@ -105,7 +106,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let mut t = Thread::new(tid);
     t.regs = regs;
     t.fp = fp;
-    t.tpidr = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tpidr() };
+    t.tls = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tls() };
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     t.sigmask = sigmask;
     p.threads.insert(tid, t);

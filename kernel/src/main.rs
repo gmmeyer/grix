@@ -66,7 +66,7 @@ pub extern "C" fn kernel_main() -> ! {
     console::init_virtio();
     rng::init(&img.seed);
     snapshot::init(img.snapshot);
-    arch::allow_el0_counter();
+    arch::allow_user_counter();
     klog!("grix kernel: {} MiB RAM, {} imported paths, exec {}\n", img.ram_size >> 20, img.entries.len(), img.exe);
     process::start(img)
 }

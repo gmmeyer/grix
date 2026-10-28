@@ -1829,7 +1829,7 @@ fn deadlock(p: &mut Process, held: locks::Lock) -> bool {
         let Some(q) = procs.others.get(&pid) else { return false };
         // A thread of it blocked in F_SETLKW, and what it waits for.
         let waiting = q.threads.values().find_map(|t| {
-            let blocked = t.wait.is_some() && t.regs.x[8] == nr::fcntl as u64 && t.regs.x[1] == F_SETLKW;
+            let blocked = t.wait.is_some() && t.regs.syscall_nr() == nr::fcntl as u64 && t.regs.arg(1) == F_SETLKW;
             blocked.then_some(t.lock_wait).flatten()
         });
         let Some((key, s, e, write)) = waiting else { return false };

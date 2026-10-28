@@ -10,10 +10,9 @@
 //! them is fetched again; stdin hasn't been touched: nothing has been sent
 //! yet.) It's taken with every other CPU idle, and the VMM stops them all.
 
-use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use grix_abi::image::{SNAPSHOT_CALL, SNAPSHOT_RESTORED, SNAPSHOT_RETRY, SNAPSHOT_TAKEN};
+use grix_abi::image::{SNAPSHOT_RESTORED, SNAPSHOT_RETRY, SNAPSHOT_TAKEN};
 use grix_abi::wire::{Event, ExitKind};
 
 use crate::console::{self, klog};
@@ -42,13 +41,7 @@ pub fn take_if_wanted() {
     if !console::take_all_input() {
         return;
     }
-    let (x0, x1, x2, x3, x4, x5): (u64, u64, u64, u64, u64, u64);
-    // SAFETY: a hypervisor call. The VMM saves every register; a restored
-    // run returns here with x0..x5 set and the rest as they were.
-    unsafe {
-        asm!("hvc #0", inout("x0") SNAPSHOT_CALL => x0, out("x1") x1, out("x2") x2, out("x3") x3, out("x4") x4,
-             out("x5") x5);
-    }
+    let [x0, x1, x2, x3, x4, x5] = crate::arch::snapshot_call();
     match x0 {
         SNAPSHOT_RESTORED => {
             WANTED.store(false, Ordering::Relaxed);

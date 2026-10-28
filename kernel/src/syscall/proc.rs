@@ -76,12 +76,12 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     };
     let mut t = Thread::new(pid);
     t.regs = *tf;
-    t.regs.x[0] = 0;
+    t.regs.set_return(0);
     if args.stack != 0 {
-        t.regs.sp_el0 = args.stack;
+        t.regs.set_sp(args.stack);
     }
     arch::save_fp(&mut t.fp);
-    t.tpidr = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tpidr() };
+    t.tls = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tls() };
     let parent_thread = p.cur();
     t.sigmask = parent_thread.sigmask;
     t.altstack = parent_thread.altstack;
@@ -226,8 +226,8 @@ pub fn execve(
     {
         parent.wake(tid, Some(p.pid as u64));
     }
-    *tf = TrapFrame { elr: entry, sp_el0: sp, ..TrapFrame::default() };
-    arch::set_tpidr(0);
+    *tf = TrapFrame::new_user(entry, sp);
+    arch::set_tls(0);
     arch::restore_fp(&FpState::default());
     Ok(0)
 }

@@ -5,11 +5,25 @@
 //! pending interrupt even while masked.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use grix_abi::machine::{GICR_GRIX_VMM, GICR_STRIDE};
 
 use crate::mm::KERNEL_OFFSET;
 use crate::time;
 
 const GICD: u64 = KERNEL_OFFSET + grix_abi::machine::GICD;
+
+/// The redistributors' physical base: where the VMM put them (the boot
+/// image says).
+static GICR: AtomicU64 = AtomicU64::new(0);
+/// They're where grix-vmm puts them: it's the VMM.
+static GRIX_VMM: AtomicBool = AtomicBool::new(false);
+
+/// Is the VMM grix-vmm (which wants `KICK_CALL`s)?
+pub fn on_grix_vmm() -> bool {
+    GRIX_VMM.load(Ordering::Relaxed)
+}
 
 /// Virtual timer PPI.
 pub const TIMER_INTID: u32 = 27;
@@ -25,6 +39,8 @@ pub const KICK_INTID: u32 = 0;
 /// Set the GIC up, on CPU 0. `gicr` is the redistributors' physical base,
 /// which depends on the VMM (the boot image says).
 pub fn init(gicr: u64) {
+    GICR.store(gicr, Ordering::Relaxed);
+    GRIX_VMM.store(gicr == GICR_GRIX_VMM, Ordering::Relaxed);
     // SAFETY: GIC distributor registers, mapped at GICD.
     unsafe {
         // Distributor: affinity routing, group 1 enabled (single security state).
@@ -32,13 +48,13 @@ pub fn init(gicr: u64) {
         ctlr.write_volatile((1 << 4) | (1 << 1));
         while ctlr.read_volatile() & (1 << 31) != 0 {}
     }
-    init_cpu(gicr);
+    init_cpu(0);
 }
 
-/// This CPU's part of the GIC: `gicr` is its redistributor (physical).
-pub fn init_cpu(gicr: u64) {
-    // RD_base frame, then SGI_base frame 64 KiB later.
-    let gicr = KERNEL_OFFSET + gicr;
+/// CPU `cpu`'s part of the GIC, on that CPU.
+pub fn init_cpu(cpu: usize) {
+    // Its redistributor: RD_base frame, then SGI_base frame 64 KiB later.
+    let gicr = KERNEL_OFFSET + GICR.load(Ordering::Relaxed) + cpu as u64 * GICR_STRIDE;
     let gicr_sgi = gicr + 0x1_0000;
     unsafe {
         // Wake the redistributor.

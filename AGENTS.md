@@ -61,12 +61,12 @@ The host (`crates/grix`) turns imports, argv/env and a capability `Policy`
 into a boot image (`crates/abi/src/image.rs`). The VMM, a child process
 (`crates/vmm`'s `grix-vmm` on Hypervisor.framework, or QEMU), loads the image at
 physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
-(`kernel/src`) enables the MMU in `arch/boot.S`, runs in the high half
+(`kernel/src`) enables the MMU in `arch/aarch64/boot.S`, runs in the high half
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
 the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
 (`elf.rs`, `process.rs`), and drops to EL0.
 After that, every bit of kernel work happens in an exception handler
-(`arch/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
+(`arch/aarch64/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames
 (`console.rs`, format in `crates/abi/src/wire.rs`) on a virtio console
 (`virtio.rs`: virtio-mmio, port 1 of a `virtio-serial-device`, on the VMM's
@@ -84,6 +84,16 @@ and `ExportKind::Removed` for the topmost paths that are gone. The host
 (`crates/grix/src/mount.rs`) applies those to the mounted directory
 without following links and skips anything that changed on the host during
 the run. Mount points are `Node::mount_point` (EBUSY to remove or rename).
+
+Architectures: everything a CPU decides is in `kernel/src/arch/<arch>/`
+(today `aarch64`): boot and the linker script, exception entry and the
+return to user mode, `TrapFrame` and its accessors (the system call's
+number, arguments and result, pc, sp, rewinding to the call), the FP and
+TLS registers, page-table entries (`pte`), the interrupt controller and
+timer (`irq`), the early UART (`uart`), the signal frame (`sigframe`), the
+vDSO's code, PSCI and the VMM calls, and `/proc/cpuinfo`. Code outside
+`arch` uses only that interface; the syscall table (`syscall/table.rs`)
+and the structures system calls copy are still arm64's.
 
 Images (`crates/grix/src/container.rs`, `build.rs`, `oci.rs`): a `.grix`
 file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),

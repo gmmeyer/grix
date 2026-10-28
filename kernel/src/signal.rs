@@ -1,21 +1,20 @@
 //! Signals: pending queues, delivery to handlers through an `rt_sigframe` on
 //! the user stack, `rt_sigreturn`, and interrupting blocked syscalls.
 //!
-//! The frame is laid out exactly as Linux arm64 does it
-//! (arch/arm64/kernel/signal.c): libc's `ucontext_t`, Go's preemption (which
-//! rewrites the saved pc/sp/lr) and unwinders all read it directly.
+//! The frame is laid out exactly as Linux does it (`arch::sigframe`): libc's
+//! `ucontext_t`, Go's preemption (which rewrites the saved registers) and
+//! unwinders all read it directly.
 //!
-//! Delivery happens on the way back to EL0 (`return_to_user`), like Linux's
+//! Delivery happens on the way back to user mode (`return_to_user`), like Linux's
 //! do_notify_resume: after a syscall, a fault or a timer interrupt, the
 //! current thread's deliverable signals get frames. A thread blocked in a
 //! syscall is woken by `send` and its syscall either fails with EINTR or, for
 //! `SA_RESTART` handlers and restartable calls, re-executes after the handler.
 
 use alloc::collections::VecDeque;
-use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::{self, FpState, TrapFrame};
+use crate::arch::{self, TrapFrame};
 use crate::errno::*;
 use crate::mm::aspace::{AddressSpace, SIGPAGE};
 use crate::process::{JobReport, PROCESS, Process, SigAction, Thread, Wait, WaitOn};
@@ -87,12 +86,13 @@ pub const STOP_SIGNALS: u64 = bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(S
 const MAX_QUEUED_RT: u64 = 4096;
 static QUEUED_RT: AtomicU64 = AtomicU64::new(0);
 
-/// A synchronous fault: what the frame's `fault_address` and ESR record say.
+/// A synchronous fault: the address, and the syndrome the CPU gave (arm64's
+/// ESR), which the signal frame may report.
 #[derive(Clone, Copy, Debug)]
 pub struct Fault {
     pub addr: u64,
     pub pc: u64,
-    pub esr: Option<u64>,
+    pub syndrome: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,8 +200,7 @@ impl Drop for SigQueue {
 pub const SS_ONSTACK: u32 = 1;
 pub const SS_DISABLE: u32 = 2;
 pub const SS_AUTODISARM: u32 = 1 << 31;
-/// arm64's MINSIGSTKSZ: room for a frame with the FP/SIMD record.
-const MINSIGSTKSZ: u64 = 5120;
+use crate::arch::MINSIGSTKSZ;
 
 /// A thread's sigaltstack.
 #[derive(Clone, Copy, Debug)]
@@ -514,17 +513,17 @@ fn acting_signal(p: &Process, t: &Thread) -> Option<u32> {
 /// `SA_RESTART` handler. Waits with timeouts, poll/select/epoll and sleeps
 /// always fail with EINTR instead (see signal(7)).
 fn restartable(regs: &TrapFrame) -> bool {
-    match regs.x[8] as u32 {
+    match regs.syscall_nr() as u32 {
         nr::read | nr::readv | nr::write | nr::writev | nr::pread64 | nr::pwrite64 | nr::preadv | nr::pwritev => true,
         nr::recvfrom | nr::recvmsg | nr::sendto | nr::sendmsg | nr::openat | nr::flock | nr::getrandom => true,
         nr::sendmmsg => true,
         // recvmmsg with a timeout is EINTR, as the other timed waits.
-        nr::recvmmsg => regs.x[4] == 0,
+        nr::recvmmsg => regs.arg(4) == 0,
         nr::wait4 | nr::waitid => true,
         // F_SETLKW and F_OFD_SETLKW.
-        nr::fcntl => matches!(regs.x[1], 7 | 38),
+        nr::fcntl => matches!(regs.arg(1), 7 | 38),
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
-        nr::futex => matches!(regs.x[1] & 127, 0 | 9) && regs.x[3] == 0,
+        nr::futex => matches!(regs.arg(1) & 127, 0 | 9) && regs.arg(3) == 0,
         _ => false,
     }
 }
@@ -550,7 +549,7 @@ fn notify(p: &mut Process, tid: u32) {
     }
     p.cancel_wait(tid);
     let t = p.threads.get_mut(&tid).unwrap();
-    t.regs.elr -= 4;
+    t.regs.rewind_syscall();
     t.restarting = true;
     t.recheck = true;
     p.runq.push_back(tid);
@@ -565,7 +564,7 @@ pub fn interrupt_self(p: &mut Process, tf: &mut TrapFrame) -> bool {
         return false; // no signal, or the thread exited
     }
     p.cancel_wait(tid);
-    tf.elr -= 4;
+    tf.rewind_syscall();
     p.cur().restarting = true;
     true
 }
@@ -577,17 +576,17 @@ fn interrupt_syscall(a: &mut AddressSpace, t: &mut Thread, tf: &mut TrapFrame, a
     // A write that got some data out returns that much, restart or not.
     let done = core::mem::take(&mut t.io_done);
     if done > 0 {
-        tf.elr += 4;
-        tf.x[0] = done;
+        tf.skip_syscall();
+        tf.set_return(done);
         return;
     }
     if act.flags & SA_RESTART != 0 && restartable(tf) {
         return;
     }
     // nanosleep and relative clock_nanosleep report the time left.
-    let rem = match tf.x[8] as u32 {
-        nr::nanosleep => tf.x[1],
-        nr::clock_nanosleep if tf.x[1] & 1 == 0 => tf.x[3],
+    let rem = match tf.syscall_nr() as u32 {
+        nr::nanosleep => tf.arg(1),
+        nr::clock_nanosleep if tf.arg(1) & 1 == 0 => tf.arg(3),
         _ => 0,
     };
     if rem != 0
@@ -595,42 +594,11 @@ fn interrupt_syscall(a: &mut AddressSpace, t: &mut Thread, tf: &mut TrapFrame, a
     {
         let _ = write_timespec(a, rem, d.saturating_sub(time::monotonic_ns()));
     }
-    tf.elr += 4;
-    tf.x[0] = (-(EINTR.0 as i64)) as u64;
+    tf.skip_syscall();
+    tf.set_return((-(EINTR.0 as i64)) as u64);
 }
 
 // ---------------------------------------------------------------- delivery
-
-// struct rt_sigframe { siginfo info; ucontext uc; } followed by a frame
-// record {fp, lr} for unwinders. Offsets are from the frame's start.
-const UC: usize = 128;
-const UC_STACK: usize = UC + 16;
-const UC_SIGMASK: usize = UC + 40;
-/// struct sigcontext, 16-byte aligned after uc_sigmask's 128-byte glibc sigset.
-const MCONTEXT: usize = UC + 176;
-const MC_REGS: usize = MCONTEXT + 8;
-const MC_SP: usize = MCONTEXT + 256;
-const MC_PC: usize = MCONTEXT + 264;
-const MC_PSTATE: usize = MCONTEXT + 272;
-/// sigcontext.__reserved: a list of {magic, size} records ending with a zero one.
-const RESERVED: usize = MCONTEXT + 288;
-const RESERVED_SIZE: usize = 4096;
-const FRAME_SIZE: usize = RESERVED + RESERVED_SIZE;
-const FPSIMD_MAGIC: u32 = 0x4650_8001;
-const FPSIMD_SIZE: usize = 528;
-const ESR_MAGIC: u32 = 0x4553_5201;
-const ESR_SIZE: usize = 16;
-/// sizeof(struct rt_sigframe), a multiple of 16 so the frame stays aligned.
-const _: () = assert!(FRAME_SIZE == 4688);
-
-/// PSTATE bits user code may not set: EL and SP selection, AArch32, DAIF masks.
-const PSTATE_PRIVILEGED: u64 = 0x3df;
-const PSTATE_NZCV: u64 = 0xf000_0000;
-
-/// `mov x8, #139 (rt_sigreturn); svc #0`. Signal handlers return here unless
-/// they bring their own SA_RESTORER, as Go and glibc on arm64 don't: they rely
-/// on the vDSO's __kernel_rt_sigreturn, which is exactly this code.
-pub const TRAMPOLINE: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
 
 /// How many handler frames to push per return to user space. More pending
 /// signals are delivered at the next kernel exit (rt_sigreturn at the latest).
@@ -712,7 +680,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         if push_frame(p, tf, &info, &act).is_err() {
             // Linux's force_sigsegv: a signal that can't be delivered ends the program.
             let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
-            p.kill(SIGSEGV, tf.sp_el0, tf.elr, why, true);
+            p.kill(SIGSEGV, tf.sp(), tf.pc(), why, true);
             return;
         }
         frames += 1;
@@ -724,66 +692,21 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
     }
 }
 
-fn put_u32(b: &mut [u8], off: usize, v: u32) {
-    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn put_u64(b: &mut [u8], off: usize, v: u64) {
-    b[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-fn get_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
-
-fn get_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-
 /// Build a signal frame for `info` and redirect `tf` to the handler
 /// (Linux's setup_rt_frame and setup_return).
 fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigAction) -> Result<(), Errno> {
     let sig = info.signo;
     let t = p.threads.get_mut(&p.current).unwrap();
-    let sp = tf.sp_el0;
+    let sp = tf.sp();
     let alt = t.altstack;
     let top = if act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0 { alt.sp.wrapping_add(alt.size) } else { sp };
-    let record = top.checked_sub(16).ok_or(EFAULT)? & !15;
-    let frame = record.checked_sub(FRAME_SIZE as u64).ok_or(EFAULT)?;
-
-    let mut b = vec![0u8; FRAME_SIZE + 16];
-    b[..UC].copy_from_slice(&info.bytes());
-    put_u64(&mut b, UC_STACK, alt.sp);
-    put_u32(&mut b, UC_STACK + 8, alt.flags);
-    put_u64(&mut b, UC_STACK + 16, alt.size);
-    put_u64(&mut b, UC_SIGMASK, t.saved_sigmask.unwrap_or(t.sigmask));
-    put_u64(&mut b, MCONTEXT, info.fault.map_or(0, |f| f.addr));
-    for (i, x) in tf.x.iter().enumerate() {
-        put_u64(&mut b, MC_REGS + i * 8, *x);
-    }
-    put_u64(&mut b, MC_SP, sp);
-    put_u64(&mut b, MC_PC, tf.elr);
-    put_u64(&mut b, MC_PSTATE, tf.spsr);
-    // The current thread's FP/SIMD state is live in the CPU (the kernel never touches it).
-    let mut fp = FpState::default();
-    arch::save_fp(&mut fp);
-    put_u32(&mut b, RESERVED, FPSIMD_MAGIC);
-    put_u32(&mut b, RESERVED + 4, FPSIMD_SIZE as u32);
-    put_u32(&mut b, RESERVED + 8, fp.fpsr as u32);
-    put_u32(&mut b, RESERVED + 12, fp.fpcr as u32);
-    for (i, q) in fp.q.iter().enumerate() {
-        b[RESERVED + 16 + i * 16..RESERVED + 32 + i * 16].copy_from_slice(&q.to_le_bytes());
-    }
-    if let Some(esr) = info.fault.and_then(|f| f.esr) {
-        let at = RESERVED + FPSIMD_SIZE;
-        put_u32(&mut b, at, ESR_MAGIC);
-        put_u32(&mut b, at + 4, ESR_SIZE as u32);
-        put_u64(&mut b, at + 8, esr);
-    }
-    // The terminating {0, 0} record is already zero.
-    put_u64(&mut b, FRAME_SIZE, tf.x[29]);
-    put_u64(&mut b, FRAME_SIZE + 8, tf.x[30]);
-    copy_out(&mut p.aspace, frame, &b)?;
+    let ctx = arch::sigframe::Context {
+        info: info.bytes(),
+        stack: (alt.sp, alt.flags, alt.size),
+        mask: t.saved_sigmask.unwrap_or(t.sigmask),
+        fault: info.fault,
+    };
+    let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, &ctx)?;
 
     let t = p.threads.get_mut(&p.current).unwrap();
     t.saved_sigmask = None;
@@ -800,16 +723,8 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     if act.flags & SA_RESETHAND != 0 {
         p.sigactions[sig as usize].handler = SIG_DFL;
     }
-
-    tf.x[0] = sig as u64;
-    if act.flags & SA_SIGINFO != 0 {
-        tf.x[1] = frame;
-        tf.x[2] = frame + UC as u64;
-    }
-    tf.sp_el0 = frame;
-    tf.x[29] = record;
-    tf.x[30] = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
-    tf.elr = act.handler;
+    let restorer = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
+    arch::sigframe::enter_handler(tf, frame, sig, act.handler, restorer, act.flags & SA_SIGINFO != 0);
     Ok(())
 }
 
@@ -817,73 +732,15 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
 /// fails Linux's checks (including any attempt to return to a privileged
 /// mode) ends the program with SIGSEGV.
 pub fn sigreturn(p: &mut Process, tf: &mut TrapFrame) -> SysResult {
-    let frame = tf.sp_el0;
-    let Ok((b, fp)) = read_frame(&mut p.aspace, frame) else {
-        p.kill(SIGSEGV, frame, tf.elr, "rt_sigreturn with a corrupt signal frame", true);
+    let Ok((mask, (sp, flags, size))) = arch::sigframe::sigreturn(&mut p.aspace, tf) else {
+        p.kill(SIGSEGV, tf.sp(), tf.pc(), "rt_sigreturn with a corrupt signal frame", true);
         return Err(EBLOCKED);
     };
-    for (i, x) in tf.x.iter_mut().enumerate() {
-        *x = get_u64(&b, MC_REGS + i * 8);
-    }
-    tf.sp_el0 = get_u64(&b, MC_SP);
-    tf.elr = get_u64(&b, MC_PC);
-    tf.spsr = get_u64(&b, MC_PSTATE) & PSTATE_NZCV;
-    arch::restore_fp(&fp);
     let t = p.cur();
-    t.sigmask = get_u64(&b, UC_SIGMASK) & !UNBLOCKABLE;
-    let alt =
-        AltStack { sp: get_u64(&b, UC_STACK), flags: get_u32(&b, UC_STACK + 8), size: get_u64(&b, UC_STACK + 16) };
+    t.sigmask = mask & !UNBLOCKABLE;
     // Like Linux's restore_altstack, errors other than EFAULT are ignored.
-    let _ = t.altstack.set(alt, tf.sp_el0);
-    Ok(tf.x[0])
-}
-
-/// Read and validate a signal frame (restore_sigframe, parse_user_sigframe).
-fn read_frame(a: &mut AddressSpace, frame: u64) -> Result<(alloc::vec::Vec<u8>, FpState), Errno> {
-    if frame & 15 != 0 {
-        return Err(EFAULT);
-    }
-    let mut b = vec![0u8; FRAME_SIZE];
-    copy_in(a, frame, &mut b)?;
-    if get_u64(&b, MC_PSTATE) & PSTATE_PRIVILEGED != 0 {
-        return Err(EINVAL);
-    }
-    let mut fp = None;
-    let mut off = 0;
-    let records = &b[RESERVED..];
-    loop {
-        if records.len() - off < 8 {
-            return Err(EINVAL);
-        }
-        let (magic, size) = (get_u32(records, off), get_u32(records, off + 4) as usize);
-        if magic == 0 {
-            if size != 0 {
-                return Err(EINVAL);
-            }
-            break;
-        }
-        if size < 8 || size % 16 != 0 || size > records.len() - off {
-            return Err(EINVAL);
-        }
-        match magic {
-            FPSIMD_MAGIC if fp.is_none() && size == FPSIMD_SIZE => {
-                let mut s = FpState {
-                    fpsr: get_u32(records, off + 8) as u64,
-                    fpcr: get_u32(records, off + 12) as u64,
-                    ..FpState::default()
-                };
-                for (i, q) in s.q.iter_mut().enumerate() {
-                    let at = off + 16 + i * 16;
-                    *q = u128::from_le_bytes(records[at..at + 16].try_into().unwrap());
-                }
-                fp = Some(s);
-            }
-            ESR_MAGIC => {}
-            _ => return Err(EINVAL),
-        }
-        off += size;
-    }
-    Ok((b, fp.ok_or(EINVAL)?))
+    let _ = t.altstack.set(AltStack { sp, flags, size }, tf.sp());
+    Ok(tf.return_value())
 }
 
 // ---------------------------------------------------------------- for syscalls

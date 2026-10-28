@@ -697,7 +697,7 @@ crates/abi/        shared host<->guest definitions: boot image, policy, wire pro
 crates/grix/       host library + `grix` CLI (builds images, runs the VMM, decodes output)
 crates/vmm/        grix-vmm: the VMM (Hypervisor.framework, KVM), PL011 + virtio console
 kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
-  src/arch/        boot.S (MMU bring-up), vectors.S (traps), system registers
+  src/arch/        per architecture (aarch64/): boot, traps, page-table entries, GIC, signal frame
   src/mm/          frame allocator, page tables, address spaces / VMAs
   src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart

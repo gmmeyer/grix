@@ -11,7 +11,6 @@ use crate::mm::{PAGE_SIZE, page_down, page_up};
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
-const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
@@ -113,7 +112,7 @@ pub fn load(aspace: &mut AddressSpace, src: &Source, ino: Ino, base: Option<u64>
         return Err("not a 64-bit little-endian ELF");
     }
     let ty = u16_at(data, 16)?;
-    if u16_at(data, 18)? != EM_AARCH64 {
+    if u16_at(data, 18)? != crate::arch::ELF_MACHINE {
         return Err("not an AArch64 binary");
     }
     if ty != ET_EXEC && ty != ET_DYN {

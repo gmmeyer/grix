@@ -11,7 +11,6 @@
 //! queue carries everything the guest says.
 
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::sync::atomic::{Ordering, fence};
 
 use grix_abi::machine::{
@@ -151,8 +150,7 @@ impl Queue {
 
     fn notify(&self, base: u64) {
         // Ring updates complete before the device is told to look.
-        // SAFETY: a barrier.
-        unsafe { asm!("dsb sy") };
+        crate::arch::device_barrier();
         write(base, QUEUE_NOTIFY, self.index);
     }
 

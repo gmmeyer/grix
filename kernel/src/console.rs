@@ -1,7 +1,7 @@
 //! The console: framed messages to the host and the program's stdin from
 //! it (format in `grix_abi::wire`). They travel over virtio-console
 //! (`virtio.rs`) once it's up. Before that, and for panics, frames go out
-//! on the PL011 UART, which needs no memory and no lock.
+//! on the UART (`arch::uart`), which needs no memory and no lock.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -12,49 +12,16 @@ use grix_abi::hostfs::Assembler;
 use grix_abi::wire::{self, Channel, ExitKind, Input, InputDecoder};
 use spin::Mutex;
 
-use crate::mm::KERNEL_OFFSET;
+use crate::arch::uart;
 use crate::virtio;
 
-const UART: u64 = KERNEL_OFFSET + grix_abi::machine::UART;
-const UART_DR: u64 = 0x00;
-const UART_FR: u64 = 0x18;
-const UART_LCR_H: u64 = 0x2c;
-const UART_CR: u64 = 0x30;
-const FR_TXFE: u32 = 1 << 7;
-/// The PL011's FIFOs (QEMU's are 16 deep too).
-const FIFO_DEPTH: usize = 16;
-
-fn uart(reg: u64) -> *mut u32 {
-    (UART + reg) as *mut u32
-}
-
-/// Set the UART up: 8-bit words, FIFOs on, transmitter enabled. Done first
-/// thing at boot.
+/// Set the UART up. Done first thing at boot.
 pub fn init() {
-    // SAFETY: PL011 registers, mapped at UART.
-    unsafe {
-        uart(UART_LCR_H).write_volatile((3 << 5) | (1 << 4));
-        uart(UART_CR).write_volatile(1 | (1 << 8)); // UARTEN, TXE
-    }
+    uart::init();
 }
 
-/// Send bytes on the UART. Every register access is a VM exit, so wait for
-/// an empty transmit FIFO once per FIFO-full of bytes instead of checking
-/// before each one.
 fn uart_put(parts: &[&[u8]]) {
-    let mut room = 0;
-    for &b in parts.iter().flat_map(|p| p.iter()) {
-        if room == 0 {
-            // SAFETY: PL011 registers, mapped at UART.
-            while unsafe { uart(UART_FR).read_volatile() } & FR_TXFE == 0 {
-                core::hint::spin_loop();
-            }
-            room = FIFO_DEPTH;
-        }
-        // SAFETY: as above.
-        unsafe { uart(UART_DR).write_volatile(b as u32) };
-        room -= 1;
-    }
+    uart::put(parts);
 }
 
 /// Split `data` into frames and hand each (header, payload) to `out`.

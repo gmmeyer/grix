@@ -17,7 +17,7 @@ pub fn init(seed: &[u8; 32]) {
         *k = u32::from_le_bytes(seed[i * 4..i * 4 + 4].try_into().unwrap());
     }
     for i in 0..4 {
-        if let Some(v) = arch::rndr() {
+        if let Some(v) = arch::hw_random() {
             rng.key[i * 2] ^= v as u32;
             rng.key[i * 2 + 1] ^= (v >> 32) as u32;
         }

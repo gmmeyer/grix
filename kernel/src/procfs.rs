@@ -148,7 +148,7 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             let m = root_mode(p);
             let _ = write!(s, "grix / tmpfs {m} 0 0\nproc /proc proc rw 0 0\ndev /dev devtmpfs rw 0 0\n");
         }
-        ProcFile::Cpuinfo => cpuinfo(&mut s),
+        ProcFile::Cpuinfo => arch::cpuinfo(&mut s, crate::smp::count()),
         ProcFile::CpuList => {
             let n = crate::smp::count();
             let _ = if n == 1 { writeln!(s, "0") } else { writeln!(s, "0-{}", n - 1) };
@@ -329,31 +329,6 @@ fn limits(p: &Process, s: &mut String) {
     for (i, (name, unit)) in NAMES.iter().enumerate() {
         let (cur, max) = p.rlimits[i];
         let _ = writeln!(s, "{name:<26}{:<21}{:<21}{unit:<10}", fmt(cur), fmt(max));
-    }
-}
-
-fn cpuinfo(s: &mut String) {
-    const NAMES: [&str; 22] = [
-        "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp", "asimdhp", "cpuid",
-        "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4", "asimddp", "sha512",
-    ];
-    let hw = arch::hwcap();
-    let features: Vec<&str> = NAMES.iter().enumerate().filter(|(i, _)| hw & (1 << i) != 0).map(|(_, n)| *n).collect();
-    let midr = arch::midr();
-    let bogomips = arch::counter_freq() * 2 / 10_000;
-    for cpu in 0..crate::smp::count() {
-        let _ = write!(
-            s,
-            "processor\t: {cpu}\nBogoMIPS\t: {}.{:02}\nFeatures\t: {}\nCPU implementer\t: {:#04x}\n\
-             CPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
-            bogomips / 100,
-            bogomips % 100,
-            features.join(" "),
-            (midr >> 24) & 0xff,
-            (midr >> 20) & 0xf,
-            (midr >> 4) & 0xfff,
-            midr & 0xf,
-        );
     }
 }
 

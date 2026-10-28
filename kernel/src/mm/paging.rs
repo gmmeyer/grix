@@ -1,19 +1,11 @@
-//! 4-level, 4 KiB-granule page tables for user address spaces (TTBR0).
+//! 4-level, 4 KiB-granule page tables for user address spaces (the entries'
+//! format is `arch::pte`'s).
 
 use super::{PAGE_SIZE, frame, p2v};
 use crate::arch;
 
-pub const PTE_VALID: u64 = 1 << 0;
-const PTE_TABLE_OR_PAGE: u64 = 1 << 1;
-const PTE_ATTR_NORMAL: u64 = 1 << 2; // MAIR index 1
-const PTE_AP_EL0: u64 = 1 << 6;
-const PTE_AP_RO: u64 = 1 << 7;
-const PTE_SH_INNER: u64 = 3 << 8;
-const PTE_AF: u64 = 1 << 10;
-const PTE_NG: u64 = 1 << 11;
-const PTE_PXN: u64 = 1 << 53;
-const PTE_UXN: u64 = 1 << 54;
-pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+pub use crate::arch::pte::ADDR_MASK;
+use crate::arch::pte::{self, VALID};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prot {
@@ -40,33 +32,20 @@ impl Prot {
         !(self.read || self.write || self.exec)
     }
 
-    /// Page-table flags for a user page. Writable implies readable and exec
-    /// implies readable (as on Linux/arm64). PROT_NONE pages stay mapped but
-    /// are inaccessible from EL0, so their contents survive mprotect round-trips.
+    /// Page-table flags for a user page (`arch::pte::leaf`).
     pub fn pte_flags(self) -> u64 {
-        let mut f = PTE_VALID | PTE_TABLE_OR_PAGE | PTE_ATTR_NORMAL | PTE_SH_INNER | PTE_AF | PTE_NG | PTE_PXN;
-        if self.is_none() {
-            return f | PTE_UXN;
-        }
-        f |= PTE_AP_EL0;
-        if !self.write {
-            f |= PTE_AP_RO;
-        }
-        if !self.exec {
-            f |= PTE_UXN;
-        }
-        f
+        pte::leaf(self)
     }
 }
 
 /// A leaf entry with writes forbidden, for pages shared copy-on-write.
-pub fn read_only(pte: u64) -> u64 {
-    pte | PTE_AP_RO
+pub fn read_only(e: u64) -> u64 {
+    pte::read_only(e)
 }
 
-/// Does a leaf entry let EL0 (and the kernel) write the page?
-pub fn writable(pte: u64) -> bool {
-    pte & PTE_AP_RO == 0
+/// Does a leaf entry let user code (and the kernel) write the page?
+pub fn writable(e: u64) -> bool {
+    pte::writable(e)
 }
 
 pub struct PageTable {
@@ -89,14 +68,14 @@ impl PageTable {
             let idx = (va >> (39 - 9 * level)) & 511;
             let e = entry(table, idx);
             let v = unsafe { *e };
-            if v & PTE_VALID == 0 {
+            if v & VALID == 0 {
                 if !create {
                     return None;
                 }
                 let next = frame::alloc()?;
                 // The zeroed table before the entry that points at it.
                 arch::publish_barrier();
-                unsafe { *e = next | PTE_VALID | PTE_TABLE_OR_PAGE };
+                unsafe { *e = pte::table(next) };
                 table = next;
             } else {
                 table = v & ADDR_MASK;
@@ -108,7 +87,7 @@ impl PageTable {
     /// The valid leaf entry for `va`, if any.
     pub fn lookup(&mut self, va: u64) -> Option<u64> {
         let e = unsafe { *self.walk(va, false)? };
-        (e & PTE_VALID != 0).then_some(e)
+        (e & VALID != 0).then_some(e)
     }
 
     pub fn map(&mut self, va: u64, pa: u64, flags: u64) -> Option<()> {
@@ -136,7 +115,7 @@ impl Drop for PageTable {
             if level < 3 {
                 for idx in 0..512 {
                     let v = unsafe { *entry(table, idx) };
-                    if v & PTE_VALID != 0 {
+                    if v & VALID != 0 {
                         free_level(v & ADDR_MASK, level + 1);
                     }
                 }
@@ -155,7 +134,7 @@ fn visit(table: u64, level: u32, base: u64, start: u64, end: u64, f: &mut dyn Fn
     for idx in lo..=hi {
         let e = entry(table, idx);
         let v = unsafe { *e };
-        if v & PTE_VALID == 0 {
+        if v & VALID == 0 {
             continue;
         }
         let va = base + idx * span;

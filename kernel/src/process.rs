@@ -93,7 +93,7 @@ pub struct Thread {
     pub tid: u32,
     /// User registers, valid while the thread is not running.
     pub regs: TrapFrame,
-    pub tpidr: u64,
+    pub tls: u64,
     pub fp: FpState,
     /// `Some` while blocked.
     pub wait: Option<Wait>,
@@ -137,7 +137,7 @@ impl Thread {
         Thread {
             tid,
             regs: TrapFrame::default(),
-            tpidr: 0,
+            tls: 0,
             fp: FpState::default(),
             wait: None,
             clear_child_tid: 0,
@@ -450,8 +450,8 @@ impl Process {
         for tid in waiting {
             let t = self.threads.get_mut(&tid).unwrap();
             t.wait = None;
-            // Re-execute the svc: x0..x7 still hold the original arguments.
-            t.regs.elr -= 4;
+            // Re-execute the system call: its arguments are still there.
+            t.regs.rewind_syscall();
             t.restarting = true;
             t.recheck = true;
             self.runq.push_back(tid);
@@ -467,11 +467,11 @@ impl Process {
         let t = self.threads.get_mut(&tid).unwrap();
         if ret.is_none() && w.rerun {
             // Out of time: it runs again, keeping its (past) deadline.
-            t.regs.elr -= 4;
+            t.regs.rewind_syscall();
             t.restarting = true;
             t.recheck = true;
         } else {
-            t.regs.x[0] = ret.unwrap_or(w.timeout_ret);
+            t.regs.set_return(ret.unwrap_or(w.timeout_ret));
             t.restart_deadline = None;
         }
         self.runq.push_back(tid);
@@ -596,19 +596,19 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
         Ok(()) => crate::procs::zap_stale(p, &mut crate::procs::PROCS.lock()),
         Err(FaultError::Segv) => {
             let code = if p.aspace.find(far).is_some() { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
-            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            let fault = signal::Fault { addr: far, pc: tf.pc(), syndrome: Some(esr) };
             signal::fault(p, signal::SIGSEGV, code, fault, access.describe_violation())
         }
-        Err(FaultError::OutOfMemory) => p.kill(signal::SIGKILL, far, tf.elr, "out of memory", true),
+        Err(FaultError::OutOfMemory) => p.kill(signal::SIGKILL, far, tf.pc(), "out of memory", true),
         Err(FaultError::PastEnd) => {
             const BUS_ADRERR: i32 = 2;
-            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            let fault = signal::Fault { addr: far, pc: tf.pc(), syndrome: Some(esr) };
             signal::fault(p, signal::SIGBUS, BUS_ADRERR, fault, "past the end of a mapped file")
         }
         // As Linux does when a mapped file can't be read.
         Err(FaultError::Io) => {
             const BUS_ADRERR: i32 = 2;
-            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            let fault = signal::Fault { addr: far, pc: tf.pc(), syndrome: Some(esr) };
             signal::fault(p, signal::SIGBUS, BUS_ADRERR, fault, "a mapped file couldn't be read")
         }
     }
@@ -694,7 +694,7 @@ pub fn start(img: Image<'static>) -> ! {
     crate::smp::lock();
     *PROCESS.lock() = Some(p);
     arch::irq::init(gicr);
-    crate::smp::start(cpus, gicr);
+    crate::smp::start(cpus);
     console::start(stdin);
     crate::smp::unlock();
     arch::enter_user(entry, sp)
@@ -939,7 +939,7 @@ fn build_stack(
     let execfn_ptr = cstr(a, execfn)?;
     let env_ptrs = envp.iter().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
     let arg_ptrs = argv.iter().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
-    let platform_ptr = cstr(a, "aarch64")?;
+    let platform_ptr = cstr(a, crate::arch::PLATFORM)?;
     let mut random = [0u8; 16];
     rng::fill(&mut random);
     let random_ptr = push(a, &random)?;

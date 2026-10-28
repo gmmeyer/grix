@@ -67,7 +67,7 @@ pub enum Backing {
     /// from byte `offset + o` of the file when it faults in. File bytes at
     /// or past `end` read as zero (an ELF segment's .bss).
     Data { data: Content, offset: u64, end: u64, ino: Ino, shared: Option<Arc<()>> },
-    /// Each page starts with the signal-return trampoline (`signal::TRAMPOLINE`).
+    /// Each page starts with the signal-return trampoline (`arch::sigframe::TRAMPOLINE`).
     Sigpage,
     /// MAP_SHARED anonymous memory: page `index + o / PAGE_SIZE` of
     /// `pages`, which every mapping of it sees, in every process that
@@ -678,7 +678,7 @@ impl AddressSpace {
                 }
                 &[]
             }
-            Backing::Sigpage => &crate::signal::TRAMPOLINE,
+            Backing::Sigpage => &crate::arch::sigframe::TRAMPOLINE,
             Backing::Shared { .. } | Backing::SharedFile { .. } | Backing::KernelPage(_) => {
                 unreachable!("handled above")
             }

@@ -24,8 +24,8 @@ use table::{Gate, nr};
 pub(crate) const AT_FDCWD: i32 = -100;
 
 pub fn handle(tf: &mut TrapFrame) {
-    let n = tf.x[8];
-    let a = [tf.x[0], tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5]];
+    let n = tf.syscall_nr();
+    let a = tf.syscall_args();
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("syscall without a process");
     // A rewound call is running again: no longer something a signal must
@@ -52,10 +52,10 @@ pub fn handle(tf: &mut TrapFrame) {
     if result != Err(EBLOCKED) {
         p.cur().restart_deadline = None;
         p.cur().io_done = 0;
-        tf.x[0] = match result {
+        tf.set_return(match result {
             Ok(v) => v,
             Err(e) => (-(e.0 as i64)) as u64,
-        };
+        });
         crate::signal::syscall_done(p, result == Err(EINTR));
     }
     sched::wake_io_everywhere(p);
@@ -239,7 +239,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::rt_sigqueueinfo => signal::rt_sigqueueinfo(p, a[0], None, a[1], a[2]),
         nr::rt_tgsigqueueinfo => signal::rt_sigqueueinfo(p, a[0], Some(a[1]), a[2], a[3]),
         nr::rt_sigreturn => crate::signal::sigreturn(p, tf),
-        nr::sigaltstack => signal::sigaltstack(p, tf.sp_el0, a[0], a[1]),
+        nr::sigaltstack => signal::sigaltstack(p, tf.sp(), a[0], a[1]),
         nr::kill => signal::kill(p, a[0], a[1]),
 
         // processes

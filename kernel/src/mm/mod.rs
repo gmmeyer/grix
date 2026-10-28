@@ -7,8 +7,9 @@ pub mod paging;
 use grix_abi::image::{MAX_RAM, RAM_BASE};
 
 pub const PAGE_SIZE: u64 = 4096;
-/// Physical memory is mapped linearly at this offset (TTBR1).
-pub const KERNEL_OFFSET: u64 = 0xFFFF_0000_0000_0000;
+/// Physical memory is mapped linearly at this offset (the arch's high half,
+/// where the kernel runs: its linker script says the same).
+pub const KERNEL_OFFSET: u64 = crate::arch::KERNEL_OFFSET;
 const HEAP_SIZE: u64 = 32 << 20;
 
 #[inline]

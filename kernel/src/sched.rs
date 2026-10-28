@@ -39,9 +39,9 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     {
         t.cpu_ns += now.saturating_sub(p.slice_start);
         t.regs = *tf;
-        // The kernel never touches FP/SIMD or TPIDR_EL0, so the CPU still
-        // holds prev's values.
-        t.tpidr = arch::tpidr();
+        // The kernel never touches FP/SIMD or the TLS register, so the CPU
+        // still holds prev's values.
+        t.tls = arch::tls();
         arch::save_fp(&mut t.fp);
         if t.wait.is_none() {
             p.runq.push_back(prev);
@@ -94,7 +94,7 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     drop(procs);
     let tid = p.runq.pop_front().unwrap();
     let t = &p.threads[&tid];
-    arch::set_tpidr(t.tpidr);
+    arch::set_tls(t.tls);
     arch::restore_fp(&t.fp);
     *tf = t.regs;
     p.current = tid;

@@ -576,6 +576,16 @@ Next, in TODO.md order:
   arrives at once; the physical counter isn't restored (writing it would
   make KVM trap physical timer accesses on hosts without ECV).
 
+- **The kernel's architecture split** (round 2, item 19, first step):
+  everything arm64 decides moved under `kernel/src/arch/aarch64/` (boot,
+  vectors, the linker script, page-table entries, the GIC and timer, the
+  PL011, the signal frame, the vDSO's code, PSCI, the VMM calls,
+  `/proc/cpuinfo`), and the rest of the kernel reaches registers through
+  `TrapFrame`'s accessors (`syscall_nr`, `arg`, `set_return`,
+  `rewind_syscall`, ...). No behaviour changed. Still arm64's outside
+  `arch`: the syscall table and the layouts system calls copy (`stat`,
+  ...), which x86_64 gets as its own.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

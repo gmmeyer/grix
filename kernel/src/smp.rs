@@ -20,10 +20,9 @@
 //! the others leave it at their next scheduling point, which a kick (an
 //! SGI) brings forward.
 
-use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use grix_abi::machine::{GICR_STRIDE, KICK_CALL, MAX_CPUS};
+use grix_abi::machine::MAX_CPUS;
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::process::{PROCESS, Process};
@@ -59,18 +58,10 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 static SERVING: AtomicU64 = AtomicU64::new(0);
 /// Something may be runnable for this CPU (set before its kick).
 static WORK: [AtomicBool; N] = [const { AtomicBool::new(false) }; N];
-/// The redistributors' base (for the CPUs started later).
-static GICR: AtomicU64 = AtomicU64::new(0);
-/// The VMM is grix-vmm (which needs `KICK_CALL`; QEMU would take the call
-/// as an undefined instruction).
-static GRIX_VMM: AtomicBool = AtomicBool::new(false);
 
 /// This CPU (MPIDR affinity 0; the VMMs number CPUs 0..n).
 pub fn me() -> usize {
-    let mpidr: u64;
-    // SAFETY: reading an ID register.
-    unsafe { asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
-    (mpidr & 0xff) as usize % N
+    arch::cpu_number() % N
 }
 
 /// How many CPUs the machine has.
@@ -268,15 +259,7 @@ pub fn kick_thread(tid: u32) {
 fn kick(cpu: usize) {
     WORK[cpu].store(true, Ordering::Release);
     irq::send_sgi(cpu as u32);
-    // grix-vmm sleeps in WFI for the guest and doesn't see SGIs (on KVM
-    // the call gets NOT_SUPPORTED, and WFI wakes on the SGI).
-    if GRIX_VMM.load(Ordering::Relaxed) {
-        // SAFETY: a hypervisor call with no memory effects. SMCCC returns
-        // results in x0..x3 (KVM zeroes x1..x3).
-        unsafe {
-            asm!("hvc #0", inout("x0") KICK_CALL => _, inout("x1") cpu as u64 => _, out("x2") _, out("x3") _);
-        }
-    }
+    arch::vmm_kick(cpu);
 }
 
 /// Called last on every exception, with the kernel lock: if this CPU has
@@ -346,8 +329,7 @@ fn unlock_idle() {
 fn wait() {
     let me = me();
     while !WORK[me].swap(false, Ordering::Acquire) && !irq::pending() {
-        // SAFETY: waits for an interrupt (IRQs stay masked; WFI still wakes).
-        unsafe { asm!("dsb sy", "wfi") };
+        arch::wait_for_interrupt();
     }
 }
 
@@ -368,23 +350,15 @@ pub fn activated(root: u64) {
 }
 
 /// Start the other CPUs (on CPU 0, before the program runs).
-pub fn start(cpus: u32, gicr: u64) {
+pub fn start(cpus: u32) {
     COUNT.store(cpus.clamp(1, MAX_CPUS), Ordering::Relaxed);
-    GICR.store(gicr, Ordering::Relaxed);
-    GRIX_VMM.store(gicr == grix_abi::machine::GICR_GRIX_VMM, Ordering::Relaxed);
     CPUS.lock()[0].ttbr = PROCESS.lock().as_ref().map_or(0, |p| p.aspace.pt.root);
     for cpu in 1..count() {
         let entry = arch::secondary_entry_phys();
         let stack = arch::stack_top(cpu as usize);
-        let r: u64;
-        // SAFETY: PSCI CPU_ON (SMC32/HVC): the VMM starts `cpu` at `entry`
-        // with the MMU off, x0 = its stack.
-        unsafe {
-            asm!("hvc #0", inout("x0") 0xc400_0003u64 => r, inout("x1") cpu as u64 => _, inout("x2") entry => _,
-                 inout("x3") stack => _);
-        }
+        let r = arch::start_cpu(cpu as usize, entry, stack);
         if r != 0 {
-            crate::console::klog!("cpu {cpu} didn't start (PSCI {})\n", r as i64);
+            crate::console::klog!("cpu {cpu} didn't start ({r})\n");
             COUNT.store(cpu, Ordering::Relaxed);
             break;
         }
@@ -397,8 +371,8 @@ pub fn start(cpus: u32, gicr: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn secondary_main(frame: *mut TrapFrame) -> ! {
     let me = me();
-    irq::init_cpu(GICR.load(Ordering::Relaxed) + me as u64 * GICR_STRIDE);
-    arch::allow_el0_counter();
+    irq::init_cpu(me);
+    arch::allow_user_counter();
     arch::set_user_page_table(arch::empty_page_table());
     ONLINE.fetch_add(1, Ordering::Relaxed);
     debug_assert_eq!(frame as u64 + core::mem::size_of::<TrapFrame>() as u64, arch::stack_top(me));
