@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1083,8 +1084,13 @@ impl Sandbox {
     /// mounts are kept: each run gives them their host directories again
     /// ([`Snapshot::mount`](crate::Snapshot::mount)).
     pub fn snapshot<S: AsRef<str>>(&self, argv: &[S], path: impl AsRef<Path>) -> Result<crate::Snapshot> {
+        self.snapshot_real(argv, &image::real_dirs(path.as_ref())?)
+    }
+
+    /// [`snapshot`](Self::snapshot) to a path whose directories are real
+    /// ones already, which nothing resolves again (see `import_real`).
+    pub(crate) fn snapshot_real<S: AsRef<str>>(&self, argv: &[S], path: &Path) -> Result<crate::Snapshot> {
         let cfg = &self.cfg;
-        let path = path.as_ref();
         if cfg.arch == Arch::X86_64 {
             bail!("snapshots of x86_64 machines aren't there yet (arm64's are)");
         }
@@ -1125,16 +1131,21 @@ impl Sandbox {
         };
         // Written to a new file of our own (it holds the program's memory:
         // only we may read it), then renamed into place: never through a
-        // link, and never over a snapshot runs may still be mapping.
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let name = path.file_name().context("the snapshot needs a file name")?.to_string_lossy();
-        let temp = dir.join(format!(".{name}.{}.tmp", crate::container::random_suffix()));
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&temp)
-        }
-        .with_context(|| format!("creating {}", temp.display()))?;
-        let cleanup = TempFile(temp.clone());
+        // link, and never over a snapshot runs may still be mapping. In the
+        // directory it goes in, held open from the start, so whatever is
+        // swapped in on the way there meanwhile can't move it elsewhere.
+        path.file_name().context("the snapshot needs a file name")?;
+        let (dir, name) =
+            crate::at::open_parent(path).with_context(|| format!("the directory for {}", path.display()))?;
+        let temp = crate::at::cname(
+            format!(".{}.{}.tmp", name.to_string_lossy(), crate::container::random_suffix()).as_ref(),
+        )?;
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+        let file = std::fs::File::from(
+            crate::at::openat(dir.as_raw_fd(), &temp, flags, 0o600)
+                .with_context(|| format!("creating a file beside {}", path.display()))?,
+        );
+        let cleanup = TempAt(dir, temp);
         let mut keep = file.try_clone()?;
         let (out, taken) = self.run_mode(argv, None, Some(file), |_, _| {})?;
         // The VMM ends the run once it has written the machine out; the
@@ -1155,18 +1166,19 @@ impl Sandbox {
             base64::engine::general_purpose::STANDARD.encode(fs_state)
         };
         crate::snapshot::finish(&mut keep, &settings)?;
-        std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))?;
+        crate::at::rename(cleanup.0.as_raw_fd(), &cleanup.1, cleanup.0.as_raw_fd(), &name, false)
+            .with_context(|| format!("writing {}", path.display()))?;
         std::mem::forget(cleanup);
         crate::Snapshot::open(path)
     }
 }
 
-/// Removes a file unless forgotten.
-struct TempFile(PathBuf);
+/// Removes file `.1` in directory `.0` unless forgotten.
+struct TempAt(std::os::fd::OwnedFd, std::ffi::CString);
 
-impl Drop for TempFile {
+impl Drop for TempAt {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = crate::at::remove_at(self.0.as_raw_fd(), &self.1, false);
     }
 }
 

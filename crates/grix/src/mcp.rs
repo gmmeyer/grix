@@ -596,7 +596,7 @@ fn snapshot(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(S
     let out = output_path(config, args)?;
     let (sandbox, command) = sandbox(config, args, control)?;
     let started = std::time::Instant::now();
-    let snap = sandbox.snapshot(&command, &out)?;
+    let snap = sandbox.snapshot_real(&command, &out)?;
     let size = std::fs::metadata(&out).map_or(0, |m| m.len());
     let text = format!(
         "saved {} ({} MiB of memory) after {} ms: pass it as `snapshot` to `run`",
