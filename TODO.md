@@ -29,6 +29,31 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 8. ~~**Networking through the host** (`net`)~~: done. TCP clients and
    servers, DNS, loopback, port forwards and an allow-list.
 
+### Round 2 (2026-10-28), in this order
+
+9. **glibc programs** (Debian/Ubuntu arm64 images): most prebuilt Linux
+   tools are glibc-linked; only musl (Alpine) is tested.
+10. **Interactive use**: a TTY mode (`grix run -t`), pseudo-terminals and
+    termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
+    host too).
+11. **Shared file mappings and locks**: writable `MAP_SHARED` file
+    mappings and `msync`; `flock`/`fcntl` record locks (sqlite, databases).
+12. **Big imports without copying them into RAM**: a lazily read,
+    read-only disk for large runtimes and datasets.
+13. **Networking**: UDP beyond DNS; AF_UNIX sockets bound to paths.
+14. **Smaller syscalls**: pidfd, CPU-time timers, a vDSO for fast
+    `clock_gettime`, stack growth and guard pages, `/proc/<pid>` for every
+    process (`ps`).
+15. **Images**: zstd layers, registries that need a login, a cache of
+    applied base layers.
+16. **Agents**: MCP progress/streaming and cancellation; native Python
+    bindings (PyO3).
+17. **SMP**: several processes in parallel; finer locking than one kernel
+    lock.
+18. **Snapshots**: on KVM, with more CPUs, with live mounts.
+19. **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
+20. **An outside security review** (after the above).
+
 ## Agent integrations
 
 - [x] MCP server (`grix mcp`): `run` and `build_image` tools, confined to
