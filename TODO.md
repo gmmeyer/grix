@@ -51,7 +51,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] Registries that need credentials (only anonymous pulls today).
 - [ ] Multi-image layering without re-reading the base (a cache of applied
       bases); building is a full re-import every time.
-- [ ] A Docker image of grix itself (`Dockerfile`): static `grix` and
+- [x] A Docker image of grix itself (`Dockerfile`): static `grix` and
       `grix-vmm`, FROM scratch, run with `--device /dev/kvm`.
 
 ## Processes and exec
@@ -157,7 +157,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
 - [ ] `MAP_SHARED` mappings of writable files, `msync`.
       Shared mappings hold a copy taken at fault time. Changing the file, or making the mapping writable, is reported as unimplemented.
-- [ ] Executing files the program wrote (needs execve).
+- [x] Executing files the program wrote.
 - [ ] Large imports without copying everything into RAM: read-only
       virtio-blk/virtio-fs, loaded lazily (big runtimes, datasets).
 
