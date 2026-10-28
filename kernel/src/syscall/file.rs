@@ -16,6 +16,7 @@ use crate::fd::{
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
 use crate::procfs;
+use crate::locks;
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
@@ -299,6 +300,7 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         if flags & O_TRUNC != 0 && (remote || c.lock().len() != 0) {
             note_shared(p, nr::openat, c);
             c.lock().truncate(0)?;
+            zap_shared(p, c, 0);
             fs::lock().modified(ino);
         }
     }
@@ -350,7 +352,23 @@ pub fn fsync(p: &mut Process, fd: u64) -> SysResult {
 }
 
 pub fn close(p: &mut Process, fd: u64) -> SysResult {
+    if let Ok(file) = p.fds.get(fd) {
+        closing(p, &file);
+    }
     p.fds.close(fd).map(|_| 0)
+}
+
+/// A descriptor for `file` is about to close: the process's POSIX record
+/// locks on the file go with it, whichever descriptor they were taken
+/// through (POSIX's rule).
+pub(crate) fn closing(p: &Process, file: &crate::fd::FileRef) {
+    let f = file.lock();
+    // (An O_PATH descriptor doesn't count, as on Linux.)
+    if p.posix_locks && !f.path_only {
+        let key = f.lock_key();
+        drop(f);
+        locks::release(key, locks::Owner::Process(p.pid));
+    }
 }
 
 pub fn close_range(p: &mut Process, first: u64, last: u64, flags: u64) -> SysResult {
@@ -365,6 +383,9 @@ pub fn close_range(p: &mut Process, first: u64, last: u64, flags: u64) -> SysRes
                 e.cloexec = true;
             }
         } else {
+            if let Ok(file) = p.fds.get(fd) {
+                closing(p, &file);
+            }
             let _ = p.fds.close(fd);
         }
     }
@@ -1215,8 +1236,23 @@ fn set_len(p: &mut Process, n: u32, c: &Content, ino: Ino, len: u64) -> SysResul
     c.lock().may_resize(len)?;
     note_shared(p, n, c);
     c.lock().truncate(len)?;
+    zap_shared(p, c, len);
     fs::lock().modified(ino);
     Ok(0)
+}
+
+/// A file shrank: its pages past the end go from every process's shared
+/// mappings of it, as on Linux (touching them is SIGBUS). Page tables are
+/// the kernel's to change, whichever process they're for; the TLBs are
+/// flushed everywhere.
+pub(super) fn zap_shared(p: &mut Process, c: &Content, len: u64) {
+    if !c.lock().mapped_live() {
+        return;
+    }
+    p.aspace.zap_file(c, len);
+    for q in crate::procs::PROCS.lock().others.values_mut() {
+        q.aspace.zap_file(c, len);
+    }
 }
 
 pub fn truncate(p: &mut Process, pathp: u64, len: u64) -> SysResult {
@@ -1547,8 +1583,167 @@ pub fn dup3(p: &mut Process, old: u64, new: u64, flags: u64) -> SysResult {
         return Err(EINVAL);
     }
     let file = p.fds.get(old)?;
+    if let Ok(replaced) = p.fds.get(new) {
+        closing(p, &replaced);
+    }
     p.fds.set(new, FdEntry { file, cloexec: flags != 0 })?;
     Ok(new)
+}
+
+/// flock(2): a whole-file lock held by the open file description.
+pub fn flock(p: &mut Process, fd: u64, op: u64) -> SysResult {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    let write = match op & !LOCK_NB {
+        LOCK_SH => Some(false),
+        LOCK_EX => Some(true),
+        LOCK_UN => None,
+        _ => return Err(EINVAL),
+    };
+    let file = p.fds.get(fd)?;
+    let (key, id) = {
+        let f = file.lock();
+        if f.path_only {
+            return Err(EBADF);
+        }
+        (f.lock_key(), f.id())
+    };
+    match locks::flock(key, locks::Owner::File(id), p.pid, write)? {
+        locks::Outcome::Done => {
+            file.lock().locked = true;
+            Ok(0)
+        }
+        locks::Outcome::Conflict(_) if op & LOCK_NB != 0 => Err(EAGAIN),
+        // Re-run when a lock goes (`locks` says so with ipc::changed).
+        locks::Outcome::Conflict(_) => {
+            let deadline = p.timeout_deadline(None);
+            p.block_io(deadline, Ok(0))
+        }
+    }
+}
+
+const F_SETLKW: u64 = 7;
+const F_OFD_SETLKW: u64 = 38;
+
+/// fcntl's record locks: POSIX (F_GETLK, F_SETLK, F_SETLKW: the process
+/// holds them) and open file description ones (F_OFD_*: the open file does).
+fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
+    const F_GETLK: u64 = 5;
+    const F_OFD_GETLK: u64 = 36;
+    const F_UNLCK: i16 = 2;
+    let ofd = matches!(cmd, 36..=38);
+    let mut b = [0u8; 32];
+    copy_in(&mut p.aspace, arg, &mut b)?;
+    // struct flock: l_type, l_whence (i16), l_start, l_len (i64 at 8), l_pid (i32 at 24).
+    let ty = i16::from_le_bytes([b[0], b[1]]);
+    let whence = i16::from_le_bytes([b[2], b[3]]);
+    let start = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    let len = i64::from_le_bytes(b[16..24].try_into().unwrap());
+    if ofd && i32::from_le_bytes(b[24..28].try_into().unwrap()) != 0 {
+        return Err(EINVAL);
+    }
+    let write = match ty {
+        0 => Some(false),
+        1 => Some(true),
+        F_UNLCK => None,
+        _ => return Err(EINVAL),
+    };
+    let file = p.fds.get(fd)?;
+    let (key, id, acc, offset, size) = {
+        let f = file.lock();
+        if f.path_only {
+            return Err(EBADF);
+        }
+        let size = f.content.as_ref().map_or(0, |c| c.lock().len());
+        (f.lock_key(), f.id(), f.flags & O_ACCMODE, f.offset, size)
+    };
+    let base: i64 = match whence {
+        0 => 0,
+        1 => offset as i64,
+        2 => size as i64,
+        _ => return Err(EINVAL),
+    };
+    let at = base.checked_add(start).ok_or(EOVERFLOW)?;
+    // A negative length is the bytes before; zero, everything after.
+    let (s, e) = match len {
+        0 => (at, None),
+        // The last byte must be representable (the end itself may be 2^63).
+        l if l > 0 => (at, Some(at.checked_add(l - 1).ok_or(EOVERFLOW)? as u64 + 1)),
+        l => (at.checked_add(l).ok_or(EINVAL)?, Some(at as u64)),
+    };
+    if s < 0 {
+        return Err(EINVAL);
+    }
+    let (s, e) = (s as u64, e.unwrap_or(u64::MAX));
+    let owner = if ofd { locks::Owner::File(id) } else { locks::Owner::Process(p.pid) };
+    if matches!(cmd, F_GETLK | F_OFD_GETLK) {
+        let Some(want) = write else { return Err(EINVAL) };
+        match locks::conflict(key, owner, want, s, e) {
+            Some(l) => {
+                b[0..2].copy_from_slice(&(l.write as i16).to_le_bytes());
+                b[2..4].copy_from_slice(&0i16.to_le_bytes());
+                b[8..16].copy_from_slice(&(l.start as i64).to_le_bytes());
+                let n = if l.end == u64::MAX { 0 } else { (l.end - l.start) as i64 };
+                b[16..24].copy_from_slice(&n.to_le_bytes());
+                // An open file description's lock has no process: -1.
+                let pid = if matches!(l.owner, locks::Owner::File(_)) { -1 } else { l.pid as i32 };
+                b[24..28].copy_from_slice(&pid.to_le_bytes());
+            }
+            None => b[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+        }
+        return copy_out(&mut p.aspace, arg, &b).map(|_| 0);
+    }
+    if (write == Some(false) && acc == O_WRONLY) || (write == Some(true) && acc == O_RDONLY) {
+        return Err(EBADF);
+    }
+    match locks::set_range(key, owner, p.pid, write, s, e)? {
+        locks::Outcome::Done => {
+            if ofd {
+                file.lock().locked = true;
+            } else {
+                p.posix_locks = true;
+            }
+            Ok(0)
+        }
+        locks::Outcome::Conflict(l) if matches!(cmd, F_SETLKW | F_OFD_SETLKW) => {
+            if !ofd && deadlock(p, l) {
+                return Err(EDEADLK);
+            }
+            p.cur().lock_wait = Some((key, s, e, write == Some(true)));
+            let deadline = p.timeout_deadline(None);
+            p.block_io(deadline, Ok(0))
+        }
+        locks::Outcome::Conflict(_) => Err(EAGAIN),
+    }
+}
+
+/// Would waiting for `held` close a circle of processes waiting for each
+/// other's POSIX locks (Linux's posix_locks_deadlock)? Each one waits in
+/// fcntl(F_SETLKW) for a lock someone in the circle holds.
+fn deadlock(p: &mut Process, held: locks::Lock) -> bool {
+    let me = p.pid;
+    let procs = crate::procs::PROCS.lock();
+    let mut holder = held.owner;
+    for _ in 0..64 {
+        let locks::Owner::Process(pid) = holder else { return false };
+        if pid == me {
+            return true;
+        }
+        let Some(q) = procs.others.get(&pid) else { return false };
+        // A thread of it blocked in F_SETLKW, and what it waits for.
+        let waiting = q.threads.values().find_map(|t| {
+            let blocked = t.wait.is_some() && t.regs.x[8] == nr::fcntl as u64 && t.regs.x[1] == F_SETLKW;
+            blocked.then_some(t.lock_wait).flatten()
+        });
+        let Some((key, s, e, write)) = waiting else { return false };
+        match locks::conflict(key, locks::Owner::Process(pid), write, s, e) {
+            Some(next) => holder = next.owner,
+            None => return false,
+        }
+    }
+    false
 }
 
 pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
@@ -1559,7 +1754,6 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETFL: u64 = 4;
     const F_GETLK: u64 = 5;
     const F_SETLK: u64 = 6;
-    const F_SETLKW: u64 = 7;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     const F_ADD_SEALS: u64 = 1033;
     const F_GET_SEALS: u64 = 1034;
@@ -1580,12 +1774,7 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             f.flags = (f.flags & !SETFL_MASK) | (arg as u32 & SETFL_MASK);
             Ok(0)
         }
-        // Single process: advisory locks always succeed.
-        F_SETLK | F_SETLKW => p.fds.get(fd).map(|_| 0),
-        F_GETLK => {
-            p.fds.get(fd)?;
-            copy_out(&mut p.aspace, arg, &2u16.to_le_bytes()).map(|_| 0) // l_type = F_UNLCK
-        }
+        F_GETLK | F_SETLK | F_SETLKW | 36..=38 => record_lock(p, fd, cmd, arg),
         // memfd seals: only sealable files (memfds) have them.
         F_ADD_SEALS | F_GET_SEALS => {
             let file = p.fds.get(fd)?;
@@ -1605,6 +1794,11 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             }
             if !writable || seals & fs::F_SEAL_SEAL != 0 {
                 return Err(EPERM);
+            }
+            // Not while a shared mapping may still write it (Linux's
+            // mapping_deny_writable).
+            if arg as u32 & fs::F_SEAL_WRITE != 0 && data.mapped_writable() {
+                return Err(EBUSY);
             }
             data.seals = Some(seals | arg as u32);
             Ok(0)

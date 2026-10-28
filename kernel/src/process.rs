@@ -124,6 +124,10 @@ pub struct Thread {
     pub io_done: u64,
     /// CPU time used (ns), up to its last switch out.
     pub cpu_ns: u64,
+    /// The record lock it waits for in fcntl(F_SETLKW): (file, start, end,
+    /// write), for finding deadlocks. Only meaningful while it's blocked
+    /// there.
+    pub lock_wait: Option<(usize, u64, u64, bool)>,
 }
 
 impl Thread {
@@ -145,6 +149,7 @@ impl Thread {
             recheck: false,
             io_done: 0,
             cpu_ns: 0,
+            lock_wait: None,
         }
     }
 }
@@ -247,6 +252,9 @@ pub struct Process {
     pub job_notice: Option<crate::signal::SigInfo>,
     /// The controlling terminal (the session's, inherited across fork).
     pub ctty: Option<crate::tty::TtyRef>,
+    /// It has taken POSIX record locks (which go when it closes any
+    /// descriptor for the file, or ends).
+    pub posix_locks: bool,
 }
 
 /// A change a parent's wait can report besides an exit.
@@ -317,6 +325,7 @@ impl Process {
             job_report: None,
             job_notice: None,
             ctty: None,
+            posix_locks: false,
         }
     }
 
@@ -566,13 +575,20 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("fault without a process");
     match p.aspace.fault(far, access) {
-        Ok(()) => {}
+        // A write that gave a page its frame: other mappings' copies of it
+        // go before this thread goes on.
+        Ok(()) => crate::procs::zap_stale(p, &mut crate::procs::PROCS.lock()),
         Err(FaultError::Segv) => {
             let code = if p.aspace.find(far).is_some() { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
             let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
             signal::fault(p, signal::SIGSEGV, code, fault, access.describe_violation())
         }
         Err(FaultError::OutOfMemory) => p.kill(signal::SIGKILL, far, tf.elr, "out of memory", true),
+        Err(FaultError::PastEnd) => {
+            const BUS_ADRERR: i32 = 2;
+            let fault = signal::Fault { addr: far, pc: tf.elr, esr: Some(esr) };
+            signal::fault(p, signal::SIGBUS, BUS_ADRERR, fault, "past the end of a mapped file")
+        }
         // As Linux does when a mapped file can't be read.
         Err(FaultError::Io) => {
             const BUS_ADRERR: i32 = 2;

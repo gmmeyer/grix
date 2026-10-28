@@ -80,6 +80,38 @@ fn python() {
     assert_no_surprises(&out);
 }
 
+/// Several processes writing one SQLite database in WAL mode: POSIX
+/// record locks between them, and the -shm file mapped shared.
+#[test]
+fn sqlite_from_several_processes() {
+    let script = r#"
+import os, sqlite3
+db = "/tmp/t.db"
+c = sqlite3.connect(db)
+print(c.execute("pragma journal_mode=wal").fetchone()[0])
+c.execute("create table t (v)")
+c.commit()
+c.close()
+pids = []
+for w in range(4):
+    pid = os.fork()
+    if pid == 0:
+        c = sqlite3.connect(db, timeout=60)
+        for i in range(200):
+            c.execute("insert into t values (?)", (w * 1000 + i,))
+            c.commit()
+        os._exit(0)
+    pids.append(pid)
+print([os.waitpid(pid, 0)[1] for pid in pids])
+print(sqlite3.connect(db).execute("select count(*), count(distinct v) from t").fetchone())
+"#;
+    let b =
+        sandbox("python").allow(Capability::Process).allow(Capability::FsWrite).file("/t.py", script, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/python3", "/t.py"]);
+    assert_eq!(out.stdout_str(), "wal\n[0, 0, 0, 0]\n(800, 800)\n");
+    assert_no_surprises(&out);
+}
+
 /// An interactive shell on a pseudo-terminal, driven from Python: job
 /// control (^Z, jobs, fg), ^C, and the terminal's echo and CR NL.
 #[test]

@@ -4,8 +4,8 @@
 // O_TMPFILE; readdir while deleting; permissions and ownership; timestamps;
 // copy-on-write of imported files; mmap, sendfile and copy_file_range;
 // hostile inputs (symlink bombs, /proc). Modes: `fill` writes until the size
-// limit says ENOSPC, `meta` exhausts the metadata budget, `shared` changes
-// a file that is mapped MAP_SHARED.
+// limit says ENOSPC, `meta` exhausts the metadata budget, `shared PATH`
+// maps a live mount's file MAP_SHARED and changes it.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -312,11 +312,13 @@ static int meta(void) {
     return 0;
 }
 
-static int shared(void) {
-    // A MAP_SHARED mapping holds a copy: changing the file is reported, and
-    // making the mapping writable is refused (both as unimplemented).
-    CHECK(put("/tmp/shm", "before") == 0);
-    int fd = open("/tmp/shm", O_RDWR);
+static int shared(const char *path) {
+    // A live mount's file mapped MAP_SHARED: the mapping holds a copy, so a
+    // writable one is refused, and so is making one writable or changing
+    // the file (as unimplemented).
+    CHECK(put(path, "before") == 0);
+    int fd = open(path, O_RDWR);
+    CHECK(mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == ENODEV);
     char *m = mmap(0, 4096, PROT_READ, MAP_SHARED, fd, 0);
     CHECK(m != MAP_FAILED && !memcmp(m, "before", 6));
     CHECK(mprotect(m, 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
@@ -328,7 +330,7 @@ static int shared(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "fill")) return fill();
     if (argc > 1 && !strcmp(argv[1], "meta")) return meta();
-    if (argc > 1 && !strcmp(argv[1], "shared")) return shared();
+    if (argc > 2 && !strcmp(argv[1], "shared")) return shared(argv[2]);
     RUN(test_files);
     RUN(test_dirs);
     RUN(test_links);

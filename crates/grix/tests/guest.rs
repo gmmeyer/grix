@@ -359,9 +359,12 @@ fn filesystem_metadata_limit() {
 }
 
 #[test]
-fn shared_file_mappings_are_reported() {
-    let out = run(with("files").allow(Capability::FsWrite), &["/bin/files", "shared"]);
-    assert_eq!(out.stdout_str(), "shared ok\n");
+fn shared_mappings_of_mounted_files_are_reported() {
+    // A live mount's file is the host's: a shared mapping of it is a copy.
+    let host = temp_dir("sharedmount");
+    let b = with("files").mount(&host, "/work").unwrap();
+    let out = run(b, &["/bin/files", "shared", "/work/shm"]);
+    assert_eq!(out.stdout_str(), "shared ok\n", "{:?}", out.events);
     assert_eq!(out.status, ExitStatus::Exited(0));
     let unimplemented: Vec<&str> = out
         .events
@@ -371,7 +374,7 @@ fn shared_file_mappings_are_reported() {
             _ => None,
         })
         .collect();
-    assert_eq!(unimplemented, ["mprotect", "write"], "{:?}", out.events);
+    assert_eq!(unimplemented, ["mmap", "mprotect", "write"], "{:?}", out.events);
 }
 
 #[test]
@@ -1439,6 +1442,19 @@ fn tty_mode() {
     }
     // (An interactive ash looks for mail.)
     assert!(out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { .. })), "{:?}", out.events);
+}
+
+#[test]
+fn shared_file_mappings_and_locks() {
+    let b = with("filelocks")
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .file("/data/blob", vec![b'A'; 8192], 0o644)
+        .unwrap();
+    let out = run(b, &["/bin/filelocks"]);
+    assert_eq!(out.stdout_str(), "filelocks ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 #[test]

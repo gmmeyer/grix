@@ -183,6 +183,9 @@ pub fn execve(
     t.saved_sigmask = None;
     p.current = p.pid;
     p.threads.insert(p.pid, t);
+    for file in p.fds.cloexec_files() {
+        super::file::closing(p, &file);
+    }
     p.fds.close_on_exec();
     // Handlers point into the old program; ignoring a signal survives exec.
     for act in p.sigactions.iter_mut() {

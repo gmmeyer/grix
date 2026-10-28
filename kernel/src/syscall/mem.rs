@@ -72,18 +72,33 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         match (&f.kind, &f.content) {
             (FileKind::Node(ino), Some(c)) => {
                 let ino = *ino;
+                let rdwr = f.flags & O_ACCMODE == O_RDWR;
+                if shared && prot.write && !rdwr {
+                    return Err(EACCES);
+                }
+                let mut data = c.lock();
+                // A sealed memfd can't be written through a mapping either.
+                let sealed = data.seals.unwrap_or(0) & (crate::fs::F_SEAL_WRITE | crate::fs::F_SEAL_FUTURE_WRITE) != 0;
+                if shared && prot.write && sealed {
+                    return Err(EPERM);
+                }
+                let may_write = rdwr && !sealed;
+                // A file in the sandbox: the mapping is the file's pages.
+                if shared && data.remote_id().is_none() {
+                    let token = data.map_live(may_write);
+                    let backing = Backing::SharedFile { data: c.clone(), offset: off, ino, may_write, token };
+                    drop(data);
+                    drop(f);
+                    return map_at(p, addr, len, flags, prot, backing);
+                }
                 if shared && prot.write {
-                    if f.flags & O_ACCMODE != O_RDWR {
-                        return Err(EACCES);
-                    }
-                    // Writes through the mapping would have to reach the file.
-                    return p.unimplemented(nr::mmap, "mmap", "shared writable file mappings", ENODEV);
+                    // A live mount's: writes through it would have to reach the host.
+                    return p.unimplemented(nr::mmap, "mmap", "shared writable mappings of a mounted file", ENODEV);
                 }
                 // Unmodified imports map straight from the boot image; written
                 // files are copied page by page as they fault in. Either way
-                // the mapping holds a copy, so a shared one is registered with
-                // the file: changing the file later is reported.
-                let mut data = c.lock();
+                // the mapping holds a copy, so a live mount's shared one is
+                // registered with the file: changing the file later is reported.
                 let shared = shared.then(|| data.map_shared());
                 match data.image() {
                     Some(bytes) => Backing::File {
@@ -102,7 +117,12 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
             _ => return Err(ENODEV),
         }
     };
+    map_at(p, addr, len, flags, prot, backing)
+}
 
+/// Place a new mapping: at `addr` with MAP_FIXED, there if it's free and
+/// asked for, or wherever there's room.
+fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing: Backing) -> SysResult {
     let a = &mut p.aspace;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     let start = if fixed {
@@ -149,9 +169,12 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(ENOMEM)?;
     let prot = Prot::from_linux(prot);
     p.aspace.room_for(addr, end, true, 0)?;
+    if prot.write && p.aspace.has_read_only_shared_file(addr, end) {
+        return Err(EACCES);
+    }
     if prot.write && p.aspace.has_shared_file(addr, end) {
-        // Writes through it would have to reach the file.
-        return p.unimplemented(nr::mprotect, "mprotect", "shared writable file mappings", EACCES);
+        // Writes through it would have to reach the host.
+        return p.unimplemented(nr::mprotect, "mprotect", "shared writable mappings of a mounted file", EACCES);
     }
     p.aspace.protect(addr, end, prot).map(|_| 0)
 }

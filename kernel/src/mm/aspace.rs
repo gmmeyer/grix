@@ -64,6 +64,12 @@ pub enum Backing {
     /// `pages`, which every mapping of it sees, in every process that
     /// shares it since a fork. Never copy-on-write.
     Shared { pages: Arc<SharedPages>, index: u64 },
+    /// MAP_SHARED of a file in the sandbox: the file's own pages (byte
+    /// `offset + o`), so writes through the mapping are the file's and the
+    /// file's writes show in it. Never copy-on-write. `may_write`: the fd
+    /// was open for writing (mprotect may add PROT_WRITE). `token` counts
+    /// it among the file's shared mappings (`FileData::mapped_shared`).
+    SharedFile { data: Content, offset: u64, ino: Ino, may_write: bool, token: Arc<()> },
 }
 
 /// The pages of a MAP_SHARED anonymous mapping, made as they're first
@@ -105,6 +111,13 @@ impl Vma {
             Backing::Shared { ref pages, index } => {
                 Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
             }
+            Backing::SharedFile { ref data, offset, ino, may_write, ref token } => Backing::SharedFile {
+                data: data.clone(),
+                offset: offset + skip,
+                ino,
+                may_write,
+                token: token.clone(),
+            },
             Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
                 data,
                 offset: offset + skip,
@@ -116,9 +129,15 @@ impl Vma {
         Vma { start: s, end: e, prot: self.prot, backing }
     }
 
-    /// A MAP_SHARED file mapping (which only holds a copy of the file).
+    /// A MAP_SHARED file mapping that only holds a copy of the file (a
+    /// live mount's).
     pub fn is_shared_file(&self) -> bool {
         matches!(self.backing, Backing::File { shared: Some(_), .. } | Backing::Data { shared: Some(_), .. })
+    }
+
+    /// Never copy-on-write: its pages are the same for everyone.
+    fn shared_pages(&self) -> bool {
+        matches!(self.backing, Backing::Shared { .. } | Backing::SharedFile { .. })
     }
 
     pub fn allows(&self, access: Access) -> bool {
@@ -137,6 +156,8 @@ pub enum FaultError {
     OutOfMemory,
     /// The file behind the mapping couldn't be read (a live mount's).
     Io,
+    /// A shared file mapping's page past the end of the file (SIGBUS).
+    PastEnd,
 }
 
 pub struct AddressSpace {
@@ -187,7 +208,7 @@ impl AddressSpace {
         child.brk = self.brk;
         let mut out_of_memory = false;
         for v in self.vmas.values() {
-            let cow = v.prot.write && !matches!(v.backing, Backing::Shared { .. });
+            let cow = v.prot.write && !v.shared_pages();
             self.pt.for_each_mapped(v.start, v.end, |va, pte| unsafe {
                 if out_of_memory {
                     return;
@@ -357,9 +378,56 @@ impl AddressSpace {
         }
     }
 
-    /// Does `[start, end)` overlap a MAP_SHARED file mapping?
+    /// Does `[start, end)` overlap a MAP_SHARED file mapping that only
+    /// holds a copy (a live mount's)?
     pub fn has_shared_file(&self, start: u64, end: u64) -> bool {
         self.overlapping(start, end).any(Vma::is_shared_file)
+    }
+
+    /// Does `[start, end)` overlap a shared mapping of a file whose fd
+    /// wasn't open for writing (mprotect can't make that writable)?
+    pub fn has_read_only_shared_file(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).any(|v| matches!(v.backing, Backing::SharedFile { may_write: false, .. }))
+    }
+
+    /// Pages that got a frame since this address space's shared mappings
+    /// took read-only copies of them ((file id, page index), from
+    /// `fs::take_stale`): the copies go, and the next access maps the frame.
+    pub fn zap_stale(&mut self, stale: &[(usize, u64)]) {
+        let mut pages = Vec::new();
+        for v in self.vmas.values() {
+            let Backing::SharedFile { data, offset, .. } = &v.backing else { continue };
+            let id = data.lock().id();
+            for &(file, idx) in stale {
+                let at = idx * PAGE_SIZE;
+                if file == id && at >= *offset && at - offset < v.end - v.start {
+                    pages.push(v.start + (at - offset));
+                }
+            }
+        }
+        for va in pages {
+            self.discard(va, va + PAGE_SIZE);
+        }
+    }
+
+    /// `data` shrank to `len`: its pages past the end go from this address
+    /// space's shared mappings of it (they fault with SIGBUS from now on).
+    pub fn zap_file(&mut self, data: &Content, len: u64) {
+        let keep = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let ranges: Vec<(u64, u64)> = self
+            .vmas
+            .values()
+            .filter_map(|v| match &v.backing {
+                Backing::SharedFile { data: d, offset, .. } if Arc::ptr_eq(d, data) => {
+                    let from = v.start + keep.saturating_sub(*offset);
+                    (from < v.end).then_some((from, v.end))
+                }
+                _ => None,
+            })
+            .collect();
+        for (s, e) in ranges {
+            self.discard(s, e);
+        }
     }
 
     /// mprotect. Fails with ENOMEM if any part of the range is unmapped.
@@ -381,7 +449,7 @@ impl AddressSpace {
             piece.prot = prot;
             // A page shared with a forked process stays read-only until
             // it's written (and copied); shared memory is meant to be shared.
-            let cow = prot.write && !matches!(piece.backing, Backing::Shared { .. });
+            let cow = prot.write && !piece.shared_pages();
             self.pt.for_each_mapped(piece.start, piece.end, |_, pte| unsafe {
                 let pa = *pte & ADDR_MASK;
                 *pte = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
@@ -470,6 +538,22 @@ impl AddressSpace {
                 // Mapped, and allowed: another CPU's fault got there first
                 // (or a TLB had an old entry). The access is tried again.
                 _ if access != Access::Write || paging::writable(pte) => Ok(()),
+                // Writing a page it has a read-only copy of: the file's frame
+                // replaces it.
+                Backing::SharedFile { ref data, offset, .. } => {
+                    let idx = (offset + (page - vma.start)) / PAGE_SIZE;
+                    let pa = data.lock().shared_frame(idx, true)?.expect("a frame for a write");
+                    let old = pte & ADDR_MASK;
+                    if old != pa {
+                        frame::share(pa);
+                    }
+                    self.pt.map(page, pa, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
+                    arch::flush_tlb();
+                    if old != pa {
+                        frame::free(old);
+                    }
+                    Ok(())
+                }
                 Backing::Shared { .. } => {
                     self.pt.map(page, pte & ADDR_MASK, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
                     arch::flush_tlb();
@@ -499,6 +583,36 @@ impl AddressSpace {
             }
             return Ok(());
         }
+        if let Backing::SharedFile { ref data, offset, .. } = vma.backing {
+            let idx = (offset + (page - vma.start)) / PAGE_SIZE;
+            let mut d = data.lock();
+            let (pa, flags) = match d.shared_frame(idx, access == Access::Write)? {
+                // The mapping's own reference; the file keeps its.
+                Some(pa) => {
+                    frame::share(pa);
+                    (pa, vma.prot.pte_flags())
+                }
+                // A read-only copy, until someone writes the page.
+                None => {
+                    let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+                    // SAFETY: `pa` is the frame just allocated, mapped linearly.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(p2v(pa) as *mut u8, PAGE_SIZE as usize) };
+                    dst.fill(0);
+                    let _ = d.read_at(idx * PAGE_SIZE, dst);
+                    d.copied_page(idx);
+                    (pa, Prot { write: false, ..vma.prot }.pte_flags())
+                }
+            };
+            drop(d);
+            if vma.prot.exec {
+                arch::sync_icache(p2v(pa), PAGE_SIZE);
+            }
+            if self.pt.map(page, pa, flags).is_none() {
+                frame::free(pa);
+                return Err(FaultError::OutOfMemory);
+            }
+            return Ok(());
+        }
         let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
         let src: &[u8] = match vma.backing {
             Backing::Anon => &[],
@@ -514,7 +628,7 @@ impl AddressSpace {
                 &[]
             }
             Backing::Sigpage => &crate::signal::TRAMPOLINE,
-            Backing::Shared { .. } => unreachable!("handled above"),
+            Backing::Shared { .. } | Backing::SharedFile { .. } => unreachable!("handled above"),
             Backing::File { data, offset, filesz, .. } => {
                 let o = page - vma.start;
                 let n = filesz.saturating_sub(o).min(PAGE_SIZE);
@@ -559,6 +673,7 @@ impl AddressSpace {
                     FaultError::OutOfMemory => ENOMEM,
                     FaultError::Segv => EFAULT,
                     FaultError::Io => EIO,
+                    FaultError::PastEnd => EFAULT,
                 })?;
             }
             page += PAGE_SIZE;

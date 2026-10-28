@@ -521,6 +521,8 @@ fn restartable(regs: &TrapFrame) -> bool {
         // recvmmsg with a timeout is EINTR, as the other timed waits.
         nr::recvmmsg => regs.x[4] == 0,
         nr::wait4 | nr::waitid => true,
+        // F_SETLKW and F_OFD_SETLKW.
+        nr::fcntl => matches!(regs.x[1], 7 | 38),
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
         nr::futex => matches!(regs.x[1] & 127, 0 | 9) && regs.x[3] == 0,
         _ => false,

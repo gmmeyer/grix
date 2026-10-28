@@ -152,7 +152,7 @@ With `fs_write` the whole tree is writable in guest memory
 - **getdents** uses a name cursor, so `rm -rf` works while it deletes.
 - **mmap** of written files works. MAP_SHARED mappings hold a copy, so
   changing the file, or making the mapping writable, is reported as
-  unimplemented.
+  unimplemented. (Since round 2, item 11, only a live mount's do.)
 - **Missing-path events** are no longer reported for directories the
   program changed, or for /tmp.
 
@@ -391,6 +391,24 @@ Next, in TODO.md order:
   (Linux clears them; CPython reads the sets, so a timed-out select
   looked ready): they now run once more when the deadline passes
   (`Process::block_io_rerun`).
+
+- **Shared file mappings and locks** (round 2, item 11): a MAP_SHARED
+  mapping of a file in the sandbox maps the file's own frames
+  (`Backing::SharedFile`, `FileData::shared_frame`), never copy-on-write,
+  so writes go both ways and across fork; past the end of the file is
+  SIGBUS, and a truncate takes the pages out of every process's mappings
+  (`AddressSpace::zap_file`). Reading a page the file has no frame for
+  (an import's) takes a read-only copy instead, so reading doesn't use up
+  file space; once the page gets a frame, the copies go everywhere
+  (`fs::take_stale`, `procs::zap_stale`). Sealed memfds can't be written
+  through mappings (EPERM, and EBUSY for F_SEAL_WRITE while one may
+  write). Locks were faked (always granted), which
+  stopped being harmless once there were several processes: `locks.rs`
+  now keeps flock locks (per open file description), POSIX record locks
+  (per process, gone on any close of the file, on exec's close-on-exec
+  and on exit, with `EDEADLK` for a cycle of F_SETLKW waiters) and OFD
+  locks, at most `MAX_LOCKS` (ENOLCK). Four processes writing SQLite in
+  WAL mode agree.
 
 ### Notes for the next session
 

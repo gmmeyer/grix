@@ -17,7 +17,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use grix_abi::hostfs::{Attr, FileType};
 use grix_abi::image::{Entry, EntryKind, LiveMount};
 use spin::{Mutex, MutexGuard};
@@ -110,9 +110,18 @@ pub struct FileData {
     /// Page index -> physical address of a frame owned by this file.
     pages: BTreeMap<u64, u64>,
     len: u64,
-    /// MAP_SHARED mappings of this file, which see a copy taken when each
-    /// page faulted in (writes don't reach them yet).
+    /// A live mount's file's MAP_SHARED mappings, which see a copy taken
+    /// when each page faulted in (writes don't reach them).
     shared_maps: Vec<Weak<()>>,
+    /// MAP_SHARED mappings of a file in the sandbox, which map its pages,
+    /// and those of them that may write (memfd seals refuse F_SEAL_WRITE
+    /// while there are any).
+    live_maps: Vec<Weak<()>>,
+    writable_maps: Vec<Weak<()>>,
+    /// Pages a shared mapping read before the file had a frame for them:
+    /// it got a read-only copy, which must go once there's a frame
+    /// (`STALE`).
+    copied: alloc::collections::BTreeSet<u64>,
     /// memfd seals (F_SEAL_*); `None` for files that can't be sealed.
     pub seals: Option<u32>,
     /// A live mount's file: the host's id for it. Its bytes are on the host
@@ -144,6 +153,9 @@ impl FileData {
             pages: BTreeMap::new(),
             len: base.len() as u64,
             shared_maps: Vec::new(),
+            live_maps: Vec::new(),
+            writable_maps: Vec::new(),
+            copied: alloc::collections::BTreeSet::new(),
             seals: None,
             remote: None,
             unlinked: false,
@@ -157,6 +169,9 @@ impl FileData {
             pages: BTreeMap::new(),
             len: size,
             shared_maps: Vec::new(),
+            live_maps: Vec::new(),
+            writable_maps: Vec::new(),
+            copied: alloc::collections::BTreeSet::new(),
             seals: None,
             remote: Some(id),
             unlinked: false,
@@ -209,6 +224,39 @@ impl FileData {
         self.shared_maps.iter().any(|w| w.strong_count() > 0)
     }
 
+    /// Register a MAP_SHARED mapping of the file's own pages (`writable`:
+    /// one that may write, now or after mprotect).
+    pub fn map_live(&mut self, writable: bool) -> Arc<()> {
+        self.live_maps.retain(|w| w.strong_count() > 0);
+        self.writable_maps.retain(|w| w.strong_count() > 0);
+        let token = Arc::new(());
+        self.live_maps.push(Arc::downgrade(&token));
+        if writable {
+            self.writable_maps.push(Arc::downgrade(&token));
+        }
+        token
+    }
+
+    /// Is the file mapped MAP_SHARED by a mapping that may write?
+    pub fn mapped_writable(&self) -> bool {
+        self.writable_maps.iter().any(|w| w.strong_count() > 0)
+    }
+
+    /// This file, as `STALE` names it.
+    pub fn id(&self) -> usize {
+        self as *const FileData as usize
+    }
+
+    /// A shared mapping took a read-only copy of page `idx`.
+    pub fn copied_page(&mut self, idx: u64) {
+        self.copied.insert(idx);
+    }
+
+    /// Is the file's memory mapped MAP_SHARED anywhere?
+    pub fn mapped_live(&self) -> bool {
+        self.live_maps.iter().any(|w| w.strong_count() > 0)
+    }
+
     /// Copy the bytes at `off` into `out`; returns how many there were. A
     /// live mount's file that can't be read reads as ended (and is logged);
     /// `read_at` says why.
@@ -253,8 +301,29 @@ impl FileData {
 
     /// The frame for page `idx`, allocating it (with the imported bytes) on first write.
     fn page_mut(&mut self, idx: u64) -> Result<&'static mut [u8], Errno> {
+        self.frame_of(idx).map(page_mut)
+    }
+
+    /// Page `idx`'s frame for a shared mapping (which takes its own
+    /// reference). A write makes it if need be; a read of a page the file
+    /// has no frame for gets None (the mapping takes a read-only copy, so
+    /// reading an import doesn't use up file space). Past the end of the
+    /// file there's none (SIGBUS); a live mount's file has no frames.
+    pub fn shared_frame(&mut self, idx: u64, write: bool) -> Result<Option<u64>, crate::mm::aspace::FaultError> {
+        use crate::mm::aspace::FaultError;
+        if self.remote.is_some() || idx.saturating_mul(PAGE_SIZE) >= self.len {
+            return Err(FaultError::PastEnd);
+        }
+        match self.pages.get(&idx) {
+            Some(&pa) => Ok(Some(pa)),
+            None if write => self.frame_of(idx).map(Some).map_err(|_| FaultError::Io),
+            None => Ok(None),
+        }
+    }
+
+    fn frame_of(&mut self, idx: u64) -> Result<u64, Errno> {
         if let Some(&pa) = self.pages.get(&idx) {
-            return Ok(page_mut(pa));
+            return Ok(pa);
         }
         let (used, limit) = usage();
         if used >= limit {
@@ -267,7 +336,11 @@ impl FileData {
         let end = (start + PAGE_SIZE as usize).min(self.base.len());
         p[..end - start].copy_from_slice(&self.base[start..end]);
         self.pages.insert(idx, pa);
-        Ok(p)
+        if self.copied.remove(&idx) {
+            STALE.lock().push((self.id(), idx));
+            STALE_ANY.store(true, Ordering::Relaxed);
+        }
+        Ok(pa)
     }
 
     /// Write `data` at `off`, growing the file. On ENOSPC part of it may have
@@ -329,6 +402,9 @@ impl FileData {
     /// frees whole pages and zeroes the rest of the last one, so a later
     /// extension reads zeros.
     pub fn truncate(&mut self, len: u64) -> Result<(), Errno> {
+        // (The mappings' copies past the end go with `zap_file`.)
+        let keep = len.div_ceil(PAGE_SIZE);
+        let _ = self.copied.split_off(&keep);
         if let Some(id) = self.remote {
             hostfs::set_len(id, len)?;
             self.len = len;
@@ -360,6 +436,19 @@ impl Drop for FileData {
             hostfs::release(id);
         }
     }
+}
+
+/// Pages (file, index) that got a frame while shared mappings had
+/// read-only copies of them: `procs::zap_stale` takes the copies out, so
+/// they fault onto the frame.
+static STALE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+static STALE_ANY: AtomicBool = AtomicBool::new(false);
+
+pub fn take_stale() -> Vec<(usize, u64)> {
+    if !STALE_ANY.swap(false, Ordering::Relaxed) {
+        return Vec::new();
+    }
+    core::mem::take(&mut *STALE.lock())
 }
 
 fn page(pa: u64) -> &'static [u8] {

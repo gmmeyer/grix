@@ -222,9 +222,12 @@ fn maps(p: &Process, s: &mut String) {
         for (on, c) in perms {
             flags.push(if on { c } else { '-' });
         }
-        flags.push(if matches!(v.backing, Backing::Shared { .. }) { 's' } else { 'p' });
+        let shared = matches!(v.backing, Backing::Shared { .. } | Backing::SharedFile { .. }) || v.is_shared_file();
+        flags.push(if shared { 's' } else { 'p' });
         let (offset, inode, name) = match v.backing {
-            Backing::File { offset, ino, .. } | Backing::Data { offset, ino, .. } => {
+            Backing::File { offset, ino, .. }
+            | Backing::Data { offset, ino, .. }
+            | Backing::SharedFile { offset, ino, .. } => {
                 (offset, fs.ino_number(ino), fs.path_of(ino))
             }
             Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),

@@ -26,6 +26,7 @@ mod hostfs;
 mod inet;
 mod ipc;
 mod kmem;
+mod locks;
 mod mm;
 mod netlink;
 mod process;

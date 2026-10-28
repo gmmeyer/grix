@@ -46,8 +46,14 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     timer (any byte returns), orphaned process groups (SIGTSTP from a
     terminal isn't dropped, no SIGHUP when one with stopped members is
     orphaned), snapshots in TTY mode, TTY mode over MCP and Python.
-11. **Shared file mappings and locks**: writable `MAP_SHARED` file
-    mappings and `msync`; `flock`/`fcntl` record locks (sqlite, databases).
+11. [x] **Shared file mappings and locks**: `MAP_SHARED` file mappings are
+    the file's pages (writes go both ways, across fork; SIGBUS past the
+    end, also after a truncate); `flock`, POSIX record locks (`F_GETLK`,
+    waiting, `EDEADLK`, released on any close and on exit) and OFD locks.
+    SQLite in WAL mode from several processes works. Left: a live mount's
+    files still map as copies (a writable shared mapping of one is
+    unimplemented); locks are the sandbox's own (the host doesn't see
+    them).
 12. **Big imports without copying them into RAM**: a lazily read,
     read-only disk for large runtimes and datasets.
 13. **Networking**: UDP beyond DNS; AF_UNIX sockets bound to paths.
@@ -179,8 +185,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Coreutils `ls -la` currently hits an "unknown" syscall.
 - [~] `inotify`. Node `fs.watch`, webpack, watchdog.
       Watches can be added and removed but never fire, even now that files change.
-- [ ] `flock` and `fcntl` record locks with real semantics (sqlite) once there
-      are writers.
+- [x] `flock` and `fcntl` record locks with real semantics (sqlite): see
+      round 2, item 11.
 - [x] Real file timestamps from the host (make, build caches). Everything
       shows boot time today.
       Imports carry the host's mtime (atime and ctime start there too), and files the program changes get real times.
@@ -190,8 +196,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [ ] `openat2`, `name_to_handle_at` (newer tools).
 - [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
-- [ ] `MAP_SHARED` mappings of writable files, `msync`.
-      Shared mappings hold a copy taken at fault time. Changing the file, or making the mapping writable, is reported as unimplemented.
+- [x] `MAP_SHARED` mappings of writable files, `msync`.
+      They map the file's own pages. A live mount's files still map as copies: a writable shared mapping of one, or changing one mapped shared, is reported as unimplemented.
 - [x] Executing files the program wrote.
 - [ ] Large imports without copying everything into RAM: read-only
       virtio-blk/virtio-fs, loaded lazily (big runtimes, datasets).

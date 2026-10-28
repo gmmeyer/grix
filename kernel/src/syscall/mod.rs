@@ -167,7 +167,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sync => Ok(0),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),
-        nr::flock => p.fds.get(a[0]).map(|_| 0),
+        nr::flock => file::flock(p, a[0], a[1]),
 
         // sockets
         nr::socketpair => net::socketpair(p, a[0], a[1], a[2], a[3]),

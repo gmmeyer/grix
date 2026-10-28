@@ -198,6 +198,19 @@ replaces the network policy and caps the limits. Nothing the host held is
 saved, and the host refuses mounts. Anything new that lives on the host
 side of a run needs the same treatment.
 
+Shared file mappings and locks: a MAP_SHARED mapping of a file in the
+sandbox maps the file's own frames (`Backing::SharedFile`; the file and
+each mapping hold a reference; a read of a page without a frame maps a
+read-only copy, taken out everywhere once the page gets one,
+`procs::zap_stale`), so it's never copy-on-write, and a file
+that shrinks takes its pages out of every process's mappings
+(`file::zap_shared`): page tables are kernel memory, so another
+process's can be changed without its address space active. A live
+mount's files still map as copies. `locks.rs` has flock, POSIX and OFD
+locks; anything that closes a descriptor must call `file::closing`
+first (POSIX locks go with any close of the file), and `OpenFile::drop`
+releases flock and OFD locks.
+
 Job control (`signal.rs` `stop`/`resume`): a stop signal's default action
 stops the whole process when it's sent (or delivered, if it was blocked):
 `Process::stopped`, and the scheduler passes it over (`sched::runnable`,
@@ -311,9 +324,11 @@ treated as deadlocked.
       all processes), queued real-time signals, inotify watches, POSIX
       timers, threads (all processes), descriptors, open files
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
-      zombies included), network connections (`inet::MAX_CONNS`) and
-      connections waiting to be accepted (`inet::MAX_PENDING`). argv and
-      environment copies take a `kmem::Charge`.
+      zombies included), network connections (`inet::MAX_CONNS`),
+      connections waiting to be accepted (`inet::MAX_PENDING`),
+      pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers) and
+      file locks (`locks::MAX_LOCKS`). argv and environment copies take a
+      `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,
     and fork copies whatever is per process.

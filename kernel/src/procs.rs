@@ -72,6 +72,9 @@ impl Procs {
 pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut Procs) {
     let status = dead.exit_status.expect("finalizing a live process");
     let cpu_ns = dead.process_cpu_ns() + dead.children_cpu_ns;
+    if dead.posix_locks {
+        crate::locks::release_all(crate::locks::Owner::Process(dead.pid));
+    }
     dead.fds = FdTable::empty();
     dead.threads.clear();
     dead.runq.clear();
@@ -120,11 +123,24 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     crate::ipc::changed();
 }
 
+/// Shared mappings' read-only copies of file pages that now have frames
+/// go from every process (see `fs::take_stale`).
+pub fn zap_stale(cur: &mut Process, procs: &mut Procs) {
+    let stale = crate::fs::take_stale();
+    if stale.is_empty() {
+        return;
+    }
+    for q in procs.all(cur) {
+        q.aspace.zap_stale(&stale);
+    }
+}
+
 /// Finish off processes other than the running one that were killed (by a
 /// signal from it, or a timer). Their address spaces go too. And tell the
 /// parents of processes that stopped or continued.
 pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
     crate::tty::service(cur, procs);
+    zap_stale(cur, procs);
     if signal::JOBS.swap(false, Ordering::Relaxed) {
         let notices: Vec<(u32, SigInfo)> =
             procs.all(cur).filter_map(|q| Some((q.ppid, q.job_notice.take()?))).collect();

@@ -125,17 +125,37 @@ pub struct OpenFile {
     pub dir_pos: Option<alloc::string::String>,
     /// Kernel memory this file holds (generated /proc contents).
     pub held: Option<crate::kmem::Charge>,
+    /// It has taken flock or OFD locks (which go when it closes).
+    pub locked: bool,
 }
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
         OPEN_FILES.fetch_sub(1, Ordering::Relaxed);
+        if self.locked {
+            crate::locks::release_all(crate::locks::Owner::File(self.id()));
+        }
     }
 }
 
 impl OpenFile {
     pub fn nonblocking(&self) -> bool {
         self.flags & O_NONBLOCK != 0
+    }
+
+    /// The open file description, as a lock owner.
+    pub fn id(&self) -> usize {
+        self as *const OpenFile as usize
+    }
+
+    /// The file a lock on this is a lock on: its node (inode numbers are
+    /// small, unlike kernel addresses), or the open file itself.
+    pub fn lock_key(&self) -> crate::locks::Key {
+        match &self.kind {
+            FileKind::Node(ino) | FileKind::Dev(_, ino) => *ino,
+            FileKind::Pty(end) => end.ino,
+            _ => self.id(),
+        }
     }
 }
 
@@ -180,6 +200,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         pin: None,
         dir_pos: None,
         held: None,
+        locked: false,
     }))
 }
 
@@ -205,6 +226,11 @@ impl FdTable {
     }
 
     /// execve: close what's marked close-on-exec.
+    /// What `close_on_exec` will close.
+    pub fn cloexec_files(&self) -> Vec<FileRef> {
+        self.slots.iter().flatten().filter(|e| e.cloexec).map(|e| e.file.clone()).collect()
+    }
+
     pub fn close_on_exec(&mut self) {
         let mut closed = false;
         for s in self.slots.iter_mut() {
