@@ -4,3 +4,5 @@ __pycache__/
 /build/
 __pycache__/
 /python/grix/_native*.so
+/web/dist/
+/web/.cache/

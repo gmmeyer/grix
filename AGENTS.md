@@ -273,6 +273,13 @@ box64 should work, untested) with its path and arguments, as binfmt_misc would
 (`resolve_interpreters`). Whatever the translator needs is the program's
 to import (x86_64 libraries for dynamic programs, `QEMU_LD_PREFIX`).
 
+In a web page (`web/`, `crates/web`): the kernel boots in QEMU compiled
+to wasm, and `grix-web` (wasm32) is the host side: the boot image and
+the console's frames with `grix_abi` itself, stdin within the guest's
+credit. QEMU's arguments come from `grix_web::qemu_args`; keep them in
+step with `vmm.rs`'s `qemu_command`. See `web/README.md` for what the
+browser changes (the console's pty, `virtio-mmio.ioeventfd=off`).
+
 Snapshots (`kernel/src/snapshot.rs`, `crates/vmm/src/snapshot.rs`,
 `crates/grix/src/snapshot.rs`): with `Image::snapshot`, the first time the
 scheduler idles with a thread waiting for I/O and no other CPU running

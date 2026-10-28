@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>grix smoke test</title>
+<pre id="out">loading…</pre>
+<script type="module">
+import { Grix } from './grix.js';
+import { fetchTar } from './tar.js';
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s; };
+const params = new URLSearchParams(location.search);
+const bin = params.get('bin') ?? 'hello';
+const argv = JSON.parse(params.get('argv') ?? '["/bin/hello","world"]');
+const allow = JSON.parse(params.get('allow') ?? '[]');
+const t0 = performance.now();
+const grix = await Grix.load({ qemu: './qemu-system-aarch64.js', kernel: './grix-kernel', web: './grix_web.wasm' });
+const files = params.has('tar') ? await fetchTar(`./rootfs/${params.get('tar')}`)
+  : [{ path: argv[0], data: new Uint8Array(await (await fetch(`./bin/${bin}`)).arrayBuffer()), mode: 0o755 }];
+out.textContent = `loaded in ${(performance.now() - t0).toFixed(0)} ms\n`;
+const run = grix.run({
+  argv, allow, env: ['GREETING=hi'], qemuArgs: JSON.parse(params.get('qemu') ?? '[]'),
+  files, memoryMb: Number(params.get('mem') ?? 256), cpus: Number(params.get('cpus') ?? 1),
+  stdin: params.has('stdin') ? new TextEncoder().encode(params.get('stdin')) : undefined,
+  onStdout: (b) => log(new TextDecoder().decode(b)),
+  onStderr: (b) => log('[err] ' + new TextDecoder().decode(b)),
+  onEvent: (e) => log(`grix: ${e}\n`),
+  onLog: (s) => log(`[kernel] ${s}`),
+  onQemu: (s) => { log(`[qemu] ${s}\n`); console.log('qemu', s); },
+});
+const r = await run.done;
+log(`\n== ${r.status} (${r.qemu}) in ${((r.ended ?? performance.now()) - r.started).toFixed(0)} ms\n`);
+if (!r.status) log(r.qemuLog.join('\n'));
+document.title = 'done';
+</script>
