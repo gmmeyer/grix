@@ -255,6 +255,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::setsid => proc::setsid(p),
         nr::tkill => signal::tgkill(p, None, a[0], a[1]),
         nr::tgkill => signal::tgkill(p, Some(a[0]), a[1], a[2]),
+        nr::pidfd_open => proc::pidfd_open(p, a[0], a[1]),
+        nr::pidfd_send_signal => signal::pidfd_send_signal(p, a[0], a[1], a[2], a[3]),
+        nr::pidfd_getfd => proc::pidfd_getfd(p, a[0], a[1], a[2]),
 
         // everything else
         _ => misc::dispatch(p, n, name, a),

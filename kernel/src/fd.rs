@@ -56,6 +56,8 @@ pub enum FileKind {
     /// An AF_UNIX socket that's named, listening, or passes messages
     /// (unix.rs; a connected stream is a `Socket`).
     Unix(crate::unix::SockRef),
+    /// A pidfd: refers to process `pid` (pids aren't reused).
+    PidFd(u32),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -101,8 +103,9 @@ impl FileKind {
             FileKind::Pipe(end) => end.poll(),
             FileKind::Netlink(nl) => nl.poll(),
             FileKind::UnixUnbound(_) => (EPOLLOUT | crate::ipc::EPOLLHUP, 0),
-            // Depends on the reader's pending signals: see file::poll_kind.
-            FileKind::SignalFd(_) => (0, 0),
+            // Depend on the reader's pending signals, or on other
+            // processes: see file::poll_kind.
+            FileKind::SignalFd(_) | FileKind::PidFd(_) => (0, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
             FileKind::Pty(end) => end.tty.lock().poll(end.master),

@@ -28,11 +28,17 @@ pub struct CloneArgs {
     pub parent_tid: u64,
     pub tls: u64,
     pub child_tid: u64,
+    /// Where CLONE_PIDFD puts the pidfd.
+    pub pidfd: u64,
 }
 
 /// clone(flags, stack, parent_tid, tls, child_tid) — arm64 argument order.
 pub fn clone(p: &mut Process, tf: &TrapFrame, a: [u64; 6]) -> SysResult {
-    let args = CloneArgs { flags: a[0], stack: a[1], parent_tid: a[2], tls: a[3], child_tid: a[4] };
+    let args = CloneArgs { flags: a[0], stack: a[1], parent_tid: a[2], tls: a[3], child_tid: a[4], pidfd: a[2] };
+    // clone puts both at parent_tid.
+    if args.flags & (CLONE_PIDFD | CLONE_PARENT_SETTID) == CLONE_PIDFD | CLONE_PARENT_SETTID {
+        return Err(EINVAL);
+    }
     do_clone(p, tf, nr::clone, args)
 }
 
@@ -54,6 +60,7 @@ pub fn clone3(p: &mut Process, tf: &TrapFrame, uargs: u64, size: u64) -> SysResu
         parent_tid: w(3),
         tls: w(7),
         child_tid: w(2),
+        pidfd: w(1),
     };
     do_clone(p, tf, nr::clone3, args)
 }
@@ -71,8 +78,9 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & (CLONE_VM | CLONE_SIGHAND) != CLONE_VM | CLONE_SIGHAND {
         return Err(EINVAL);
     }
+    // A pidfd is a process's, not a thread's (before Linux 6.9).
     if flags & CLONE_PIDFD != 0 {
-        return p.unimplemented(n, name, "CLONE_PIDFD", EINVAL);
+        return Err(EINVAL);
     }
     if crate::procs::PROCS.lock().threads(p) >= MAX_THREADS {
         return Err(EAGAIN);

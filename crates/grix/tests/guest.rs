@@ -1349,6 +1349,14 @@ fn job_control() {
 }
 
 #[test]
+fn pidfds() {
+    let out = run(with("pidfd").allow(Capability::Process), &["/bin/pidfd"]);
+    assert_eq!(out.stdout_str(), "pidfd ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn pseudo_terminals() {
     // The line discipline, controlling terminals and their signals.
     let out = run(with("pty").allow(Capability::Process), &["/bin/pty"]);

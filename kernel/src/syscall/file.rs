@@ -100,12 +100,11 @@ pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     }
 }
 
-/// `f` of another process, if the caller may look at its descriptors (as
-/// ptrace's PTRACE_MODE_READ on Linux: root, or the same user throughout).
+/// `f` of another process, if the caller may look at its descriptors.
 fn with_other<T>(p: &Process, pid: u32, f: impl FnOnce(&Process) -> Result<T, Errno>) -> Result<T, Errno> {
     let procs = crate::procs::PROCS.lock();
     let q = procs.others.get(&pid).ok_or(ENOENT)?;
-    if p.uid != 0 && (p.uid, p.uid, p.uid) != (q.uid, q.ids.ruid, q.ids.suid) {
+    if !crate::procs::may_inspect(p, q, false) {
         return Err(EACCES);
     }
     f(q)
@@ -160,7 +159,8 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Epoll(_)
         | FileKind::Inotify(_)
         | FileKind::TimerFd(_)
-        | FileKind::SignalFd(_) => anon(0x2000_0000 + fd, 0o600, 0),
+        | FileKind::SignalFd(_)
+        | FileKind::PidFd(_) => anon(0x2000_0000 + fd, 0o600, 0),
     })
 }
 
@@ -447,6 +447,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
         FileKind::Inotify(_) => would_block(p, nonblock),
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
+        FileKind::PidFd(_) => Err(EINVAL),
         FileKind::SignalFd(mask) => {
             // struct signalfd_siginfo is 128 bytes; read as many as fit.
             if count < 128 {
@@ -680,7 +681,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::TimerFd(_) => return Err(EINVAL),
         FileKind::UnixUnbound(_) => return Err(ENOTCONN),
-        FileKind::SignalFd(_) => return Err(EINVAL),
+        FileKind::SignalFd(_) | FileKind::PidFd(_) => return Err(EINVAL),
         FileKind::Netlink(_) => {
             let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
             return super::net::netlink_request(p, nl, &[(buf, count)]);
@@ -1953,6 +1954,8 @@ pub(super) fn poll_kind(p: &Process, kind: &FileKind) -> (u32, u64) {
             let pending = crate::signal::pending_for(p, p.current) & mask;
             (if pending != 0 { EPOLLIN } else { 0 }, crate::signal::generation())
         }
+        // Readable once the process has ended.
+        FileKind::PidFd(pid) => (if crate::procs::ended(p, *pid) { EPOLLIN } else { 0 }, crate::procs::exits()),
         k => k.poll(),
     }
 }

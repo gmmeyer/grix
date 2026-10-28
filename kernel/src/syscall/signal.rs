@@ -193,6 +193,49 @@ pub fn kill(p: &mut Process, pid: u64, sig: u64) -> SysResult {
     if found { Ok(0) } else { Err(ESRCH) }
 }
 
+/// pidfd_send_signal(pidfd, sig, info, flags): kill() for the process a
+/// pidfd refers to, with a siginfo of the caller's if it gives one.
+pub fn pidfd_send_signal(p: &mut Process, pidfd: u64, sig: u64, uinfo: u64, flags: u64) -> SysResult {
+    if flags != 0 {
+        return Err(EINVAL);
+    }
+    let pid = super::proc::pidfd_pid(p, pidfd)?;
+    let sig = if sig == 0 { 0 } else { signo(sig)? };
+    let (me, uid) = (p.pid, p.uid);
+    let info = if uinfo == 0 {
+        SigInfo::sent(sig, SI_USER, me, uid, SENT_BY_PROGRAM)
+    } else {
+        let mut b = [0u8; 128];
+        copy_in(&mut p.aspace, uinfo, &mut b)?;
+        let signo_field = i32::from_le_bytes(b[..4].try_into().unwrap());
+        let code = i32::from_le_bytes(b[8..12].try_into().unwrap());
+        if signo_field != sig as i32 {
+            return Err(EINVAL);
+        }
+        // Only the kernel (or the process itself) may claim kill or tkill
+        // sent it, as for rt_sigqueueinfo.
+        if pid != me && (code >= 0 || code == SI_TKILL) {
+            return Err(EPERM);
+        }
+        let mut fields = [0u64; 4];
+        for (i, f) in fields.iter_mut().enumerate() {
+            *f = u64::from_le_bytes(b[16 + i * 8..24 + i * 8].try_into().unwrap());
+        }
+        SigInfo { signo: sig, code, fields, fault: None, timer: None, why: SENT_BY_PROGRAM }
+    };
+    let mut procs = PROCS.lock();
+    let Some(q) = procs.get(p, pid) else {
+        // A zombie can still be signalled, to no effect.
+        return if procs.zombies.contains_key(&pid) { Ok(0) } else { Err(ESRCH) };
+    };
+    if sig == 0 || super::proc::shields_init(q, me, sig) {
+        return Ok(0);
+    }
+    signal::send(q, Target::Process, info)?;
+    p.timer_dirty = true;
+    Ok(0)
+}
+
 /// tkill(tid, sig) when `tgid` is None, tgkill(tgid, tid, sig) otherwise.
 pub fn tgkill(p: &mut Process, tgid: Option<u64>, tid: u64, sig: u64) -> SysResult {
     let (tgid, tid) = (tgid.map(|g| g as i32), tid as i32);

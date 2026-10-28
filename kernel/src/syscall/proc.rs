@@ -11,6 +11,7 @@ use super::thread::{
 use super::{require, table};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
+use crate::fd::{FdEntry, FileKind, O_NONBLOCK, O_RDWR, new_file};
 use crate::process::{self, JobReport, Process, SigAction, Thread, WaitOn};
 use crate::procs::{MAX_PROCESSES, PROCS};
 use crate::signal::{self, SIG_IGN, SIGCHLD, SigInfo};
@@ -41,7 +42,6 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         (CLONE_FS, "CLONE_FS without CLONE_THREAD"),
         (CLONE_SIGHAND, "CLONE_SIGHAND without CLONE_THREAD"),
         (CLONE_PARENT, "CLONE_PARENT"),
-        (CLONE_PIDFD, "CLONE_PIDFD"),
     ] {
         if flags & bit != 0 {
             return p.unimplemented(n, name, what, EINVAL);
@@ -62,6 +62,18 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let aspace = p.aspace.fork()?;
     let mut c = p.fork(pid, aspace)?;
     c.exit_signal = exit_signal;
+    // The parent's pidfd for the child, made after the child's copy of the
+    // descriptors (it has none).
+    let pidfd = if flags & CLONE_PIDFD != 0 {
+        let fd = new_pidfd(p, pid, false)?;
+        if let Err(e) = write_u32(&mut p.aspace, args.pidfd, fd as u32) {
+            let _ = p.fds.close(fd);
+            return Err(e);
+        }
+        Some(fd)
+    } else {
+        None
+    };
     let mut t = Thread::new(pid);
     t.regs = *tf;
     t.regs.x[0] = 0;
@@ -79,7 +91,12 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         c.aspace.activate();
         let r = write_u32(&mut c.aspace, args.child_tid, pid);
         p.aspace.activate();
-        r?;
+        if let Err(e) = r {
+            if let Some(fd) = pidfd {
+                let _ = p.fds.close(fd);
+            }
+            return Err(e);
+        }
     }
     c.threads.insert(pid, t);
     c.runq.push_back(pid);
@@ -331,11 +348,16 @@ pub fn waitid(p: &mut Process, idtype: u64, id: u64, infop: u64, options: u64, r
         P_PID if id as i32 > 0 => Which::Pid(id as u32),
         P_PGID if id == 0 => Which::Group(p.pgid),
         P_PGID if id as i32 > 0 => Which::Group(id as u32),
-        P_PIDFD => return p.unimplemented(table::nr::waitid, "waitid", "P_PIDFD", EINVAL),
+        P_PIDFD => Which::Pid(pidfd_pid(p, id)?),
         _ => return Err(EINVAL),
     };
     let found = waitable(p, which, options, false)?;
     let Some((child, status, cpu)) = found else {
+        // A non-blocking pidfd doesn't wait (Linux 5.10).
+        let nonblocking = idtype == P_PIDFD && p.fds.get(id)?.lock().nonblocking();
+        if options & WNOHANG == 0 && nonblocking {
+            return Err(EAGAIN);
+        }
         if options & WNOHANG == 0 {
             return block_for_child(p);
         }
@@ -352,6 +374,56 @@ pub fn waitid(p: &mut Process, idtype: u64, id: u64, infop: u64, options: u64, r
         waitable(p, Which::Pid(child), options, true)?;
     }
     Ok(0)
+}
+
+/// A new pidfd for process `pid`, close-on-exec as on Linux.
+fn new_pidfd(p: &mut Process, pid: u32, nonblock: bool) -> SysResult {
+    let file = new_file(FileKind::PidFd(pid), O_RDWR | if nonblock { O_NONBLOCK } else { 0 });
+    p.fds.alloc(FdEntry { file, cloexec: true }, 0)
+}
+
+/// The process a pidfd refers to.
+pub(super) fn pidfd_pid(p: &Process, fd: u64) -> Result<u32, Errno> {
+    match p.fds.get(fd)?.lock().kind {
+        FileKind::PidFd(pid) => Ok(pid),
+        _ => Err(EINVAL),
+    }
+}
+
+/// pidfd_open(pid, flags): a pidfd for a process (or zombie).
+pub fn pidfd_open(p: &mut Process, pid: u64, flags: u64) -> SysResult {
+    if flags & !(O_NONBLOCK as u64) != 0 || pid as i32 <= 0 {
+        return Err(EINVAL);
+    }
+    let pid = pid as u32;
+    let exists = pid == p.pid || {
+        let procs = PROCS.lock();
+        procs.others.contains_key(&pid) || procs.zombies.contains_key(&pid)
+    };
+    if !exists {
+        return Err(ESRCH);
+    }
+    new_pidfd(p, pid, flags & O_NONBLOCK as u64 != 0)
+}
+
+/// pidfd_getfd(pidfd, fd, flags): a copy of another process's descriptor
+/// (as SCM_RIGHTS would give it), for a caller ptrace would let attach.
+pub fn pidfd_getfd(p: &mut Process, pidfd: u64, fd: u64, flags: u64) -> SysResult {
+    if flags != 0 {
+        return Err(EINVAL);
+    }
+    let pid = pidfd_pid(p, pidfd)?;
+    let file = if pid == p.pid {
+        p.fds.get(fd)?
+    } else {
+        let procs = PROCS.lock();
+        let q = procs.others.get(&pid).ok_or(ESRCH)?;
+        if !crate::procs::may_inspect(p, q, true) {
+            return Err(EPERM);
+        }
+        q.fds.get(fd)?
+    };
+    p.fds.alloc(FdEntry { file, cloexec: true }, 0)
 }
 
 /// getpgid / getsid for `pid` (0 = the caller).

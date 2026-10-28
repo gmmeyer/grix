@@ -254,6 +254,7 @@ syscalls! {
     425 io_uring_setup Core;
     434 pidfd_open Cap(Process);
     435 clone3 Core; // gated by flags: threads vs process
+    438 pidfd_getfd Cap(Process);
     436 close_range Core;
     437 openat2 Core;
     439 faccessat2 Core;

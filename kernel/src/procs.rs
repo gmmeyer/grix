@@ -35,6 +35,27 @@ pub struct Procs {
 
 pub static PROCS: Mutex<Procs> = Mutex::new(Procs { others: BTreeMap::new(), zombies: BTreeMap::new() });
 
+/// Bumped whenever a process ends (pidfds' readiness).
+static EXITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn exits() -> u64 {
+    EXITS.load(Ordering::Relaxed)
+}
+
+/// Has process `pid` ended (a zombie, or reaped)? `p` is the running one.
+pub fn ended(p: &Process, pid: u32) -> bool {
+    pid != p.pid && !PROCS.lock().others.contains_key(&pid)
+}
+
+/// May `p` look at `q`'s descriptors (Linux's ptrace access check, which
+/// /proc/<pid>/fd and pidfd_getfd use): root may, and so may a process
+/// whose user and group (`real`: real ids, otherwise effective ones) are
+/// all of `q`'s.
+pub fn may_inspect(p: &Process, q: &Process, real: bool) -> bool {
+    let (uid, gid) = if real { (p.ids.ruid, p.ids.rgid) } else { (p.uid, p.gid) };
+    p.uid == 0 || ([q.uid, q.ids.ruid, q.ids.suid] == [uid; 3] && [q.gid, q.ids.rgid, q.ids.sgid] == [gid; 3])
+}
+
 /// A process has ended and may need finishing off (`reap_others`).
 pub static DYING: AtomicBool = AtomicBool::new(false);
 
@@ -85,6 +106,9 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.dead = true;
     let (pid, ppid) = (dead.pid, dead.ppid);
     crate::fs::proc_gone(pid);
+    // Its pidfds are readable.
+    EXITS.fetch_add(1, Ordering::Relaxed);
+    crate::ipc::changed();
     // A session leader's end hangs up its terminal's foreground group.
     if let Some(tty) = dead.ctty.take()
         && dead.sid == pid
