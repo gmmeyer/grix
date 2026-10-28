@@ -51,12 +51,13 @@ jobs:
           docker cp "$id:/out/bin" out-bin
           docker rm "$id"
           file out-bin/grix out-bin/grix-vmm
-      - name: Unit tests
+      - name: Unit tests, and the Python module
         run: |
           command -v rustup || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install stable --profile minimal
           cargo test -p grix --lib
+          cargo build --release -p grix-python
       # A static program, booted in the kernel just built (QEMU here: the
       # runners may not have KVM).
       - name: Smoke test
@@ -76,8 +77,11 @@ jobs:
         run: |
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-linux-arm64
-          mkdir "$d"
+          mkdir -p "$d/python/grix"
           cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          cp python/grix/__init__.py "$d/python/grix/"
+          cp target/release/lib_native.so "$d/python/grix/_native.abi3.so"
+          PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'
           tar czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -102,14 +106,19 @@ jobs:
           # Hypervisor.framework runs only programs with its entitlement; an
           # ad-hoc signature carries it.
           codesign --sign - --entitlements crates/vmm/entitlements.plist --force target/release/grix-vmm
-      - name: Unit tests
-        run: cargo test -p grix --lib
+      - name: Unit tests, and the Python module
+        run: |
+          cargo test -p grix --lib
+          cargo build --release -p grix-python
       - name: Package
         run: |
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-macos-arm64
-          mkdir "$d"
+          mkdir -p "$d/python/grix"
           cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          cp python/grix/__init__.py "$d/python/grix/"
+          cp target/release/lib_native.dylib "$d/python/grix/_native.abi3.so"
+          PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'
           ./target/release/grix --version
           tar czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -151,7 +160,8 @@ jobs:
               git log -1 --format='- %s'
             fi
             echo
-            echo "Each archive has grix, grix-vmm and the grix kernel (grix finds it beside itself)."
+            echo "Each archive has grix, grix-vmm and the grix kernel (grix finds it beside itself),"
+            echo "and the Python package with its native module (\`PYTHONPATH=python\`, Python 3.9+)."
             echo "macOS: arm64, macOS 15+; if it came through a browser, \`xattr -d com.apple.quarantine grix grix-vmm\`."
             echo "Linux: arm64, static; grix-vmm needs /dev/kvm (otherwise grix uses QEMU)."
           } > notes.md

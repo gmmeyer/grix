@@ -80,8 +80,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     of applied base layers and of build steps, and images built on grix
     images (`from = "image:FILE"`). Left: pushing images; an image's root
     served lazily.
-16. **Agents**: MCP progress/streaming and cancellation; native Python
-    bindings (PyO3).
+16. [x] **Agents**: MCP progress/streaming, cancellation and parallel
+    tool calls; native Python bindings (PyO3: `grix._native`, the GIL
+    released, output callbacks, `grix.Control`, Ctrl-C). Left: wheels on
+    PyPI; `build` through the native module.
 17. **SMP**: several processes in parallel; finer locking than one kernel
     lock.
 18. **Snapshots**: on KVM, with more CPUs, with live mounts.
@@ -99,7 +101,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] Streaming output and signals over MCP: progress notifications with
       the output as it comes, cancellation into `RunControl::cancel`, tool
       calls in parallel (`--max-parallel`).
-- [ ] Native Python bindings (PyO3) instead of driving the CLI.
+- [x] Native Python bindings (PyO3) instead of driving the CLI
+      (`make python`; the CLI is the fallback).
 
 ## Images
 

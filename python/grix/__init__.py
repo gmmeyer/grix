@@ -10,9 +10,14 @@ beyond that is denied and reported in the result's ``events``.
     result = sb.run(["/bin/busybox", "echo", "hi"])
     print(result.exit_code, result.stdout, result.events)
 
-This drives the ``grix`` command (``grix run --json``): set ``grix=`` or
-the ``GRIX_BIN`` environment variable to say where it is, or have it on the
-PATH.
+With grix's native module (``grix._native``, built by ``make python``),
+runs happen in this process: they release the GIL, output can come back as
+it's written (``on_output``), a :class:`Control` signals or stops a run
+from another thread, and Ctrl-C stops the run. Without it (or with
+``grix=`` or ``GRIX_PYTHON=cli``), this drives the ``grix`` command
+(``grix run --json``): set ``grix=`` or ``GRIX_BIN`` to say where it is, or
+have it on the PATH. Either way, a release's kernel and grix-vmm are found
+beside the ``grix`` command.
 """
 
 from __future__ import annotations
@@ -24,15 +29,58 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence, Union
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Union
 
-__all__ = ["Sandbox", "Snapshot", "Result", "GrixError", "build", "find_grix"]
+try:
+    from . import _native
+except ImportError:  # not built: the grix command does the work
+    _native = None
+
+__all__ = ["Sandbox", "Snapshot", "Result", "GrixError", "Control", "build", "find_grix", "native"]
 
 PathLike = Union[str, os.PathLike]
+#: ``on_output(stream, data)``: ``"stdout"`` or ``"stderr"``, and the bytes.
+OnOutput = Callable[[str, bytes], None]
 
 
 class GrixError(Exception):
     """grix couldn't run the sandbox (not the program failing)."""
+
+
+def native(grix: Optional[PathLike] = None) -> bool:
+    """Whether runs happen in this process (grix's native module), rather
+    than through the ``grix`` command."""
+    return _native is not None and grix is None and os.environ.get("GRIX_PYTHON") != "cli"
+
+
+def _grix_dir() -> Optional[str]:
+    """The ``grix`` command's directory, if there is one: a release has the
+    kernel and grix-vmm there."""
+    path = os.environ.get("GRIX_BIN") or shutil.which("grix")
+    return os.fspath(Path(path).resolve().parent) if path else None
+
+
+class Control:
+    """Signals or stops a run from another thread: pass it to ``run``. Needs
+    grix's native module."""
+
+    def __init__(self) -> None:
+        if _native is None:
+            raise GrixError("Control needs grix's native module (make python)")
+        self._inner = _native.Control()
+
+    def signal(self, sig: int) -> bool:
+        """Send signal ``sig`` (2 SIGINT, 15 SIGTERM, 9 SIGKILL, ...) to the
+        program's process group. False if nothing is running."""
+        return self._inner.signal(sig)
+
+    def stop(self) -> bool:
+        """End the run in progress now. False if nothing is running."""
+        return self._inner.stop()
+
+    def cancel(self) -> None:
+        """Stop the run in progress, and any started later with this control."""
+        self._inner.cancel()
 
 
 def find_grix(grix: Optional[PathLike] = None) -> str:
@@ -145,21 +193,66 @@ class Sandbox:
             a += ["--max-output", str(int(self.max_output_mb))]
         return a
 
-    def run(self, command: Optional[Sequence[str]] = None, stdin: Union[str, bytes, None] = None) -> Result:
-        """Run ``command`` (or the image's) and wait for it."""
+    def _config(self) -> dict:
+        """What the native module takes."""
+        files = [(g, c.encode() if isinstance(c, str) else bytes(c), 0o644) for g, c in self.files.items()]
+        num = lambda v, t: None if v is None else t(v)  # noqa: E731
+        return {
+            "image": num(self.image, os.fspath),
+            "imports": [(os.fspath(h), g) for h, g in self.imports.items()],
+            "files": files,
+            "env": list(self.env.items()),
+            "cwd": self.cwd,
+            "capabilities": list(self.capabilities),
+            "memory_mb": num(self.memory_mb or None, int),
+            "cpus": num(self.cpus or None, int),
+            "x86_64": num(self.x86_64, os.fspath),
+            "timeout": num(self.timeout, float),
+            "grace": num(self.grace, float),
+            "allow_hosts": list(self.allow_hosts),
+            "publish": list(self.publish),
+            "mounts": [(os.fspath(m[0]), m[1], m[2] if len(m) > 2 else "rw") for m in self.mounts],
+            "exports": [(g, os.fspath(h)) for g, h in self.exports.items()],
+            "max_output_mb": num(self.max_output_mb or None, int),
+            "grix_dir": _grix_dir(),
+        }
+
+    def run(
+        self,
+        command: Optional[Sequence[str]] = None,
+        stdin: Union[str, bytes, None] = None,
+        *,
+        on_output: Optional[OnOutput] = None,
+        control: Optional[Control] = None,
+    ) -> Result:
+        """Run ``command`` (or the image's) and wait for it. ``on_output``
+        gets the program's output as it comes (natively; through the
+        ``grix`` command, once it's done)."""
+        if native(self.grix):
+            data = stdin.encode() if isinstance(stdin, str) else stdin
+            inner = control._inner if control is not None else None
+            return _native_result(_native.run, self._config(), list(command or []), data, on_output, inner)
+        if control is not None:
+            raise GrixError("Control needs grix's native module (make python)")
         with tempfile.TemporaryDirectory(prefix="grix-py-") as tmp:
             argv = [find_grix(self.grix), "run", "--json", "--quiet"] + self._args(Path(tmp))
             if stdin is None:
                 argv.append("--no-stdin")
             if command:
                 argv += ["--", *command]
-            return _run(argv, stdin)
+            return _run(argv, stdin, on_output)
 
     def snapshot(self, path: PathLike, command: Optional[Sequence[str]] = None) -> "Snapshot":
         """Start ``command`` (or the image's) and save the whole machine to
         ``path`` when it first waits for input; each :meth:`Snapshot.run`
         then starts from there, in milliseconds. Needs grix's own VMM
         (macOS 15+); the sandbox can't have mounts."""
+        if native(self.grix):
+            try:
+                _native.snapshot(self._config(), os.fspath(path), list(command or []))
+            except _native.Error as e:
+                raise GrixError(str(e)) from None
+            return Snapshot(path, grix=self.grix)
         with tempfile.TemporaryDirectory(prefix="grix-py-") as tmp:
             argv = [find_grix(self.grix), "snapshot", "--quiet", "-o", os.fspath(path)] + self._args(Path(tmp))
             if command:
@@ -179,25 +272,55 @@ class Snapshot:
     timeout: Optional[float] = None
     grix: Optional[PathLike] = None
 
-    def run(self, stdin: Union[str, bytes, None] = None) -> Result:
+    def run(
+        self,
+        stdin: Union[str, bytes, None] = None,
+        *,
+        on_output: Optional[OnOutput] = None,
+        control: Optional[Control] = None,
+    ) -> Result:
+        if native(self.grix):
+            data = stdin.encode() if isinstance(stdin, str) else stdin
+            inner = control._inner if control is not None else None
+            return _native_result(
+                _native.snapshot_run, os.fspath(self.path), data, self.timeout, on_output, inner, _grix_dir()
+            )
+        if control is not None:
+            raise GrixError("Control needs grix's native module (make python)")
         argv = [find_grix(self.grix), "run", "--json", "--quiet", "--snapshot", os.fspath(self.path)]
         if self.timeout is not None:
             argv += ["--timeout", str(max(1, int(round(self.timeout))))]
         if stdin is None:
             argv.append("--no-stdin")
-        return _run(argv, stdin)
+        return _run(argv, stdin, on_output)
 
 
-def _run(argv: list, stdin: Union[str, bytes, None]) -> Result:
+def _native_result(fn, *args) -> Result:
+    try:
+        out = json.loads(fn(*args))
+    except _native.Error as e:
+        raise GrixError(str(e)) from None
+    return _result(out, out["exit_code"], "")
+
+
+def _run(argv: list, stdin: Union[str, bytes, None], on_output: Optional[OnOutput] = None) -> Result:
     data = stdin.encode() if isinstance(stdin, str) else stdin
     proc = subprocess.run(argv, input=data, capture_output=True)
     try:
         out = json.loads(proc.stdout)
     except ValueError:
         raise GrixError(proc.stderr.decode(errors="replace").strip() or f"grix exited with {proc.returncode}")
+    if on_output is not None:
+        for stream in ("stdout", "stderr"):
+            if out[stream]:
+                on_output(stream, out[stream].encode())
+    return _result(out, proc.returncode, proc.stderr.decode(errors="replace"))
+
+
+def _result(out: dict, exit_code: int, messages: str) -> Result:
     return Result(
         status=out["status"],
-        exit_code=proc.returncode,
+        exit_code=exit_code,
         stdout=out["stdout"],
         stderr=out["stderr"],
         events=out["events"],
@@ -205,7 +328,7 @@ def _run(argv: list, stdin: Union[str, bytes, None]) -> Result:
         duration_ms=out["duration"],
         exports=out.get("exports", []),
         mount_changes=out.get("mount_changes", []),
-        messages=proc.stderr.decode(errors="replace"),
+        messages=messages,
         raw=out,
     )
 

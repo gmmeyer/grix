@@ -1,0 +1,3 @@
+[env]
+# grix-python is an extension module: it doesn't link libpython.
+PYO3_BUILD_EXTENSION_MODULE = "1"

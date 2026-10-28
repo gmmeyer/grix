@@ -16,7 +16,22 @@ FIXTURES = ROOT / "fixtures/build"
 BUSYBOX = FIXTURES / "alpine/bin/busybox.static"
 
 
-class SandboxTest(unittest.TestCase):
+class Common:
+    """Tests for both ways of running: natively and through the grix command."""
+
+    mode = ""
+
+    def setUp(self):
+        self.saved = os.environ.get("GRIX_PYTHON")
+        os.environ["GRIX_PYTHON"] = self.mode
+        self.assertEqual(grix.native(), self.mode == "native")
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("GRIX_PYTHON", None)
+        else:
+            os.environ["GRIX_PYTHON"] = self.saved
+
     def test_run_with_files_stdin_and_events(self):
         sb = grix.Sandbox(
             imports={BUSYBOX: "/bin/busybox"},
@@ -69,6 +84,72 @@ class SandboxTest(unittest.TestCase):
     def test_errors(self):
         with self.assertRaises(grix.GrixError):
             grix.Sandbox(imports={"/no/such/file": "/x"}).run(["/x"])
+
+    def test_output_as_it_comes(self):
+        seen = []
+        sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
+        r = sb.run(["/bin/busybox", "sh", "-c", "echo out; echo err >&2"], on_output=lambda s, d: seen.append((s, d)))
+        self.assertTrue(r.ok, r)
+        self.assertEqual(b"".join(d for s, d in seen if s == "stdout"), b"out\n")
+        self.assertEqual(b"".join(d for s, d in seen if s == "stderr"), b"err\n")
+
+
+class CliTest(Common, unittest.TestCase):
+    mode = "cli"
+
+
+class NativeTest(Common, unittest.TestCase):
+    """The native module (make python builds it; it's never skipped)."""
+
+    mode = "native"
+
+    def test_control_from_another_thread(self):
+        import threading
+        import time
+
+        control = grix.Control()
+        sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
+        seen = threading.Event()
+
+        def on_output(stream, data):
+            if b"ready" in data:
+                seen.set()
+
+        t = threading.Thread(target=lambda: (seen.wait(30), time.sleep(0.2), control.signal(15)))
+        t.start()
+        script = "trap 'echo got TERM; exit 3' TERM; echo ready; while :; do /bin/busybox sleep 1; done"
+        r = sb.run(["/bin/busybox", "sh", "-c", script], on_output=on_output, control=control)
+        t.join()
+        self.assertEqual(r.exit_code, 3, r)
+        self.assertIn("got TERM", r.stdout)
+        # Cancelled: what starts after that stops at once.
+        control.cancel()
+        r = sb.run(["/bin/busybox", "sleep", "30"], control=control)
+        self.assertEqual(r.status["kind"], "stopped", r)
+
+    def test_runs_in_parallel_threads(self):
+        import threading
+        import time
+
+        sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
+        results = []
+        started = time.monotonic()
+        threads = [threading.Thread(target=lambda: results.append(sb.run(["/bin/busybox", "sleep", "2"]))) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([r.exit_code for r in results], [0, 0, 0])
+        # The GIL is released while they run: not one after another.
+        self.assertLess(time.monotonic() - started, 5.5)
+
+    def test_callback_errors_stop_the_run(self):
+        def boom(stream, data):
+            raise ValueError("no thanks")
+
+        sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
+        with self.assertRaises(ValueError):
+            sb.run(["/bin/busybox", "sh", "-c", "echo hi; /bin/busybox sleep 30"], on_output=boom)
 
 
 if __name__ == "__main__":

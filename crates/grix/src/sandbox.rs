@@ -196,16 +196,7 @@ fn macos_major() -> Option<u32> {
 /// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
 /// means QEMU.
 pub(crate) fn default_vmm() -> Option<PathBuf> {
-    if std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
-        return None;
-    }
-    // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
-    let runs = match default_accel() {
-        "hvf" => macos_major().is_none_or(|v| v >= 15),
-        "kvm" => true,
-        _ => false,
-    };
-    if !runs {
+    if !vmm_runs_here() {
         return None;
     }
     match std::env::var_os("GRIX_VMM") {
@@ -230,6 +221,19 @@ fn default_kernel() -> PathBuf {
     ));
     let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("grix-kernel")));
     beside.filter(|p| p.is_file()).unwrap_or(built)
+}
+
+/// Does grix-vmm run here, unless told otherwise (`GRIX_ACCEL`)?
+fn vmm_runs_here() -> bool {
+    if std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
+    match default_accel() {
+        "hvf" => macos_major().is_none_or(|v| v >= 15),
+        "kvm" => true,
+        _ => false,
+    }
 }
 
 /// How [`SandboxBuilder::mount_with`] mounts a host directory.
@@ -616,6 +620,24 @@ impl SandboxBuilder {
         }
         self.net.forwards.push((ForwardFrom::Listener(std::sync::Arc::new(listener)), guest_port));
         Ok(self)
+    }
+
+    /// Where grix is installed (as a release unpacks: `grix`, `grix-vmm`
+    /// and `grix-kernel` together), for programs that aren't `grix`
+    /// themselves (the Python module): its kernel and grix-vmm are used,
+    /// unless `GRIX_KERNEL` or `GRIX_VMM` say otherwise or grix-vmm can't
+    /// run here.
+    pub fn install_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref();
+        let kernel = dir.join("grix-kernel");
+        if std::env::var_os("GRIX_KERNEL").is_none() && kernel.is_file() {
+            self.kernel = kernel;
+        }
+        let vmm = dir.join("grix-vmm");
+        if std::env::var_os("GRIX_VMM").is_none() && vmm_runs_here() && vmm.is_file() {
+            self.vmm = Some(vmm);
+        }
+        self
     }
 
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {

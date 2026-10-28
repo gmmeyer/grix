@@ -9,6 +9,7 @@ what the project is and how to use it, see [README.md](README.md).
 make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 make host        # host CLI      -> target/release/grix
 make vmm         # our own VMM   -> target/release/grix-vmm (arm64 macOS 15+ / Linux KVM; codesigned on macOS)
+make python      # grix's native Python module -> python/grix/_native.abi3.so (PyO3)
 make fixtures    # C (zig) and Go test programs + Alpine busybox, python3, nodejs (network, cached)
 make test        # everything; end-to-end tests boot the kernel in grix-vmm (or QEMU)
 make test-kvm    # grix-vmm on KVM: Linux in QEMU with nested virtualization (M3+ Mac)

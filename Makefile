@@ -1,9 +1,9 @@
 KERNEL := kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
 VMM := target/release/grix-vmm
 
-.PHONY: all kernel host vmm fixtures test test-kvm check clean
+.PHONY: all kernel host vmm python fixtures test test-kvm check clean
 
-all: kernel host vmm fixtures
+all: kernel host vmm python fixtures
 
 kernel:
 	cd kernel && cargo build --release
@@ -20,6 +20,11 @@ ifeq ($(shell uname -s),Darwin)
 	codesign --sign - --entitlements crates/vmm/entitlements.plist --force $(VMM)
 endif
 
+# grix's native Python module, in place: python/grix/_native.abi3.so.
+python:
+	cargo build --release -p grix-python
+	cp -f target/release/lib_native.$(if $(filter Darwin,$(shell uname -s)),dylib,so) python/grix/_native.abi3.so
+
 fixtures:
 	./fixtures/build.sh
 	python3 -I tools/alpine.py --out fixtures/build/alpine busybox-static busybox
@@ -35,7 +40,7 @@ fixtures:
 	# glibc programs: Debian.
 	./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci/debian
 
-test: kernel vmm fixtures
+test: kernel vmm python fixtures
 	cargo test --workspace
 	python3 -m unittest discover -s python/tests
 

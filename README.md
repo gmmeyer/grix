@@ -349,7 +349,11 @@ For example, in a Claude Code or other MCP client config:
 {"mcpServers": {"grix": {"command": "grix", "args": ["mcp", "--root", "/path/to/project"]}}}
 ```
 
-Python (`pip install ./python`) drives the same CLI:
+Python: `make python` builds grix's native module (PyO3) into the
+package, and `pip install ./python` installs it (a release has it built,
+in `python/`). Runs happen in the Python process, with the GIL released, so
+threads run sandboxes side by side; without the module the package drives
+the `grix` command instead, the same way.
 
 ```python
 import grix
@@ -358,6 +362,12 @@ sb = grix.Sandbox(imports={"./busybox": "/bin/busybox"}, files={"/data/in.txt": 
                   capabilities=["process"], timeout=30)
 r = sb.run(["/bin/busybox", "sort", "/data/in.txt"])
 print(r.exit_code, r.stdout, r.events, r.missing_capabilities)
+
+# Output as it comes, and a run stopped from another thread (or by Ctrl-C).
+control = grix.Control()
+r = sb.run(["/bin/busybox", "sh", "-c", "tail -f /dev/null"], control=control,
+           on_output=lambda stream, data: print(stream, data))
+# elsewhere: control.signal(15), control.stop(), control.cancel()
 
 grix.build("app.grix", grixfile="Grixfile")        # images too
 print(grix.Sandbox(image="app.grix").run().stdout)

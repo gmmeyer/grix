@@ -483,8 +483,20 @@ Next, in TODO.md order:
   `notifications/cancelled` cancels the call's `RunControl` (`cancel` is
   sticky: a run that starts later stops at once too; builds stop between
   steps) and suppresses its answer; at EOF the calls in progress finish
-  and are answered (as when calls ran one at a time). A `progressToken` gets `notifications/progress`
-  with the output, coalesced (every 250 ms or 8 KiB), up to 1 MiB.
+  and are answered (as when calls ran one at a time). A `progressToken`
+  gets `notifications/progress` with the output, coalesced (every 250 ms
+  or 8 KiB), up to 1 MiB.
+
+- **Python, natively** (round 2, item 16): `crates/python` builds
+  `grix._native` (PyO3 0.30, abi3 3.9+, not linked to libpython:
+  `.cargo/config.toml` sets PYO3_BUILD_EXTENSION_MODULE). A run goes on a
+  thread of its own while the caller waits with the GIL released, checking
+  for signals every 100 ms (Ctrl-C stops the run); output callbacks attach
+  to Python; an exception in one stops the run and is raised. The package
+  uses it when it's there (`grix.native()`; `GRIX_PYTHON=cli` forces the
+  command), and finds a release's kernel and grix-vmm beside the `grix`
+  command (`SandboxBuilder::install_dir`). The Python tests run everything
+  both ways. Releases carry the package with the module built.
 
 ### Notes for the next session
 
