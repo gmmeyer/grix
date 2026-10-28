@@ -315,6 +315,21 @@ pub(crate) fn read_node<R: Read>(
     }))
 }
 
+/// `cache_dir()/name`, made private (0700, the cache directory too): it
+/// may hold private images.
+pub(crate) fn private_cache(name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = cache_dir()?;
+    let dir = root.join(name);
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    for d in [&root, &dir] {
+        if fs::metadata(d)?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(dir)
+}
+
 pub(crate) fn cache_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("GRIX_CACHE") {
         return Ok(PathBuf::from(dir));

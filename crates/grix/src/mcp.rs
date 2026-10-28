@@ -83,6 +83,7 @@ impl McpConfig {
             registries: net,
             docker: false,
             credentials: self.registry_credentials,
+            local_registries: false,
             cache: true,
             step_timeout: self.max_timeout,
             step_memory_mb: self.max_memory_mb,

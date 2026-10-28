@@ -18,15 +18,13 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::container::{append_files, cache_dir, random_suffix, read_node};
+use crate::container::{append_files, random_suffix, read_node};
 use crate::image::{self, Node};
 
 const DEFAULT_LIMIT_MB: u64 = 10 << 10;
 
 fn dir() -> Result<PathBuf> {
-    let dir = cache_dir()?.join("trees");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+    crate::container::private_cache("trees")
 }
 
 fn hex(b: &[u8]) -> String {
@@ -154,7 +152,10 @@ pub(crate) fn put(key: &str, files: &BTreeMap<String, Node>) -> Result<()> {
     let dir = dir()?;
     let tmp = dir.join(format!("{key}.tmp-{}", random_suffix()));
     let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?
+        };
         // The hash goes first, once the tar after it is written.
         file.write_all(&[b'\n'; 65])?;
         let mut out = HashingWriter { inner: BufWriter::new(file), hasher: Sha256::new() };
@@ -178,8 +179,20 @@ pub(crate) fn put(key: &str, files: &BTreeMap<String, Node>) -> Result<()> {
     Ok(())
 }
 
-/// Remove the least recently used trees past the limit.
+/// Remove the least recently used trees past the limit, and what writers
+/// that didn't finish left (an hour on).
 fn prune(dir: &std::path::Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        let stale = |e: &fs::DirEntry| {
+            e.file_name().to_string_lossy().contains(".tmp-")
+                && e.metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age.as_secs() > 3600))
+        };
+        for e in entries.filter_map(|e| e.ok()).filter(stale) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
     let limit =
         std::env::var("GRIX_TREE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_LIMIT_MB) << 20;
     let Ok(entries) = fs::read_dir(dir) else { return };

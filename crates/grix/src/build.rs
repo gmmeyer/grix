@@ -157,6 +157,9 @@ pub struct BuildPolicy {
     pub docker: bool,
     /// A registry that wants a login gets the user's (`auth`).
     pub credentials: bool,
+    /// `from` may name a registry on this machine (which may speak plain
+    /// HTTP): a way to reach the host's own services otherwise.
+    pub local_registries: bool,
     /// Steps whose inputs are unchanged may be taken from the cache
     /// instead of running (what they leave is cached either way).
     pub cache: bool,
@@ -173,6 +176,7 @@ impl Default for BuildPolicy {
             registries: true,
             docker: true,
             credentials: true,
+            local_registries: true,
             cache: true,
             step_timeout: Duration::from_secs(1800),
             step_memory_mb: 3000,
@@ -224,7 +228,7 @@ impl Grixfile {
                         in_context(base, Path::new(p), self.from_outside_context)?;
                     }
                 }
-                let pulled = crate::oci::load(source, base, opts.policy.credentials)
+                let pulled = crate::oci::load(source, base, opts.policy.credentials, opts.policy.local_registries)
                     .with_context(|| format!("from {source}"))?;
                 files = pulled.files;
                 let c = pulled.config;

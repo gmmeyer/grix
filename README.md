@@ -326,7 +326,9 @@ grix mcp --max-timeout 120 --max-mem 1024
 Images an agent runs get the server's kernel, and may ask only for
 capabilities the server allows. Builds follow the same policy: their steps
 get `net` (under the same host rules) and `from` may pull from a registry
-only if the server allows `net`; `docker:` sources are refused.
+only if the server allows `net`, anonymously unless it says
+`--registry-credentials`; `docker:` sources and registries on the host
+itself are refused.
 
 For example, in a Claude Code or other MCP client config:
 
@@ -430,7 +432,8 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   Hub is `docker.io`, the default) saves a login in
   `~/.config/grix/auth.json`; Docker's and Podman's logins (and credential
   helpers) work too. A login goes only to the registry that asks for it,
-  and its token service, over TLS (or to a registry on this machine).
+  and its token service, over TLS (or to a registry on this machine,
+  which may speak plain HTTP). The caches are private (0700).
 - Builds are cached in `~/.cache/grix/trees` (at most 10 GiB, or
   `GRIX_TREE_CACHE_MB`): what an image's layers add up to, and what each
   build step left, by everything that went into it (the files before it,

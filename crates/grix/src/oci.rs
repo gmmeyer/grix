@@ -67,12 +67,13 @@ pub(crate) struct Pulled {
 /// in the local Docker daemon, through `docker save`), or a registry
 /// reference such as `alpine:3.21`, `python:3.12-alpine` or
 /// `ghcr.io/owner/repo@sha256:...`. Relative paths are taken from `base`.
-/// With `credentials`, a registry that asks for a login gets the user's.
-pub(crate) fn load(source: &str, base: &Path, credentials: bool) -> Result<Pulled> {
-    load_with(source, base, if credentials { Store::user() } else { Store::none() })
+/// With `credentials`, a registry that asks for a login gets the user's;
+/// without `local`, registries on this machine are refused.
+pub(crate) fn load(source: &str, base: &Path, credentials: bool, local: bool) -> Result<Pulled> {
+    load_with(source, base, if credentials { Store::user() } else { Store::none() }, local)
 }
 
-fn load_with(source: &str, base: &Path, store: Store) -> Result<Pulled> {
+fn load_with(source: &str, base: &Path, store: Store, local: bool) -> Result<Pulled> {
     let resolve = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
     if let Some(dir) = source.strip_prefix("oci:") {
         return Layout::open(&resolve(dir))?.load();
@@ -95,6 +96,9 @@ fn load_with(source: &str, base: &Path, store: Store) -> Result<Pulled> {
         return load_archive(&tar);
     }
     let reference = Reference::parse(source)?;
+    if loopback(&reference.host) && !local {
+        bail!("this build may not pull from registries on this machine ({})", reference.host);
+    }
     let mut registry = Registry::new(&reference, store)?;
     let manifest_digest = registry.resolve(&reference.tag_or_digest)?;
     let layout = Layout::cache()?;
@@ -176,15 +180,51 @@ impl Reference {
         } else {
             (host, repo)
         };
-        let ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c);
-        if repo.is_empty() || !repo.chars().all(ok) {
+        // As the OCI distribution spec has them: what goes into URLs is
+        // names, never `..` or anything that changes what a URL means.
+        let component = |c: &str| {
+            let edge = |b: Option<char>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            edge(c.chars().next())
+                && edge(c.chars().last())
+                && c.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || "._-".contains(ch))
+                && !c.contains("..")
+        };
+        if !valid_host(&host) || repo.is_empty() || !repo.split('/').all(component) {
             bail!("{s:?} isn't an image reference");
         }
-        if tag.is_empty() || tag.contains('/') {
+        let tag_ok = tag.len() <= 128
+            && tag.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && tag.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        if !(tag_ok || (tag.starts_with("sha256:") && check_digest(&tag).is_ok())) {
             bail!("{s:?} has a bad tag");
         }
         Ok(Reference { host, repo, tag_or_digest: tag })
     }
+}
+
+/// A registry host: a DNS name or IPv4 address, or an IPv6 one in
+/// brackets, and maybe a port.
+fn valid_host(host: &str) -> bool {
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((v6, after)) => {
+                if v6.parse::<std::net::Ipv6Addr>().is_err() {
+                    return false;
+                }
+                (None, after.strip_prefix(':'))
+            }
+            None => return false,
+        },
+        None => match host.split_once(':') {
+            Some((n, p)) => (Some(n), Some(p)),
+            None => (Some(host), None),
+        },
+    };
+    let name_ok = name.is_none_or(|n| {
+        !n.is_empty() && n.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    });
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()));
+    name_ok && port_ok && (host.starts_with('[') || !host.contains(']'))
 }
 
 fn check_digest(d: &str) -> Result<&str> {
@@ -211,8 +251,9 @@ impl Layout {
         Ok(Layout { dir: dir.to_path_buf() })
     }
 
+    /// The blob cache: private, since images may be.
     fn cache() -> Result<Layout> {
-        let dir = crate::container::cache_dir()?.join("oci");
+        let dir = crate::container::private_cache("oci")?;
         fs::create_dir_all(dir.join("blobs/sha256"))?;
         Ok(Layout { dir })
     }
@@ -592,13 +633,28 @@ struct Registry {
     credential: Option<Option<Credential>>,
 }
 
-/// Is `host` (`name[:port]`, `[v6]:port`) this machine?
+/// Is `host` (a reference's: `name[:port]`, `[v6]:port`) this machine?
 fn loopback(host: &str) -> bool {
     let name = match host.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or(""),
         None => host.split(':').next().unwrap_or(""),
     };
     matches!(name, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Is `url` a plain-HTTP URL of this machine (and nothing else: no user
+/// name, which would make what comes before `@` look like the host)?
+fn loopback_http(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else { return false };
+    u.scheme() == "http"
+        && u.username().is_empty()
+        && u.password().is_none()
+        && match u.host() {
+            Some(url::Host::Domain(d)) => d == "localhost",
+            Some(url::Host::Ipv4(a)) => a.is_loopback(),
+            Some(url::Host::Ipv6(a)) => a.is_loopback(),
+            None => false,
+        }
 }
 
 impl Registry {
@@ -625,15 +681,21 @@ impl Registry {
     /// carry a login in the clear). A registry on this machine without
     /// TLS may send us elsewhere on it.
     fn may_reach(&self, url: &str) -> bool {
-        url.starts_with("https://")
-            || (self.scheme == "http"
-                && url.strip_prefix("http://").is_some_and(|rest| loopback(rest.split('/').next().unwrap_or(""))))
+        let Ok(u) = url::Url::parse(url) else { return false };
+        let plain = u.username().is_empty() && u.password().is_none() && u.host().is_some();
+        (u.scheme() == "https" && plain) || (self.scheme == "http" && loopback_http(url))
     }
 
-    /// The user's login for this registry, looked up once.
+    /// The user's login for this registry, looked up once. One that can't
+    /// be read (a helper that's gone, a broken file) isn't a reason to
+    /// fail a pull that may not need it.
     fn credential(&mut self) -> Result<Option<Credential>> {
         if self.credential.is_none() {
-            self.credential = Some(self.store.lookup(&self.host)?);
+            let found = self.store.lookup(&self.host).unwrap_or_else(|e| {
+                eprintln!("grix: no login for {} ({e:#}); pulling anonymously", self.login_name());
+                None
+            });
+            self.credential = Some(found);
         }
         Ok(self.credential.clone().flatten())
     }
@@ -802,7 +864,10 @@ impl Registry {
         let accept = [OCI_MANIFEST, DOCKER_MANIFEST, "*/*"].join(", ");
         let resp = self.get(path, &accept)?;
         let tmp = dest.with_extension(format!("part-{}", crate::container::random_suffix()));
-        let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut out = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?
+        };
         let mut hasher = Sha256::new();
         // Without a size from a manifest, it's a manifest itself.
         let limit = size.unwrap_or(MAX_JSON).min(MAX_BYTES);
@@ -1092,7 +1157,7 @@ mod tests {
             let reg = FakeRegistry::start(bearer, blobs.clone(), manifest.clone());
             let source = format!("localhost:{}/team/private:1", reg.port);
             // Without a login: refused, saying how to log in.
-            let err = load_with(&source, &dir.path, Store::none()).err().unwrap();
+            let err = load_with(&source, &dir.path, Store::none(), true).err().unwrap();
             assert!(format!("{err:#}").contains(&format!("grix login localhost:{}", reg.port)), "{err:#}");
             // With one (as Docker keeps it): pulled.
             std::fs::write(
@@ -1100,7 +1165,10 @@ mod tests {
                 serde_json::json!({"auths": {format!("localhost:{}", reg.port): {"auth": auth}}}).to_string(),
             )
             .unwrap();
-            let pulled = load_with(&source, &dir.path, Store::file(&creds)).unwrap();
+            let pulled = load_with(&source, &dir.path, Store::file(&creds), true).unwrap();
+            // Unless registries on this machine are off limits.
+            let err = load_with(&source, &dir.path, Store::file(&creds), false).err().unwrap();
+            assert!(err.to_string().contains("on this machine"), "{err:#}");
             assert_eq!(pulled.config.cmd, ["/hello"]);
             assert!(pulled.files.contains_key("/hello"));
             // A wrong one is refused.
@@ -1110,7 +1178,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            let err = load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds));
+            let err = load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds), true);
             assert!(err.is_err());
         }
     }
@@ -1128,6 +1196,13 @@ mod tests {
         assert!(reg.may_reach("http://127.0.0.1:8080/token"));
         assert!(reg.may_reach("http://[::1]:8080/x") && !reg.may_reach("http://example.com/x"));
         assert!(loopback("localhost:5000") && loopback("[::1]:5000") && !loopback("localhost.example.com"));
+        // What's before an @ is a user name, not the host.
+        for sneaky in
+            ["http://localhost:1@evil.example/token", "http://127.0.0.1:x@10.0.0.5/", "http://[::1]@evil.example/"]
+        {
+            assert!(!reg.may_reach(sneaky), "{sneaky}");
+        }
+        assert!(!reg.may_reach("https://user:pw@elsewhere.example/token"));
     }
 
     #[test]
@@ -1141,8 +1216,23 @@ mod tests {
         assert_eq!((r.repo.as_str(), r.tag_or_digest.as_str()), ("library/python", "3.12-alpine"));
         let r = Reference::parse("ghcr.io/owner/tool:v1").unwrap();
         assert_eq!((r.host.as_str(), r.repo.as_str()), ("ghcr.io", "owner/tool"));
-        let r = Reference::parse("localhost:5000/x@sha256:abc").unwrap();
-        assert_eq!((r.host.as_str(), r.tag_or_digest.as_str()), ("localhost:5000", "sha256:abc"));
-        assert!(Reference::parse("UPPER").is_err());
+        let d = format!("sha256:{}", "ab".repeat(32));
+        let r = Reference::parse(&format!("localhost:5000/x@{d}")).unwrap();
+        assert_eq!((r.host.as_str(), r.tag_or_digest.as_str()), ("localhost:5000", d.as_str()));
+        let r = Reference::parse("[::1]:5000/x:v1.2_3").unwrap();
+        assert_eq!((r.host.as_str(), r.tag_or_digest.as_str()), ("[::1]:5000", "v1.2_3"));
+        for bad in [
+            "UPPER",
+            "localhost:8080/../../admin@..?action=x",
+            "localhost:8080/a/../b:1",
+            "localhost:1@evil.example/x:1",
+            "localhost:5000/x:-tag",
+            "localhost:5000/x:a?b",
+            "localhost:5000/x@sha256:abc",
+            "local host:5000/x:1",
+            "localhost:99999999/x:1",
+        ] {
+            assert!(Reference::parse(bad).is_err(), "{bad}");
+        }
     }
 }
