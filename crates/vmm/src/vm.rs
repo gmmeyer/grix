@@ -321,8 +321,11 @@ mod hvf_loop {
         }
         // A restored machine: the GIC once every vCPU exists, and before
         // the console can raise its interrupt (input may be there at once);
-        // then each vCPU that was on, on its own thread.
+        // then each vCPU that was on, on its own thread. Confined first: the
+        // file may be anyone's, and its GIC state goes to the framework's
+        // own parser (which, like the vCPUs' registers, works confined).
         if let Some(s) = &restored {
+            hvf::confine()?;
             snapshot_hvf::restore_gic(s)?;
             snapshot_hvf::restore_cpu(s, 0, &mut cpu)?;
         }
@@ -347,8 +350,10 @@ mod hvf_loop {
         let shared =
             Arc::new(Shared { m, console, wakes, pauses: Pauses::new(power), snapshot: args.snapshot, restored });
         // Confined before any guest code runs: a restored machine's other
-        // vCPUs run as soon as they have it.
-        hvf::confine()?;
+        // vCPUs run as soon as they have it (and it's confined already).
+        if shared.restored.is_none() {
+            hvf::confine()?;
+        }
         shared.console.go();
         for tx in machine {
             let _ = tx.send(shared.clone());
