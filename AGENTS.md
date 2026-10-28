@@ -195,26 +195,32 @@ kernel writes (`vdso::publish`); the kernel's clock uses the same
 More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
 is still the single-CPU kernel, made safe by a big kernel lock that every
 exception takes (`smp::lock` in `trap_handler`) and gives back on the way
-to EL0 (`smp::finish`). What runs in parallel is user code: the threads of
-the process in `PROCESS` (gang scheduling). Each CPU's scheduling state
-(`smp::CPUS`: its thread, time slice, resched, timer_dirty) is swapped into
-the `Process` fields while it holds the lock, so `p.current` is this
-CPU's thread, and a thread running on another CPU is in neither `runq`
-nor `current`, its registers live in that CPU: don't touch them. A CPU
-with nothing to run waits in `smp::finish` holding nothing (a kick: SGI 0,
-plus `KICK_CALL` for grix-vmm). Switching processes, finishing off one
-that ended and execve need the other CPUs out of the process
-(`smp::alone`); they leave at their next schedule (`exclusive_wanted`,
-`kick_others`). Signals for a thread on another CPU kick it
-(`kick_thread`). A CPU that declines to run more of `p` (another process
-waits, or `p` ended) kicks the others so the last one can switch.
+to EL0 (`smp::finish`). What runs in parallel is user code: each CPU runs
+a thread of any process. Between kernel entries every process is in
+`procs::PROCS`; `smp::lock` moves the one this CPU runs into `PROCESS`
+and `smp::unlock` puts it back (a finished-off one goes then, out of
+TTBR0 first), so kernel code still sees "the running process" and "the
+others", and a process in `PROCS` may be running on another CPU. Each
+CPU's scheduling state (`smp::CPUS`: its process and thread, time slice,
+resched, timer_dirty) is swapped into the `Process` fields while it holds
+the lock, so `p.current` is this CPU's thread, and a thread running on
+another CPU is in neither `runq` nor `current`, its registers live in that
+CPU: don't touch them. A CPU with nothing to run waits in `smp::finish`
+holding nothing (a kick: SGI 0, plus `KICK_CALL` for grix-vmm); `unlock`
+kicks idle CPUs for threads waiting anywhere. Finishing off a process
+that ended and execve need the other CPUs out of it (`smp::alone(pid)`);
+they leave at their next schedule (`exclusive_wanted`, `kick_others`), and
+a process killed while it runs elsewhere is finished off there
+(`smp::running_anywhere`, `procs::reap_others`). Signals for a thread on
+another CPU kick it (`kick_thread`).
 TLB flushes and instruction-cache invalidation are broadcast; free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
 (`publish_barrier`). User memory other threads use at the same time is
 updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
-makes every other CPU running the process enter the kernel
-(`smp::barrier_others`). Secondaries start with PSCI CPU_ON (`boot.S`
+makes every other CPU running the process (or any, for GLOBAL) enter the
+kernel (`smp::barrier_others`). Processes running at once write at once:
+a fixture that checks whole lines writes each with one `write`. Secondaries start with PSCI CPU_ON (`boot.S`
 `secondary_entry`). Snapshots are of one CPU.
 
 x86_64 programs (`Image::x86_64`, `SandboxBuilder::x86_64`, `--x86-64`):

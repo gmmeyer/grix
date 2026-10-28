@@ -178,12 +178,23 @@ pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
             }
         }
     }
+    let mut later = false;
     while DYING.swap(false, Ordering::Relaxed) {
         let dying: Vec<u32> =
             procs.others.iter().filter(|(_, q)| q.exit_status.is_some()).map(|(&pid, _)| pid).collect();
         for pid in dying {
+            // One running on another CPU is finished off there, once its
+            // threads have all left (its address space is in use).
+            if crate::smp::running_anywhere(pid) {
+                crate::smp::kick_others(pid);
+                later = true;
+                continue;
+            }
             let mut q = procs.others.remove(&pid).unwrap();
             finalize(&mut q, Some(cur), procs);
         }
+    }
+    if later {
+        DYING.store(true, Ordering::Relaxed);
     }
 }

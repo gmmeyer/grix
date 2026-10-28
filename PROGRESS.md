@@ -509,6 +509,18 @@ Next, in TODO.md order:
   only where they're installed; the Python module never beside the
   interpreter.
 
+- **SMP across processes** (round 2, item 17): no more gang scheduling.
+  Between kernel entries every process lives in `PROCS`; the CPU that
+  takes the lock moves the process it runs into `PROCESS` and puts it
+  back on the way out (dropping a finished-off one once it's out of
+  TTBR0), so the kernel's view ("the running process" and "the others")
+  is unchanged and each CPU picks threads of any process, round robin.
+  `alone`, `kick_others` and `barrier_others` are per process; a process
+  killed while it runs on another CPU is finished off there. Three busy
+  processes on four CPUs: 2.45 CPUs' worth (1.00 before). The one test
+  that broke was a fixture whose parent and child printed at once, as on
+  Linux: lines are now written whole.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
@@ -517,7 +529,9 @@ Next, in TODO.md order:
   the PATH that `make` sees: `export PATH="$HOME/.cargo/bin:$PATH"`.
 - `make fixtures` now also needs Go (cross-compiles `fixtures/go/*`).
 - Tests that time things can fail under the full suite's load, mostly on
-  TCG: `timers` (an itimer's remaining time), `stdout_backpressure`,
+  TCG: `timers` (an itimer's remaining time), `cpu_time_timers` and
+  `memfd_signalfd_cpu_clocks_and_more` (CPU time against wall time),
+  `stdout_backpressure`,
   `serving_through_a_forwarded_port` and `signals_from_the_host` (TCG
   under load), and once `snapshots_resume_where_the_program_waited` (its
   third restore didn't answer `read -t 2` in time). Rerun them alone before suspecting

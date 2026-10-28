@@ -356,18 +356,18 @@ fn membarrier(p: &mut Process, cmd: u64, flags: u64) -> SysResult {
             Ok(0)
         }
         // Every thread running on another CPU goes through the kernel (a
-        // barrier, and a context synchronization). Only `PROCESS`'s
-        // threads run anywhere, so that's GLOBAL too.
+        // barrier, and a context synchronization): any process's, or this
+        // one's.
         GLOBAL | GLOBAL_EXPEDITED => {
-            crate::smp::barrier_others();
+            crate::smp::barrier_others(None);
             Ok(0)
         }
         PRIVATE_EXPEDITED if registered(p, REGISTER_PRIVATE_EXPEDITED) => {
-            crate::smp::barrier_others();
+            crate::smp::barrier_others(Some(p.pid));
             Ok(0)
         }
         PRIVATE_EXPEDITED_SYNC_CORE if registered(p, REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) => {
-            crate::smp::barrier_others();
+            crate::smp::barrier_others(Some(p.pid));
             Ok(0)
         }
         PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => Err(EPERM),

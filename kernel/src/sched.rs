@@ -4,8 +4,8 @@
 //! the old thread and loading the new thread's saved state into the trap
 //! frame before returning to EL0. Switching processes also swaps the
 //! running process's body in `PROCESS` with one from `procs::PROCS`, and
-//! the address space in TTBR0; with more CPUs, only once the others have
-//! left it (see `smp`).
+//! the address space in TTBR0. With more CPUs each runs threads of any
+//! process (see `smp`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -49,13 +49,13 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     }
     p.running = false;
     p.current = smp::NO_THREAD;
-    let alone = smp::alone();
+    let alone = smp::alone(p.pid);
     if p.exit_status.is_some() && !p.dead {
         if alone {
             procs::finalize(p, None, &mut procs);
         } else {
             // Its threads on other CPUs stop; the last CPU finishes it off.
-            smp::kick_others();
+            smp::kick_others(p.pid);
         }
     }
     // The other CPUs have left: whoever waited for that (execve) goes on.
@@ -64,17 +64,19 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     }
     procs::reap_others(p, &mut procs);
     poll(p, &mut procs);
+    // Others may have ended just now too (a timer's signal, the host's).
+    procs::reap_others(p, &mut procs);
     // The process may have ended just now (a timer's signal, the host's).
     if p.exit_status.is_some() && !p.dead && alone {
         procs::finalize(p, None, &mut procs);
     }
+    // Other CPUs running a process that wants to be alone (execve, its
+    // end) or has stopped leave it.
+    if !alone && !smp::runs_here(p) {
+        smp::kick_others(p.pid);
+    }
     let Some(next) = pick(p, &procs, alone) else {
-        // The others leave too, so the last one can switch to the process
-        // that waits (or finish this one off): they'd run on otherwise.
-        if !alone && (others_wait(&procs) || !smp::runs_here(p)) {
-            smp::kick_others();
-        }
-        idle(p, &mut procs, alone);
+        idle(p, &mut procs);
         return;
     };
     if next != p.pid {
@@ -103,17 +105,17 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
 }
 
 /// The process to run next: the first after this one (by pid, wrapping)
-/// with a runnable thread, so processes take turns; this one if it's the
-/// only one.
+/// with a thread waiting to run, so processes take turns; this one if it's
+/// the only one. A process that wants to be alone (execve, its end) only
+/// if no other CPU runs it: then it is.
 fn pick(p: &Process, procs: &Procs, alone: bool) -> Option<u32> {
-    // Other CPUs run threads of `p`: more of them, unless `p` wants to be
-    // alone or another process waits for the CPUs (then they all leave it,
-    // and the last one switches).
-    if !alone {
-        return (runnable(p) && smp::runs_here(p) && !others_wait(procs)).then_some(p.pid);
-    }
+    let takes = |q: &Process, alone: bool| runnable(q) && (smp::runs_here(q) || alone);
     let others = procs.others.range(p.pid + 1..).chain(procs.others.range(..p.pid));
-    others.filter(|(_, q)| runnable(q)).map(|(&pid, _)| pid).next().or_else(|| runnable(p).then_some(p.pid))
+    others
+        .filter(|(pid, q)| takes(q, !smp::running_anywhere(**pid)))
+        .map(|(&pid, _)| pid)
+        .next()
+        .or_else(|| takes(p, alone).then_some(p.pid))
 }
 
 /// `q` has threads waiting to run, and isn't stopped.
@@ -205,18 +207,19 @@ fn wake_expired(p: &mut Process) -> bool {
 /// Nothing is runnable here: set the timer for the next deadline (the CPU
 /// then waits in `smp::finish`), or give up if no thread anywhere can ever
 /// wake.
-fn idle(p: &mut Process, procs: &mut Procs, alone: bool) {
+fn idle(p: &mut Process, procs: &mut Procs) {
+    let others_running = smp::others_running();
     match earliest_deadline(p, procs) {
         Some(deadline) => irq::timer_at(deadline),
         // The host can still wake whoever waits for I/O, and a thread
         // waiting for a signal may get one: a RunControl's, or the SIGTERM
         // the time limit sends. Threads on other CPUs may wake anyone.
-        None if !alone || waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
+        None if others_running || waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
         None => deadlock(p, procs),
     }
     p.timer_dirty = true;
     // The moment a snapshot wants: everything started, waiting for input.
-    if alone && waiting_for_input(p, procs) {
+    if !others_running && waiting_for_input(p, procs) {
         crate::snapshot::take_if_wanted();
     }
 }
@@ -315,6 +318,7 @@ pub fn irq(tf: &mut TrapFrame) {
         let mut procs = PROCS.lock();
         procs::reap_others(p, &mut procs);
         let woke = poll(p, &mut procs);
+        procs::reap_others(p, &mut procs);
         (woke, others_wait(&procs))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;

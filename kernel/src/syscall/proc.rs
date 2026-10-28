@@ -182,9 +182,9 @@ pub fn execve(
     // about to go, leave it first (see `smp`); the call then runs again.
     // (A signal meanwhile leaves the process on one CPU until the next
     // execve: slower, not wrong.)
-    if !crate::smp::alone() {
+    if !crate::smp::alone(p.pid) {
         p.exclusive_wanted = true;
-        crate::smp::kick_others();
+        crate::smp::kick_others(p.pid);
         return p.block_io(None, Err(EINTR));
     }
     p.exclusive_wanted = false;

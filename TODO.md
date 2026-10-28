@@ -84,7 +84,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     tool calls; native Python bindings (PyO3: `grix._native`, the GIL
     released, output callbacks, `grix.Control`, Ctrl-C). Left: wheels on
     PyPI; `build` through the native module.
-17. **SMP**: several processes in parallel; finer locking than one kernel
+17. [~] **SMP**: several processes in parallel (each CPU runs a thread
+    of any process; three busy processes on four CPUs use 2.5 CPUs'
+    worth, one at a time before). Left: finer locking than one kernel
     lock.
 18. **Snapshots**: on KVM, with more CPUs, with live mounts.
 19. **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
@@ -339,8 +341,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] SMP: more than one vCPU (`--cpus N`, `SandboxBuilder::cpus`): the
       threads of a process run in parallel (3.9× on 4 CPUs), with a big
       kernel lock; on grix-vmm (HVF, KVM) and QEMU.
-- [ ] SMP for several processes at once (today they take turns: gang
-      scheduling), and finer locking than one kernel lock.
+- [x] SMP for several processes at once (each CPU runs a thread of any
+      process).
+- [ ] Finer locking than one kernel lock.
 - [ ] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s

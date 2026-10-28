@@ -295,7 +295,7 @@ fn stop(p: &mut Process, sig: u32) {
     if p.running {
         p.resched = true;
     }
-    crate::smp::kick_others();
+    crate::smp::kick_others(p.pid);
     p.timer_dirty = true;
     // A parent's wait4 looks again.
     crate::ipc::changed();

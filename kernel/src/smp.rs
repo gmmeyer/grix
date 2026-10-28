@@ -7,14 +7,18 @@
 //! ever waits holding it: a CPU with nothing to run waits in `finish`
 //! with no locks at all.
 //!
-//! What runs in parallel is user code: the threads of the process in
-//! `PROCESS` (gang scheduling). Each CPU runs one of its threads, and keeps
-//! its own scheduling state (`Cpu`: thread, time slice), swapped into the
-//! `Process` fields the rest of the kernel uses (`current`, `slice_start`,
-//! `resched`, `timer_dirty`, `running`) while it holds the lock. Switching
-//! to another process, finishing off one that ended, and execve wait until
-//! the CPU doing it is the only one running the process: the others park
-//! at their next scheduling point, which a kick (an SGI) brings forward.
+//! What runs in parallel is user code: each CPU runs a thread of any
+//! process, several processes at once. Between kernel entries every
+//! process lives in `procs::PROCS`; the CPU that takes the lock moves the
+//! process it runs into `PROCESS` (`lock`) and puts it back (`unlock`),
+//! so the rest of the kernel still sees "the running process" and "the
+//! others". Each CPU keeps its own scheduling state (`Cpu`: process,
+//! thread, time slice), swapped into the `Process` fields the kernel uses
+//! (`current`, `slice_start`, `resched`, `timer_dirty`, `running`) while it
+//! holds the lock. Finishing off a process that ended, and execve, wait
+//! until the CPU doing it is the only one running the process (`alone`):
+//! the others leave it at their next scheduling point, which a kick (an
+//! SGI) brings forward.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -23,6 +27,7 @@ use grix_abi::machine::{GICR_STRIDE, KICK_CALL, MAX_CPUS};
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::process::{PROCESS, Process};
+use crate::procs::PROCS;
 
 const N: usize = MAX_CPUS as usize;
 /// `Process::current` on a CPU with no thread.
@@ -31,7 +36,8 @@ pub const NO_THREAD: u32 = u32::MAX;
 /// One CPU's scheduling state, kept here while another CPU has the kernel.
 #[derive(Clone, Copy)]
 struct Cpu {
-    /// The thread of `PROCESS` this CPU runs, if any.
+    /// The process this CPU runs a thread of, and the thread, if any.
+    pid: Option<u32>,
     tid: Option<u32>,
     slice_start: u64,
     resched: bool,
@@ -40,7 +46,7 @@ struct Cpu {
     ttbr: u64,
 }
 
-const IDLE: Cpu = Cpu { tid: None, slice_start: 0, resched: false, timer_dirty: true, ttbr: 0 };
+const IDLE: Cpu = Cpu { pid: None, tid: None, slice_start: 0, resched: false, timer_dirty: true, ttbr: 0 };
 
 /// Indexed by CPU; only touched with the kernel lock held.
 static CPUS: spin::Mutex<[Cpu; N]> = spin::Mutex::new([IDLE; N]);
@@ -77,7 +83,9 @@ pub fn count() -> u32 {
 static ENTRIES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static IN_KERNEL: [AtomicBool; N] = [const { AtomicBool::new(false) }; N];
 
-/// Take the kernel, and put this CPU's scheduling state in the process.
+/// Take the kernel, and make the process this CPU runs `PROCESS`, with
+/// this CPU's scheduling state in it. A CPU with no thread gets some
+/// process to schedule from.
 pub fn lock() {
     let cpu = me();
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
@@ -88,42 +96,71 @@ pub fn lock() {
     }
     let me = me();
     let cpu = CPUS.lock()[me];
-    if let Some(p) = PROCESS.lock().as_mut() {
+    let mut guard = PROCESS.lock();
+    let mut procs = PROCS.lock();
+    if guard.is_none() {
+        let pid = cpu.pid.filter(|pid| procs.others.contains_key(pid)).or_else(|| procs.others.keys().next().copied());
+        *guard = pid.and_then(|pid| procs.others.remove(&pid));
+    }
+    if let Some(p) = guard.as_mut() {
         // A thread that ended while this CPU ran it (exit_group, execve on
         // another CPU) is gone: nothing runs here until it schedules.
-        let tid = cpu.tid.filter(|t| p.threads.contains_key(t));
+        let tid = cpu.tid.filter(|t| cpu.pid == Some(p.pid) && p.threads.contains_key(t));
         p.current = tid.unwrap_or(NO_THREAD);
         p.running = tid.is_some();
         p.slice_start = cpu.slice_start;
         p.resched = cpu.resched || tid.is_none() && cpu.tid.is_some();
         p.timer_dirty = cpu.timer_dirty;
+        crate::process::set_current_pid(p.pid);
     }
 }
 
-/// Keep this CPU's scheduling state, kick CPUs that have something to run
-/// now, and give the kernel back.
+/// Keep this CPU's scheduling state, put its process back with the others
+/// (or, if it has ended, let it go), kick idle CPUs for threads waiting
+/// to run anywhere, and give the kernel back.
 pub fn unlock() {
     let me = me();
     {
         let mut cpus = CPUS.lock();
-        if let Some(p) = PROCESS.lock().as_mut() {
+        let taken = PROCESS.lock().take();
+        let mut procs = PROCS.lock();
+        if let Some(mut p) = taken {
             let c = &mut cpus[me];
             c.tid = (p.running && p.current != NO_THREAD).then_some(p.current);
+            c.pid = c.tid.map(|_| p.pid);
             c.slice_start = p.slice_start;
             c.resched = p.resched;
             c.timer_dirty = p.timer_dirty;
-            // Idle CPUs for the threads waiting to run (not while another
-            // process waits for the CPUs: they'd only decline).
-            if crate::sched::runnable(p) && runs_here(p) && !crate::sched::others_wait(&crate::procs::PROCS.lock()) {
-                let mut want = p.runq.len();
-                for (i, other) in cpus.iter().enumerate() {
-                    if want == 0 {
-                        break;
-                    }
-                    if i != me && i < online() && other.tid.is_none() {
-                        kick(i);
-                        want -= 1;
-                    }
+            // What's per CPU stays with the CPU.
+            p.running = false;
+            p.current = NO_THREAD;
+            if p.dead {
+                // Finished off (no other CPU runs it): its address space
+                // goes, once it isn't this CPU's.
+                if c.ttbr == p.aspace.pt.root {
+                    arch::set_user_page_table(arch::empty_page_table());
+                    c.ttbr = 0;
+                }
+            } else {
+                procs.others.insert(p.pid, p);
+            }
+        }
+        // Idle CPUs for the threads waiting to run.
+        let idle = (0..online()).filter(|&i| i != me && cpus[i].tid.is_none()).count();
+        if idle > 0 {
+            let mut want: usize = procs
+                .others
+                .values()
+                .filter(|q| crate::sched::runnable(q) && (runs_here(q) || !running_on(&cpus, q.pid)))
+                .map(|q| q.runq.len())
+                .sum();
+            for (i, other) in cpus.iter().enumerate() {
+                if want == 0 {
+                    break;
+                }
+                if i != me && i < online() && other.tid.is_none() {
+                    kick(i);
+                    want -= 1;
                 }
             }
         }
@@ -132,17 +169,22 @@ pub fn unlock() {
     SERVING.fetch_add(1, Ordering::Release);
 }
 
-/// Every other CPU running a thread of `PROCESS` executes a full barrier
-/// and a context synchronization (an exception) before this returns:
-/// membarrier. One already in the kernel has.
-pub fn barrier_others() {
+/// Is a thread of `pid` on any CPU (`cpus`: the CPUs, already locked)?
+fn running_on(cpus: &[Cpu; N], pid: u32) -> bool {
+    cpus.iter().any(|c| c.pid == Some(pid))
+}
+
+/// Every other CPU running a thread (of process `pid`, or of any process)
+/// executes a full barrier and a context synchronization (an exception)
+/// before this returns: membarrier. One already in the kernel has.
+pub fn barrier_others(pid: Option<u32>) {
     if count() == 1 {
         return;
     }
     let me = me();
     let running: [bool; N] = {
         let cpus = CPUS.lock();
-        core::array::from_fn(|i| i != me && cpus[i].tid.is_some())
+        core::array::from_fn(|i| i != me && cpus[i].tid.is_some() && pid.is_none_or(|pid| cpus[i].pid == Some(pid)))
     };
     for (i, &runs) in running.iter().enumerate() {
         if !runs || IN_KERNEL[i].load(Ordering::SeqCst) {
@@ -167,29 +209,42 @@ fn online() -> usize {
     ONLINE.load(Ordering::Relaxed) as usize
 }
 
-/// Is this CPU the only one running threads of `PROCESS`?
-pub fn alone() -> bool {
+/// Is no other CPU running threads of process `pid`?
+pub fn alone(pid: u32) -> bool {
     if count() == 1 {
         return true;
     }
     let me = me();
-    CPUS.lock().iter().enumerate().all(|(i, c)| i == me || c.tid.is_none())
+    CPUS.lock().iter().enumerate().all(|(i, c)| i == me || c.pid != Some(pid))
+}
+
+/// Does another CPU run a thread of `pid`? (This one, in the kernel, runs
+/// none: its entry may name the process it was running when it came in.)
+pub fn running_anywhere(pid: u32) -> bool {
+    let me = me();
+    CPUS.lock().iter().enumerate().any(|(i, c)| i != me && c.pid == Some(pid))
+}
+
+/// Does another CPU run a thread of any process (which may wake anyone)?
+pub fn others_running() -> bool {
+    let me = me();
+    CPUS.lock().iter().enumerate().any(|(i, c)| i != me && c.tid.is_some())
 }
 
 /// Can more CPUs take threads of `p` now? Not while it waits to be alone
-/// (execve, its end), is stopped, or while other processes wait for the
-/// CPUs.
+/// (execve, its end), or is stopped.
 pub fn runs_here(p: &Process) -> bool {
     !p.exclusive_wanted && p.exit_status.is_none() && !p.stopped
 }
 
-/// Make the other CPUs running threads come into the kernel and schedule
-/// (they then park if `p` wants to be alone, or has ended).
-pub fn kick_others() {
+/// Make the other CPUs running threads of `pid` come into the kernel and
+/// schedule (they then leave it if it wants to be alone, has ended or has
+/// stopped).
+pub fn kick_others(pid: u32) {
     let me = me();
     let mut cpus = CPUS.lock();
     for (i, c) in cpus.iter_mut().enumerate() {
-        if i != me && c.tid.is_some() {
+        if i != me && c.pid == Some(pid) {
             c.resched = true;
             kick(i);
         }

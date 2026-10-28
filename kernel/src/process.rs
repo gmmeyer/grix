@@ -512,6 +512,9 @@ impl Process {
         if self.exit_status.is_none() {
             self.exit_status = Some(status);
             crate::procs::DYING.store(true, Ordering::Relaxed);
+            // Its threads running on other CPUs stop now (it may not be
+            // the running process: a signal from the host, a timer).
+            crate::smp::kick_others(self.pid);
         }
     }
 

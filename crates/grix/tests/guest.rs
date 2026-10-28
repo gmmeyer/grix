@@ -664,6 +664,28 @@ fn signals_from_the_host() {
 }
 
 #[test]
+fn killed_from_the_host_while_running_elsewhere() {
+    // A busy child the host's SIGINT kills (its parent ignores it), on
+    // whichever CPU it runs: it ends at once, and its parent hears of it.
+    for cpus in [1, 4] {
+        let control = RunControl::new();
+        let sb = hostsig().cpus(cpus).timeout(Duration::from_secs(30)).control(&control).build().unwrap();
+        let c = control.clone();
+        let mut sent = false;
+        let out = sb
+            .run_streaming(&["/bin/hostsig", "busy"], |_, data| {
+                if !sent && String::from_utf8_lossy(data).contains("ready") {
+                    sent = c.signal(2);
+                }
+            })
+            .unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{cpus} CPUs: {}{}", out.stdout_str(), out.kernel_log);
+        assert_eq!(out.stdout_str(), "ready\nchild ended by signal 2\n");
+        assert!(out.duration < Duration::from_secs(10), "{cpus} CPUs: {:?}", out.duration);
+    }
+}
+
+#[test]
 fn stopped_and_continued_from_the_host() {
     // SIGTSTP from the host stops the program's process group (a shell and
     // the sleep it waits for) until SIGCONT; the host hears of both.
@@ -1463,6 +1485,21 @@ fn vdso() {
     assert_eq!(out.stdout_str(), "vdso ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn processes_in_parallel() {
+    // With four CPUs, three busy processes run at once (their CPU time is
+    // nearly three times the wall time); with one, they take turns.
+    let ratio = |cpus: u32| {
+        let out = run(with("parallel").allow(Capability::Process).cpus(cpus), &["/bin/parallel", "3"]);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.kernel_log);
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        out.stdout_str().trim().parse::<f64>().unwrap()
+    };
+    let (four, one) = (ratio(4), ratio(1));
+    assert!(four > 2.0, "4 CPUs: {four}");
+    assert!(one < 1.2, "1 CPU: {one}");
 }
 
 #[test]
