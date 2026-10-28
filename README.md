@@ -468,7 +468,8 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   layout), `docker-archive:FILE` (`docker save` output), `docker:NAME`,
   `dir:DIR`, or `image:FILE` (another grix image: its files and settings,
   to build on). Layers (tar, gzip or zstd) are applied with their
-  whiteouts, every blob is checked against its digest, and the image's
+  whiteouts (without setuid and setgid bits, which nothing in the sandbox
+  honours), every blob is checked against its digest, and the image's
   entrypoint, command, environment and working directory become the grix
   image's, and so does its user (root unless it names one, as in Docker).
   A command that's a bare name is looked up on the image's `PATH`. `grix

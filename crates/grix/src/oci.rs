@@ -42,6 +42,17 @@ pub(crate) struct Totals {
     files: usize,
 }
 
+impl Totals {
+    /// Count `bytes` more of the image; None past MAX_BYTES.
+    fn charge(&mut self, bytes: u64) -> Option<()> {
+        self.bytes = self.bytes.checked_add(bytes).filter(|&b| b <= MAX_BYTES)?;
+        Some(())
+    }
+}
+
+/// Linux's PATH_MAX: no layer entry's name is longer.
+const MAX_PATH: usize = 4096;
+
 /// What a Docker/OCI image says to run, and how.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OciConfig {
@@ -300,7 +311,7 @@ impl Layout {
         fetch(config_digest, manifest["config"]["size"].as_u64())?;
         let config = parse_config(&self.json(config_digest)?)?;
         // The layers, applied before: nothing to fetch or unpack.
-        let key = treecache::key("applied-layers-v1", &[digest.as_bytes()]);
+        let key = treecache::key("applied-layers-v2", &[digest.as_bytes()]);
         if let Some(files) = treecache::get(&key) {
             return Ok(Pulled { files, config, digest });
         }
@@ -370,10 +381,16 @@ fn parse_config(data: &[u8]) -> Result<OciConfig> {
 
 // ---------------------------------------------------------------- docker save
 
+/// The most a `docker save` archive may unpack to (its layers can add up to
+/// more than the image they make, but not without bound: a sparse entry
+/// says how big it is, whatever the archive holds).
+const MAX_ARCHIVE: u64 = 2 * MAX_BYTES;
+
 fn load_archive(tar_path: &Path) -> Result<Pulled> {
     let tmp = tempdir("archive")?;
     let mut ar = tar::Archive::new(File::open(tar_path).with_context(|| format!("opening {}", tar_path.display()))?);
     // Plain names only: it's extracted to read it, not trusted.
+    let mut left = MAX_ARCHIVE;
     for entry in ar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -383,7 +400,11 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
         if entry.header().entry_type().is_file() {
             let dest = tmp.path.join(&path);
             fs::create_dir_all(dest.parent().unwrap())?;
-            std::io::copy(&mut entry, &mut File::create(&dest)?)?;
+            let n = std::io::copy(&mut (&mut entry).take(left + 1), &mut File::create(&dest)?)?;
+            if n > left {
+                bail!("{} unpacks to more than {} GiB", tar_path.display(), MAX_ARCHIVE >> 30);
+            }
+            left -= n;
         }
     }
     // Newer Docker saves an OCI layout.
@@ -410,13 +431,8 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
         .unwrap_or_default();
     let (mut files, mut totals) = (BTreeMap::new(), Totals::default());
     for (i, layer) in m["Layers"].as_array().context("manifest.json without layers")?.iter().enumerate() {
-        let mut blob = Hashing::new(File::open(plain(layer)?)?);
-        let compressed = apply_layer(&mut files, &mut blob, &mut totals)?;
-        let hash = blob.finish()?;
-        if let Some(d) = diff_ids.get(i)
-            && !compressed
-            && hash != check_digest(d)?
-        {
+        let d = diff_ids.get(i).with_context(|| format!("the config doesn't give layer {}'s digest", i + 1))?;
+        if apply_layer(&mut files, &mut File::open(plain(layer)?)?, &mut totals)? != check_digest(d)? {
             bail!("layer {} doesn't match its digest", i + 1);
         }
     }
@@ -427,12 +443,14 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
 
 /// Apply one layer (a tar: plain, gzipped or zstd-compressed) to `files`:
 /// OCI whiteouts (`.wh.NAME`, `.wh..wh..opq`) remove what lower layers
-/// had. Returns whether it was compressed.
+/// had. Everything kept counts against `MAX_BYTES`: files' bytes (a hard
+/// link's copy too), names and link targets. Returns the digest of the
+/// tar itself, uncompressed (what a config's `diff_ids` list).
 pub(crate) fn apply_layer(
     files: &mut BTreeMap<String, Node>,
     data: &mut dyn Read,
     totals: &mut Totals,
-) -> Result<bool> {
+) -> Result<String> {
     let mut r = BufReader::new(data);
     let head = r.fill_buf()?;
     let (gzipped, zstd) = (head.starts_with(&[0x1f, 0x8b]), head.starts_with(&ZSTD_MAGIC));
@@ -444,7 +462,8 @@ pub(crate) fn apply_layer(
         Box::new(r)
     };
     // However it's packed, no more than an image may hold comes out.
-    let mut ar = tar::Archive::new(reader.take(MAX_BYTES + (64 << 20)));
+    let mut ar = tar::Archive::new(Hashing::new(reader.take(MAX_BYTES + (64 << 20))));
+    let too_big = || anyhow::anyhow!("the image is bigger than grix can run ({} GiB)", MAX_BYTES >> 30);
     // What this layer added: an opaque marker hides only lower layers.
     let mut added = std::collections::HashSet::new();
     for entry in ar.entries()? {
@@ -453,6 +472,9 @@ pub(crate) fn apply_layer(
         let rel = raw.trim_start_matches("./").trim_end_matches('/');
         if rel.is_empty() || rel == "." {
             continue;
+        }
+        if rel.len() > MAX_PATH {
+            bail!("a layer entry's name is longer than a path may be ({} bytes)", rel.len());
         }
         let Ok(path) = image::guest_path(&format!("/{rel}")) else {
             // /dev, /proc and /sys are the kernel's; `..` is refused.
@@ -481,16 +503,15 @@ pub(crate) fn apply_layer(
             continue;
         }
         let header = entry.header();
-        let mode = header.mode().unwrap_or(0o644) & 0o7777;
+        // Not setuid or setgid: nothing in the sandbox honours them, and
+        // nothing that leaves it should carry them.
+        let mode = header.mode().unwrap_or(0o644) & 0o1777;
         let mtime_ns = header.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
         let node = match header.entry_type() {
             tar::EntryType::Directory => Node::Dir { mode, mtime_ns },
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 let size = header.size()?;
-                if totals.bytes.saturating_add(size) > MAX_BYTES {
-                    bail!("the image is bigger than grix can run ({} GiB)", MAX_BYTES >> 30);
-                }
-                totals.bytes += size;
+                totals.charge(size).ok_or_else(too_big)?;
                 let mut data = Vec::with_capacity(size.min(1 << 20) as usize);
                 (&mut entry).take(size).read_to_end(&mut data)?;
                 Node::File { data, mode, mtime_ns }
@@ -505,7 +526,10 @@ pub(crate) fn apply_layer(
                 let target = entry.link_name()?.context("link without a target")?.to_string_lossy().into_owned();
                 let target = format!("/{}", target.trim_start_matches("./").trim_start_matches('/'));
                 match files.get(&target) {
-                    Some(n @ Node::File { .. }) => n.clone(),
+                    Some(n @ Node::File { data, .. }) => {
+                        totals.charge(data.len() as u64).ok_or_else(too_big)?;
+                        n.clone()
+                    }
                     _ => continue,
                 }
             }
@@ -522,10 +546,13 @@ pub(crate) fn apply_layer(
         if totals.files > MAX_FILES {
             bail!("the image has more than {MAX_FILES} entries");
         }
+        let target = if let Node::Symlink { target, .. } = &node { target.len() } else { 0 };
+        totals.charge((path.len() + target) as u64).ok_or_else(too_big)?;
         added.insert(path.clone());
         files.insert(path, node);
     }
-    Ok(gzipped || zstd)
+    // The whole tar's, what follows its end too.
+    ar.into_inner().finish()
 }
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -1102,30 +1129,93 @@ mod tests {
 
     #[test]
     fn docker_save_archives() {
-        // The classic `docker save` layout: manifest.json, a config, layer tars.
-        let config =
-            br#"{"architecture":"arm64","os":"linux","config":{"Env":["A=1"],"Cmd":["/bin/x"],"WorkingDir":"/w"}}"#;
-        let manifest = br#"[{"Config":"cfg.json","RepoTags":["t:1"],"Layers":["l1/layer.tar"]}]"#;
-        let mut b = tar::Builder::new(Vec::new());
-        for (name, data) in [
-            ("manifest.json", &manifest[..]),
-            ("cfg.json", &config[..]),
-            ("l1/layer.tar", &layer(&[("w/", None), ("w/f", Some("hi"))])[..]),
-        ] {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o644);
-            b.append_data(&mut h, name, data).unwrap();
-        }
+        // The classic `docker save` layout: manifest.json, a config, layer
+        // tars, which may be compressed; the config lists the digests of
+        // the layers uncompressed.
+        let tar = layer(&[("w/", None), ("w/f", Some("hi"))]);
+        let gzipped = {
+            let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            z.write_all(&tar).unwrap();
+            z.finish().unwrap()
+        };
         let dir = tempdir("test").unwrap();
-        let path = dir.path.join("image.tar");
-        fs::write(&path, b.into_inner().unwrap()).unwrap();
-        let p = load_archive(&path).unwrap();
-        assert_eq!(p.config.cmd, ["/bin/x"]);
-        assert_eq!((p.config.env, p.config.cwd.as_deref()), (vec!["A=1".to_string()], Some("/w")));
-        assert!(matches!(p.files.get("/w/f"), Some(Node::File { data, .. }) if data == b"hi"));
+        let archive = |layer: &[u8], diff_ids: &str| {
+            let config = format!(
+                r#"{{"architecture":"arm64","os":"linux","config":{{"Env":["A=1"],"Cmd":["/bin/x"],"WorkingDir":"/w"}},"rootfs":{{"type":"layers","diff_ids":[{diff_ids}]}}}}"#
+            );
+            let manifest = br#"[{"Config":"cfg.json","RepoTags":["t:1"],"Layers":["l1/layer.tar"]}]"#;
+            let mut b = tar::Builder::new(Vec::new());
+            for (name, data) in
+                [("manifest.json", &manifest[..]), ("cfg.json", config.as_bytes()), ("l1/layer.tar", layer)]
+            {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                b.append_data(&mut h, name, data).unwrap();
+            }
+            let path = dir.path.join("image.tar");
+            fs::write(&path, b.into_inner().unwrap()).unwrap();
+            load_archive(&path)
+        };
+        let good = format!("\"sha256:{}\"", sha256(&tar));
+        for packed in [&tar, &gzipped] {
+            let p = archive(packed, &good).unwrap();
+            assert_eq!(p.config.cmd, ["/bin/x"]);
+            assert_eq!((p.config.env, p.config.cwd.as_deref()), (vec!["A=1".to_string()], Some("/w")));
+            assert!(matches!(p.files.get("/w/f"), Some(Node::File { data, .. }) if data == b"hi"));
+            // A layer that isn't the one the config lists, compressed or
+            // not, or no digest for it: refused.
+            let wrong = format!("\"sha256:{}\"", "0".repeat(64));
+            let err = archive(packed, &wrong).err().unwrap();
+            assert!(err.to_string().contains("doesn't match its digest"), "{err:#}");
+            assert!(archive(packed, "").is_err());
+        }
         // Not for arm64: refused.
         assert!(parse_config(br#"{"architecture":"amd64"}"#).is_err());
+    }
+
+    /// Hard links' copies, names and link targets all count against the
+    /// image's size, and modes lose setuid and setgid.
+    #[test]
+    fn layers_count_everything_they_keep() {
+        let mut b = tar::Builder::new(Vec::new());
+        let file = |b: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            b.append_data(&mut h, path, data).unwrap();
+        };
+        file(&mut b, "big", 0o4755, &[7; 1000]);
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_size(0);
+        h.set_mode(0o1777);
+        b.append_data(&mut h, "tmp/", &[][..]).unwrap();
+        for i in 0..3 {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Link);
+            h.set_size(0);
+            b.append_link(&mut h, format!("copy{i}"), "big").unwrap();
+        }
+        let tar = b.into_inner().unwrap();
+        let mut files = BTreeMap::new();
+        let mut totals = Totals::default();
+        apply_layer(&mut files, &mut &tar[..], &mut totals).unwrap();
+        assert!(matches!(files.get("/big"), Some(Node::File { mode: 0o755, .. })));
+        assert!(matches!(files.get("/tmp"), Some(Node::Dir { mode: 0o1777, .. })));
+        assert!(matches!(files.get("/copy2"), Some(Node::File { data, .. }) if data.len() == 1000));
+        let names: u64 = files.keys().map(|k| k.len() as u64).sum();
+        assert_eq!(totals.bytes, 4 * 1000 + names);
+        // With less room than the copies take: refused, not kept.
+        let mut nearly = Totals { bytes: MAX_BYTES - 2500, files: 0 };
+        let err = apply_layer(&mut BTreeMap::new(), &mut &tar[..], &mut nearly).unwrap_err();
+        assert!(err.to_string().contains("bigger than grix can run"), "{err:#}");
+        // A name no path could have.
+        let mut b = tar::Builder::new(Vec::new());
+        file(&mut b, &"d/".repeat(3000), 0o644, b"x");
+        let err = apply_layer(&mut BTreeMap::new(), &mut &b.into_inner().unwrap()[..], &mut Totals::default());
+        assert!(err.unwrap_err().to_string().contains("longer than a path"));
     }
 
     fn zstd(data: &[u8]) -> Vec<u8> {
@@ -1142,8 +1232,8 @@ mod tests {
         split.extend_from_slice(&zstd(&tar[5000..]));
         for packed in [zstd(&tar), split] {
             let mut files = BTreeMap::new();
-            let compressed = apply_layer(&mut files, &mut &packed[..], &mut Totals::default()).unwrap();
-            assert!(compressed);
+            let diff_id = apply_layer(&mut files, &mut &packed[..], &mut Totals::default()).unwrap();
+            assert_eq!(diff_id, sha256(&tar), "the uncompressed tar's digest");
             assert!(matches!(files.get("/etc/a"), Some(Node::File { data, .. }) if data.len() == 100_000));
             assert!(matches!(files.get("/etc/b"), Some(Node::File { data, .. }) if data == b"b"));
         }
