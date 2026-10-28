@@ -44,6 +44,16 @@ make check       # clippy for host and kernel
   shows status, output and events together. A kernel panic message ends up in
   `RunOutput::kernel_log`.
 
+## Releases
+
+Every commit to `main` is a release, numbered 0.0.1, 0.0.2, ...: bump the
+version in the commit itself (`tools/bump-version.sh`: the workspace,
+the kernel and the Python package, and the lock files) and push each
+commit on its own. `.github/workflows/release.yml` builds the kernel and
+grix and grix-vmm for arm64 macOS and Linux, runs the unit tests and a
+smoke test, and publishes `v<version>` with the archives; a version
+already released isn't released again.
+
 ## Architecture in one paragraph
 
 The host (`crates/grix`) turns imports, argv/env and a capability `Policy`

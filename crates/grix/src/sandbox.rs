@@ -218,6 +218,20 @@ pub(crate) fn default_vmm() -> Option<PathBuf> {
     beside.into_iter().chain([built]).find(|p| p.is_file())
 }
 
+/// The grix kernel: `GRIX_KERNEL`, beside the running program (as a
+/// release unpacks), or this source tree's build.
+fn default_kernel() -> PathBuf {
+    if let Some(k) = std::env::var_os("GRIX_KERNEL") {
+        return k.into();
+    }
+    let built = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"
+    ));
+    let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("grix-kernel")));
+    beside.filter(|p| p.is_file()).unwrap_or(built)
+}
+
 /// How [`SandboxBuilder::mount_with`] mounts a host directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,13 +299,7 @@ impl Default for SandboxBuilder {
             grace: DEFAULT_GRACE,
             uid: 1000,
             gid: 1000,
-            kernel: env_path(
-                "GRIX_KERNEL",
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"
-                ),
-            ),
+            kernel: default_kernel(),
             qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
             accel: std::env::var("GRIX_ACCEL").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| default_accel().into()),
             vmm: default_vmm(),

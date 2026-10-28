@@ -30,6 +30,12 @@ grix: missing /etc/passwd: not imported
 
 ## Quick start
 
+Every commit to `main` is a release
+([releases](https://github.com/gmmeyer/grix/releases)): `grix`, `grix-vmm`
+and the grix kernel for arm64 macOS (15+) and arm64 Linux (static).
+Unpack one and run `./grix`; it finds the kernel and `grix-vmm` beside
+itself. To build it yourself:
+
 Requirements: macOS 15+ on Apple silicon or arm64 Linux with KVM (grix's own
 VMM), or QEMU (`qemu-system-aarch64`) on anything else; Rust (stable);
 [zig](https://ziglang.org) to build the C test programs, and Go to build the

@@ -1,0 +1,160 @@
+# Every push to main builds grix and, if its version (Cargo.toml's
+# workspace version, bumped with every commit by tools/bump-version.sh)
+# hasn't been released yet, releases it as v<version>: the kernel, and grix
+# and grix-vmm for arm64 macOS and arm64 Linux (static).
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          command -v rustup || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install stable --profile minimal
+          "$HOME/.cargo/bin/rustup" target add aarch64-unknown-none-softfloat
+      - name: Build the kernel
+        run: cd kernel && cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
+          if-no-files-found: error
+
+  linux-arm64:
+    needs: kernel
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: kernel-out
+      # The Dockerfile's build stage: static grix and grix-vmm (musl).
+      - name: Build grix and grix-vmm
+        run: |
+          docker build --platform linux/arm64 --target build -t grix-build .
+          id=$(docker create grix-build)
+          docker cp "$id:/out/bin" out-bin
+          docker rm "$id"
+          file out-bin/grix out-bin/grix-vmm
+      - name: Unit tests
+        run: |
+          command -v rustup || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install stable --profile minimal
+          cargo test -p grix --lib
+      # A static program, booted in the kernel just built (QEMU here: the
+      # runners may not have KVM).
+      - name: Smoke test
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q qemu-system-arm
+          printf '#include <stdio.h>\nint main(int c, char **v) { printf("hello from %%s\\n", v[1]); return 7; }\n' > hello.c
+          gcc -static -O2 -o hello hello.c
+          cp kernel-out/grix-kernel out-bin/
+          set +e
+          out=$(GRIX_ACCEL=tcg ./out-bin/grix run --timeout 120 -i ./hello:/bin/hello -- /bin/hello grix)
+          code=$?
+          set -e
+          echo "$out (exit $code)"
+          [ "$out" = "hello from grix" ] && [ "$code" = 7 ]
+          ./out-bin/grix --version
+      - name: Package
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          d=grix-$v-linux-arm64
+          mkdir "$d"
+          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: grix-*-linux-arm64.tar.gz
+          if-no-files-found: error
+
+  macos-arm64:
+    needs: kernel
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: kernel-out
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Build grix and grix-vmm
+        run: |
+          cargo build --release -p grix -p grix-vmm
+          # Hypervisor.framework runs only programs with its entitlement; an
+          # ad-hoc signature carries it.
+          codesign --sign - --entitlements crates/vmm/entitlements.plist --force target/release/grix-vmm
+      - name: Unit tests
+        run: cargo test -p grix --lib
+      - name: Package
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          d=grix-$v-macos-arm64
+          mkdir "$d"
+          cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          ./target/release/grix --version
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: grix-*-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [linux-arm64, macos-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if gh release view "v$v" >/dev/null 2>&1; then
+            echo "v$v is already released: bump the version (tools/bump-version.sh) to release this commit"
+            exit 0
+          fi
+          prev=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          {
+            echo "grix $v, built from $(git rev-parse --short HEAD)."
+            echo
+            if [ -n "$prev" ]; then
+              echo "Since $prev:"
+              git log --format='- %s' "$prev..HEAD"
+            else
+              git log -1 --format='- %s'
+            fi
+            echo
+            echo "Each archive has grix, grix-vmm and the grix kernel (grix finds it beside itself)."
+            echo "macOS: arm64, macOS 15+; if it came through a browser, \`xattr -d com.apple.quarantine grix grix-vmm\`."
+            echo "Linux: arm64, static; grix-vmm needs /dev/kvm (otherwise grix uses QEMU)."
+          } > notes.md
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          gh release create "v$v" dist/*.tar.gz dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --title "grix $v" --notes-file notes.md

@@ -12,7 +12,7 @@ use grix::{
 };
 
 #[derive(Parser)]
-#[command(name = "grix", about = "Run Linux programs in a capability-scoped unikernel")]
+#[command(name = "grix", version, about = "Run Linux programs in a capability-scoped unikernel")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
