@@ -71,6 +71,9 @@ pub enum Input {
     Fs = 4,
     /// A signal for the program's process group: one byte, 1-64.
     Signal = 5,
+    /// TTY mode: the host's terminal changed size. Rows then columns, u16
+    /// little-endian each.
+    Resize = 6,
 }
 
 impl Input {
@@ -81,6 +84,7 @@ impl Input {
             3 => Some(Self::Link),
             4 => Some(Self::Fs),
             5 => Some(Self::Signal),
+            6 => Some(Self::Resize),
             _ => None,
         }
     }
@@ -344,6 +348,10 @@ pub enum Event<'a> {
     Fault { signal: u32, addr: u64, pc: u64, detail: &'a str },
     /// The initial exec failed (missing binary, bad ELF, ...).
     ExecFailed { path: &'a str, reason: &'a str },
+    /// The program (init) stopped: a stop signal's default action.
+    Stopped { signal: u32 },
+    /// The program continued (SIGCONT) after stopping.
+    Continued,
 }
 
 impl<'a> Event<'a> {
@@ -379,6 +387,11 @@ impl<'a> Event<'a> {
                 w.str(path);
                 w.str(reason);
             }
+            Event::Stopped { signal } => {
+                w.u8(5);
+                w.u32(signal);
+            }
+            Event::Continued => w.u8(6),
         }
         w.buf
     }
@@ -391,6 +404,8 @@ impl<'a> Event<'a> {
             2 => Event::MissingPath { path: r.str()? },
             3 => Event::Fault { signal: r.u32()?, addr: r.u64()?, pc: r.u64()?, detail: r.str()? },
             4 => Event::ExecFailed { path: r.str()?, reason: r.str()? },
+            5 => Event::Stopped { signal: r.u32()? },
+            6 => Event::Continued,
             _ => return Err(DecodeError),
         };
         Ok(ev)
@@ -471,6 +486,8 @@ mod tests {
             Event::MissingPath { path: "/etc/passwd" },
             Event::Fault { signal: 11, addr: 8, pc: 0x1000, detail: "write" },
             Event::ExecFailed { path: "/bin/x", reason: "not found" },
+            Event::Stopped { signal: 20 },
+            Event::Continued,
         ];
         for e in evs {
             assert_eq!(Event::decode(&e.encode()).unwrap(), e);

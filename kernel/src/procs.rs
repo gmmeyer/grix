@@ -11,7 +11,7 @@ use spin::Mutex;
 
 use crate::fd::FdTable;
 use crate::process::{INIT, Process};
-use crate::signal::{self, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SigInfo, Target};
+use crate::signal::{self, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SigInfo, Target};
 
 /// Processes, zombies included, that may exist at once. Each holds page
 /// tables and kernel memory, so a fork bomb gets EAGAIN instead.
@@ -81,6 +81,12 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.cwd_pin = None;
     dead.dead = true;
     let (pid, ppid) = (dead.pid, dead.ppid);
+    // A session leader's end hangs up its terminal's foreground group.
+    if let Some(tty) = dead.ctty.take()
+        && dead.sid == pid
+    {
+        crate::tty::disassociate(cur.as_deref_mut(), procs, &tty, pid, true);
+    }
     for q in procs.others.values_mut().chain(cur.as_deref_mut()) {
         if q.ppid == pid {
             q.ppid = INIT;
@@ -115,8 +121,22 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
 }
 
 /// Finish off processes other than the running one that were killed (by a
-/// signal from it, or a timer). Their address spaces go too.
+/// signal from it, or a timer). Their address spaces go too. And tell the
+/// parents of processes that stopped or continued.
 pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
+    crate::tty::service(cur, procs);
+    if signal::JOBS.swap(false, Ordering::Relaxed) {
+        let notices: Vec<(u32, SigInfo)> =
+            procs.all(cur).filter_map(|q| Some((q.ppid, q.job_notice.take()?))).collect();
+        for (ppid, info) in notices {
+            let parent = if cur.pid == ppid { Some(&mut *cur) } else { procs.others.get_mut(&ppid) };
+            if let Some(parent) = parent
+                && parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDSTOP == 0
+            {
+                let _ = signal::send(parent, Target::Process, info);
+            }
+        }
+    }
     while DYING.swap(false, Ordering::Relaxed) {
         let dying: Vec<u32> =
             procs.others.iter().filter(|(_, q)| q.exit_status.is_some()).map(|(&pid, _)| pid).collect();

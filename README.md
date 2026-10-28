@@ -47,6 +47,10 @@ make test       # unit tests + end-to-end tests that boot the kernel
 # stdin is passed through when it isn't a terminal (--no-stdin turns that off).
 echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox wc -w
 
+# Interactive, as `docker run -t`: the program gets a terminal (/dev/pts/0),
+# with job control, Ctrl-C and Ctrl-Z.
+./target/release/grix run -t -a process -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -i
+
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox cp /etc/passwd /out/
@@ -140,6 +144,35 @@ let out = sandbox.run(&["/bin/server"])?;
   own process group, so a terminal's Ctrl-C is the program's alone). The
   third Ctrl-C stops the sandbox. `--grace SECS` and the manifest's
   `grace_secs` set the grace period.
+- Job control works as on Linux: SIGTSTP (or SIGSTOP, SIGTTIN, SIGTTOU)
+  stops a process and SIGCONT continues it, `wait` reports both
+  (`WUNTRACED`, `WCONTINUED`), and the parent gets SIGCHLD. From the host,
+  `c.signal(20)` stops the program's process group and `c.signal(18)`
+  continues it; `GuestEvent::Stopped` and `Continued` say when the program
+  did. `RunControl::on_event` sees events as they happen.
+
+### Terminals
+
+`SandboxBuilder::tty(rows, cols)` (`grix run -t`) is TTY mode, as with
+`docker run -t`: the program's stdin, stdout and stderr are a terminal,
+`/dev/pts/0`, its controlling terminal. What the host sends as stdin is
+what's typed: Ctrl-C, Ctrl-Z and the rest are bytes the terminal turns into
+signals for its foreground process group, and a shell's line editing,
+echo and job control work. stdout is what the terminal shows (CR LF line
+ends, echo); there's no separate stderr. `RunControl::resize` changes the
+size (the foreground group gets SIGWINCH), and the CLI follows its own
+terminal's. When the host's stdin ends, a program reading a line gets
+end-of-file, as with util-linux's `script`. In the CLI, a program that
+stops itself (Ctrl-Z with nothing to catch it, or vim's suspend) stops
+grix too, until `fg`. Snapshots don't take TTY mode yet.
+
+Programs can make their own terminals too: `/dev/ptmx` and `/dev/pts/N`
+(`posix_openpt`, `openpty`, Python's `pty`), with Linux's line discipline
+(canonical mode with erase, kill, word erase and literal next, echo,
+`VMIN`/`VTIME`, output processing, `IXON`), termios and window sizes,
+controlling terminals and `/dev/tty`, foreground process groups, SIGTTIN
+and SIGTTOU for background jobs, and SIGHUP when the master closes. At
+most 64 exist at once.
 
 ### Working on a host directory
 
@@ -544,22 +577,23 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 
 | Works today | Not yet |
 |---|---|
-| Static, static-PIE and dynamic executables, musl and glibc (Debian's bash, coreutils, perl, apt, git, curl; the official `python` and `node` images) | Terminals: `posix_openpt`, a TTY for the program |
+| Static, static-PIE and dynamic executables, musl and glibc (Debian's bash, coreutils, perl, apt, git, curl; the official `python` and `node` images) | |
+| Terminals: pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`, Python's `pty`), termios, controlling terminals and `/dev/tty`, TTY mode (`grix run -t`, `tty`) with an interactive shell's job control | Packet mode (`TIOCPKT`), `TIOCSTI`; `VMIN` and `VTIME` together return at the first byte; orphaned process groups aren't treated specially |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | UDP other than DNS, raw sockets, ICMP (`ping`) |
 | With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `pidfd_*`; `/proc/<pid>` for other processes |
-| With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec` | Job control (stopping and continuing) |
+| With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec`. Job control: stopping and continuing, `WUNTRACED`/`WCONTINUED`, `CLD_STOPPED` | |
 | Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
-| Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | Job control signals from the host (SIGTSTP/SIGCONT) |
-| Signals from the host: `RunControl::signal` and the CLI's Ctrl-C reach the program's process group; a timeout sends SIGTERM and a grace period first, so exports still come back | |
+| Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | |
+| Signals from the host: `RunControl::signal` and the CLI's Ctrl-C reach the program's process group (SIGTSTP and SIGCONT stop and continue it); a timeout sends SIGTERM and a grace period first, so exports still come back | |
 | `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | |
 | Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`) | inotify events for host changes |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files. Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` file mappings (reported); `inotify` events; xattrs |
-| `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging) | Multiple vCPUs (threads share one) |
-| Clocks (including per-thread and per-process CPU time), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | x86_64 guests |
-| Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | Linux/KVM hosts are untested |
+| `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging); more CPUs (`--cpus`): a process's threads run in parallel | Several processes in parallel (they take turns) |
+| Clocks (including per-thread and per-process CPU time), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | A native x86_64 kernel (x86_64 programs run through a translator, `--x86-64`) |
+| Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | x86 hosts |
 
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
 and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);

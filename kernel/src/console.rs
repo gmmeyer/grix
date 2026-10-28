@@ -94,11 +94,20 @@ struct Console {
     deferred: Vec<Vec<u8>>,
     /// Signals from the host, for the scheduler to deliver.
     signals: Vec<u32>,
+    /// TTY mode: the host's terminal's new size (rows, columns).
+    resize: Option<(u16, u16)>,
 }
 
 /// Signals queued from the host at most (more are dropped, as a pending
 /// standard signal would merge anyway).
 const MAX_HOST_SIGNALS: usize = 32;
+
+/// TTY mode: the terminal size the host last sent, if it sent one since
+/// last asked.
+pub fn take_resize() -> Option<(u16, u16)> {
+    let mut guard = CONSOLE.lock();
+    guard.as_mut().and_then(|c| c.resize.take())
+}
 
 /// The signals the host sent since last asked.
 pub fn take_host_signals() -> Vec<u32> {
@@ -120,6 +129,7 @@ pub fn init_virtio() {
         fs_reply: None,
         deferred: Vec::new(),
         signals: Vec::new(),
+        resize: None,
     });
 }
 
@@ -251,7 +261,7 @@ pub fn interrupt(id: u32) -> bool {
 /// out, for `dispatch` once the console lock is released (handling them may
 /// send replies).
 fn drain(c: &mut Console) -> Vec<Vec<u8>> {
-    let Console { dev, stdin, fs, fs_reply, deferred, signals, .. } = c;
+    let Console { dev, stdin, fs, fs_reply, deferred, signals, resize, .. } = c;
     let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
     let mut link = core::mem::take(deferred);
@@ -261,6 +271,10 @@ fn drain(c: &mut Console) -> Vec<Vec<u8>> {
                 Some((Input::Link, msg)) => link.push(msg.to_vec()),
                 Some((Input::Signal, &[sig])) if (1..=64).contains(&sig) && signals.len() < MAX_HOST_SIGNALS => {
                     signals.push(sig as u32);
+                }
+                Some((Input::Resize, &[a, b, c, d])) => {
+                    *resize = Some((u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])));
+                    changed = true;
                 }
                 // Garbled answers are dropped; the request then gets none.
                 Some((Input::Fs, msg)) => {

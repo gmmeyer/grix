@@ -15,6 +15,11 @@ pub enum GuestEvent {
     Fault { signal: u32, addr: u64, pc: u64, detail: String },
     /// The program could not be started.
     ExecFailed { path: String, reason: String },
+    /// The program stopped (job control: a stop signal's default action),
+    /// until SIGCONT.
+    Stopped { signal: u32 },
+    /// The program continued after stopping.
+    Continued,
 }
 
 impl From<Event<'_>> for GuestEvent {
@@ -29,6 +34,8 @@ impl From<Event<'_>> for GuestEvent {
             Event::MissingPath { path } => GuestEvent::MissingPath { path: path.into() },
             Event::Fault { signal, addr, pc, detail } => GuestEvent::Fault { signal, addr, pc, detail: detail.into() },
             Event::ExecFailed { path, reason } => GuestEvent::ExecFailed { path: path.into(), reason: reason.into() },
+            Event::Stopped { signal } => GuestEvent::Stopped { signal },
+            Event::Continued => GuestEvent::Continued,
         }
     }
 }
@@ -73,6 +80,8 @@ impl fmt::Display for GuestEvent {
                 Ok(())
             }
             GuestEvent::ExecFailed { path, reason } => write!(f, "could not start {path}: {reason}"),
+            GuestEvent::Stopped { signal } => write!(f, "stopped by signal {signal} (until SIGCONT)"),
+            GuestEvent::Continued => write!(f, "continued"),
         }
     }
 }

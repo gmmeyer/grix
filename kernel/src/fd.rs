@@ -22,6 +22,9 @@ pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_CLOEXEC: u32 = 0o2000000;
+/// O_CREAT | O_EXCL | O_TRUNC: open's, not the file's.
+pub const O_CREAT_EXCL_TRUNC: u32 = 0o100 | 0o200 | 0o1000;
 
 pub enum FileKind {
     /// Not connected to anything yet: reads return EOF.
@@ -48,6 +51,8 @@ pub enum FileKind {
     SignalFd(u64),
     /// An AF_INET/AF_INET6 socket (inet.rs).
     Inet(crate::inet::Inet),
+    /// Either end of a pseudo-terminal, or the console's terminal (tty.rs).
+    Pty(crate::tty::PtyEnd),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -97,6 +102,7 @@ impl FileKind {
             FileKind::SignalFd(_) => (0, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
+            FileKind::Pty(end) => end.tty.lock().poll(end.master),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).
             FileKind::Epoll(_) => (0, 0),
@@ -184,6 +190,12 @@ impl FdTable {
             t.slots.push(Some(FdEntry { file: new_file(kind, flags), cloexec: false }));
         }
         t
+    }
+
+    /// TTY mode: stdin, stdout and stderr are one open terminal.
+    pub fn with_terminal(file: FileRef) -> Self {
+        let slots = (0..3).map(|_| Some(FdEntry { file: file.clone(), cloexec: false })).collect();
+        FdTable { slots }
     }
 
     /// No descriptors at all (a process that has ended).

@@ -198,6 +198,27 @@ replaces the network policy and caps the limits. Nothing the host held is
 saved, and the host refuses mounts. Anything new that lives on the host
 side of a run needs the same treatment.
 
+Job control (`signal.rs` `stop`/`resume`): a stop signal's default action
+stops the whole process when it's sent (or delivered, if it was blocked):
+`Process::stopped`, and the scheduler passes it over (`sched::runnable`,
+`smp::runs_here`) with its threads where they were; SIGCONT, whatever its
+action, continues it. `job_report` is for wait's WUNTRACED/WCONTINUED;
+`job_notice` is the parent's SIGCHLD, sent from `procs::reap_others`
+(which can reach the parent). Init stopping is an `Event::Stopped`.
+
+Terminals (`tty.rs`, `syscall/tty.rs`): a `Tty` is a pseudo-terminal
+pair, its line discipline Linux's N_TTY (`receive` for what the master
+writes, `out` for OPOST). It doesn't touch processes: it returns the
+signals to send, and the caller sends them (`signal_group`). /dev/ptmx
+makes one (at most `MAX_PTYS`, each charged its buffers), /dev/pts/N is
+shown while the master is open (`Fs::pts_show`, the node kept for reuse),
+/dev/tty is `Process::ctty`. A closed master hangs up from
+`tty::service` (in `reap_others`). Background reads and writes stop the
+group (`job_control`) and re-run once it continues. In TTY mode
+(`Image::tty`) the program's stdio is /dev/pts/0, whose master side is the
+console: `tty::pump` moves host stdin in and output out, and
+`wire::Input::Resize` changes its size.
+
 Signals (`signal.rs`): actions are per process; masks, pending queues and
 sigaltstacks are per thread. `kill` picks a receiver like Linux (the main
 thread first, then any thread that doesn't block the signal) and queues it

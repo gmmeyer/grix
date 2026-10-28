@@ -39,6 +39,7 @@ mod snapshot;
 mod syscall;
 mod time;
 mod timer;
+mod tty;
 mod uaccess;
 mod virtio;
 

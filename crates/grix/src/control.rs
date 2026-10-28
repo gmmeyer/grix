@@ -24,7 +24,15 @@ use crate::net::Outbox;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Clone, Default)]
-pub struct RunControl(Arc<Mutex<Vec<Weak<Live>>>>);
+pub struct RunControl(Arc<Inner>);
+
+#[derive(Default)]
+struct Inner {
+    runs: Mutex<Vec<Weak<Live>>>,
+    on_event: Mutex<Option<EventHook>>,
+}
+
+type EventHook = Arc<dyn Fn(&crate::GuestEvent) + Send + Sync>;
 
 /// A run in progress, as its control sees it.
 pub(crate) struct Live {
@@ -44,7 +52,7 @@ impl RunControl {
     }
 
     fn live(&self) -> Vec<Arc<Live>> {
-        let mut runs = self.0.lock().unwrap();
+        let mut runs = self.0.runs.lock().unwrap();
         runs.retain(|w| w.strong_count() > 0);
         runs.iter().filter_map(Weak::upgrade).collect()
     }
@@ -67,6 +75,20 @@ impl RunControl {
         !runs.is_empty()
     }
 
+    /// TTY mode ([`SandboxBuilder::tty`](crate::SandboxBuilder::tty)): the
+    /// terminal is now `rows` by `cols`, and its foreground process group
+    /// gets SIGWINCH. False if no run is in progress.
+    pub fn resize(&self, rows: u16, cols: u16) -> bool {
+        let runs = self.live();
+        for run in &runs {
+            let mut f = wire::input_header(Input::Resize, 4).to_vec();
+            f.extend(rows.max(1).to_le_bytes());
+            f.extend(cols.max(1).to_le_bytes());
+            run.outbox.signal(f);
+        }
+        !runs.is_empty()
+    }
+
     /// End the runs in progress now, whatever the program is doing: their
     /// status is [`ExitStatus::Stopped`](crate::ExitStatus::Stopped), and
     /// exports don't come back. False if no run is in progress.
@@ -78,10 +100,24 @@ impl RunControl {
         !runs.is_empty()
     }
 
+    /// Call `f` with each event as the guest reports it during a run (they
+    /// are in [`RunOutput::events`](crate::RunOutput::events) too), on the
+    /// thread that reads the VM's output: it should return soon.
+    pub fn on_event(&self, f: impl Fn(&crate::GuestEvent) + Send + Sync + 'static) {
+        *self.0.on_event.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    pub(crate) fn event(&self, e: &crate::GuestEvent) {
+        let hook = self.0.on_event.lock().unwrap().clone();
+        if let Some(f) = hook {
+            f(e);
+        }
+    }
+
     /// A run starts: signals go through `outbox`.
     pub(crate) fn attach(&self, outbox: Arc<Outbox>) -> Arc<Live> {
         let live = Arc::new(Live { outbox, stop: AtomicBool::new(false) });
-        let mut runs = self.0.lock().unwrap();
+        let mut runs = self.0.runs.lock().unwrap();
         runs.retain(|w| w.strong_count() > 0);
         runs.push(Arc::downgrade(&live));
         live

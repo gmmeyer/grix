@@ -114,7 +114,7 @@ pub fn unlock() {
             c.timer_dirty = p.timer_dirty;
             // Idle CPUs for the threads waiting to run (not while another
             // process waits for the CPUs: they'd only decline).
-            if !p.runq.is_empty() && runs_here(p) && !crate::sched::others_wait(&crate::procs::PROCS.lock()) {
+            if crate::sched::runnable(p) && runs_here(p) && !crate::sched::others_wait(&crate::procs::PROCS.lock()) {
                 let mut want = p.runq.len();
                 for (i, other) in cpus.iter().enumerate() {
                     if want == 0 {
@@ -177,9 +177,10 @@ pub fn alone() -> bool {
 }
 
 /// Can more CPUs take threads of `p` now? Not while it waits to be alone
-/// (execve, its end) or while other processes wait for the CPUs.
+/// (execve, its end), is stopped, or while other processes wait for the
+/// CPUs.
 pub fn runs_here(p: &Process) -> bool {
-    !p.exclusive_wanted && p.exit_status.is_none()
+    !p.exclusive_wanted && p.exit_status.is_none() && !p.stopped
 }
 
 /// Make the other CPUs running threads come into the kernel and schedule

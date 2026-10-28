@@ -379,6 +379,19 @@ Next, in TODO.md order:
   probe of a file must fail with ENOTDIR. The test pulls
   `debian:bookworm-slim` once into `fixtures/build/oci/debian`.
 
+- **Interactive use** (round 2, item 10): job control (stop signals stop
+  the whole process, SIGCONT continues it, `WUNTRACED`/`WCONTINUED`,
+  `CLD_STOPPED`, from the host too), pseudo-terminals with Linux's line
+  discipline, controlling terminals and foreground groups, and TTY mode
+  (`grix run -t`, `SandboxBuilder::tty`): an interactive busybox shell
+  with ^Z, `jobs`, `fg` and ^C, through Python's `pty` and through the
+  host's terminal. Two older bugs came out on the way: musl passes
+  ioctl numbers sign-extended (the kernel takes an unsigned int), and
+  select and ppoll left the caller's sets as they were on a timeout
+  (Linux clears them; CPython reads the sets, so a timed-out select
+  looked ready): they now run once more when the deadline passes
+  (`Process::block_io_rerun`).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

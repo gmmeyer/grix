@@ -52,7 +52,10 @@ pub struct ImageConfig {
 /// The uid and gid `spec` (`user[:group]`, numbers or names) names in
 /// `files`' /etc/passwd and /etc/group, as Docker resolves `User`: a user
 /// without a group gets its passwd entry's group (0 if it has none).
-pub(crate) fn resolve_user(spec: &str, files: &std::collections::BTreeMap<String, crate::image::Node>) -> Result<(u32, u32)> {
+pub(crate) fn resolve_user(
+    spec: &str,
+    files: &std::collections::BTreeMap<String, crate::image::Node>,
+) -> Result<(u32, u32)> {
     let table = |path: &str| -> Vec<Vec<String>> {
         match files.get(path) {
             Some(crate::image::Node::File { data, .. }) => String::from_utf8_lossy(data)

@@ -581,6 +581,68 @@ fn signals_from_the_host() {
 }
 
 #[test]
+fn stopped_and_continued_from_the_host() {
+    // SIGTSTP from the host stops the program's process group (a shell and
+    // the sleep it waits for) until SIGCONT; the host hears of both.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let control = RunControl::new();
+    let sb = Sandbox::builder()
+        .timeout(Duration::from_secs(30))
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .control(&control)
+        .build()
+        .unwrap();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let (c, t) = (control.clone(), ticks.clone());
+    let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = counts.clone();
+    let script = "while :; do echo t; /bin/busybox usleep 20000; done";
+    let out = sb
+        .run_streaming(&["/bin/busybox", "sh", "-c", script], |_, data| {
+            let n = data.iter().filter(|&&b| b == b'\n').count();
+            if t.fetch_add(n, Ordering::SeqCst) == 0 {
+                let (c, t, seen) = (c.clone(), t.clone(), seen.clone());
+                std::thread::spawn(move || {
+                    let at = |ms| {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        seen.lock().unwrap().push(t.load(Ordering::SeqCst));
+                    };
+                    c.signal(20);
+                    at(300);
+                    at(500);
+                    c.signal(18);
+                    // Ticking again (slow emulation under load takes a while).
+                    for _ in 0..100 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        if t.load(Ordering::SeqCst) > seen.lock().unwrap()[1] + 2 {
+                            break;
+                        }
+                    }
+                    at(0);
+                    c.signal(15);
+                });
+            }
+        })
+        .unwrap();
+    assert_eq!(out.status, ExitStatus::Signaled(15), "{:?} {}", out.events, out.kernel_log);
+    let counts = counts.lock().unwrap().clone();
+    assert_eq!(counts[0], counts[1], "ticks while stopped: {counts:?}");
+    assert!(counts[2] > counts[1] + 2, "ticks after SIGCONT: {counts:?}");
+    // (Then SIGTERM's default action ends it, which the host hears of too.)
+    assert!(
+        matches!(
+            &out.events[..],
+            [GuestEvent::Stopped { signal: 20 }, GuestEvent::Continued, GuestEvent::Fault { signal: 15, .. }]
+        ),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
 fn a_timeout_sends_sigterm_first() {
     // Out of time: SIGTERM, and the program's exports come back if it ends
     // within the grace period. Without one, it's stopped at once.
@@ -1270,6 +1332,113 @@ fn users_proc_dev_statfs_xattr_inotify() {
     assert_eq!(out.stdout_str(), "via /dev/stdout\ncompat ok \n");
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert_eq!(out.events, [GuestEvent::MissingPath { path: "/nope".into() }]);
+}
+
+#[test]
+fn job_control() {
+    // Stopping and continuing other processes (and themselves), with every
+    // thread; the parent hears of it through wait and SIGCHLD.
+    let b = with("jobs").allow(Capability::Process).allow(Capability::Threads);
+    let out = run(b, &["/bin/jobs"]);
+    assert_eq!(out.stdout_str(), "jobs ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn pseudo_terminals() {
+    // The line discipline, controlling terminals and their signals.
+    let out = run(with("pty").allow(Capability::Process), &["/bin/pty"]);
+    assert_eq!(out.stdout_str(), "pty ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// stdin for a run, written as the test goes.
+struct Typed(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
+
+impl std::io::Read for Typed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.1.is_empty() {
+            match self.0.recv() {
+                Ok(v) => self.1 = v,
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.1.len());
+        buf[..n].copy_from_slice(&self.1[..n]);
+        self.1.drain(..n);
+        Ok(n)
+    }
+}
+
+#[test]
+fn tty_mode() {
+    // The program's stdio is a terminal: one stream, CR LF, the shell's
+    // stderr too; with nothing typed, a shell reading it gets end-of-file.
+    let b = Sandbox::builder()
+        .timeout(Duration::from_secs(30))
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .tty(24, 80);
+    let out = b
+        .clone()
+        .build()
+        .unwrap()
+        .run(&["/bin/busybox", "sh", "-c", "echo a; /bin/busybox tty; echo b >&2; read x; echo eof $?"])
+        .unwrap();
+    assert_eq!(out.stdout_str(), "a\r\n/dev/pts/0\r\nb\r\neof 1\r\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+
+    // An interactive shell: what's typed is echoed, the size is the host's
+    // (and changes), and Ctrl-C interrupts the foreground job.
+    let control = RunControl::new();
+    let sb = b.env("PS1", "$ ").control(&control).build().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let mut seen = String::new();
+    let mut step = 0;
+    let out = sb
+        .run_streaming_with_stdin(&["/bin/busybox", "sh", "-i"], Typed(rx, Vec::new()), |_, data| {
+            seen.push_str(&String::from_utf8_lossy(data));
+            let type_in = |s: &str| {
+                let tx = tx.clone();
+                let s = s.as_bytes().to_vec();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = tx.send(s);
+                });
+            };
+            let next = ["$ ", "24 80\r\n", "40 120\r\n", "sleep 30\r\n", "rc=130\r\n"];
+            if step < next.len() && seen.contains(next[step]) {
+                match step {
+                    0 => type_in("/bin/busybox tty; /bin/busybox stty size\n"),
+                    1 => {
+                        control.resize(40, 120);
+                        type_in("/bin/busybox stty size\n")
+                    }
+                    2 => type_in("/bin/busybox sleep 30\n"),
+                    3 => {
+                        type_in("\x03");
+                        std::thread::sleep(Duration::from_millis(400));
+                        type_in("echo rc=$?\n")
+                    }
+                    _ => type_in("exit\n"),
+                }
+                step += 1;
+            }
+        })
+        .unwrap();
+    let stdout = out.stdout_str();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}\n{}", out.kernel_log);
+    for want in
+        ["/bin/busybox tty; /bin/busybox stty size\r\n/dev/pts/0\r\n24 80\r\n", "40 120\r\n", "^C", "rc=130\r\n"]
+    {
+        assert!(stdout.contains(want), "{want:?} in {stdout:?}");
+    }
+    // (An interactive ash looks for mail.)
+    assert!(out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { .. })), "{:?}", out.events);
 }
 
 #[test]

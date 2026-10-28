@@ -11,7 +11,7 @@ use super::thread::{
 use super::{require, table};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
-use crate::process::{self, Process, SigAction, Thread, WaitOn};
+use crate::process::{self, JobReport, Process, SigAction, Thread, WaitOn};
 use crate::procs::{MAX_PROCESSES, PROCS};
 use crate::signal::{self, SIG_IGN, SIGCHLD, SigInfo};
 use crate::uaccess::*;
@@ -232,14 +232,16 @@ impl Which {
     }
 }
 
-/// An ended child that `which` matches: (pid, status, cpu ns). `reap`
-/// removes it. ECHILD if there is no matching child at all; `None` if they
-/// are all still running.
-fn waitable(p: &mut Process, which: Which, reap: bool) -> Result<Option<(u32, i32, u64)>, Errno> {
+/// A child that `which` matches with something to report: (pid, wait
+/// status, cpu ns). Ended children (with WEXITED), then stopped ones
+/// (WUNTRACED) and continued ones (WCONTINUED). `reap` removes the zombie,
+/// or the report. ECHILD if there is no matching child at all; `None` if
+/// none has anything to report.
+fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<Option<(u32, i32, u64)>, Errno> {
     let mut procs = PROCS.lock();
-    let found =
-        procs.zombies.iter().find(|(pid, z)| z.ppid == p.pid && which.matches(**pid, z.pgid)).map(|(pid, _)| *pid);
-    if let Some(pid) = found {
+    let me = p.pid;
+    let zombie = procs.zombies.iter().find(|(pid, z)| z.ppid == me && which.matches(**pid, z.pgid)).map(|(pid, _)| *pid);
+    if let Some(pid) = zombie.filter(|_| options & WEXITED != 0) {
         let z = &procs.zombies[&pid];
         let r = (pid, z.status, z.cpu_ns);
         if reap {
@@ -248,7 +250,20 @@ fn waitable(p: &mut Process, which: Which, reap: bool) -> Result<Option<(u32, i3
         }
         return Ok(Some(r));
     }
-    if procs.others.values().any(|q| q.ppid == p.pid && which.matches(q.pid, q.pgid)) { Ok(None) } else { Err(ECHILD) }
+    let mut children = zombie.is_some();
+    for q in procs.others.values_mut().filter(|q| q.ppid == me && which.matches(q.pid, q.pgid)) {
+        children = true;
+        let status = match q.job_report {
+            Some(JobReport::Stopped(sig)) if options & WUNTRACED != 0 => 0x7f | (sig as i32) << 8,
+            Some(JobReport::Continued) if options & WCONTINUED != 0 => 0xffff,
+            _ => continue,
+        };
+        if reap {
+            q.job_report = None;
+        }
+        return Ok(Some((q.pid, status, 0)));
+    }
+    if children { Ok(None) } else { Err(ECHILD) }
 }
 
 fn block_for_child(p: &mut Process) -> SysResult {
@@ -277,15 +292,16 @@ pub fn wait4(p: &mut Process, pid: u64, wstatus: u64, options: u64, ru: u64) -> 
         pid if pid > 0 => Which::Pid(pid as u32),
         pgid => Which::Group(pgid.unsigned_abs()),
     };
+    let options = options | WEXITED;
     // Look first, so a bad pointer leaves the child to wait for again.
-    let Some((child, status, cpu)) = waitable(p, which, false)? else {
+    let Some((child, status, cpu)) = waitable(p, which, options, false)? else {
         return if options & WNOHANG != 0 { Ok(0) } else { block_for_child(p) };
     };
     if wstatus != 0 {
         write_u32(&mut p.aspace, wstatus, status as u32)?;
     }
     rusage(p, ru, cpu)?;
-    waitable(p, Which::Pid(child), true)?;
+    waitable(p, Which::Pid(child), options, true)?;
     Ok(child as u64)
 }
 
@@ -307,8 +323,7 @@ pub fn waitid(p: &mut Process, idtype: u64, id: u64, infop: u64, options: u64, r
         P_PIDFD => return p.unimplemented(table::nr::waitid, "waitid", "P_PIDFD", EINVAL),
         _ => return Err(EINVAL),
     };
-    // Only exits happen here: nothing stops or continues.
-    let found = if options & WEXITED != 0 { waitable(p, which, false)? } else { waitable(p, which, false)?.and(None) };
+    let found = waitable(p, which, options, false)?;
     let Some((child, status, cpu)) = found else {
         if options & WNOHANG == 0 {
             return block_for_child(p);
@@ -323,7 +338,7 @@ pub fn waitid(p: &mut Process, idtype: u64, id: u64, infop: u64, options: u64, r
     }
     rusage(p, ru, cpu)?;
     if options & WNOWAIT == 0 {
-        waitable(p, Which::Pid(child), true)?;
+        waitable(p, Which::Pid(child), options, true)?;
     }
     Ok(0)
 }
@@ -376,6 +391,7 @@ pub fn setsid(p: &mut Process) -> SysResult {
     }
     p.sid = pid;
     p.pgid = pid;
+    p.ctty = None;
     Ok(pid as u64)
 }
 

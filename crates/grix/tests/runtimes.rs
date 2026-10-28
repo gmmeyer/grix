@@ -80,6 +80,48 @@ fn python() {
     assert_no_surprises(&out);
 }
 
+/// An interactive shell on a pseudo-terminal, driven from Python: job
+/// control (^Z, jobs, fg), ^C, and the terminal's echo and CR NL.
+#[test]
+fn an_interactive_shell_on_a_pty() {
+    let script = r#"
+import os, pty, select, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["PS1"] = "$ "
+    os.execv("/bin/busybox", ["sh", "-i"])
+def drain(until):
+    out = b""
+    end = time.time() + 20
+    while until not in out and time.time() < end:
+        if select.select([fd], [], [], 0.05)[0]:
+            out += os.read(fd, 4096)
+    return out.decode()
+log = drain(b"$ ")
+for cmd, until in [("echo hi\n", "$ "), ("/bin/busybox sleep 30\n", "sleep 30\r\n"), ("\x1a", "$ "),
+                   ("jobs\n", "$ "), ("fg\n", "sleep 30\r\n"), ("\x03", "$ "), ("echo $?\n", "$ "), ("exit\n", "exit")]:
+    time.sleep(0.2)
+    os.write(fd, cmd.encode())
+    log += drain(until.encode())
+print(log.replace("\x1b[6n", ""))
+print("status", os.waitpid(pid, 0)[1])
+"#;
+    let b = sandbox("python")
+        .import(runtime("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .file("/t.py", script, 0o644)
+        .unwrap();
+    let out = run(b, &["/usr/bin/python3", "/t.py"]);
+    let stdout = out.stdout_str();
+    for want in
+        ["echo hi\r\nhi\r\n", "^Z[1]+  Stopped", "jobs\r\n[1]+  Stopped", "^C\r\n", "echo $?\r\n130\r\n", "status 0"]
+    {
+        assert!(stdout.contains(want), "{want:?} in {stdout}");
+    }
+    assert_no_surprises(&out);
+}
+
 const PYTHON_FILES: &str = r#"
 import json, os, pathlib, shutil, sqlite3, tempfile
 d = tempfile.mkdtemp()

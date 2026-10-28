@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
 use crate::mm::aspace::{AddressSpace, SIGPAGE};
-use crate::process::{PROCESS, Process, SigAction, Thread, Wait, WaitOn};
+use crate::process::{JobReport, PROCESS, Process, SigAction, Thread, Wait, WaitOn};
 use crate::syscall::table::nr;
 use crate::time;
 use crate::uaccess::*;
@@ -31,7 +31,11 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 pub const SIGSYS: u32 = 31;
 const SIGRTMIN: u32 = 32;
 pub const NSIG: u32 = 64;
@@ -39,6 +43,7 @@ pub const NSIG: u32 = 64;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
+pub const SA_NOCLDSTOP: u64 = 1;
 pub const SA_NOCLDWAIT: u64 = 2;
 pub const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
@@ -62,6 +67,8 @@ pub const TRAP_BRKPT: i32 = 1;
 pub const FPE_FLTUNK: i32 = 14;
 const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
+const CLD_STOPPED: i32 = 5;
+const CLD_CONTINUED: i32 = 6;
 
 pub const fn bit(sig: u32) -> u64 {
     1 << (sig - 1)
@@ -70,9 +77,11 @@ pub const fn bit(sig: u32) -> u64 {
 pub const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 /// Delivered before other pending signals, as Linux does (SYNCHRONOUS_MASK).
 const SYNCHRONOUS: u64 = bit(SIGSEGV) | bit(SIGBUS) | bit(SIGILL) | bit(SIGTRAP) | bit(SIGFPE) | bit(SIGSYS);
-/// Signals whose default action is to do nothing: CHLD, URG, WINCH, and also
-/// CONT and the stop signals, since there is no job control to stop for.
-const DEFAULT_IGNORED: u64 = bit(17) | bit(18) | bit(19) | bit(20) | bit(21) | bit(22) | bit(23) | bit(28);
+/// Signals whose default action is to do nothing: CHLD, URG, WINCH, and
+/// CONT (whose continuing happens when it's sent, whatever its action).
+const DEFAULT_IGNORED: u64 = bit(SIGCHLD) | bit(SIGCONT) | bit(23) | bit(28);
+/// Signals whose default action stops the process.
+pub const STOP_SIGNALS: u64 = bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(SIGTTOU);
 /// Real-time signals queue every instance. Like Linux's RLIMIT_SIGPENDING,
 /// one limit covers all queues (it bounds kernel memory).
 const MAX_QUEUED_RT: u64 = 4096;
@@ -106,10 +115,12 @@ impl SigInfo {
         SigInfo { signo, code, fields: [pid as u64 | (uid as u64) << 32, 0, 0, 0], fault: None, timer: None, why }
     }
 
-    /// A child ended (usually SIGCHLD): its pid, uid, and exit code or
-    /// signal, from wait4 status `status`.
+    /// A child ended, stopped or continued (usually SIGCHLD): its pid,
+    /// uid, and exit code or signal, from wait4 status `status`.
     pub fn child(signo: u32, pid: u32, uid: u32, status: i32) -> Self {
         let (code, value) = match status & 0x7f {
+            _ if status == 0xffff => (CLD_CONTINUED, SIGCONT as i32),
+            0x7f => (CLD_STOPPED, (status >> 8) & 0xff),
             0 => (CLD_EXITED, (status >> 8) & 0xff),
             sig => (CLD_KILLED, sig),
         };
@@ -251,7 +262,66 @@ pub fn is_ignored(act: &SigAction, sig: u32) -> bool {
 
 /// The default action ends the program (Term or Core on Linux).
 fn is_fatal(act: &SigAction, sig: u32) -> bool {
-    act.handler == SIG_DFL && DEFAULT_IGNORED & bit(sig) == 0
+    act.handler == SIG_DFL && (DEFAULT_IGNORED | STOP_SIGNALS) & bit(sig) == 0
+}
+
+/// The default action stops the process.
+fn is_stop(act: &SigAction, sig: u32) -> bool {
+    act.handler == SIG_DFL && STOP_SIGNALS & bit(sig) != 0
+}
+
+/// Set when a process stops or continues: `procs::reap_others` tells the
+/// parents (`Process::job_notice`).
+pub static JOBS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stop the process (a stop signal's default action, Linux's
+/// do_signal_stop). Its threads stay where they are, runnable or waiting;
+/// the scheduler passes it over until SIGCONT. Linux doesn't stop orphaned
+/// process groups for SIGTSTP, SIGTTIN and SIGTTOU; here nothing is
+/// orphaned (the host stands for the shell init was started from).
+fn stop(p: &mut Process, sig: u32) {
+    if p.stopped {
+        return;
+    }
+    p.stopped = true;
+    let status = 0x7f | (sig as i32) << 8;
+    p.job_report = Some(JobReport::Stopped(sig));
+    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, status));
+    JOBS.store(true, Ordering::Relaxed);
+    if p.pid == crate::process::INIT {
+        crate::console::event(&grix_abi::wire::Event::Stopped { signal: sig });
+    }
+    // Off the CPUs: this one at its next scheduling point, the others now.
+    if p.running {
+        p.resched = true;
+    }
+    crate::smp::kick_others();
+    p.timer_dirty = true;
+    // A parent's wait4 looks again.
+    crate::ipc::changed();
+}
+
+/// SIGCONT was sent: whatever its action, pending stop signals go, and a
+/// stopped process continues (Linux's prepare_signal).
+fn resume(p: &mut Process) {
+    for sig in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+        p.shared_pending.discard(sig);
+        for t in p.threads.values_mut() {
+            t.pending.discard(sig);
+        }
+    }
+    if !p.stopped {
+        return;
+    }
+    p.stopped = false;
+    p.job_report = Some(JobReport::Continued);
+    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, 0xffff));
+    JOBS.store(true, Ordering::Relaxed);
+    if p.pid == crate::process::INIT {
+        crate::console::event(&grix_abi::wire::Event::Continued);
+    }
+    p.timer_dirty = true;
+    crate::ipc::changed();
 }
 
 /// Signals the thread won't take now. rt_sigtimedwait temporarily accepts the
@@ -338,6 +408,15 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
     let sig = info.signo;
     let b = bit(sig);
     let act = p.sigactions[sig as usize];
+    // Continuing and stopping cancel each other's pending signals.
+    if sig == SIGCONT {
+        resume(p);
+    } else if STOP_SIGNALS & b != 0 {
+        p.shared_pending.discard(SIGCONT);
+        for t in p.threads.values_mut() {
+            t.pending.discard(SIGCONT);
+        }
+    }
     let wants = |tid: u32| p.threads.get(&tid).is_some_and(|t| effective_mask(t) & b == 0);
     // Like complete_signal, try the thread kill() names (the main thread)
     // first, then the others.
@@ -355,6 +434,10 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
         }
         if is_fatal(&act, sig) {
             die(p, &info);
+            return Ok(());
+        }
+        if is_stop(&act, sig) {
+            stop(p, sig);
             return Ok(());
         }
     }
@@ -558,7 +641,7 @@ pub fn return_to_user(tf: &mut TrapFrame) {
     let mut guard = PROCESS.lock();
     let Some(p) = guard.as_mut() else { return };
     loop {
-        if p.exit_status.is_some() && p.running {
+        if (p.exit_status.is_some() || p.stopped) && p.running {
             crate::sched::schedule(p, tf);
         }
         // Nothing to run here now: `smp::finish` waits for something.
@@ -566,7 +649,7 @@ pub fn return_to_user(tf: &mut TrapFrame) {
             return;
         }
         deliver(p, tf);
-        if p.exit_status.is_none() {
+        if p.exit_status.is_none() && !p.stopped {
             break;
         }
     }
@@ -613,6 +696,11 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         }
         if is_fatal(&act, info.signo) {
             die(p, &info);
+            return;
+        }
+        // Back at the syscall it was in (if any) when it continues.
+        if is_stop(&act, info.signo) {
+            stop(p, info.signo);
             return;
         }
         if core::mem::take(&mut t.restarting) {

@@ -9,6 +9,7 @@ mod signal;
 pub mod table;
 mod thread;
 mod timer;
+mod tty;
 
 use grix_abi::policy::Capability;
 

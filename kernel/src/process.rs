@@ -82,6 +82,9 @@ pub struct Wait {
     pub deadline: Option<u64>,
     /// x0 to return if the deadline passes.
     pub timeout_ret: u64,
+    /// When the deadline passes, run the syscall again instead (it then
+    /// finds its deadline gone: select and poll write out what's ready).
+    pub rerun: bool,
 }
 
 pub struct Thread {
@@ -233,6 +236,24 @@ pub struct Process {
     pub membarrier_registered: u64,
     /// A signalfd was created: queued signals must wake I/O waiters.
     pub uses_signalfd: bool,
+    /// Stopped by a stop signal (job control): none of its threads run
+    /// until SIGCONT (`sched::runnable`).
+    pub stopped: bool,
+    /// The last stop or continue, until a wait4/waitid with WUNTRACED or
+    /// WCONTINUED reports it.
+    pub job_report: Option<JobReport>,
+    /// The SIGCHLD that tells the parent about it, sent from
+    /// `procs::reap_others` (which can reach the parent).
+    pub job_notice: Option<crate::signal::SigInfo>,
+    /// The controlling terminal (the session's, inherited across fork).
+    pub ctty: Option<crate::tty::TtyRef>,
+}
+
+/// A change a parent's wait can report besides an exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobReport {
+    Stopped(u32),
+    Continued,
 }
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
@@ -292,6 +313,10 @@ impl Process {
             subreaper: false,
             membarrier_registered: 0,
             uses_signalfd: false,
+            stopped: false,
+            job_report: None,
+            job_notice: None,
+            ctty: None,
         }
     }
 
@@ -306,6 +331,7 @@ impl Process {
         c.ppid = self.pid;
         c.pgid = self.pgid;
         c.sid = self.sid;
+        c.ctty = self.ctty.clone();
         c.fds = self.fds.clone();
         c.cwd = self.cwd;
         c.cwd_pin = self.cwd_pin.clone();
@@ -360,7 +386,7 @@ impl Process {
             Err(e) => (-(e.0 as i64)) as u64,
         };
         let t = self.cur();
-        t.wait = Some(Wait { on, deadline, timeout_ret });
+        t.wait = Some(Wait { on, deadline, timeout_ret, rerun: false });
         t.restart_deadline = deadline;
         self.timer_dirty = true;
         Err(EBLOCKED)
@@ -376,6 +402,16 @@ impl Process {
     /// Block until I/O state changes (then the syscall reruns) or the deadline passes.
     pub fn block_io(&mut self, deadline: Option<u64>, on_timeout: SysResult) -> SysResult {
         self.block(WaitOn::Io, deadline, on_timeout)
+    }
+
+    /// The same, but the syscall runs again when the deadline passes too
+    /// (`restart_deadline` then says it has).
+    pub fn block_io_rerun(&mut self, deadline: Option<u64>) -> SysResult {
+        let r = self.block(WaitOn::Io, deadline, Ok(0));
+        if let Some(w) = self.cur().wait.as_mut() {
+            w.rerun = true;
+        }
+        r
     }
 
     /// If any I/O state changed, restart every thread blocked on I/O.
@@ -407,8 +443,15 @@ impl Process {
     pub fn wake(&mut self, tid: u32, ret: Option<u64>) {
         let Some(w) = self.cancel_wait(tid) else { return };
         let t = self.threads.get_mut(&tid).unwrap();
-        t.regs.x[0] = ret.unwrap_or(w.timeout_ret);
-        t.restart_deadline = None;
+        if ret.is_none() && w.rerun {
+            // Out of time: it runs again, keeping its (past) deadline.
+            t.regs.elr -= 4;
+            t.restarting = true;
+            t.recheck = true;
+        } else {
+            t.regs.x[0] = ret.unwrap_or(w.timeout_ret);
+            t.restart_deadline = None;
+        }
         self.runq.push_back(tid);
         self.timer_dirty = true;
     }
@@ -511,6 +554,8 @@ impl Process {
 /// The program has ended: report its status, then send the exported
 /// directories. Status first, so a slow export can't cost the host it.
 pub fn finish(kind: ExitKind, code: i32) -> ! {
+    // What the terminal still has to show goes before the status.
+    crate::tty::flush_console();
     console::report_exit(kind, code);
     crate::export::send();
     console::power_off()
@@ -588,6 +633,14 @@ pub fn start(img: Image<'static>) -> ! {
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    if let Some((rows, cols)) = img.tty {
+        // The program leads its session, with the terminal as its
+        // controlling one, in the foreground.
+        let (tty, file) = crate::tty::console_terminal(rows, cols, img.uid, img.gid);
+        p.fds = FdTable::with_terminal(file);
+        (tty.lock().session, tty.lock().fg) = (INIT, INIT);
+        p.ctty = Some(tty);
+    }
     p.cwd = cwd;
     p.cwd_pin = Some(fs::lock().pin(cwd));
     p.running = true;

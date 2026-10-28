@@ -50,6 +50,12 @@ pub enum Dev {
     Null,
     Zero,
     Random,
+    /// /dev/ptmx: opening it makes a pseudo-terminal pair (tty.rs).
+    Ptmx,
+    /// /dev/pts/N: a pair's slave.
+    Pts(u32),
+    /// /dev/tty: the caller's controlling terminal.
+    Tty,
 }
 
 // ---------------------------------------------------------------- limits
@@ -550,6 +556,10 @@ pub struct Fs {
     free: Vec<Ino>,
     /// `/proc/1/fd`, whose entries are the live descriptors.
     pub fd_dir: Ino,
+    /// `/dev/pts`, and the nodes of the pseudo-terminals ever made: each
+    /// index keeps its node, linked there while its master is open.
+    pts_dir: Ino,
+    pts_nodes: BTreeMap<u32, Ino>,
     /// The last page read of a large live directory.
     page: Option<Page>,
     /// A live mount's files' contents by host id, so a node made again for
@@ -643,6 +653,8 @@ impl Fs {
             orphans: Vec::new(),
             free: Vec::new(),
             fd_dir: ROOT,
+            pts_dir: ROOT,
+            pts_nodes: BTreeMap::new(),
             page: None,
             remote_files: BTreeMap::new(),
         };
@@ -678,6 +690,9 @@ impl Fs {
         fs.insert(dev, "random", Kind::Dev(Dev::Random), 0o666);
         fs.insert(dev, "urandom", Kind::Dev(Dev::Random), 0o666);
         fs.insert(dev, "fd", Kind::Symlink("/proc/self/fd".into()), 0o777);
+        fs.insert(dev, "ptmx", Kind::Dev(Dev::Ptmx), 0o666);
+        fs.insert(dev, "tty", Kind::Dev(Dev::Tty), 0o666);
+        fs.pts_dir = fs.insert(dev, "pts", Kind::Dir(BTreeMap::new()), 0o755);
         for (i, name) in ["stdin", "stdout", "stderr"].iter().enumerate() {
             fs.insert(dev, name, Kind::Symlink(alloc::format!("/proc/self/fd/{i}")), 0o777);
         }
@@ -856,6 +871,46 @@ impl Fs {
         ino
     }
 
+    /// A pseudo-terminal's slave appears as /dev/pts/N, owned by whoever
+    /// opened the master (devpts). Returns its node.
+    pub fn pts_show(&mut self, index: u32, owner: (u32, u32)) -> Ino {
+        let name = alloc::format!("{index}");
+        let now = crate::time::realtime_ns();
+        let ino = match self.pts_nodes.get(&index) {
+            Some(&ino) => {
+                if let Kind::Dir(children) = &mut self.nodes[self.pts_dir].kind {
+                    children.insert(name, ino);
+                }
+                ino
+            }
+            None => {
+                let ino = self.insert(self.pts_dir, &name, Kind::Dev(Dev::Pts(index)), 0o620);
+                self.pts_nodes.insert(index, ino);
+                ino
+            }
+        };
+        let n = &mut self.nodes[ino];
+        (n.uid, n.gid, n.perm, n.nlink, n.system) = (owner.0, owner.1, 0o620, 1, true);
+        (n.atime, n.mtime, n.ctime) = (now, now, now);
+        ino
+    }
+
+    /// Its master closed: /dev/pts/N goes (open slaves keep the node).
+    pub fn pts_hide(&mut self, index: u32) {
+        let Some(&ino) = self.pts_nodes.get(&index) else { return };
+        if let Kind::Dir(children) = &mut self.nodes[self.pts_dir].kind
+            && children.get(&alloc::format!("{index}")) == Some(&ino)
+        {
+            children.remove(&alloc::format!("{index}"));
+        }
+        self.nodes[ino].nlink = 0;
+    }
+
+    /// The node of /dev/pts/N, while it's there.
+    pub fn pts_node(&self, index: u32) -> Option<Ino> {
+        self.pts_nodes.get(&index).copied().filter(|&ino| self.nodes[ino].nlink > 0)
+    }
+
     pub fn node(&self, ino: Ino) -> &Node {
         &self.nodes[ino]
     }
@@ -984,12 +1039,16 @@ impl Fs {
             Kind::Dir(_) => (S_IFDIR, 4096, 0, 0),
             Kind::Symlink(t) => (S_IFLNK, t.len() as u64, n.nlink, 0),
             Kind::Dev(d) => {
-                let minor = match d {
-                    Dev::Null => 3,
-                    Dev::Zero => 5,
-                    Dev::Random => 9,
+                let (major, minor) = match d {
+                    Dev::Null => (1, 3),
+                    Dev::Zero => (1, 5),
+                    Dev::Random => (1, 9),
+                    Dev::Tty => (5, 0),
+                    Dev::Ptmx => (5, 2),
+                    Dev::Pts(n) => (136, *n),
                 };
-                (S_IFCHR, 0, 1, (1 << 8) | minor)
+                // Linux's new_encode_dev.
+                (S_IFCHR, 0, 1, ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64)
             }
             Kind::Proc(_) => (S_IFREG, 0, 1, 0),
         };
@@ -1107,10 +1166,11 @@ impl Fs {
     /// name is the program's business (a file it deleted, or is checking for
     /// before creating it).
     pub fn missing_is_import_gap(&mut self, base: Ino, path: &str) -> bool {
-        // A live mount has whatever the host has: nothing there is missing.
+        // A live mount has whatever the host has: nothing there is missing;
+        // nor in /dev/pts, whose entries come and go with pseudo-terminals.
         let gap = |fs: &Fs, ino: Ino| {
             let n = &fs.nodes[ino];
-            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none()
+            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none() && ino != fs.pts_dir
         };
         let mut p = path.trim_end_matches('/');
         loop {

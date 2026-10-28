@@ -358,6 +358,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
     match kind {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => format!("pipe:[{}]", 0x1000_0000 + fd),
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().path_of(*ino),
+        FileKind::Pty(end) => fs::lock().path_of(end.ino),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
         FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),

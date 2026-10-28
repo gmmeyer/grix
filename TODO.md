@@ -40,9 +40,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
    Left: `capset` (setpriv), supplementary groups in permission checks,
    `posix_openpt` (apt's log; item 10), a `--user` flag for `grix build`
    and `grix run`.
-10. **Interactive use**: a TTY mode (`grix run -t`), pseudo-terminals and
-    termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
-    host too).
+10. [x] **Interactive use**: TTY mode (`grix run -t`, `tty`), pseudo-terminals
+    and termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
+    host too). Left: packet mode (`TIOCPKT`), `VMIN`+`VTIME`'s interbyte
+    timer (any byte returns), orphaned process groups (SIGTSTP from a
+    terminal isn't dropped, no SIGHUP when one with stopped members is
+    orphaned), snapshots in TTY mode, TTY mode over MCP and Python.
 11. **Shared file mappings and locks**: writable `MAP_SHARED` file
     mappings and `msync`; `flock`/`fcntl` record locks (sqlite, databases).
 12. **Big imports without copying them into RAM**: a lazily read,

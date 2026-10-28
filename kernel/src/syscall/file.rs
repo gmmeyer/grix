@@ -135,6 +135,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
     Ok(match &f.kind {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600, 0),
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
+        FileKind::Pty(end) => fs::lock().stat(end.ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
         FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) => {
             anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0)
@@ -246,6 +247,12 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
             return Err(EROFS);
         }
         match &fs.node(ino).kind {
+            &Kind::Dev(d @ (Dev::Ptmx | Dev::Pts(_) | Dev::Tty)) => {
+                let file = super::tty::open_dev(p, &mut fs, d, ino, flags)?;
+                file.lock().pin = Some(fs.pin(ino));
+                drop(fs);
+                return p.fds.alloc(FdEntry { file, cloexec }, 0);
+            }
             Kind::Dev(d) => {
                 let file = new_file(FileKind::Dev(*d, ino), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
                 file.lock().pin = Some(fs.pin(ino));
@@ -436,6 +443,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         }
         FileKind::Pipe(end) if end.write => Err(EBADF),
         FileKind::Pipe(end) => pipe_read(p, end, buf, count, nonblock, false),
+        FileKind::Pty(end) => super::tty::read(p, end, buf, count, nonblock),
         FileKind::Socket(s) => match &s.rx {
             Some(rx) => pipe_read(p, rx, buf, count, nonblock, false),
             None => Ok(0), // shut down for reading
@@ -469,6 +477,8 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             }
             Ok(count)
         }
+        // Terminal nodes open as FileKind::Pty.
+        FileKind::Dev(Dev::Ptmx | Dev::Pts(_) | Dev::Tty, _) => Err(ENXIO),
         FileKind::Node(_) => match &f.content {
             Some(c) => {
                 let n = read_content(p, c, at.unwrap_or(f.offset), buf, count)?;
@@ -624,6 +634,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
+        FileKind::Pty(end) => return super::tty::write(p, end, buf, count, nonblock),
         FileKind::Socket(s) => {
             return match &s.tx {
                 Some(tx) => pipe_write(p, tx, buf, count, nonblock, true),
@@ -1665,6 +1676,19 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const SIOCGIFCONF: u64 = 0x8912;
+    // The command is an unsigned int: C callers may pass it sign-extended.
+    let req = req as u32 as u64;
+    let file = p.fds.get(fd)?;
+    let pty = match &file.lock().kind {
+        FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
+        _ => None,
+    };
+    // FIONBIO and FIOCLEX are the descriptor's, as for any file.
+    if let Some((tty, master)) = pty
+        && !matches!(req, FIONBIO | FIONCLEX | FIOCLEX)
+    {
+        return super::tty::ioctl(p, fd, tty, master, req, arg);
+    }
     let entry = p.fds.entry_mut(fd)?;
     let socket = matches!(
         entry.file.lock().kind,
@@ -1744,6 +1768,10 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
     let timeout = timespec_timeout(p, timeout)?;
     let mut raw = alloc::vec![0u8; nfds as usize * 8];
     copy_in(&mut p.aspace, fds, &mut raw)?;
+    // A re-run after the deadline passed reports what's ready (perhaps
+    // nothing) like a zero timeout: revents must be written either way.
+    let deadline = p.timeout_deadline(timeout);
+    let expired = deadline.is_some_and(|d| d <= crate::time::monotonic_ns());
     let mut ready = 0;
     for c in raw.chunks_mut(8) {
         let fd = i32::from_le_bytes(c[..4].try_into().unwrap());
@@ -1770,7 +1798,7 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
             ready += 1;
         }
     }
-    if ready > 0 || timeout == Some(0) {
+    if ready > 0 || timeout == Some(0) || expired {
         copy_out(&mut p.aspace, fds, &raw)?;
         return Ok(ready);
     }
@@ -1780,8 +1808,7 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
     if timeout.is_none() && raw.chunks(8).all(|c| i32::from_le_bytes(c[..4].try_into().unwrap()) < 0) {
         return p.block(WaitOn::Signal, None, Ok(0));
     }
-    let deadline = p.timeout_deadline(timeout);
-    p.block_io(deadline, Ok(0))
+    p.block_io_rerun(deadline)
 }
 
 pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, timeout: u64) -> SysResult {
@@ -1789,6 +1816,10 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
         return Err(EINVAL);
     }
     let timeout = timespec_timeout(p, timeout)?;
+    // As ppoll: after the deadline, the sets come back (cleared if nothing
+    // is ready), as Linux returns them.
+    let deadline = p.timeout_deadline(timeout);
+    let expired = deadline.is_some_and(|d| d <= crate::time::monotonic_ns());
     let words = (nfds as usize).div_ceil(64);
     let mut sets = [alloc::vec![0u64; words], alloc::vec![0u64; words], alloc::vec![0u64; words]];
     for (set, ptr) in sets.iter_mut().zip([rfds, wfds, efds]) {
@@ -1817,7 +1848,7 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
             }
         }
     }
-    if count > 0 || timeout == Some(0) {
+    if count > 0 || timeout == Some(0) || expired {
         for (set, ptr) in out.iter().zip([rfds, wfds, efds]) {
             if ptr != 0 {
                 let b: Vec<u8> = set.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -1829,8 +1860,7 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
     if timeout.is_none() && sets.iter().all(|set| set.iter().all(|&w| w == 0)) {
         return p.block(WaitOn::Signal, None, Ok(0));
     }
-    let deadline = p.timeout_deadline(timeout);
-    p.block_io(deadline, Ok(0))
+    p.block_io_rerun(deadline)
 }
 
 // ---------------------------------------------------------------- pipes, eventfd, epoll

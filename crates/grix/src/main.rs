@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use grix::{
-    Capability, DenyAction, Export, ExportState, Manifest, MountMode, MountState, RunControl, RunOutput, Sandbox,
-    Stream,
+    Capability, DenyAction, Export, ExportState, GuestEvent, Manifest, MountMode, MountState, RunControl, RunOutput,
+    Sandbox, Stream,
 };
 
 #[derive(Parser)]
@@ -191,6 +191,13 @@ struct RunArgs {
     /// Don't pass our stdin to the program (it's passed when it isn't a terminal).
     #[arg(long)]
     no_stdin: bool,
+    /// TTY mode, as `docker run -t`: the program gets a terminal
+    /// (/dev/pts/0) the size of this one. It shows what the program writes
+    /// and takes what you type, Ctrl-C and Ctrl-Z included: they reach the
+    /// program through its terminal. If the program itself stops (Ctrl-Z
+    /// with nothing to catch it), grix stops too, until `fg`.
+    #[arg(short = 't', long, conflicts_with_all = ["snapshot", "json"])]
+    tty: bool,
     /// Kill the program (SIGSYS) instead of returning EPERM when it uses a capability it lacks.
     #[arg(long)]
     kill_on_deny: bool,
@@ -308,9 +315,28 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     let p = prepare(&args)?;
     forward_signals(p.control.clone(), args.quiet);
-    // Piped or redirected input goes to the program; a terminal doesn't
-    // (there's no interactive mode yet), so the program sees end-of-file.
-    let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
+    // Piped or redirected input goes to the program; a terminal only in
+    // TTY mode (otherwise the program sees end-of-file).
+    let stdin = !args.no_stdin && (args.tty || !std::io::stdin().is_terminal());
+    // TTY mode with our terminal: raw, so every key goes to the program's.
+    let raw = if args.tty && stdin && std::io::stdin().is_terminal() { RawTerminal::enter() } else { None };
+    if let Some(saved) = raw.as_ref().map(|r| r.0) {
+        follow_size(p.control.clone());
+        let c = p.control.clone();
+        p.control.on_event(move |e| {
+            if let GuestEvent::Stopped { .. } = e {
+                // As a shell does for a stopped job: our terminal back as
+                // it was, and grix stopped until `fg`; then the program
+                // goes on.
+                let _ = std::io::stdout().flush();
+                RawTerminal::set(&saved, false);
+                // SAFETY: raising a signal; its default action stops us.
+                unsafe { libc::raise(libc::SIGTSTP) };
+                RawTerminal::set(&saved, true);
+                c.signal(18);
+            }
+        });
+    }
     let (sandbox, command) = (&p.sandbox, &p.command);
     let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
         if stdin {
@@ -320,12 +346,84 @@ fn run(args: RunArgs) -> Result<i32> {
         }
     };
     let out = if args.json { run(&mut |_, _| {})? } else { run(&mut write_stream)? };
+    drop(raw);
     report(&args, out, &p.exports)
 }
 
+/// Our terminal in raw mode (TTY mode), put back as it was when dropped.
+struct RawTerminal(libc::termios);
+
+impl RawTerminal {
+    fn enter() -> Option<RawTerminal> {
+        // SAFETY: tcgetattr fills the termios it's given.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
+            return None;
+        }
+        RawTerminal::set(&saved, true);
+        Some(RawTerminal(saved))
+    }
+
+    /// `saved`, or (`raw`) it made raw.
+    fn set(saved: &libc::termios, raw: bool) {
+        let mut t = *saved;
+        // SAFETY: cfmakeraw and tcsetattr on a termios we own.
+        unsafe {
+            if raw {
+                libc::cfmakeraw(&mut t);
+            }
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        RawTerminal::set(&self.0, false);
+    }
+}
+
+/// Our terminal's size (rows, columns); 24 by 80 if it has none.
+fn terminal_size() -> (u16, u16) {
+    for fd in [1, 0, 2] {
+        // SAFETY: TIOCGWINSZ fills the winsize it's given.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+            return (ws.ws_row, ws.ws_col);
+        }
+    }
+    (24, 80)
+}
+
+static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn resized(_: libc::c_int) {
+    RESIZED.store(true, Ordering::SeqCst);
+}
+
+/// Our terminal's size changes go to the program's.
+fn follow_size(control: RunControl) {
+    // SAFETY: the handler only sets an atomic, which is async-signal-safe.
+    unsafe { libc::signal(libc::SIGWINCH, resized as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            if RESIZED.swap(false, Ordering::SeqCst) {
+                let (rows, cols) = terminal_size();
+                control.resize(rows, cols);
+            }
+        }
+    });
+}
+
+/// The program's output as it comes, unbuffered: a prompt or an echoed
+/// key has no newline to flush it.
 fn write_stream(stream: Stream, data: &[u8]) {
     let _ = match stream {
-        Stream::Stdout => std::io::stdout().write_all(data),
+        Stream::Stdout => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(data).and_then(|_| out.flush())
+        }
         Stream::Stderr => std::io::stderr().write_all(data),
     };
 }
@@ -422,6 +520,10 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
     }
     if let Some(n) = args.cpus {
         b = b.cpus(n);
+    }
+    if args.tty {
+        let (rows, cols) = terminal_size();
+        b = b.tty(rows, cols);
     }
     if let Some(t) = &args.x86_64 {
         b = b.x86_64(t)?;

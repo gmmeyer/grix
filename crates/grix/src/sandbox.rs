@@ -257,6 +257,8 @@ pub struct SandboxBuilder {
     cpus: u32,
     /// The guest path of the x86_64 translator, if any.
     x86_64: Option<String>,
+    /// TTY mode's terminal size (rows, columns).
+    tty: Option<(u16, u16)>,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -293,6 +295,7 @@ impl Default for SandboxBuilder {
             vmm: default_vmm(),
             cpus: std::env::var("GRIX_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(1),
             x86_64: None,
+            tty: None,
             command: Vec::new(),
         }
     }
@@ -380,6 +383,18 @@ impl SandboxBuilder {
     /// parallel; separate processes take turns.
     pub fn cpus(mut self, n: u32) -> Self {
         self.cpus = n;
+        self
+    }
+
+    /// TTY mode: the program's stdin, stdout and stderr are a terminal
+    /// (/dev/pts/0, its controlling terminal) of `rows` by `cols`, as with
+    /// `docker run -t`. Its stdin is what's typed (Ctrl-C and Ctrl-Z
+    /// included, as the bytes a terminal sends: the terminal turns them
+    /// into signals), and its stdout what the terminal shows, with CR LF
+    /// line ends and echo; there's no separate stderr.
+    /// [`RunControl::resize`](crate::RunControl::resize) changes the size.
+    pub fn tty(mut self, rows: u16, cols: u16) -> Self {
+        self.tty = Some((rows.max(1), cols.max(1)));
         self
     }
 
@@ -817,7 +832,7 @@ impl Sandbox {
             uid: cfg.uid,
             gid: cfg.gid,
             cwd: &cfg.cwd,
-            stdin: stdin.is_some() || take.is_some(),
+            stdin: stdin.is_some() || take.is_some() || cfg.tty.is_some(),
             exe,
             argv: argv.clone(),
             envp: env.iter().map(String::as_str).collect(),
@@ -834,6 +849,7 @@ impl Sandbox {
             snapshot: take.is_some(),
             cpus: cfg.cpus,
             x86_64: cfg.x86_64.as_deref().unwrap_or(""),
+            tty: cfg.tty,
         }
         .encode();
         let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
@@ -853,8 +869,15 @@ impl Sandbox {
             snapshot: take.map(SnapshotFile::Take),
         };
         // A snapshot is taken while the program waits for stdin, which
-        // must neither come nor end.
+        // must neither come nor end. A terminal with nothing to type gets
+        // end-of-file (^D, see the kernel's tty.rs).
         let stdin = if vm.snapshot.is_some() { None } else { stdin };
+        let stdin = match stdin {
+            None if cfg.tty.is_some() && vm.snapshot.is_none() => {
+                Some(Box::new(std::io::empty()) as Box<dyn Read + Send>)
+            }
+            s => s,
+        };
         let (mut out, changes, taken) = execute(&vm, &bytes, cfg.timeout, stdin, exports, cfg.max_output, on_output)?;
         out.mount_changes = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
         Ok((out, taken))
@@ -873,6 +896,9 @@ impl Sandbox {
         }
         if !cfg.mounts.is_empty() || !cfg.live.is_empty() {
             bail!("a sandbox with mounts can't be snapshotted: what the host holds for them isn't saved");
+        }
+        if cfg.tty.is_some() {
+            bail!("a sandbox in TTY mode can't be snapshotted (yet)");
         }
         if cfg.cpus != 1 {
             bail!("a sandbox with more than one CPU can't be snapshotted yet");
@@ -982,7 +1008,13 @@ fn execute(
         }
         Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
         Channel::Event => match Event::decode(payload) {
-            Ok(e) => out.events.push(e.into()),
+            Ok(e) => {
+                let e: GuestEvent = e.into();
+                if let Some(c) = &vm.control {
+                    c.event(&e);
+                }
+                out.events.push(e);
+            }
             Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
         },
         Channel::Export => exports.push(payload),

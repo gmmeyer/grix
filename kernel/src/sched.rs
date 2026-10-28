@@ -105,20 +105,24 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
 /// with a runnable thread, so processes take turns; this one if it's the
 /// only one.
 fn pick(p: &Process, procs: &Procs, alone: bool) -> Option<u32> {
-    let runnable = |(&pid, q): (&u32, &Process)| (!q.runq.is_empty()).then_some(pid);
     // Other CPUs run threads of `p`: more of them, unless `p` wants to be
     // alone or another process waits for the CPUs (then they all leave it,
     // and the last one switches).
     if !alone {
-        return (!p.runq.is_empty() && smp::runs_here(p) && !others_wait(procs)).then_some(p.pid);
+        return (runnable(p) && smp::runs_here(p) && !others_wait(procs)).then_some(p.pid);
     }
     let others = procs.others.range(p.pid + 1..).chain(procs.others.range(..p.pid));
-    others.filter_map(runnable).next().or_else(|| (!p.runq.is_empty()).then_some(p.pid))
+    others.filter(|(_, q)| runnable(q)).map(|(&pid, _)| pid).next().or_else(|| runnable(p).then_some(p.pid))
+}
+
+/// `q` has threads waiting to run, and isn't stopped.
+pub fn runnable(q: &Process) -> bool {
+    !q.runq.is_empty() && !q.stopped
 }
 
 /// Another process has threads waiting to run.
 pub fn others_wait(procs: &Procs) -> bool {
-    procs.others.values().any(|q| !q.runq.is_empty())
+    procs.others.values().any(runnable)
 }
 
 /// Everything due, in every process: timers, I/O waiters, expired
@@ -223,10 +227,12 @@ fn waiting_for_input(p: &mut Process, procs: &mut Procs) -> bool {
     io && console::host_pending()
 }
 
-/// A thread waits for a signal (pause, sigsuspend, sigwait).
+/// A thread waits for a signal (pause, sigsuspend, sigwait), or a
+/// process for SIGCONT.
 fn waiting_for_signal(p: &mut Process, procs: &mut Procs) -> bool {
     procs.all(p).any(|q| {
-        q.threads.values().any(|t| t.wait.is_some_and(|w| matches!(w.on, WaitOn::Signal | WaitOn::SigWait(_))))
+        q.stopped
+            || q.threads.values().any(|t| t.wait.is_some_and(|w| matches!(w.on, WaitOn::Signal | WaitOn::SigWait(_))))
     })
 }
 
@@ -285,8 +291,7 @@ pub fn update_timer(p: &mut Process) {
     }
     p.timer_dirty = false;
     let mut procs = PROCS.lock();
-    let others_runnable = procs.others.values().any(|q| !q.runq.is_empty());
-    let slice_end = (!p.runq.is_empty() || others_runnable).then(|| p.slice_start + SLICE_NS);
+    let slice_end = (runnable(p) || others_wait(&procs)).then(|| p.slice_start + SLICE_NS);
     match [slice_end, earliest_deadline(p, &mut procs)].into_iter().flatten().min() {
         Some(t) => irq::timer_at(t),
         None => irq::timer_off(),
@@ -309,10 +314,10 @@ pub fn irq(tf: &mut TrapFrame) {
         let mut procs = PROCS.lock();
         procs::reap_others(p, &mut procs);
         let woke = poll(p, &mut procs);
-        (woke, procs.others.values().any(|q| !q.runq.is_empty()))
+        (woke, others_wait(&procs))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
-    if p.resched || (!p.runq.is_empty() || others_runnable) && (slice_over || woke) {
+    if p.resched || (runnable(p) || others_runnable) && (slice_over || woke) {
         schedule(p, tf);
     } else {
         update_timer(p);
