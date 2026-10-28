@@ -37,6 +37,7 @@ pub(crate) struct VmConfig {
     pub accel: String,
     /// grix-vmm, instead of QEMU.
     pub vmm: Option<PathBuf>,
+    pub cpus: u32,
     /// Take a snapshot into this file, or run the one in it.
     pub snapshot: Option<SnapshotFile>,
 }
@@ -232,7 +233,7 @@ pub(crate) fn run(
             match &img {
                 Some(img) => {
                     cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(&img.0);
-                    cmd.args(["--mem", &cfg.memory_mb.to_string()]);
+                    cmd.args(["--mem", &cfg.memory_mb.to_string(), "--cpus", &cfg.cpus.to_string()]);
                 }
                 None => {
                     cmd.arg("--restore");
@@ -306,7 +307,7 @@ fn qemu_command(cfg: &VmConfig, uart_path: &std::path::Path, image: &std::path::
     // Under emulation use QEMU's richest CPU model; with hardware virtualization, the host CPU.
     let cpu = if cfg.accel == "tcg" { "max,pauth-impdef=on" } else { "host" };
     let mut cmd = Command::new(&cfg.qemu);
-    cmd.args(["-machine", "virt,gic-version=3", "-cpu", cpu, "-smp", "1"])
+    cmd.args(["-machine", "virt,gic-version=3", "-cpu", cpu, "-smp", &cfg.cpus.to_string()])
         .args(["-m", &format!("{}M", cfg.memory_mb)])
         .args(["-accel", &cfg.accel])
         .args(["-nodefaults", "-no-user-config", "-display", "none", "-no-reboot"])

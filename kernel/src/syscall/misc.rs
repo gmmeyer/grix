@@ -98,7 +98,8 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             if a[1] < 8 {
                 return Err(EINVAL);
             }
-            write_u64(&mut p.aspace, a[2], 1)?;
+            // Every CPU (bits 0..n).
+            write_u64(&mut p.aspace, a[2], (1u64 << crate::smp::count()) - 1)?;
             Ok(8)
         }
         nr::sched_setaffinity | nr::sched_setparam | nr::sched_setscheduler => Ok(0),
@@ -107,9 +108,10 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         nr::getpriority => Ok(20),
         nr::setpriority => Ok(0),
         nr::getcpu => {
-            for ptr in &a[..2] {
+            // The CPU, and its NUMA node (there's one).
+            for (ptr, v) in a[..2].iter().zip([crate::smp::me() as u32, 0]) {
                 if *ptr != 0 {
-                    write_u32(&mut p.aspace, *ptr, 0)?;
+                    write_u32(&mut p.aspace, *ptr, v)?;
                 }
             }
             Ok(0)
@@ -290,9 +292,21 @@ fn membarrier(p: &mut Process, cmd: u64, flags: u64) -> SysResult {
             p.membarrier_registered |= cmd;
             Ok(0)
         }
-        GLOBAL | GLOBAL_EXPEDITED => Ok(0),
-        PRIVATE_EXPEDITED if registered(p, REGISTER_PRIVATE_EXPEDITED) => Ok(0),
-        PRIVATE_EXPEDITED_SYNC_CORE if registered(p, REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) => Ok(0),
+        // Every thread running on another CPU goes through the kernel (a
+        // barrier, and a context synchronization). Only `PROCESS`'s
+        // threads run anywhere, so that's GLOBAL too.
+        GLOBAL | GLOBAL_EXPEDITED => {
+            crate::smp::barrier_others();
+            Ok(0)
+        }
+        PRIVATE_EXPEDITED if registered(p, REGISTER_PRIVATE_EXPEDITED) => {
+            crate::smp::barrier_others();
+            Ok(0)
+        }
+        PRIVATE_EXPEDITED_SYNC_CORE if registered(p, REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) => {
+            crate::smp::barrier_others();
+            Ok(0)
+        }
         PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => Err(EPERM),
         _ => Err(EINVAL),
     }

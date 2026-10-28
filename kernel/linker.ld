@@ -51,9 +51,12 @@ SECTIONS
     }
 
     . = ALIGN(4096);
+    /* A 64 KiB kernel stack per CPU (grix_abi::machine::MAX_CPUS); CPU 0's first. */
     .stack (NOLOAD) : AT(ADDR(.stack) - KERNEL_OFFSET) {
+        __stacks = .;
         . += 0x10000;
         __stack_top = .;
+        . += 0x10000 * 7;
     }
 
     . = ALIGN(4096);

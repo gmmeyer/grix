@@ -19,26 +19,40 @@ fn reg32(addr: u64) -> *mut u32 {
     addr as *mut u32
 }
 
-/// Set the GIC up. `gicr` is the redistributors' physical base, which
-/// depends on the VMM (the boot image says).
+/// The SGI CPUs kick each other with (`smp::kick`).
+pub const KICK_INTID: u32 = 0;
+
+/// Set the GIC up, on CPU 0. `gicr` is the redistributors' physical base,
+/// which depends on the VMM (the boot image says).
 pub fn init(gicr: u64) {
-    // CPU 0's redistributor: RD_base frame, then SGI_base frame 64 KiB later.
-    let gicr = KERNEL_OFFSET + gicr;
-    let gicr_sgi = gicr + 0x1_0000;
+    // SAFETY: GIC distributor registers, mapped at GICD.
     unsafe {
         // Distributor: affinity routing, group 1 enabled (single security state).
         let ctlr = reg32(GICD);
         ctlr.write_volatile((1 << 4) | (1 << 1));
         while ctlr.read_volatile() & (1 << 31) != 0 {}
+    }
+    init_cpu(gicr);
+}
+
+/// This CPU's part of the GIC: `gicr` is its redistributor (physical).
+pub fn init_cpu(gicr: u64) {
+    // RD_base frame, then SGI_base frame 64 KiB later.
+    let gicr = KERNEL_OFFSET + gicr;
+    let gicr_sgi = gicr + 0x1_0000;
+    unsafe {
         // Wake the redistributor.
         let waker = reg32(gicr + 0x14);
         waker.write_volatile(waker.read_volatile() & !(1 << 1));
         while waker.read_volatile() & (1 << 2) != 0 {}
-        // Timer PPI: group 1, mid priority, enabled.
+        // The timer PPI and the kick SGI: group 1, mid priority, enabled.
+        let mine = (1 << TIMER_INTID) | (1 << KICK_INTID);
         let igroupr0 = reg32(gicr_sgi + 0x80);
-        igroupr0.write_volatile(igroupr0.read_volatile() | (1 << TIMER_INTID));
-        ((gicr_sgi + 0x400 + TIMER_INTID as u64) as *mut u8).write_volatile(0x80);
-        reg32(gicr_sgi + 0x100).write_volatile(1 << TIMER_INTID);
+        igroupr0.write_volatile(igroupr0.read_volatile() | mine);
+        for id in [TIMER_INTID, KICK_INTID] {
+            ((gicr_sgi + 0x400 + id as u64) as *mut u8).write_volatile(0x80);
+        }
+        reg32(gicr_sgi + 0x100).write_volatile(mine);
         // CPU interface (system registers): enable, unmask all priorities, group 1 on.
         asm!("mrs {t}, S3_0_C12_C12_5", "orr {t}, {t}, #1", "msr S3_0_C12_C12_5, {t}", "isb", t = out(reg) _); // ICC_SRE_EL1
         asm!("msr S3_0_C4_C6_0, {}", in(reg) 0xffu64); // ICC_PMR_EL1
@@ -62,6 +76,20 @@ pub fn enable_spi(intid: u32) {
     }
 }
 
+/// Send the kick SGI to CPU `cpu` (affinity 0.0.0.cpu).
+pub fn send_sgi(cpu: u32) {
+    // ICC_SGI1R_EL1: INTID in [27:24], target list in [15:0] (aff1..3 = 0).
+    let v = ((KICK_INTID as u64) << 24) | (1u64 << cpu);
+    unsafe { asm!("msr S3_0_C12_C11_5, {}", "isb", in(reg) v) };
+}
+
+/// Is an interrupt pending for this CPU (without acknowledging it)?
+pub fn pending() -> bool {
+    let id: u64;
+    unsafe { asm!("mrs {}, S3_0_C12_C12_2", out(reg) id) }; // ICC_HPPIR1_EL1
+    ((id & 0xff_ffff) as u32) < SPURIOUS
+}
+
 /// Acknowledge the highest-priority pending interrupt, if any.
 pub fn ack() -> Option<u32> {
     let id: u64;
@@ -82,11 +110,4 @@ pub fn timer_at(deadline_ns: u64) {
 
 pub fn timer_off() {
     unsafe { asm!("msr cntv_ctl_el0, {}", "isb", in(reg) 0u64) };
-}
-
-/// Sleep until an interrupt is pending and acknowledge it (the caller
-/// handles it and signals EOI). IRQs stay masked.
-pub fn wait_for_interrupt() -> Option<u32> {
-    unsafe { asm!("dsb sy", "wfi") };
-    ack()
 }

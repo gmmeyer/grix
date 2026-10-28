@@ -40,6 +40,7 @@ const KVM_DEV_ARM_VGIC_GRP_CTRL: u32 = 4;
 const KVM_VGIC_V3_ADDR_TYPE_DIST: u64 = 2;
 const KVM_VGIC_V3_ADDR_TYPE_REDIST: u64 = 3;
 const KVM_DEV_ARM_VGIC_CTRL_INIT: u64 = 0;
+const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
 const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
 const KVM_ARM_IRQ_TYPE_SPI: u32 = 1;
 
@@ -94,15 +95,21 @@ pub struct Vm {
     _gic: OwnedFd,
 }
 
-/// The vCPU, its shared `kvm_run` page, on the thread that runs it.
+/// A vCPU and its shared `kvm_run` page, for the thread that runs it.
 pub struct Cpu {
     fd: OwnedFd,
     run: *mut u8,
 }
 
+// SAFETY: the kvm_run page belongs to the vCPU's fd, which moves with it;
+// only one thread at a time runs a vCPU.
+unsafe impl Send for Cpu {}
+
 impl Vm {
     /// Create the VM with `size` bytes of memory at host `host`, guest
-    /// `ipa`, a GICv3 at the given bases, and one vCPU starting at `pc`.
+    /// `ipa`, a GICv3 at the given bases, and `cpus` vCPUs: the first
+    /// starting at `pc`, the others off until PSCI CPU_ON (which KVM
+    /// handles).
     ///
     /// # Safety
     /// `host` must stay mapped for as long as the VM runs.
@@ -113,7 +120,8 @@ impl Vm {
         gicd: u64,
         gicr: u64,
         pc: u64,
-    ) -> Result<(Vm, Cpu), Error> {
+        cpus: u32,
+    ) -> Result<(Vm, Vec<Cpu>), Error> {
         let kvm = File::options()
             .read(true)
             .write(true)
@@ -142,34 +150,40 @@ impl Vm {
         let nr_irqs: u32 = 128;
         set(KVM_DEV_ARM_VGIC_GRP_NR_IRQS, 0, &nr_irqs as *const u32 as *const u8)?;
 
-        let fd = own(ioctl(vm.as_raw_fd(), KVM_CREATE_VCPU, 0)?);
-        let mut init = VcpuInit::default();
-        ioctl(vm.as_raw_fd(), KVM_ARM_PREFERRED_TARGET, &mut init as *mut VcpuInit as u64)?;
-        // PSCI 0.2 in the kernel: SYSTEM_OFF comes back as a system event.
-        init.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
-        ioctl(fd.as_raw_fd(), KVM_ARM_VCPU_INIT, &init as *const VcpuInit as u64)?;
+        let run_size = ioctl(kvm.as_raw_fd(), KVM_GET_VCPU_MMAP_SIZE, 0)? as usize;
+        let mut vcpus = Vec::new();
+        for n in 0..cpus.max(1) {
+            let fd = own(ioctl(vm.as_raw_fd(), KVM_CREATE_VCPU, n as u64)?);
+            let mut init = VcpuInit::default();
+            ioctl(vm.as_raw_fd(), KVM_ARM_PREFERRED_TARGET, &mut init as *mut VcpuInit as u64)?;
+            // PSCI 0.2 in the kernel: SYSTEM_OFF comes back as a system
+            // event, and CPU_ON starts the others.
+            init.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+            if n > 0 {
+                init.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
+            }
+            ioctl(fd.as_raw_fd(), KVM_ARM_VCPU_INIT, &init as *const VcpuInit as u64)?;
+            // SAFETY: the vCPU's kvm_run page, shared with KVM.
+            let run = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    run_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    0,
+                )
+            };
+            if run == libc::MAP_FAILED {
+                return Err(Error(format!("mapping kvm_run: {}", std::io::Error::last_os_error())));
+            }
+            vcpus.push(Cpu { fd, run: run.cast() });
+        }
         // The GIC is ready once its vCPUs exist.
         set(KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_CTRL_INIT, std::ptr::null())?;
-
-        let size = ioctl(kvm.as_raw_fd(), KVM_GET_VCPU_MMAP_SIZE, 0)? as usize;
-        // SAFETY: the vCPU's kvm_run page, shared with KVM.
-        let run = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if run == libc::MAP_FAILED {
-            return Err(Error(format!("mapping kvm_run: {}", std::io::Error::last_os_error())));
-        }
-        let mut cpu = Cpu { fd, run: run.cast() };
-        cpu.set_reg(REG_PC, pc)?;
-        cpu.set_reg(REG_PSTATE, 0x3c5)?; // EL1h, interrupts masked
-        Ok((Vm { vm, _gic: gic }, cpu))
+        vcpus[0].set_reg(REG_PC, pc)?;
+        vcpus[0].set_reg(REG_PSTATE, 0x3c5)?; // EL1h, interrupts masked
+        Ok((Vm { vm, _gic: gic }, vcpus))
     }
 
     /// The handle device threads use to drive interrupt lines.

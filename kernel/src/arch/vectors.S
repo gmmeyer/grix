@@ -60,6 +60,9 @@ trap_common:
     mov     x0, sp
     bl      trap_handler
 
+// Back to EL0 with the frame at sp (also how a CPU starts its first thread).
+.global trap_return
+trap_return:
     ldp     x1, x2, [sp, #256]
     msr     elr_el1, x1
     msr     spsr_el1, x2
@@ -82,6 +85,25 @@ trap_common:
     ldp     x28, x29, [sp, #224]
     add     sp, sp, #FRAME_SIZE
     eret
+
+// Addresses of things linked at their physical address (.text.boot,
+// .bss.boot), out of ADRP's reach from the high half.
+.global secondary_entry_addr
+secondary_entry_addr:
+    ldr     x0, =secondary_entry
+    ret
+.global empty_l0_addr
+empty_l0_addr:
+    ldr     x0, =empty_l0
+    ret
+.ltorg
+
+// return_to_frame(frame: x0) -> !: the frame becomes the stack's last, and
+// this CPU returns to EL0 from it.
+.global return_to_frame_asm
+return_to_frame_asm:
+    mov     sp, x0
+    b       trap_return
 
 // enter_user_asm(entry: x0, user_sp: x1, kernel_stack_top: x2) -> !
 // Resets the kernel stack and drops to EL0 with all registers zeroed.

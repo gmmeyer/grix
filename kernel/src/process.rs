@@ -198,6 +198,9 @@ pub struct Process {
     pub slice_start: u64,
     /// Switch threads before returning to user space.
     pub resched: bool,
+    /// A thread waits to be the only one running (execve): other CPUs
+    /// leave this process at their next scheduling point (see `smp`).
+    pub exclusive_wanted: bool,
     /// The timer needs reprogramming (runnable set or deadlines changed).
     pub timer_dirty: bool,
     /// `ipc::generation()` when I/O waiters were last woken.
@@ -262,6 +265,7 @@ impl Process {
             futexes: BTreeMap::new(),
             slice_start: 0,
             resched: false,
+            exclusive_wanted: false,
             timer_dirty: true,
             io_seen: 0,
             timers: crate::timer::Timers::default(),
@@ -309,10 +313,12 @@ impl Process {
     /// been on the CPU since `slice_start`.
     pub fn thread_cpu_ns(&self, tid: u32) -> Option<u64> {
         let t = self.threads.get(&tid)?;
+        let now = crate::time::monotonic_ns();
         let running = if self.running && tid == self.current {
-            crate::time::monotonic_ns().saturating_sub(self.slice_start)
+            now.saturating_sub(self.slice_start)
         } else {
-            0
+            // On another CPU since then.
+            crate::smp::running_since(tid).map_or(0, |since| now.saturating_sub(since))
         };
         Some(t.cpu_ns + running)
     }
@@ -558,7 +564,7 @@ pub fn start(img: Image<'static>) -> ! {
     // Like tmpfs's default size: half of RAM for written file data.
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
-    let (stdin, gicr) = (img.stdin, img.gicr);
+    let (stdin, gicr, cpus) = (img.stdin, img.gicr, img.cpus);
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
     p.cwd = cwd;
@@ -574,9 +580,13 @@ pub fn start(img: Image<'static>) -> ! {
     fs::lock().set_exe(&program.exe);
     let (entry, sp) = program.install(&mut p);
     p.slice_start = crate::time::monotonic_ns();
+    // The kernel is ours while the other CPUs start (they wait for it).
+    crate::smp::lock();
     *PROCESS.lock() = Some(p);
     arch::irq::init(gicr);
+    crate::smp::start(cpus, gicr);
     console::start(stdin);
+    crate::smp::unlock();
     arch::enter_user(entry, sp)
 }
 

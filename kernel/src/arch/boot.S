@@ -1,37 +1,24 @@
-// Entry point. Runs at the physical load address with the MMU off.
+// Entry points. Run at the physical load address with the MMU off.
 //
-// Builds a minimal boot page table that maps physical 0..4 GiB twice:
+// CPU 0 (_start) builds a minimal boot page table that maps physical
+// 0..4 GiB twice:
 //   - identity (TTBR0), so this code keeps running when the MMU turns on
 //   - high half at KERNEL_OFFSET (TTBR1), where the rest of the kernel is linked
 // 0..1 GiB is device memory (UART etc.), 1..4 GiB is normal memory (RAM).
 // Rust code later replaces TTBR0 with the user address space.
+//
+// The other CPUs (secondary_entry, started with PSCI CPU_ON, x0 = their
+// stack) turn the MMU on with the same tables.
 
 .section .text.boot, "ax"
 .global _start
 _start:
     msr     daifset, #0xf
+    bl      drop_to_el1
 
-    // If started in EL2, drop to EL1.
-    mrs     x0, CurrentEL
-    lsr     x0, x0, #2
-    and     x0, x0, #3
-    cmp     x0, #2
-    b.ne    1f
-    mov     x0, #(1 << 31)              // HCR_EL2.RW: EL1 is AArch64
-    msr     hcr_el2, x0
-    mrs     x0, cnthctl_el2
-    orr     x0, x0, #3                  // EL1 may use the physical timer/counter
-    msr     cnthctl_el2, x0
-    msr     cntvoff_el2, xzr
-    mov     x0, #0x3c5                  // EL1h, all interrupts masked
-    msr     spsr_el2, x0
-    adr     x0, 1f
-    msr     elr_el2, x0
-    eret
-1:
-    // Zero the two boot page-table pages.
+    // Zero the boot page-table pages (and the empty one after them).
     adrp    x0, boot_l0
-    mov     x1, #(4096 * 2 / 8)
+    mov     x1, #(4096 * 3 / 8)
 2:  str     xzr, [x0], #8
     subs    x1, x1, #1
     b.ne    2b
@@ -53,7 +40,72 @@ _start:
     add     x4, x4, #1
     cmp     x4, #4
     b.ne    3b
+    // The tables reach memory before any CPU (this one, or one started
+    // later with its caches off) walks them.
+    dsb     sy
 
+    bl      mmu_on
+
+    // Now running with the MMU on (still via the identity map).
+    ldr     x0, =__stack_top
+    mov     sp, x0
+
+    ldr     x0, =__bss_start
+    ldr     x1, =__bss_end
+4:  cmp     x0, x1
+    b.hs    5f
+    str     xzr, [x0], #8
+    b       4b
+5:
+    ldr     x0, =exception_vectors
+    msr     vbar_el1, x0
+    isb
+
+    ldr     x0, =kernel_main
+    blr     x0
+6:  wfe
+    b       6b
+
+.global secondary_entry
+secondary_entry:
+    msr     daifset, #0xf
+    mov     x19, x0                     // this CPU's stack (high half)
+    bl      drop_to_el1
+    bl      mmu_on
+    // The top 272 bytes are the frame its threads start from (and traps
+    // from EL0 save theirs in); Rust runs below them.
+    sub     x19, x19, #272
+    mov     sp, x19
+    ldr     x0, =exception_vectors
+    msr     vbar_el1, x0
+    isb
+    mov     x0, x19
+    ldr     x1, =secondary_main
+    blr     x1
+7:  wfe
+    b       7b
+
+// If started in EL2, drop to EL1 (returns in EL1h, interrupts masked).
+drop_to_el1:
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    and     x0, x0, #3
+    cmp     x0, #2
+    b.ne    1f
+    mov     x0, #(1 << 31)              // HCR_EL2.RW: EL1 is AArch64
+    msr     hcr_el2, x0
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3                  // EL1 may use the physical timer/counter
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr
+    mov     x0, #0x3c5                  // EL1h, all interrupts masked
+    msr     spsr_el2, x0
+    msr     elr_el2, x30
+    eret
+1:  ret
+
+// Turn the MMU on with the boot tables (identity-mapped code keeps running).
+mmu_on:
     // MAIR: attr0 = Device-nGnRnE, attr1 = Normal write-back RW-allocate.
     mov     x0, #0xff00
     msr     mair_el1, x0
@@ -86,26 +138,7 @@ _start:
     ldr     x0, =0x34D5D805
     msr     sctlr_el1, x0
     isb
-
-    // Now running with the MMU on (still via the identity map).
-    ldr     x0, =__stack_top
-    mov     sp, x0
-
-    ldr     x0, =__bss_start
-    ldr     x1, =__bss_end
-4:  cmp     x0, x1
-    b.hs    5f
-    str     xzr, [x0], #8
-    b       4b
-5:
-    ldr     x0, =exception_vectors
-    msr     vbar_el1, x0
-    isb
-
-    ldr     x0, =kernel_main
-    blr     x0
-6:  wfe
-    b       6b
+    ret
 
 .ltorg
 
@@ -114,3 +147,6 @@ _start:
 .global boot_l0
 boot_l0: .space 4096
 boot_l1: .space 4096
+// A user page table with nothing in it, for CPUs with no thread.
+.global empty_l0
+empty_l0: .space 4096

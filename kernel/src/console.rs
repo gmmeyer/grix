@@ -453,7 +453,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         c.dev.flush(|| crate::arch::counter() > give_up);
     }
     let mut w = FrameWriter { ch: Channel::Log, buf: [0; 256], len: 0, uart: true };
-    let _ = writeln!(w, "kernel panic: {info}");
+    let _ = writeln!(w, "kernel panic (cpu {}): {info}", crate::smp::me());
     w.flush();
     frames(Channel::Exit, &wire::encode_exit(ExitKind::Panic, -1), uart_put);
     crate::arch::power_off()

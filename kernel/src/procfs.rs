@@ -35,6 +35,9 @@ pub enum ProcFile {
     Mounts,
     // /proc/...
     Cpuinfo,
+    /// 0-(n-1), the CPUs.
+    CpuList,
+    CgroupCpuMax,
     ProcStat,
     Meminfo,
     Uptime,
@@ -90,13 +93,13 @@ pub const FILES: &[(&str, ProcFile)] = &[
         ),
     ),
     ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
-    ("/sys/devices/system/cpu/online", ProcFile::Text("0\n")),
-    ("/sys/devices/system/cpu/possible", ProcFile::Text("0\n")),
-    ("/sys/devices/system/cpu/present", ProcFile::Text("0\n")),
+    ("/sys/devices/system/cpu/online", ProcFile::CpuList),
+    ("/sys/devices/system/cpu/possible", ProcFile::CpuList),
+    ("/sys/devices/system/cpu/present", ProcFile::CpuList),
     ("/sys/kernel/mm/transparent_hugepage/enabled", ProcFile::Text("always madvise [never]\n")),
     ("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", ProcFile::Text("2097152\n")),
     ("/sys/fs/cgroup/cgroup.controllers", ProcFile::Text("cpu memory pids\n")),
-    ("/sys/fs/cgroup/cpu.max", ProcFile::Text("100000 100000\n")),
+    ("/sys/fs/cgroup/cpu.max", ProcFile::CgroupCpuMax),
     ("/sys/fs/cgroup/memory.max", ProcFile::CgroupMemoryMax),
     ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
 ];
@@ -139,12 +142,24 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             let _ = write!(s, "grix / tmpfs {m} 0 0\nproc /proc proc rw 0 0\ndev /dev devtmpfs rw 0 0\n");
         }
         ProcFile::Cpuinfo => cpuinfo(&mut s),
+        ProcFile::CpuList => {
+            let n = crate::smp::count();
+            let _ = if n == 1 { writeln!(s, "0") } else { writeln!(s, "0-{}", n - 1) };
+        }
+        // As many CPUs' worth of time per period as there are.
+        ProcFile::CgroupCpuMax => {
+            let _ = writeln!(s, "{} 100000", crate::smp::count() * 100_000);
+        }
         ProcFile::ProcStat => {
             let ticks = time::monotonic_ns() / 10_000_000;
+            let n = crate::smp::count();
+            let _ = writeln!(s, "cpu  {} 0 0 0 0 0 0 0 0 0", ticks * n as u64);
+            for i in 0..n {
+                let _ = writeln!(s, "cpu{i} {ticks} 0 0 0 0 0 0 0 0 0");
+            }
             let _ = write!(
                 s,
-                "cpu  {ticks} 0 0 0 0 0 0 0 0 0\ncpu0 {ticks} 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime {}\n\
-                 processes 1\nprocs_running 1\nprocs_blocked 0\n",
+                "intr 0\nctxt 0\nbtime {}\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
                 time::realtime_to_boot_secs()
             );
         }
@@ -301,18 +316,20 @@ fn cpuinfo(s: &mut String) {
     let features: Vec<&str> = NAMES.iter().enumerate().filter(|(i, _)| hw & (1 << i) != 0).map(|(_, n)| *n).collect();
     let midr = arch::midr();
     let bogomips = arch::counter_freq() * 2 / 10_000;
-    let _ = write!(
-        s,
-        "processor\t: 0\nBogoMIPS\t: {}.{:02}\nFeatures\t: {}\nCPU implementer\t: {:#04x}\n\
-         CPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
-        bogomips / 100,
-        bogomips % 100,
-        features.join(" "),
-        (midr >> 24) & 0xff,
-        (midr >> 20) & 0xf,
-        (midr >> 4) & 0xfff,
-        midr & 0xf,
-    );
+    for cpu in 0..crate::smp::count() {
+        let _ = write!(
+            s,
+            "processor\t: {cpu}\nBogoMIPS\t: {}.{:02}\nFeatures\t: {}\nCPU implementer\t: {:#04x}\n\
+             CPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {:#05x}\nCPU revision\t: {}\n\n",
+            bogomips / 100,
+            bogomips % 100,
+            features.join(" "),
+            (midr >> 24) & 0xff,
+            (midr >> 20) & 0xf,
+            (midr >> 4) & 0xfff,
+            midr & 0xf,
+        );
+    }
 }
 
 /// A version-4 UUID: fresh random, or derived from `seed`.

@@ -50,6 +50,20 @@ pub fn write_u32(a: &mut AddressSpace, addr: u64, v: u32) -> Result<(), Errno> {
     copy_out(a, addr, &v.to_le_bytes())
 }
 
+/// Replace the aligned u32 at `addr` with `f(old)` atomically (threads on
+/// other CPUs may be changing it too); returns the old value.
+pub fn update_u32(a: &mut AddressSpace, addr: u64, f: impl Fn(u32) -> u32) -> Result<u32, Errno> {
+    if !addr.is_multiple_of(4) {
+        return Err(EINVAL);
+    }
+    a.ensure(addr, 4, true)?;
+    // SAFETY: validated, present and writable (ensure), and aligned.
+    let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(addr as *mut u32) };
+    Ok(word
+        .try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |v| Some(f(v)))
+        .unwrap_or_else(|v| v))
+}
+
 /// Read a NUL-terminated string. Non-UTF-8 strings cannot name anything in
 /// our filesystem, so they are reported as ENOENT.
 pub fn read_cstr(a: &mut AddressSpace, addr: u64, max: usize) -> Result<String, Errno> {

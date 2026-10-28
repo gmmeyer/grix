@@ -86,6 +86,9 @@ pub struct Image<'a> {
     /// Snapshot the machine when the program first waits for stdin (see
     /// [`SNAPSHOT_CALL`]).
     pub snapshot: bool,
+    /// CPUs the machine has (1..=`machine::MAX_CPUS`); the kernel starts
+    /// the others with PSCI CPU_ON.
+    pub cpus: u32,
 }
 
 /// The hypervisor call (HVC, in SMCCC's OEM service range: Hypervisor.framework
@@ -167,6 +170,7 @@ impl<'a> Image<'a> {
             w.u32(*port as u32);
         }
         w.u8(self.snapshot as u8);
+        w.u32(self.cpus);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -223,6 +227,10 @@ impl<'a> Image<'a> {
         }
         let forwards = (0..n).map(|_| r.u32().map(|p| p as u16)).collect::<Result<_, _>>()?;
         let snapshot = r.u8()? != 0;
+        let cpus = r.u32()?;
+        if cpus == 0 || cpus > crate::machine::MAX_CPUS {
+            return Err(DecodeError);
+        }
         Ok(Image {
             ram_size: header.ram_size,
             gicr: header.gicr,
@@ -243,6 +251,7 @@ impl<'a> Image<'a> {
             live_mounts,
             forwards,
             snapshot,
+            cpus,
         })
     }
 }
@@ -278,6 +287,7 @@ mod tests {
             live_mounts: vec![LiveMount { path: "/src", writable: false }],
             forwards: vec![8000, 80],
             snapshot: true,
+            cpus: 4,
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -308,6 +318,7 @@ mod tests {
             live_mounts: vec![],
             forwards: vec![],
             snapshot: false,
+            cpus: 1,
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

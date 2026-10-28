@@ -263,16 +263,16 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
             if uaddr2 % 4 != 0 {
                 return Err(EINVAL);
             }
-            let old = read_u32(&mut p.aspace, uaddr2)?;
-            let new = match op & 7 {
+            if op & 7 > 4 {
+                return Err(ENOSYS);
+            }
+            let old = crate::uaccess::update_u32(&mut p.aspace, uaddr2, |old| match op & 7 {
                 0 => oparg,
                 1 => old.wrapping_add(oparg),
                 2 => old | oparg,
                 3 => old & !oparg,
-                4 => old ^ oparg,
-                _ => return Err(ENOSYS),
-            };
-            write_u32(&mut p.aspace, uaddr2, new)?;
+                _ => old ^ oparg,
+            })?;
             let old = old as i32;
             let hit = match cmp {
                 0 => old == cmparg,

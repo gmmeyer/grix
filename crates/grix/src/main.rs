@@ -62,6 +62,9 @@ struct McpArgs {
     /// The most memory a run may have, in MiB (default 2048).
     #[arg(long, value_name = "MIB")]
     max_mem: Option<u64>,
+    /// The most CPUs a run may have (default 4).
+    #[arg(long, value_name = "N")]
+    max_cpus: Option<u32>,
     /// Let agents change files under the roots: writable mounts (rw,
     /// on_exit) and build_image's output. Without it they only read.
     #[arg(long)]
@@ -164,6 +167,9 @@ struct RunArgs {
     /// Guest memory in MiB.
     #[arg(long)]
     mem: Option<u64>,
+    /// CPUs for the program's threads (default 1).
+    #[arg(long)]
+    cpus: Option<u32>,
     /// After the time limit, how many seconds the program has to end after
     /// SIGTERM before it's stopped (default 5).
     #[arg(long, value_name = "SECS")]
@@ -408,6 +414,9 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
     }
     if let Some(mb) = args.mem {
         b = b.memory_mb(mb);
+    }
+    if let Some(n) = args.cpus {
+        b = b.cpus(n);
     }
     if let Some(s) = args.grace {
         b = b.grace(Duration::from_secs(s));
@@ -698,6 +707,9 @@ fn mcp(args: McpArgs) -> Result<i32> {
     }
     if let Some(mb) = args.max_mem {
         config.max_memory_mb = mb;
+    }
+    if let Some(n) = args.max_cpus {
+        config.max_cpus = n;
     }
     config.writable = args.writable;
     grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout().lock())?;

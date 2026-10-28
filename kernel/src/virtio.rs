@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{Ordering, fence};
 
-use grix_abi::machine::{CONSOLE_CONTROL_TX, CONSOLE_PORT, CONSOLE_RX, CONSOLE_TX, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE};
+use grix_abi::machine::{
+    CONSOLE_CONTROL_TX, CONSOLE_PORT, CONSOLE_RX, CONSOLE_TX, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE,
+};
 
 use crate::mm::{KERNEL_OFFSET, PAGE_SIZE, frame, p2v};
 

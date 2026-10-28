@@ -32,7 +32,7 @@ mkdir -p "$INITRD/bin" "$INITRD/dev" "$INITRD/proc" "$INITRD/tmp" "$INITRD/fixtu
 cp "$ROOT/target/$TARGET/release/grix" "$ROOT/target/$TARGET/release/grix-vmm" "$INITRD/bin/"
 cp "$ROOT/fixtures/build/alpine/bin/busybox.static" "$INITRD/bin/busybox"
 cp "$ROOT/kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel" "$INITRD/grix-kernel"
-cp "$ROOT/fixtures/build/hello" "$ROOT/fixtures/build/threads" "$INITRD/fixtures/"
+cp "$ROOT/fixtures/build/hello" "$ROOT/fixtures/build/threads" "$ROOT/fixtures/build/smp" "$INITRD/fixtures/"
 cat > "$INITRD/init" <<'EOF'
 #!/bin/busybox sh
 export PATH=/bin GRIX_KERNEL=/grix-kernel TMPDIR=/tmp
@@ -44,6 +44,8 @@ grix run -i /fixtures/hello:/bin/hello -e GREETING=kvm -- /bin/hello world
 echo "hello-status: $?"
 echo "words: $(echo one two three | grix run -i /bin/busybox:/bin/busybox -- /bin/busybox wc -w)"
 grix run -a threads -i /fixtures/threads:/bin/threads -- /bin/threads | busybox tail -1
+grix run --cpus 2 -a threads -a process -i /fixtures/smp:/bin/smp -- /bin/smp
+grix run --cpus 2 -a threads -a process -i /fixtures/smp:/bin/smp -- /bin/smp exec
 grix run -a process --timeout 5 -i /bin/busybox:/bin/busybox -- /bin/busybox sh -c '/bin/busybox sleep 1; echo slept'
 echo KVM-TEST-DONE
 busybox poweroff -f
@@ -66,6 +68,8 @@ check "GREETING=kvm"
 check "hello-status: 7"
 check "words: 3"
 check "threads ok counter=160000"
+check "smp ok cpus=2"
+check "exec ok"
 check "slept"
 check "KVM-TEST-DONE"
 [ $fail = 0 ] || { echo "--- $LOG"; tail -40 "$LOG"; exit 1; }

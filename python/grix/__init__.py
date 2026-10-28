@@ -91,6 +91,8 @@ class Sandbox:
     cwd: Optional[str] = None
     capabilities: Sequence[str] = ()
     memory_mb: Optional[int] = None
+    #: CPUs for the program's threads (1 by default).
+    cpus: Optional[int] = None
     timeout: Optional[float] = None
     grace: Optional[float] = None
     allow_hosts: Sequence[str] = ()
@@ -119,6 +121,8 @@ class Sandbox:
             a += ["-a", c]
         if self.memory_mb:
             a += ["--mem", str(int(self.memory_mb))]
+        if self.cpus:
+            a += ["--cpus", str(int(self.cpus))]
         if self.timeout is not None:
             a += ["--timeout", str(max(1, int(round(self.timeout))))]
         if self.grace is not None:

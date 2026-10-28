@@ -155,6 +155,16 @@ pub fn execve(
             return Err(e.errno);
         }
     };
+    // Other CPUs running threads of this process, in the address space
+    // about to go, leave it first (see `smp`); the call then runs again.
+    // (A signal meanwhile leaves the process on one CPU until the next
+    // execve: slower, not wrong.)
+    if !crate::smp::alone() {
+        p.exclusive_wanted = true;
+        crate::smp::kick_others();
+        return p.block_io(None, Err(EINTR));
+    }
+    p.exclusive_wanted = false;
     // The point of no return.
     let (entry, sp) = program.install(p);
     // The other threads end (Linux's de_thread); this one takes the pid.

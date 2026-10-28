@@ -17,7 +17,7 @@
 //! On macOS it runs on Hypervisor.framework (15+, for its GIC), on Linux on
 //! KVM.
 //!
-//! `grix-vmm --kernel FILE --image FILE --mem MIB [--uart SOCKET] [--snapshot]`
+//! `grix-vmm --kernel FILE --image FILE --mem MIB [--cpus N] [--uart SOCKET] [--snapshot]`
 //! boots the kernel; with `--snapshot`, fd 3 is where to save the machine
 //! when the kernel asks (`snapshot.rs`). `grix-vmm --restore [--uart
 //! SOCKET]` runs the snapshot on fd 3 instead.
@@ -47,6 +47,8 @@ pub struct Args {
     pub snapshot: bool,
     /// Run the snapshot on fd 3 (`kernel`, `image` and `mem_mb` unused).
     pub restore: bool,
+    /// vCPUs (the kernel starts all but the first with PSCI CPU_ON).
+    pub cpus: u32,
 }
 
 fn parse() -> Result<Args, String> {
@@ -55,6 +57,7 @@ fn parse() -> Result<Args, String> {
     let mut mem_mb = None;
     let mut uart = None;
     let (mut snapshot, mut restore) = (false, false);
+    let mut cpus = 1;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{} needs a value", a.to_string_lossy()));
@@ -66,13 +69,29 @@ fn parse() -> Result<Args, String> {
                 mem_mb = Some(v.to_str().and_then(|s| s.parse().ok()).ok_or("--mem takes a number of MiB")?);
             }
             Some("--uart") => uart = Some(PathBuf::from(value()?)),
+            Some("--cpus") => {
+                let v = value()?;
+                cpus = v
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| (1..=grix_abi::machine::MAX_CPUS).contains(n))
+                    .ok_or(format!("--cpus takes 1 to {}", grix_abi::machine::MAX_CPUS))?;
+            }
             Some("--snapshot") => snapshot = true,
             Some("--restore") => restore = true,
             _ => return Err(format!("unknown argument {}", a.to_string_lossy())),
         }
     }
     if restore {
-        return Ok(Args { kernel: PathBuf::new(), image: PathBuf::new(), mem_mb: 0, uart, snapshot: false, restore });
+        return Ok(Args {
+            kernel: PathBuf::new(),
+            image: PathBuf::new(),
+            mem_mb: 0,
+            uart,
+            snapshot: false,
+            restore,
+            cpus: 1,
+        });
     }
     Ok(Args {
         kernel: kernel.ok_or("--kernel is required")?,
@@ -81,6 +100,7 @@ fn parse() -> Result<Args, String> {
         uart,
         snapshot,
         restore,
+        cpus,
     })
 }
 

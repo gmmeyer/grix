@@ -1,10 +1,11 @@
-//! Scheduling on one CPU: round-robin across processes, and across each
-//! process's threads, with a time slice driven by the virtual timer. There
-//! is a single kernel stack: switching threads means saving the trapped user
-//! state into the old thread and loading the new thread's saved state into
-//! the trap frame before returning to EL0. Switching processes also swaps
-//! the running process's body in `PROCESS` with one from `procs::PROCS`, and
-//! the address space in TTBR0.
+//! Scheduling: round-robin across processes, and across each process's
+//! threads, with a time slice driven by the virtual timer. Each CPU has one
+//! kernel stack: switching threads means saving the trapped user state into
+//! the old thread and loading the new thread's saved state into the trap
+//! frame before returning to EL0. Switching processes also swaps the
+//! running process's body in `PROCESS` with one from `procs::PROCS`, and
+//! the address space in TTBR0; with more CPUs, only once the others have
+//! left it (see `smp`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use crate::console;
 use crate::process::{PROCESS, Process, WaitOn};
 use crate::procs::{self, PROCS, Procs};
 use crate::signal::SIGKILL;
+use crate::smp;
 use crate::time;
 use grix_abi::wire::Event;
 
@@ -22,14 +24,19 @@ pub const SLICE_NS: u64 = 10_000_000;
 /// Pick the next runnable thread, in this process or another, and make `tf`
 /// its state. If the current thread is still runnable it goes to the back
 /// of its run queue; if it blocked or exited it is simply not chosen. An
-/// ended process is finished off here, and never runs again.
+/// ended process is finished off here, and never runs again. With nothing
+/// to run, the CPU is left with no thread (`running` false) and its timer
+/// set for what comes next: `smp::finish` waits for it, then calls this
+/// again.
 pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     p.resched = false;
     let mut procs = PROCS.lock();
     let prev = p.current;
-    // CPU time: prev ran from slice_start until now (not while we idle below).
+    // CPU time: prev ran from slice_start until now (not while we idle).
     let now = time::monotonic_ns();
-    if let Some(t) = p.threads.get_mut(&prev) {
+    if p.running
+        && let Some(t) = p.threads.get_mut(&prev)
+    {
         t.cpu_ns += now.saturating_sub(p.slice_start);
         t.regs = *tf;
         // The kernel never touches FP/SIMD or TPIDR_EL0, so the CPU still
@@ -41,21 +48,40 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
         }
     }
     p.running = false;
+    p.current = smp::NO_THREAD;
+    let alone = smp::alone();
     if p.exit_status.is_some() && !p.dead {
+        if alone {
+            procs::finalize(p, None, &mut procs);
+        } else {
+            // Its threads on other CPUs stop; the last CPU finishes it off.
+            smp::kick_others();
+        }
+    }
+    // The other CPUs have left: whoever waited for that (execve) goes on.
+    if p.exclusive_wanted && alone {
+        crate::ipc::changed();
+    }
+    procs::reap_others(p, &mut procs);
+    poll(p, &mut procs);
+    // The process may have ended just now (a timer's signal, the host's).
+    if p.exit_status.is_some() && !p.dead && alone {
         procs::finalize(p, None, &mut procs);
     }
-    let next = loop {
-        procs::reap_others(p, &mut procs);
-        poll(p, &mut procs);
-        if let Some(pid) = pick(p, &procs) {
-            break pid;
+    let Some(next) = pick(p, &procs, alone) else {
+        // The others leave too, so the last one can switch to the process
+        // that waits (or finish this one off): they'd run on otherwise.
+        if !alone && (others_wait(&procs) || !smp::runs_here(p)) {
+            smp::kick_others();
         }
-        idle(p, &mut procs);
+        idle(p, &mut procs, alone);
+        return;
     };
     if next != p.pid {
         let mut body = procs.others.remove(&next).unwrap();
         core::mem::swap(p, &mut body);
         p.aspace.activate();
+        smp::activated(p.aspace.pt.root);
         // `body` is the process that was running: back with the others,
         // unless it has ended (its address space is no longer in TTBR0).
         if !body.dead {
@@ -78,10 +104,21 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
 /// The process to run next: the first after this one (by pid, wrapping)
 /// with a runnable thread, so processes take turns; this one if it's the
 /// only one.
-fn pick(p: &Process, procs: &Procs) -> Option<u32> {
+fn pick(p: &Process, procs: &Procs, alone: bool) -> Option<u32> {
     let runnable = |(&pid, q): (&u32, &Process)| (!q.runq.is_empty()).then_some(pid);
+    // Other CPUs run threads of `p`: more of them, unless `p` wants to be
+    // alone or another process waits for the CPUs (then they all leave it,
+    // and the last one switches).
+    if !alone {
+        return (!p.runq.is_empty() && smp::runs_here(p) && !others_wait(procs)).then_some(p.pid);
+    }
     let others = procs.others.range(p.pid + 1..).chain(procs.others.range(..p.pid));
     others.filter_map(runnable).next().or_else(|| (!p.runq.is_empty()).then_some(p.pid))
+}
+
+/// Another process has threads waiting to run.
+pub fn others_wait(procs: &Procs) -> bool {
+    procs.others.values().any(|q| !q.runq.is_empty())
 }
 
 /// Everything due, in every process: timers, I/O waiters, expired
@@ -109,6 +146,10 @@ fn poll(p: &mut Process, procs: &mut Procs) -> bool {
 
 /// The I/O generation the last `poll` left everyone at.
 static POLLED: AtomicU64 = AtomicU64::new(0);
+
+pub fn polled() -> u64 {
+    POLLED.load(Ordering::Relaxed)
+}
 
 /// A signal from the host: to the program's process group, as a terminal
 /// sends Ctrl-C to its foreground group. Unlike other senders, nothing
@@ -156,29 +197,22 @@ fn wake_expired(p: &mut Process) -> bool {
     !expired.is_empty()
 }
 
-/// Nothing is runnable anywhere: sleep until the next deadline, or give up
-/// if no thread can ever wake.
-fn idle(p: &mut Process, procs: &mut Procs) {
+/// Nothing is runnable here: set the timer for the next deadline (the CPU
+/// then waits in `smp::finish`), or give up if no thread anywhere can ever
+/// wake.
+fn idle(p: &mut Process, procs: &mut Procs, alone: bool) {
     match earliest_deadline(p, procs) {
         Some(deadline) => irq::timer_at(deadline),
         // The host can still wake whoever waits for I/O, and a thread
         // waiting for a signal may get one: a RunControl's, or the SIGTERM
-        // the time limit sends.
-        None if waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
+        // the time limit sends. Threads on other CPUs may wake anyone.
+        None if !alone || waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
         None => deadlock(p, procs),
     }
     p.timer_dirty = true;
     // The moment a snapshot wants: everything started, waiting for input.
-    if waiting_for_input(p, procs) {
+    if alone && waiting_for_input(p, procs) {
         crate::snapshot::take_if_wanted();
-    }
-    // Checking on the host may itself have freed room for a writer. (Not
-    // `p.io_seen`: `p` may have just ended, and nothing updates that.)
-    if crate::ipc::generation() != POLLED.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Some(id) = irq::wait_for_interrupt() {
-        handle_interrupt(id);
     }
 }
 
@@ -197,9 +231,11 @@ fn waiting_for_signal(p: &mut Process, procs: &mut Procs) -> bool {
 }
 
 /// Handle an acknowledged interrupt and signal its end.
-fn handle_interrupt(id: u32) {
+pub fn handle_interrupt(id: u32) {
     match id {
         irq::TIMER_INTID => irq::timer_off(),
+        // A kick: the CPU schedules on its way out.
+        irq::KICK_INTID => {}
         _ => {
             console::interrupt(id);
         }
@@ -263,6 +299,11 @@ pub fn irq(tf: &mut TrapFrame) {
     handle_interrupt(id);
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("interrupt without a process");
+    // Its thread ended while it ran (on another CPU's say): `smp::finish`
+    // schedules.
+    if !p.running {
+        return;
+    }
     p.timer_dirty = true;
     let (woke, others_runnable) = {
         let mut procs = PROCS.lock();
@@ -271,7 +312,7 @@ pub fn irq(tf: &mut TrapFrame) {
         (woke, procs.others.values().any(|q| !q.runq.is_empty()))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
-    if (!p.runq.is_empty() || others_runnable) && (slice_over || woke) {
+    if p.resched || (!p.runq.is_empty() || others_runnable) && (slice_over || woke) {
         schedule(p, tf);
     } else {
         update_timer(p);

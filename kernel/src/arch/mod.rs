@@ -34,9 +34,39 @@ pub struct FpState {
 
 unsafe extern "C" {
     fn enter_user_asm(entry: u64, sp: u64, kernel_stack_top: u64) -> !;
+    fn return_to_frame_asm(frame: *const TrapFrame) -> !;
     fn fpsimd_save(state: *mut FpState);
     fn fpsimd_restore(state: *const FpState);
-    static __stack_top: u8;
+    static __stacks: u8;
+    fn secondary_entry_addr() -> u64;
+    fn empty_l0_addr() -> u64;
+}
+
+const STACK_SIZE: u64 = 0x10000;
+
+/// Top of CPU `cpu`'s kernel stack (they're laid out in the linker script).
+pub fn stack_top(cpu: usize) -> u64 {
+    (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
+}
+
+/// Where a secondary CPU starts (physical: its MMU is off).
+pub fn secondary_entry_phys() -> u64 {
+    // .text.boot runs where it's loaded: its address is physical.
+    unsafe { secondary_entry_addr() }
+}
+
+/// A user page table that maps nothing (physical address: it's in
+/// .bss.boot, which is linked where it's loaded).
+pub fn empty_page_table() -> u64 {
+    unsafe { empty_l0_addr() }
+}
+
+/// Return to EL0 from `frame`, which must be at the top of this CPU's stack.
+///
+/// # Safety
+/// `frame` holds a valid EL0 state (pstate EL0t), as a trap leaves it.
+pub unsafe fn return_to_frame(frame: *const TrapFrame) -> ! {
+    unsafe { return_to_frame_asm(frame) }
 }
 
 pub fn save_fp(state: &mut FpState) {
@@ -61,8 +91,7 @@ pub fn set_tpidr(v: u64) {
 /// Drop to EL0 at `entry` with stack pointer `sp`. Never returns: from here on
 /// the kernel only runs in exception handlers.
 pub fn enter_user(entry: u64, sp: u64) -> ! {
-    let top = (&raw const __stack_top) as u64;
-    unsafe { enter_user_asm(entry, sp, top) }
+    unsafe { enter_user_asm(entry, sp, stack_top(0)) }
 }
 
 // Exception classes (ESR_EL1.EC).
@@ -77,8 +106,22 @@ const EC_BRK: u64 = 0x3c;
 
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
+    if !matches!(kind, 5 | 8 | 9) {
+        panic!(
+            "unexpected exception: kind={kind} esr={:#x} far={:#x} elr={:#x} lr={:#x} sp_el0={:#x}",
+            esr(),
+            far(),
+            tf.elr,
+            tf.x[30],
+            tf.sp_el0
+        );
+    }
+    crate::smp::lock();
+    // The thread this CPU ran may have ended meanwhile (exit_group or
+    // execve on another CPU): then there's nothing to handle for it.
+    let has_thread = process::PROCESS.lock().as_ref().is_some_and(|p| p.running);
     match kind {
-        8 => {
+        8 if has_thread => {
             el0_sync(tf);
             signal::return_to_user(tf);
         }
@@ -86,10 +129,11 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             sched::irq(tf);
             signal::return_to_user(tf);
         }
-        // The kernel runs with IRQs masked, so nothing should arrive here.
-        5 => {}
-        _ => panic!("unexpected exception: kind={kind} esr={:#x} far={:#x} elr={:#x}", esr(), far(), tf.elr),
+        // The kernel runs with IRQs masked, so nothing should arrive at 5.
+        _ => {}
     }
+    // Something to run (waiting for it if need be), and the kernel back.
+    crate::smp::finish(tf);
 }
 
 fn el0_sync(tf: &mut TrapFrame) {
@@ -253,13 +297,22 @@ pub fn set_user_page_table(root_pa: u64) {
     };
 }
 
+/// Order what was written to a page (zeroing, contents) before the entry
+/// that publishes it: another CPU's walker or thread may use the entry at
+/// once.
+pub fn publish_barrier() {
+    unsafe { asm!("dmb ishst") };
+}
+
 /// Make page-table writes visible to the table walker.
 pub fn pte_barrier() {
     unsafe { asm!("dsb ishst", "isb") };
 }
 
+/// Forget cached translations, on every CPU (they may run threads of this
+/// address space): before a page whose mapping changed is reused.
 pub fn flush_tlb() {
-    unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb nsh", "isb") };
+    unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
 
 /// Make freshly written instructions at kernel address `kva` visible to instruction fetch.
@@ -269,7 +322,8 @@ pub fn sync_icache(kva: u64, len: u64) {
         unsafe { asm!("dc cvau, {}", in(reg) a) };
         a += 64;
     }
-    unsafe { asm!("dsb ish", "ic iallu", "dsb ish", "isb") };
+    // Every CPU's instruction cache: threads move between CPUs.
+    unsafe { asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };
 }
 
 /// PSCI SYSTEM_OFF. The VMM ends the VM.

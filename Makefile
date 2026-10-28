@@ -25,6 +25,8 @@ fixtures:
 	python3 -I tools/alpine.py --out fixtures/build/alpine busybox-static busybox
 	python3 -I tools/alpine.py --out fixtures/build/python python3 ca-certificates-bundle
 	python3 -I tools/alpine.py --out fixtures/build/node nodejs
+	# qemu-x86_64 (user mode, static), to run x86_64 programs.
+	python3 -I tools/alpine.py --out fixtures/build/qemu-x86_64 qemu-x86_64
 	# A Docker Hub image, as an OCI layout, for the image tests.
 	cargo build --release -p grix
 	./target/release/grix pull alpine:3.21 --oci fixtures/build/oci/alpine

@@ -127,7 +127,7 @@ init and sends the exit signal. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
 caller running.
 
-Threads (`sched.rs`): one CPU and one kernel stack. Each thread keeps its user
+Threads (`sched.rs`): one kernel stack per CPU. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must
 wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
 returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
@@ -137,6 +137,31 @@ from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
 Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
 the scheduler programs the CPU timer for the earliest one and calls
 `timer::fire` from the timer interrupt and the idle loop.
+
+More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
+is still the single-CPU kernel, made safe by a big kernel lock that every
+exception takes (`smp::lock` in `trap_handler`) and gives back on the way
+to EL0 (`smp::finish`). What runs in parallel is user code: the threads of
+the process in `PROCESS` (gang scheduling). Each CPU's scheduling state
+(`smp::CPUS`: its thread, time slice, resched, timer_dirty) is swapped into
+the `Process` fields while it holds the lock, so `p.current` is this
+CPU's thread, and a thread running on another CPU is in neither `runq`
+nor `current`, its registers live in that CPU: don't touch them. A CPU
+with nothing to run waits in `smp::finish` holding nothing (a kick: SGI 0,
+plus `KICK_CALL` for grix-vmm). Switching processes, finishing off one
+that ended and execve need the other CPUs out of the process
+(`smp::alone`); they leave at their next schedule (`exclusive_wanted`,
+`kick_others`). Signals for a thread on another CPU kick it
+(`kick_thread`). A CPU that declines to run more of `p` (another process
+waits, or `p` ended) kicks the others so the last one can switch.
+TLB flushes and instruction-cache invalidation are broadcast; free pages
+only after the flush, break before make when a mapping changes page, and
+order a new page's contents before the entry that publishes it
+(`publish_barrier`). User memory other threads use at the same time is
+updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
+makes every other CPU running the process enter the kernel
+(`smp::barrier_others`). Secondaries start with PSCI CPU_ON (`boot.S`
+`secondary_entry`). Snapshots are of one CPU.
 
 Snapshots (`kernel/src/snapshot.rs`, `crates/vmm/src/snapshot.rs`,
 `crates/grix/src/snapshot.rs`): with `Image::snapshot`, the first time the
@@ -227,8 +252,9 @@ treated as deadlocked.
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).
-9. **The kernel never blocks inside a syscall.** There is one kernel stack,
-   so waiting means returning `EBLOCKED` after recording a wait. The one
+9. **The kernel never blocks inside a syscall.** There is one kernel stack
+   per CPU and one kernel lock, so waiting means returning `EBLOCKED` after
+   recording a wait, and no CPU ever waits holding the lock. The one
    exception is a live mount's request (`console::host_request`), which
    spins for the host's answer so file system code stays synchronous;
    networking messages that arrive meanwhile wait for the console

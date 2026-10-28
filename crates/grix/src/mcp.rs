@@ -35,6 +35,8 @@ pub struct McpConfig {
     pub allow_hosts: Vec<String>,
     pub max_timeout: Duration,
     pub max_memory_mb: u64,
+    /// The most CPUs a run may have.
+    pub max_cpus: u32,
     /// Agents may change host files: writable mounts (`rw`, `on_exit`) and
     /// `build_image`'s output. Off by default.
     pub writable: bool,
@@ -53,6 +55,7 @@ impl McpConfig {
             allow_hosts: Vec::new(),
             max_timeout: Duration::from_secs(300),
             max_memory_mb: 2048,
+            max_cpus: 4,
             writable: false,
         })
     }
@@ -239,7 +242,9 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                     "exports": {"type": "array", "items": {"type": "string"},
                                 "description": "Sandbox directories whose contents to return when the program ends."},
                     "timeout_secs": {"type": "number"},
-                    "memory_mb": {"type": "number"}
+                    "memory_mb": {"type": "number"},
+                    "cpus": {"type": "integer", "minimum": 1,
+                             "description": "CPUs for the program's threads (default 1; a snapshot has 1)."}
                 }
     })
 }
@@ -339,7 +344,14 @@ fn output_path(config: &McpConfig, args: &Value) -> Result<PathBuf> {
 
 /// The sandbox `args` describe, within the server's policy, and its command.
 fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
-    let mut b = Sandbox::builder().max_output(OUTPUT_MAX * 4);
+    let cpus = match &args["cpus"] {
+        Value::Null => 1,
+        v => v.as_u64().filter(|n| *n >= 1).context("cpus must be a whole number of CPUs")?,
+    };
+    if cpus > config.max_cpus as u64 {
+        bail!("{cpus} CPUs: the server allows at most {}", config.max_cpus);
+    }
+    let mut b = Sandbox::builder().max_output(OUTPUT_MAX * 4).cpus(cpus as u32);
     if let Some(image) = args["image"].as_str() {
         let image = crate::Image::open(config.host_path(image)?)?;
         for name in &image.config.capabilities {

@@ -361,12 +361,19 @@ pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno>
     // A process signal goes to the chosen thread's queue, so no other thread
     // takes it first (on Linux only the chosen one is told to look). If every
     // thread blocks it, it waits on the process for whoever unblocks it.
-    match receiver.or(match target {
+    let queued_on = receiver.or(match target {
         Target::Thread(tid) => Some(tid),
         Target::Process => None,
-    }) {
+    });
+    match queued_on {
         Some(tid) => p.threads.get_mut(&tid).ok_or(ESRCH)?.pending.push(info)?,
         None => p.shared_pending.push(info)?,
+    }
+    // A thread running on another CPU takes it when it next enters the
+    // kernel: now, not at its next time slice (which a thread alone on
+    // its CPU never ends). Go preempts goroutines this way.
+    if let Some(tid) = queued_on {
+        crate::smp::kick_thread(tid);
     }
     // signalfd readers (and epoll on them) look at pending signals. Waking
     // every I/O waiter is only worth it once a signalfd exists (Go sends
@@ -548,8 +555,12 @@ pub fn return_to_user(tf: &mut TrapFrame) {
     let mut guard = PROCESS.lock();
     let Some(p) = guard.as_mut() else { return };
     loop {
-        if p.exit_status.is_some() {
+        if p.exit_status.is_some() && p.running {
             crate::sched::schedule(p, tf);
+        }
+        // Nothing to run here now: `smp::finish` waits for something.
+        if !p.running {
+            return;
         }
         deliver(p, tf);
         if p.exit_status.is_none() {

@@ -9,6 +9,8 @@ for src in src/*.c; do
 done
 # A position-independent static executable (ET_DYN, self-relocating).
 zig cc -target aarch64-linux-musl -static-pie -fPIE -O2 -s -o build/hello-pie src/hello.c
+# An x86_64 program, for the x86_64 translator (`SandboxBuilder::x86_64`).
+zig cc -target x86_64-linux-musl -static -O2 -s -o build/hello-x86_64 src/hello.c
 # Go programs: static, cross-compiled with the host's Go toolchain.
 for dir in go/*/; do
     name=$(basename "$dir")

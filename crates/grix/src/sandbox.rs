@@ -193,7 +193,7 @@ fn macos_major() -> Option<u32> {
 /// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
 /// means QEMU.
 pub(crate) fn default_vmm() -> Option<PathBuf> {
-    if std::env::var_os("GRIX_ACCEL").is_some() {
+    if std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
         return None;
     }
     // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
@@ -251,6 +251,7 @@ pub struct SandboxBuilder {
     accel: String,
     /// grix's own VMM, instead of QEMU.
     vmm: Option<PathBuf>,
+    cpus: u32,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -283,8 +284,9 @@ impl Default for SandboxBuilder {
                 ),
             ),
             qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
-            accel: std::env::var("GRIX_ACCEL").unwrap_or_else(|_| default_accel().into()),
+            accel: std::env::var("GRIX_ACCEL").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| default_accel().into()),
             vmm: default_vmm(),
+            cpus: std::env::var("GRIX_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(1),
             command: Vec::new(),
         }
     }
@@ -339,6 +341,14 @@ impl SandboxBuilder {
 
     pub fn cwd(mut self, dir: impl Into<String>) -> Self {
         self.cwd = dir.into();
+        self
+    }
+
+    /// CPUs for the program's threads (1 by default, at most
+    /// `grix_abi::machine::MAX_CPUS`). The threads of one process run in
+    /// parallel; separate processes take turns.
+    pub fn cpus(mut self, n: u32) -> Self {
+        self.cpus = n;
         self
     }
 
@@ -656,6 +666,9 @@ impl SandboxBuilder {
                 needed.div_ceil(1 << 20)
             );
         }
+        if self.cpus == 0 || self.cpus > machine::MAX_CPUS {
+            bail!("cpus = {}: a sandbox has 1 to {} CPUs", self.cpus, machine::MAX_CPUS);
+        }
         if ram > MAX_RAM {
             bail!("memory_mb = {} exceeds the {} MiB limit", self.memory_mb, MAX_RAM >> 20);
         }
@@ -785,6 +798,7 @@ impl Sandbox {
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
             snapshot: take.is_some(),
+            cpus: cfg.cpus,
         }
         .encode();
         let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
@@ -800,6 +814,7 @@ impl Sandbox {
             memory_mb: cfg.memory_mb,
             accel: cfg.accel.clone(),
             vmm: cfg.vmm.clone(),
+            cpus: cfg.cpus,
             snapshot: take.map(SnapshotFile::Take),
         };
         // A snapshot is taken while the program waits for stdin, which
@@ -823,6 +838,9 @@ impl Sandbox {
         }
         if !cfg.mounts.is_empty() || !cfg.live.is_empty() {
             bail!("a sandbox with mounts can't be snapshotted: what the host holds for them isn't saved");
+        }
+        if cfg.cpus != 1 {
+            bail!("a sandbox with more than one CPU can't be snapshotted yet");
         }
         let mut forwards = Vec::new();
         for (from, port) in &cfg.net.forwards {
@@ -995,6 +1013,7 @@ pub(crate) fn run_snapshot(
         memory_mb: s.memory_mb,
         accel: String::new(),
         vmm: Some(snap.vmm.clone().context("snapshots need grix's own VMM (grix-vmm, on macOS 15+)")?),
+        cpus: 1,
         snapshot: Some(SnapshotFile::Restore(file)),
     };
     let exports = Collector::new(&s.exports, &[], s.max_export as u64);

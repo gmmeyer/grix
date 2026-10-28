@@ -506,7 +506,7 @@ fn python_from_live_mounts() {
 /// from the snapshot runs new code at once.
 #[test]
 fn python_from_a_snapshot() {
-    let b = sandbox("python");
+    let b = sandbox("python").cpus(1);
     if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
         return; // Only grix-vmm on macOS can (the guest tests check the others say so).
     }

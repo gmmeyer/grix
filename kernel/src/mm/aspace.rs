@@ -225,6 +225,12 @@ impl AddressSpace {
         if prot.exec {
             arch::sync_icache(p2v(pa), PAGE_SIZE);
         }
+        // Break before make: the old entry is gone from every CPU's TLB
+        // before the new one, to another page, appears.
+        if pa != old {
+            self.pt.for_each_mapped(page, page + PAGE_SIZE, |_, pte| unsafe { *pte = 0 });
+            arch::flush_tlb();
+        }
         self.pt.map(page, pa, prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
         arch::flush_tlb();
         Ok(())
@@ -337,14 +343,17 @@ impl AddressSpace {
     /// Free the pages in `[start, end)` but keep the VMAs; the next access
     /// faults in fresh zero (or file) contents. MADV_DONTNEED semantics.
     pub fn discard(&mut self, start: u64, end: u64) {
-        let mut any = false;
+        let mut freed = Vec::new();
         self.pt.for_each_mapped(start, end, |_, pte| unsafe {
-            frame::free(*pte & ADDR_MASK);
+            freed.push(*pte & ADDR_MASK);
             *pte = 0;
-            any = true;
         });
-        if any {
+        if !freed.is_empty() {
+            // Other CPUs may still have the pages in their TLBs until this.
             arch::flush_tlb();
+        }
+        for pa in freed {
+            frame::free(pa);
         }
     }
 
@@ -436,7 +445,9 @@ impl AddressSpace {
         }
         if let Some(pte) = self.pt.lookup(page) {
             return match vma.backing {
-                _ if access != Access::Write || paging::writable(pte) => Err(FaultError::Segv),
+                // Mapped, and allowed: another CPU's fault got there first
+                // (or a TLB had an old entry). The access is tried again.
+                _ if access != Access::Write || paging::writable(pte) => Ok(()),
                 Backing::Shared { .. } => {
                     self.pt.map(page, pte & ADDR_MASK, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
                     arch::flush_tlb();

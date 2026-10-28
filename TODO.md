@@ -262,7 +262,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 ## Performance and scale
 
-- [ ] SMP: more than one vCPU.
+- [x] SMP: more than one vCPU (`--cpus N`, `SandboxBuilder::cpus`): the
+      threads of a process run in parallel (3.9× on 4 CPUs), with a big
+      kernel lock; on grix-vmm (HVF, KVM) and QEMU.
+- [ ] SMP for several processes at once (today they take turns: gang
+      scheduling), and finer locking than one kernel lock.
+- [ ] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s
       per run. `make test-kvm` tests KVM from a Mac.

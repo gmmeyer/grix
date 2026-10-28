@@ -94,6 +94,8 @@ impl PageTable {
                     return None;
                 }
                 let next = frame::alloc()?;
+                // The zeroed table before the entry that points at it.
+                arch::publish_barrier();
                 unsafe { *e = next | PTE_VALID | PTE_TABLE_OR_PAGE };
                 table = next;
             } else {
@@ -111,6 +113,8 @@ impl PageTable {
 
     pub fn map(&mut self, va: u64, pa: u64, flags: u64) -> Option<()> {
         let e = self.walk(va, true)?;
+        // The page's contents before the entry that maps it.
+        arch::publish_barrier();
         unsafe { *e = (pa & ADDR_MASK) | flags };
         arch::pte_barrier();
         Some(())

@@ -19,6 +19,19 @@ pub const GICR_QEMU: u64 = 0x080a_0000;
 pub const GICR_GRIX_VMM: u64 = 0x1000_0000;
 pub const GICR_GRIX_VMM_END: u64 = 0x3000_0000;
 
+/// Each CPU's redistributor frames (RD_base, then SGI_base), CPU `n` at
+/// `gicr + n * GICR_STRIDE`.
+pub const GICR_STRIDE: u64 = 0x2_0000;
+
+/// The most CPUs a machine has. CPU `n` has affinity 0.0.0.n.
+pub const MAX_CPUS: u32 = 8;
+
+/// A hypervisor call (HVC, SMCCC OEM range) asking the VMM to wake CPU x1
+/// if it's waiting in WFI: a VMM that handles WFI itself (grix-vmm on
+/// Hypervisor.framework) doesn't see the SGI that should have woken it.
+/// Others answer NOT_SUPPORTED, and their WFI wakes on the SGI.
+pub const KICK_CALL: u64 = 0xc300_0002;
+
 /// PL011 UART, and its size.
 pub const UART: u64 = 0x0900_0000;
 pub const UART_SIZE: u64 = 0x1000;

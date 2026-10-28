@@ -1378,8 +1378,8 @@ fn kernel_panics_come_through_the_serial_port() {
 /// (`make vmm`) unless QEMU is asked for.
 #[test]
 fn the_default_vmm() {
-    let qemu_asked =
-        std::env::var_os("GRIX_ACCEL").is_some() || std::env::var_os("GRIX_VMM").is_some_and(|v| v == "qemu");
+    let qemu_asked = std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("GRIX_VMM").is_some_and(|v| v == "qemu");
     let kvm = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
     let macos_15 = std::process::Command::new("sw_vers")
         .arg("-productVersion")
@@ -1402,7 +1402,9 @@ fn the_default_vmm() {
 /// there: each its own (stdin, randomness), at the right time of day.
 #[test]
 fn snapshots_resume_where_the_program_waited() {
+    // Snapshots are of one CPU (whatever GRIX_CPUS says).
     let b = Sandbox::builder()
+        .cpus(1)
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
         .unwrap()
         .allow(Capability::Process)
@@ -1472,4 +1474,40 @@ fn snapshots_resume_where_the_program_waited() {
     let err = b.build().unwrap().snapshot(&["/bin/busybox", "true"], dir.join("none")).unwrap_err();
     assert!(err.to_string().contains("didn't wait for input"), "{err}");
     assert!(!dir.join("none").exists());
+}
+
+/// More CPUs: programs see them, threads run in parallel on them, and
+/// execve and exit work while other threads spin on other CPUs.
+#[test]
+fn threads_run_in_parallel_on_more_cpus() {
+    let b = || with("smp").allow(Capability::Threads).allow(Capability::Process);
+    for cpus in [1, 4] {
+        let out = run(b().cpus(cpus), &["/bin/smp"]);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stdout_str());
+        let line = out.stdout_str();
+        let field = |name: &str| -> f64 {
+            let at = line.find(&format!("{name}=")).unwrap_or_else(|| panic!("{line}")) + name.len() + 1;
+            line[at..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert_eq!(field("cpus"), cpus as f64, "{line}");
+        if cpus == 4 {
+            // Four threads' work in well under four threads' time, on more
+            // than one CPU (generous: emulation and busy hosts are slow).
+            assert!(field("speedup") >= 1.5, "{line}");
+            assert!(field("cpus_used") >= 2.0, "{line}");
+        }
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+    let out = run(b().cpus(4), &["/bin/smp", "exec"]);
+    assert_eq!(out.stdout_str(), "exec ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let out = run(b().cpus(4).timeout(Duration::from_secs(20)), &["/bin/smp", "exit"]);
+    assert_eq!(out.status, ExitStatus::Exited(3));
+    // Other processes get the CPUs a spinning thread holds.
+    let out = run(b().cpus(4).timeout(Duration::from_secs(20)), &["/bin/smp", "fork"]);
+    assert_eq!(out.stdout_str(), "fork ok\n", "{:?}", out.status);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The CPU count is checked.
+    assert!(Sandbox::builder().cpus(0).build().is_err());
+    assert!(Sandbox::builder().cpus(9).build().is_err());
 }

@@ -343,6 +343,20 @@ Next, in TODO.md order:
   Hypervisor.framework answers itself with NOT_SUPPORTED; set_simd_fp_reg
   takes a vector by value, so it's called from inline assembly.
 
+- **More CPUs** (`smp.rs`, `--cpus N`, `GRIX_CPUS` for test runs): a
+  big kernel lock taken at trap entry, gang scheduling of the running
+  process's threads, per-CPU scheduling state swapped into `Process`,
+  idle CPUs waiting outside every lock, process switches / finalize /
+  execve only when no other CPU runs the process, broadcast TLB flushes,
+  break-before-make in COW, and PSCI CPU_ON for secondaries (grix-vmm
+  creates every vCPU up front, with one vtimer offset; KVM starts them
+  itself). Two bugs worth remembering: a secondary's Rust frame sat in
+  the trap frame at the top of its stack; and a thread picked up by an
+  idle CPU went back to user code without its pending signals, so Go's
+  preemption signal (sent once until it lands) was lost and the spinning
+  thread never entered the kernel again. 3.9× on 4 CPUs for CPU-bound
+  threads.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

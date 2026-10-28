@@ -55,6 +55,9 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 ./target/release/grix run -a threads -i fixtures/build/python:/ -- /usr/bin/python3 -c 'print(6*7)'
 ./target/release/grix run -a threads -i fixtures/build/node:/ -- /usr/bin/node -e 'console.log(6*7)'
 
+# More CPUs: a process's threads run in parallel (separate processes take turns).
+./target/release/grix run --cpus 4 -a threads -i fixtures/build/smp:/bin/smp -- /bin/smp
+
 # Networking: only to example.com, port 443.
 ./target/release/grix run -a net -a threads --allow-host example.com:443 -i fixtures/build/python:/ -- \
     /usr/bin/python3 -c 'import urllib.request as u; print(u.urlopen("https://example.com").status)'
@@ -573,7 +576,8 @@ subshells.
    confined), with snapshots on macOS.
 5. ~~**Agent integrations**~~: images (`grix build`), the MCP server,
    Python bindings and snapshots for instant start are done.
-6. **SMP and x86_64 guests**.
+6. **SMP and x86_64 guests**: more CPUs are done (`--cpus N`, threads of a
+   process run in parallel). x86_64 guests are next.
 
 ## Repository layout
 
