@@ -4,8 +4,10 @@
 //!   messages, so no buffer here outgrows `link::WINDOW`.
 //! - A connection to the guest's own listener (loopback) is a local socket
 //!   pair, as AF_UNIX ones are.
-//! - UDP only carries DNS: every query to port 53 goes to the host, which
-//!   answers it with its own resolver.
+//! - UDP: a query to port 53 goes to the host, which answers it with its
+//!   own resolver; a datagram to the guest's own address to the socket
+//!   bound there; any other through the host, to destinations its policy
+//!   allows (`Udp`).
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -33,7 +35,10 @@ static PENDING: AtomicU32 = AtomicU32::new(0);
 /// still answer (it may have dropped it).
 const DNS_PATIENCE_NS: u64 = 10_000_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// ::1.
+pub const LOOPBACK_V6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SockAddr {
     pub addr: Addr,
     pub port: u16,
@@ -166,8 +171,16 @@ static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
 /// snapshot can't carry (the host's ends don't come with it).
 pub fn host_state() -> usize {
     let conns = CONNS.lock().values().filter(|w| w.strong_count() > 0).count();
-    let lookups = DNS.lock().values().filter(|w| w.strong_count() > 0).count();
-    conns + lookups
+    let udps = UDPS
+        .lock()
+        .values()
+        .filter_map(Weak::upgrade)
+        .filter(|u| {
+            let u = u.lock();
+            u.waiting > 0 || u.asking > 0 || u.used_host
+        })
+        .count();
+    conns + udps
 }
 
 /// A local port for a socket that didn't bind one (32768-60999, Linux's
@@ -432,65 +445,234 @@ pub fn connect_local(peer: SockAddr) -> Result<(SocketEnd, SockAddr), Errno> {
     Ok((ours, local))
 }
 
-// ---------------------------------------------------------------- DNS
+// ---------------------------------------------------------------- UDP
 
-/// A UDP socket's DNS traffic: queries go to the host, answers queue here.
-pub struct Dns {
-    id: u32,
-    answers: VecDeque<Vec<u8>>,
+/// Datagrams queued on one socket, and bytes (each counted with an
+/// overhead, so empty ones fill it too).
+const UDP_QUEUE: usize = 256;
+const UDP_BYTES: usize = 212_992;
+const DATAGRAM_OVERHEAD: usize = 64;
+/// Destinations one socket remembers the host's say on.
+const MAX_VERDICTS: usize = 256;
+/// How long an unanswered question to the host counts as asked.
+pub const VERDICT_PATIENCE_NS: u64 = 1_000_000_000;
+
+/// A UDP socket's traffic. A DNS query (to port 53 anywhere but the guest
+/// itself) goes to the host's resolver; a datagram to the guest's own
+/// addresses straight to the socket bound there; any other through the
+/// host, to destinations its policy allowed (asked once per destination).
+pub struct Udp {
+    pub id: u32,
+    /// Datagrams in, and who sent them.
+    rx: VecDeque<(SockAddr, Vec<u8>)>,
+    bytes: usize,
     charge: Charge,
-    /// Queries sent and not answered yet, and when the last one went.
+    /// DNS queries not answered yet, when the last one went, and (DNS id,
+    /// server) of recent ones (resolvers check where an answer came from).
     pub waiting: usize,
     last_query_ns: u64,
-    /// (DNS id, server) of recent queries.
     servers: Vec<(u16, SockAddr)>,
+    /// The host's say on each destination, and the ones it's deciding
+    /// (since when: a lost answer is asked again).
+    verdicts: BTreeMap<SockAddr, bool>,
+    asked: BTreeMap<SockAddr, u64>,
+    pub asking: usize,
+    /// It asked the host (which may hold a socket for it), and was allowed
+    /// somewhere (replies may come any time).
+    used_host: bool,
+    talking: bool,
+    /// The host couldn't take a destination now: the send that asked gets
+    /// ENOBUFS.
+    pub busy: bool,
+    /// Its local address (bound, or picked at its first send).
+    pub local: Option<SockAddr>,
+    /// connect()ed: datagrams only from there.
+    pub peer: Option<SockAddr>,
     pub version: u64,
 }
 
-static DNS: Mutex<BTreeMap<u32, Weak<Mutex<Dns>>>> = Mutex::new(BTreeMap::new());
+pub type UdpRef = Arc<Mutex<Udp>>;
 
-impl Dns {
-    pub fn new() -> Arc<Mutex<Dns>> {
+static UDPS: Mutex<BTreeMap<u32, Weak<Mutex<Udp>>>> = Mutex::new(BTreeMap::new());
+/// Local ports, for datagrams from the guest to itself.
+static UDP_PORTS: Mutex<BTreeMap<u16, Weak<Mutex<Udp>>>> = Mutex::new(BTreeMap::new());
+
+fn udp(id: u32) -> Option<UdpRef> {
+    UDPS.lock().get(&id).and_then(Weak::upgrade)
+}
+
+impl Udp {
+    pub fn new(peer: Option<SockAddr>) -> UdpRef {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) & !link::HOST_ID;
-        let d = Arc::new(Mutex::new(Dns {
+        let u = Arc::new(Mutex::new(Udp {
             id,
-            answers: VecDeque::new(),
+            rx: VecDeque::new(),
+            bytes: 0,
             charge: Charge::default(),
             waiting: 0,
             last_query_ns: 0,
             servers: Vec::new(),
+            verdicts: BTreeMap::new(),
+            asked: BTreeMap::new(),
+            asking: 0,
+            used_host: false,
+            talking: false,
+            busy: false,
+            local: None,
+            peer,
             version: 0,
         }));
-        let mut all = DNS.lock();
+        let mut all = UDPS.lock();
         all.retain(|_, w| w.strong_count() > 0);
-        all.insert(id, Arc::downgrade(&d));
-        d
+        all.insert(id, Arc::downgrade(&u));
+        u
     }
 
-    pub fn query(&mut self, q: &[u8]) {
+    /// Take local address `addr` (port 0: pick one). EADDRINUSE if its
+    /// port is taken.
+    pub fn bind(this: &UdpRef, addr: SockAddr) -> Result<SockAddr, Errno> {
+        let mut ports = UDP_PORTS.lock();
+        ports.retain(|_, w| w.strong_count() > 0);
+        let port = if addr.port != 0 {
+            addr.port
+        } else {
+            (0..1000).map(|_| ephemeral_port()).find(|p| !ports.contains_key(p)).ok_or(Errno(98))?
+        };
+        if ports.contains_key(&port) {
+            return Err(Errno(98));
+        }
+        ports.insert(port, Arc::downgrade(this));
+        let local = SockAddr { port, ..addr };
+        this.lock().local = Some(local);
+        Ok(local)
+    }
+
+    fn touch(&mut self) {
+        self.version += 1;
+        ipc::changed();
+    }
+
+    /// A datagram in: dropped if the queue is full, or (connected) it's
+    /// from somewhere else, as UDP may.
+    pub fn push(&mut self, from: SockAddr, data: &[u8]) {
+        if self.peer.is_some_and(|p| p != from) {
+            return;
+        }
+        let cost = data.len() + DATAGRAM_OVERHEAD;
+        if self.rx.len() >= UDP_QUEUE || (self.bytes > 0 && self.bytes + cost > UDP_BYTES) {
+            return;
+        }
+        if self.charge.resize((self.bytes + cost) as u64).is_err() {
+            return;
+        }
+        self.bytes += cost;
+        self.rx.push_back((from, data.to_vec()));
+        self.touch();
+    }
+
+    /// The next datagram (or a look at it).
+    pub fn pop(&mut self, peek: bool) -> Option<(SockAddr, Vec<u8>)> {
+        if peek {
+            return self.rx.front().cloned();
+        }
+        let (from, data) = self.rx.pop_front()?;
+        self.bytes -= data.len() + DATAGRAM_OVERHEAD;
+        let _ = self.charge.resize(self.bytes as u64);
+        self.touch();
+        Some((from, data))
+    }
+
+    pub fn peek_len(&self) -> Option<usize> {
+        self.rx.front().map(|d| d.1.len())
+    }
+
+    /// A DNS query for the host's resolver, sent to `server`.
+    pub fn query(&mut self, q: &[u8], server: SockAddr) {
+        if let [a, b, ..] = *q {
+            self.servers.retain(|(id, _)| *id != u16::from_be_bytes([a, b]));
+            if self.servers.len() >= MAX_ANSWERS {
+                self.servers.remove(0);
+            }
+            self.servers.push((u16::from_be_bytes([a, b]), server));
+        }
         self.waiting += 1;
         self.last_query_ns = crate::time::monotonic_ns();
         send(ToHost::Dns { id: self.id, query: q });
     }
 
-    pub fn answer(&mut self) -> Option<Vec<u8>> {
-        let a = self.answers.pop_front()?;
-        let held = self.answers.iter().map(Vec::len).sum::<usize>();
-        let _ = self.charge.resize(held as u64);
-        Some(a)
+    /// Where the answer `a` came from.
+    fn server_of(&self, a: &[u8]) -> SockAddr {
+        let id = a.get(..2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+        self.servers.iter().find(|(q, _)| Some(*q) == id).map_or(SockAddr::v4(link::DNS_V4, 53), |(_, s)| *s)
     }
 
-    pub fn peek_len(&self) -> Option<usize> {
-        self.answers.front().map(Vec::len)
+    /// What the host said of sending to `to`, if it has.
+    pub fn verdict(&self, to: SockAddr) -> Option<bool> {
+        self.verdicts.get(&to).copied()
     }
 
-    pub fn peek(&self) -> Option<Vec<u8>> {
-        self.answers.front().cloned()
+    /// Still asking the host about `to`?
+    pub fn asking_about(&self, to: SockAddr) -> bool {
+        self.asked.contains_key(&to)
     }
 
+    /// Ask the host whether it may send to `to`: once, or again if the
+    /// answer is a second late (it may have been lost).
+    pub fn ask(&mut self, to: SockAddr) {
+        let now = crate::time::monotonic_ns();
+        if self.asked.get(&to).is_some_and(|&at| now.saturating_sub(at) < VERDICT_PATIENCE_NS) {
+            return;
+        }
+        if !self.asked.contains_key(&to) && self.asked.len() >= MAX_VERDICTS {
+            return;
+        }
+        if self.verdicts.len() >= MAX_VERDICTS {
+            self.verdicts.clear();
+        }
+        self.used_host = true;
+        self.asked.insert(to, now);
+        self.asking = self.asked.len();
+        send(ToHost::UdpAllow { id: self.id, addr: to.addr, port: to.port });
+    }
+
+    /// A datagram to `to`, which the host allowed.
+    pub fn send_host(&mut self, to: SockAddr, data: &[u8]) {
+        send(ToHost::UdpSend { id: self.id, addr: to.addr, port: to.port, data });
+    }
+
+    /// Writable unless it waits for the host's say (level-triggered loops
+    /// would spin on EAGAIN meanwhile).
     pub fn poll(&self) -> (u32, u64) {
-        (EPOLLOUT | if self.answers.is_empty() { 0 } else { EPOLLIN }, self.version)
+        let out = if self.asked.is_empty() { EPOLLOUT } else { 0 };
+        (out | if self.rx.is_empty() { 0 } else { EPOLLIN }, self.version)
     }
+}
+
+impl Drop for Udp {
+    fn drop(&mut self) {
+        UDPS.lock().remove(&self.id);
+        if let Some(local) = self.local {
+            let mut ports = UDP_PORTS.lock();
+            if ports.get(&local.port).is_some_and(|w| w.strong_count() == 0) {
+                ports.remove(&local.port);
+            }
+        }
+        if self.used_host {
+            send(ToHost::Close { id: self.id });
+        }
+    }
+}
+
+/// A datagram from the guest to itself: to the socket bound at `to`'s
+/// port, if one takes it. Returns whether one did.
+pub fn deliver_local(from: SockAddr, to: SockAddr, data: &[u8]) -> bool {
+    let Some(u) = UDP_PORTS.lock().get(&to.port).and_then(Weak::upgrade) else { return false };
+    let mut u = u.lock();
+    let takes = u.local.is_some_and(|l| l.is_unspecified() || l.addr == to.addr || (l.is_loopback() && to.is_loopback()));
+    if takes {
+        u.push(from, data);
+    }
+    takes
 }
 
 // ---------------------------------------------------------------- from the host
@@ -553,15 +735,39 @@ pub fn from_host(payload: &[u8]) {
             }
         }
         ToGuest::DnsAnswer { id, answer } => {
-            if let Some(d) = DNS.lock().get(&id).and_then(Weak::upgrade) {
-                let mut d = d.lock();
-                d.waiting = d.waiting.saturating_sub(1);
-                let held = d.answers.iter().map(Vec::len).sum::<usize>() + answer.len();
-                if d.answers.len() < MAX_ANSWERS && d.charge.resize(held as u64).is_ok() {
-                    d.answers.push_back(answer.into());
+            if let Some(u) = udp(id) {
+                let mut u = u.lock();
+                u.waiting = u.waiting.saturating_sub(1);
+                let from = u.server_of(answer);
+                u.push(from, answer);
+                u.touch();
+            }
+        }
+        ToGuest::UdpVerdict { id, addr, port, verdict } => {
+            if let Some(u) = udp(id) {
+                let mut u = u.lock();
+                let to = SockAddr { addr, port };
+                // Only what it asked about. Busy isn't kept: the next send
+                // asks again.
+                if u.asked.remove(&to).is_some() {
+                    match verdict {
+                        link::UDP_ALLOWED => {
+                            u.verdicts.insert(to, true);
+                            u.talking = true;
+                        }
+                        link::UDP_REFUSED => {
+                            u.verdicts.insert(to, false);
+                        }
+                        _ => u.busy = true,
+                    }
                 }
-                d.version += 1;
-                ipc::changed();
+                u.asking = u.asked.len();
+                u.touch();
+            }
+        }
+        ToGuest::UdpRecv { id, addr, port, data } => {
+            if let Some(u) = udp(id) {
+                u.lock().push(SockAddr { addr, port }, data);
             }
         }
         ToGuest::Incoming { id, port, peer, peer_port } => {
@@ -597,10 +803,12 @@ pub fn host_pending() -> bool {
         return true;
     }
     let now = crate::time::monotonic_ns();
-    let dns: Vec<_> = DNS.lock().values().filter_map(Weak::upgrade).collect();
-    if dns.iter().any(|d| {
-        let d = d.lock();
-        d.waiting > 0 && now.saturating_sub(d.last_query_ns) < DNS_PATIENCE_NS
+    let udps: Vec<_> = UDPS.lock().values().filter_map(Weak::upgrade).collect();
+    if udps.iter().any(|u| {
+        let u = u.lock();
+        // The host answers each question; datagrams may come any time to a
+        // socket that sent through it.
+        u.asking > 0 || u.talking || (u.waiting > 0 && now.saturating_sub(u.last_query_ns) < DNS_PATIENCE_NS)
     }) {
         return true;
     }
@@ -623,7 +831,7 @@ pub enum State {
         peer: SockAddr,
     },
     /// A UDP socket that has sent DNS queries.
-    Dns(Arc<Mutex<Dns>>),
+    Udp(UdpRef),
 }
 
 pub struct Inet {
@@ -663,7 +871,7 @@ impl Inet {
             State::Listening(l) => l.lock().poll(),
             State::Remote(c) => c.lock().poll(),
             State::Local { end, .. } => end.poll(),
-            State::Dns(d) => d.lock().poll(),
+            State::Udp(u) => u.lock().poll(),
         }
     }
 
@@ -690,22 +898,3 @@ impl Inet {
     }
 }
 
-impl Dns {
-    /// Remember which server a query (by its DNS id) went to, so the
-    /// answer appears to come from there: resolvers check.
-    pub fn sent_to(&mut self, query: &[u8], server: SockAddr) {
-        if let [a, b, ..] = *query {
-            self.servers.retain(|(id, _)| *id != u16::from_be_bytes([a, b]));
-            if self.servers.len() >= MAX_ANSWERS {
-                self.servers.remove(0);
-            }
-            self.servers.push((u16::from_be_bytes([a, b]), server));
-        }
-    }
-
-    /// Where the answer `a` came from.
-    pub fn server_of(&self, a: &[u8]) -> SockAddr {
-        let id = a.get(..2).map(|b| u16::from_be_bytes([b[0], b[1]]));
-        self.servers.iter().find(|(q, _)| Some(*q) == id).map_or(SockAddr::v4(link::DNS_V4, 53), |(_, s)| *s)
-    }
-}

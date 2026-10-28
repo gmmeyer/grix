@@ -1532,6 +1532,42 @@ fn unix_sockets() {
 }
 
 #[test]
+fn udp_beyond_dns() {
+    // Between the guest's own sockets, without the host.
+    let out = run(with("udp").allow(Capability::Net), &["/bin/udp", "local"]);
+    assert_eq!(out.stdout_str(), "udp local ok\n", "{}", out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+
+    // Through the host to a destination the policy allows, and only its
+    // replies come back.
+    let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = echo.local_addr().unwrap().port();
+    echo.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        for _ in 0..3 {
+            let (n, from) = echo.recv_from(&mut buf).unwrap();
+            echo.send_to(&buf[..n], from).unwrap();
+        }
+    });
+    let b = with("udp").allow(Capability::Net).allow_host(&format!("host.grix.internal:{port}")).unwrap();
+    let out = run(b, &["/bin/udp", "echo", &port.to_string()]);
+    assert_eq!(out.stdout_str(), "udp echo ok\n", "{}", out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    server.join().unwrap();
+
+    // Anywhere else: EPERM, and the host says why.
+    let b = with("udp").allow(Capability::Net).allow_host(&format!("host.grix.internal:{port}")).unwrap();
+    let out = run(b, &["/bin/udp", "denied", &(port ^ 1).to_string()]);
+    assert_eq!(out.stdout_str(), "udp denied ok\n", "{}", out.kernel_log);
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { capability, .. }] if capability == "allow_host"),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
 fn shebang_scripts() {
     let b = Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")

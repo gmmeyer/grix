@@ -24,6 +24,14 @@ pub const WINDOW: u32 = 32 * 1024;
 pub const STDIN_WINDOW: u32 = 64 * 1024;
 /// The most data one `Data` message carries.
 pub const MAX_DATA: usize = MAX_FRAME - 8;
+/// The largest UDP datagram that goes through the host (one frame).
+pub const MAX_UDP: usize = MAX_FRAME - 32;
+
+/// `UdpVerdict`s: the policy refuses the destination; allows it; or the
+/// host can't take it now (out of sockets or threads: ask again later).
+pub const UDP_REFUSED: u8 = 0;
+pub const UDP_ALLOWED: u8 = 1;
+pub const UDP_BUSY: u8 = 2;
 
 /// The guest's address on its one network.
 pub const GUEST_V4: [u8; 4] = [10, 0, 2, 15];
@@ -39,7 +47,7 @@ pub const HOST_NAME: &str = "host.grix.internal";
 /// set; the guest picks the others.
 pub const HOST_ID: u32 = 1 << 31;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Addr {
     V4([u8; 4]),
     V6([u8; 16]),
@@ -85,6 +93,10 @@ pub enum ToHost<'a> {
     Dns { id: u32, query: &'a [u8] },
     /// The program read this much stdin.
     StdinCredit { bytes: u32 },
+    /// May UDP socket `id` send to `addr:port`? The answer is `UdpVerdict`.
+    UdpAllow { id: u32, addr: Addr, port: u16 },
+    /// A datagram from socket `id` to a destination the host allowed.
+    UdpSend { id: u32, addr: Addr, port: u16, data: &'a [u8] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +133,22 @@ pub enum ToGuest<'a> {
         port: u16,
         peer: Addr,
         peer_port: u16,
+    },
+    /// Whether UDP socket `id` may send to `addr:port`: `UDP_ALLOWED`,
+    /// `UDP_REFUSED` or `UDP_BUSY`.
+    UdpVerdict {
+        id: u32,
+        addr: Addr,
+        port: u16,
+        verdict: u8,
+    },
+    /// A datagram for UDP socket `id` from `addr:port` (a destination it
+    /// sent to).
+    UdpRecv {
+        id: u32,
+        addr: Addr,
+        port: u16,
+        data: &'a [u8],
     },
 }
 
@@ -161,6 +189,19 @@ impl<'a> ToHost<'a> {
                 w.u8(7);
                 w.u32(bytes);
             }
+            ToHost::UdpAllow { id, addr, port } => {
+                w.u8(8);
+                w.u32(id);
+                addr.put(&mut w);
+                w.raw(&port.to_le_bytes());
+            }
+            ToHost::UdpSend { id, addr, port, data } => {
+                w.u8(9);
+                w.u32(id);
+                addr.put(&mut w);
+                w.raw(&port.to_le_bytes());
+                w.raw(data);
+            }
         }
         w.buf
     }
@@ -179,6 +220,17 @@ impl<'a> ToHost<'a> {
             5 => ToHost::Close { id: r.u32()? },
             6 => ToHost::Dns { id: r.u32()?, query: r.rest() },
             7 => ToHost::StdinCredit { bytes: r.u32()? },
+            8 => {
+                let id = r.u32()?;
+                let addr = Addr::get(&mut r)?;
+                ToHost::UdpAllow { id, addr, port: u16::from_le_bytes(r.take(2)?.try_into().unwrap()) }
+            }
+            9 => {
+                let id = r.u32()?;
+                let addr = Addr::get(&mut r)?;
+                let port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+                ToHost::UdpSend { id, addr, port, data: r.rest() }
+            }
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -218,6 +270,20 @@ impl<'a> ToGuest<'a> {
                 w.u32(id);
                 w.raw(answer);
             }
+            ToGuest::UdpVerdict { id, addr, port, verdict } => {
+                w.u8(8);
+                w.u32(id);
+                addr.put(&mut w);
+                w.raw(&port.to_le_bytes());
+                w.u8(verdict);
+            }
+            ToGuest::UdpRecv { id, addr, port, data } => {
+                w.u8(9);
+                w.u32(id);
+                addr.put(&mut w);
+                w.raw(&port.to_le_bytes());
+                w.raw(data);
+            }
             ToGuest::Incoming { id, port, peer, peer_port } => {
                 w.u8(7);
                 w.u32(id);
@@ -246,6 +312,18 @@ impl<'a> ToGuest<'a> {
                 let peer = Addr::get(&mut r)?;
                 ToGuest::Incoming { id, port, peer, peer_port: u16_at(&mut r)? }
             }
+            8 => {
+                let id = r.u32()?;
+                let addr = Addr::get(&mut r)?;
+                let port = u16_at(&mut r)?;
+                ToGuest::UdpVerdict { id, addr, port, verdict: r.u8()? }
+            }
+            9 => {
+                let id = r.u32()?;
+                let addr = Addr::get(&mut r)?;
+                let port = u16_at(&mut r)?;
+                ToGuest::UdpRecv { id, addr, port, data: r.rest() }
+            }
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -267,6 +345,8 @@ mod tests {
             ToHost::Close { id: 3 },
             ToHost::Dns { id: 9, query: &[1, 2, 3] },
             ToHost::StdinCredit { bytes: 5 },
+            ToHost::UdpAllow { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123 },
+            ToHost::UdpSend { id: 4, addr: Addr::V6([1; 16]), port: 9, data: b"ntp" },
         ];
         for m in to_host {
             assert_eq!(ToHost::decode(&m.encode()), Ok(m));
@@ -279,6 +359,8 @@ mod tests {
             ToGuest::Eof { id: 3 },
             ToGuest::DnsAnswer { id: 9, answer: &[4] },
             ToGuest::Incoming { id: HOST_ID | 1, port: 8000, peer: Addr::V4([127, 0, 0, 1]), peer_port: 5555 },
+            ToGuest::UdpVerdict { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, verdict: UDP_ALLOWED },
+            ToGuest::UdpRecv { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, data: b"time" },
         ];
         for m in to_guest {
             assert_eq!(ToGuest::decode(&m.encode()), Ok(m));

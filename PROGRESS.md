@@ -422,6 +422,15 @@ Next, in TODO.md order:
   writes its own site-packages without touching the host. ABI 6 (the
   live mount's flags).
 
+- **Networking** (round 2, item 13): AF_UNIX sockets bound to paths (a
+  socket node) and abstract names, listening and connecting, datagram and
+  seqpacket sockets, SO_PEERCRED and SCM_RIGHTS (`unix.rs`); and UDP
+  beyond DNS: datagrams between the guest's own sockets stay in it, others
+  go through a socket on the host per guest socket, to destinations the
+  host's policy allowed (the first send to one waits for the answer:
+  EPERM if refused, with the usual `Denied` event), and only those
+  destinations' replies come back. ABI 7.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

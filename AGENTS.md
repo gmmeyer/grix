@@ -104,8 +104,12 @@ flows as `Data` messages with credit-based flow control (`link::WINDOW` per
 connection each way; stdin uses the same scheme). Connections to the
 guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
-as `Incoming`. UDP only carries DNS: queries to port 53 go to the host's
-resolver. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
+as `Incoming`. UDP (`inet::Udp`): a query to port 53 goes to the host's
+resolver; a datagram to the guest's own address to the socket bound there
+(`deliver_local`); any other through the host (`ToHost::UdpSend`), to
+destinations the host allowed (`UdpAllow`, asked once per destination:
+the send waits for the `UdpVerdict`, EPERM if refused), and the host
+passes back only those destinations' replies. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
 (`host.grix.internal`, only with an explicit rule), and the nameserver is
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.

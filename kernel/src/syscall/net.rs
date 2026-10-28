@@ -11,7 +11,7 @@ use super::file::{pipe_read, pipe_write};
 use super::{require, table::nr};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, FileRef, O_NONBLOCK, O_RDWR, new_file};
-use crate::inet::{self, Conn, ConnState, Dns, ECONNREFUSED, Inet, Listener, Pending, SockAddr, State};
+use crate::inet::{self, Conn, ConnState, ECONNREFUSED, Inet, Listener, Pending, SockAddr, State, Udp, UdpRef};
 use crate::ipc;
 use crate::netlink::{self, MAX_REQUEST, Netlink};
 use crate::process::Process;
@@ -40,7 +40,6 @@ const ENOTSOCK: Errno = Errno(88);
 const ENOPROTOOPT: Errno = Errno(92);
 const EPROTONOSUPPORT: Errno = Errno(93);
 const EISCONN: Errno = Errno(106);
-const ENETUNREACH: Errno = Errno(101);
 
 pub fn socketpair(p: &mut Process, domain: u64, ty: u64, _proto: u64, sv: u64) -> SysResult {
     if domain != AF_UNIX {
@@ -795,14 +794,24 @@ fn is_inet(file: &FileRef) -> bool {
 
 fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
     let a = read_sockaddr(p, addr, len)?;
-    if s.bound.is_some() || !matches!(s.state, State::Idle) {
+    if !s.dgram && (s.bound.is_some() || !matches!(s.state, State::Idle)) {
         return Err(EINVAL);
     }
     let ours = a.is_unspecified() || a.is_loopback() || a.addr == Addr::V4(link::GUEST_V4);
     if !ours {
         return Err(EADDRNOTAVAIL);
     }
-    if !s.dgram && a.port != 0 && Listener::is_bound(a.port) {
+    if s.dgram {
+        let u = udp_of(s);
+        if u.lock().local.is_some() {
+            return Err(EINVAL);
+        }
+        // Only once it has the port (a failed bind leaves it unbound).
+        let local = Udp::bind(&u, a)?;
+        s.bound = Some(local);
+        return Ok(0);
+    }
+    if a.port != 0 && Listener::is_bound(a.port) {
         return Err(Errno(98)); // EADDRINUSE
     }
     // Port 0 means one is picked now, as Linux does at bind (getsockname
@@ -891,11 +900,16 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u
     let to = read_sockaddr(p, addr, len)?;
     if s.dgram {
         // Nothing is sent: resolvers and "what's my address" code connect a
-        // UDP socket just to see the route. Only DNS goes anywhere (sends
-        // elsewhere are reported).
+        // UDP socket just to see the route. From now on datagrams come only
+        // from there.
         let ours = if to.is_loopback() { to.addr } else { Addr::V4(link::GUEST_V4) };
-        s.bound.get_or_insert(SockAddr { addr: ours, port: inet::ephemeral_port() });
+        if s.bound.is_none() {
+            s.bound = Some(SockAddr { addr: ours, port: 0 });
+        }
         s.peer = Some(to);
+        let u = udp_of(s);
+        u.lock().peer = Some(to);
+        udp_bind(s)?;
         return Ok(0);
     }
     match &s.state {
@@ -914,7 +928,7 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u
             };
         }
         State::Local { .. } => return Err(EISCONN),
-        State::Listening(_) | State::Dns(_) => return Err(EINVAL),
+        State::Listening(_) | State::Udp(_) => return Err(EINVAL),
         State::Idle => {}
     }
     if to.is_local() {
@@ -999,17 +1013,13 @@ pub(super) fn inet_read(
                 .map(|n| (n, Some(*peer))),
             None => Ok((0, Some(*peer))),
         },
-        State::Dns(d) => {
-            let mut d = d.lock();
-            let answer = if peek { d.peek() } else { d.answer() };
-            let Some(answer) = answer else {
-                drop(d);
+        State::Udp(u) => {
+            let datagram = u.lock().pop(peek);
+            let Some((from, data)) = datagram else {
                 return wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, None));
             };
-            let from = d.server_of(&answer);
-            drop(d);
-            let n = (count as usize).min(answer.len());
-            copy_out(&mut p.aspace, buf, &answer[..n])?;
+            let n = (count as usize).min(data.len());
+            copy_out(&mut p.aspace, buf, &data[..n])?;
             Ok((n as u64, Some(from)))
         }
         State::Idle if s.dgram => wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, None)),
@@ -1036,20 +1046,12 @@ pub(super) fn inet_write(
     };
     if s.dgram {
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        if to.port != 53 {
-            return p.unimplemented(nr::sendto, "sendto", "UDP sockets other than DNS", ENETUNREACH);
-        }
-        if count > link::MAX_DATA as u64 - 8 {
+        if count > link::MAX_UDP as u64 {
             return Err(EMSGSIZE);
         }
         let mut q = alloc::vec![0u8; count as usize];
         copy_in(&mut p.aspace, buf, &mut q)?;
-        dns_ready(s);
-        let State::Dns(d) = &s.state else { return Err(EDESTADDRREQ) };
-        let mut d = d.lock();
-        d.sent_to(&q, to);
-        d.query(&q);
-        return Ok(count);
+        return udp_send(p, s, &q, to, nonblock);
     }
     match &s.state {
         State::Remote(c) => {
@@ -1096,15 +1098,86 @@ pub(super) fn inet_available(s: &Inet) -> usize {
     match &s.state {
         State::Remote(c) => c.lock().available(),
         State::Local { end, .. } => end.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len()),
-        State::Dns(d) => d.lock().peek_len().unwrap_or(0),
+        State::Udp(u) => u.lock().peek_len().unwrap_or(0),
         _ => 0,
     }
 }
 
-/// A UDP socket about to send: give it its DNS channel.
-fn dns_ready(s: &mut Inet) {
-    if s.dgram && matches!(s.state, State::Idle) {
-        s.state = State::Dns(Dns::new());
+/// A UDP socket's endpoint, made when it's first used.
+fn udp_of(s: &mut Inet) -> UdpRef {
+    if let State::Udp(u) = &s.state {
+        return u.clone();
+    }
+    let u = Udp::new(s.peer);
+    s.state = State::Udp(u.clone());
+    u
+}
+
+/// Give a UDP socket its local address now if it has none (bind did, or
+/// Linux does at the first send or connect).
+fn udp_bind(s: &mut Inet) -> Result<SockAddr, Errno> {
+    let u = udp_of(s);
+    let local = u.lock().local;
+    if let Some(l) = local {
+        return Ok(l);
+    }
+    let any = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
+    let local = Udp::bind(&u, s.bound.unwrap_or(any))?;
+    s.bound = Some(local);
+    Ok(local)
+}
+
+/// Send one UDP datagram to `to`: to a socket of the guest's own, to the
+/// host's resolver (DNS), or through the host if it allows `to` (asked the
+/// first time; a refusal is EPERM, as a firewall's is).
+fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: bool) -> SysResult {
+    if to.port == 0 {
+        return Err(EINVAL);
+    }
+    let local = udp_bind(s)?;
+    let u = udp_of(s);
+    let len = data.len() as u64;
+    // (The unspecified address is this host, as on Linux.)
+    if to.is_local() || to.is_unspecified() {
+        let addr = match to {
+            _ if to.is_loopback() => to.addr,
+            _ if to.is_unspecified() => if s.v6 { Addr::V6(inet::LOOPBACK_V6) } else { Addr::V4([127, 0, 0, 1]) },
+            _ => Addr::V4(link::GUEST_V4),
+        };
+        let from = SockAddr { addr, port: local.port };
+        // Nobody serving DNS here: the host's resolver answers, as it
+        // does for every nameserver.
+        if !inet::deliver_local(from, to, data) && to.port == 53 {
+            u.lock().query(data, to);
+        }
+        return Ok(len);
+    }
+    if to.port == 53 {
+        u.lock().query(data, to);
+        return Ok(len);
+    }
+    let verdict = u.lock().verdict(to);
+    match verdict {
+        Some(true) => {
+            u.lock().send_host(to, data);
+            Ok(len)
+        }
+        Some(false) => Err(EPERM),
+        None => {
+            let mut g = u.lock();
+            // The host was out of room for it when it last asked.
+            if core::mem::take(&mut g.busy) && !g.asking_about(to) {
+                return Err(ENOBUFS);
+            }
+            g.ask(to);
+            drop(g);
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            // Again in a while if the answer is lost.
+            let deadline = crate::time::monotonic_ns() + inet::VERDICT_PATIENCE_NS;
+            p.block_io_rerun(Some(deadline))
+        }
     }
 }
 
@@ -1113,11 +1186,10 @@ fn inet_send(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64, to: Opti
     let mut of = file.lock();
     let nonblock = of.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Inet(s) = &mut of.kind else { return Err(ENOTSOCK) };
-    dns_ready(s);
     if s.dgram {
         // One datagram: gather the iovecs.
         let total = bufs.iter().try_fold(0u64, |t, b| t.checked_add(b.1)).ok_or(EINVAL)?;
-        if total > link::MAX_DATA as u64 - 8 {
+        if total > link::MAX_UDP as u64 {
             return Err(EMSGSIZE);
         }
         let mut q = Vec::with_capacity(total as usize);
@@ -1127,14 +1199,7 @@ fn inet_send(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64, to: Opti
             copy_in(&mut p.aspace, base, &mut q[at..])?;
         }
         let dest = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        if dest.port != 53 {
-            return p.unimplemented(nr::sendto, "sendto", "UDP sockets other than DNS", ENETUNREACH);
-        }
-        let State::Dns(d) = &s.state else { return Err(EDESTADDRREQ) };
-        let mut d = d.lock();
-        d.sent_to(&q, dest);
-        d.query(&q);
-        return Ok(total);
+        return udp_send(p, s, &q, dest, nonblock);
     }
     let mut total = 0;
     for (i, &(base, len)) in bufs.iter().enumerate() {
@@ -1243,7 +1308,7 @@ fn inet_shutdown(s: &mut Inet, how: u64) -> SysResult {
             }
         }
         State::Listening(_) => {}
-        State::Idle | State::Dns(_) => return Err(ENOTCONN),
+        State::Idle | State::Udp(_) => return Err(ENOTCONN),
     }
     Ok(0)
 }

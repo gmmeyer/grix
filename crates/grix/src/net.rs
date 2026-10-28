@@ -1,8 +1,10 @@
 //! The host end of the guest's networking (`grix_abi::link`). The guest has
 //! no TCP/IP stack: the connections it asks for are made here, after the
 //! sandbox's policy says yes; connections to forwarded ports are handed to
-//! it; its DNS questions are answered with the host's resolver; and its
-//! stdin credit lets more stdin through.
+//! it; its DNS questions are answered with the host's resolver; its UDP
+//! datagrams go out from a socket here per guest socket, to destinations
+//! the policy allows, and only those destinations' replies come back; and
+//! its stdin credit lets more stdin through.
 //!
 //! What the guest says is untrusted: every message is checked, sizes stay
 //! within the credit given, and nothing it sends can make the host buffer
@@ -10,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -36,6 +38,26 @@ const OUTBOX_BYTES: usize = 4 << 20;
 const MAX_REPORTED: usize = 512;
 const MAX_NAMES: usize = 4096;
 const ENOBUFS: u16 = 105;
+/// UDP sockets at once (each holds a socket here, and a thread per
+/// address family), and destinations each may send to.
+const MAX_UDP: usize = 64;
+const MAX_UDP_DESTS: usize = 256;
+/// Threads taking UDP replies in, all sockets together (a closed socket's
+/// lives on until its next read times out).
+const MAX_UDP_THREADS: u32 = 128;
+
+/// A guest UDP socket's host side.
+struct Udp {
+    /// Its sockets here, v4 and v6, made when first needed.
+    v4: Mutex<Option<Arc<UdpSocket>>>,
+    v6: Mutex<Option<Arc<UdpSocket>>>,
+    /// Destinations the policy allowed, as the guest names them, to where
+    /// they really are (host.grix.internal is the host's loopback); and
+    /// back, so only their replies come in.
+    allowed: Mutex<HashMap<(Addr, u16), SocketAddr>>,
+    reverse: Mutex<HashMap<SocketAddr, (Addr, u16)>>,
+    closed: AtomicBool,
+}
 
 /// Where the program may connect.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,6 +379,15 @@ impl Outbox {
         }
     }
 
+    /// Queue a frame that may be lost (a datagram) only while the outbox is
+    /// under half full, so replies to the guest's own messages always fit.
+    fn offer_lossy(&self, frame: Vec<u8>) {
+        let q = self.q.lock().unwrap();
+        if !q.closed && q.bytes + frame.len() <= OUTBOX_BYTES / 2 {
+            self.push(q, frame);
+        }
+    }
+
     /// The next frame to write; None once closed.
     pub fn next(&self) -> Option<Vec<u8>> {
         let mut q = self.q.lock().unwrap();
@@ -426,6 +457,8 @@ struct Shared {
     policy: NetPolicy,
     outbox: Arc<Outbox>,
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
+    udps: Mutex<HashMap<u32, Arc<Udp>>>,
+    udp_threads: AtomicU32,
     /// What DNS answered each address for, so name rules cover connections.
     names: Mutex<HashMap<IpAddr, String>>,
     name_rules: bool,
@@ -536,6 +569,8 @@ impl Proxy {
             policy,
             outbox,
             conns: Mutex::new(HashMap::new()),
+            udps: Mutex::new(HashMap::new()),
+            udp_threads: AtomicU32::new(0),
             names: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
             reported: Mutex::new(HashSet::new()),
@@ -599,6 +634,16 @@ impl Proxy {
             }
             ToHost::Close { id } => self.close(id),
             ToHost::Dns { id, query } => self.lookup(id, query),
+            ToHost::UdpAllow { id, addr, port } => self.udp_allow(id, addr, port),
+            ToHost::UdpSend { id, addr, port, data } => {
+                let Some(u) = s.udps.lock().unwrap().get(&id).cloned() else { return };
+                let Some(&to) = u.allowed.lock().unwrap().get(&(addr, port)) else { return };
+                let sock = if to.is_ipv4() { u.v4.lock().unwrap().clone() } else { u.v6.lock().unwrap().clone() };
+                if let Some(sock) = sock {
+                    // UDP: lost if it can't go now.
+                    let _ = sock.send_to(data, to);
+                }
+            }
             ToHost::StdinCredit { bytes } => {
                 let mut credit = s.stdin_credit.lock().unwrap();
                 *credit = (*credit + bytes as u64).min(link::STDIN_WINDOW as u64);
@@ -611,6 +656,73 @@ impl Proxy {
         if let Some(c) = self.shared.conns.lock().unwrap().remove(&id) {
             c.close();
         }
+        if let Some(u) = self.shared.udps.lock().unwrap().remove(&id) {
+            u.closed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// May UDP socket `id` send to `addr:port`? The policy decides, as for
+    /// a connect; the answer goes back either way.
+    fn udp_allow(&self, id: u32, addr: Addr, port: u16) {
+        let s = &self.shared;
+        let verdict = |verdict| ToGuest::UdpVerdict { id, addr, port, verdict };
+        if id & HOST_ID != 0 {
+            return;
+        }
+        if !s.policy.enabled {
+            s.deny_capability("sendto");
+            return s.reply(verdict(link::UDP_REFUSED));
+        }
+        let ip = ip_of(addr);
+        if ip == IpAddr::V4(Ipv4Addr::from(link::DNS_V4)) {
+            s.deny("sendto", format!("{ip}:{port}: the nameserver only answers DNS (port 53)"));
+            return s.reply(verdict(link::UDP_REFUSED));
+        }
+        let name = s.names.lock().unwrap().get(&ip).cloned();
+        let to = match s.policy.check(ip, port, name.as_deref()) {
+            Ok(to) => to,
+            Err(why) => {
+                s.deny("sendto", why);
+                return s.reply(verdict(link::UDP_REFUSED));
+            }
+        };
+        let u = {
+            let mut udps = s.udps.lock().unwrap();
+            match udps.get(&id) {
+                Some(u) => u.clone(),
+                None if udps.len() >= MAX_UDP => {
+                    drop(udps);
+                    return s.reply(verdict(link::UDP_BUSY));
+                }
+                None => {
+                    let u = Arc::new(Udp {
+                        v4: Mutex::new(None),
+                        v6: Mutex::new(None),
+                        allowed: Mutex::new(HashMap::new()),
+                        reverse: Mutex::new(HashMap::new()),
+                        closed: AtomicBool::new(false),
+                    });
+                    udps.insert(id, u.clone());
+                    u
+                }
+            }
+        };
+        if u.allowed.lock().unwrap().contains_key(&(addr, port)) {
+            return s.reply(verdict(link::UDP_ALLOWED));
+        }
+        if udp_socket(s, id, &u, to.is_ipv4()).is_none() {
+            return s.reply(verdict(link::UDP_BUSY));
+        }
+        let (mut allowed, mut reverse) = (u.allowed.lock().unwrap(), u.reverse.lock().unwrap());
+        // As many as the guest remembers: it forgets them all at once too.
+        if allowed.len() >= MAX_UDP_DESTS {
+            allowed.clear();
+            reverse.clear();
+        }
+        allowed.insert((addr, port), to);
+        reverse.insert(to, (addr, port));
+        drop((allowed, reverse));
+        s.reply(verdict(link::UDP_ALLOWED));
     }
 
     fn connect(&self, id: u32, ip: IpAddr, port: u16) {
@@ -732,6 +844,9 @@ impl Proxy {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
+        for (_, u) in s.udps.lock().unwrap().drain() {
+            u.closed.store(true, Ordering::Relaxed);
+        }
         // A shared listener's next run mustn't find this one still accepting.
         for t in std::mem::take(&mut *self.accepting.lock().unwrap()) {
             let _ = t.join();
@@ -772,6 +887,53 @@ impl StdinGate {
 }
 
 /// Accept connections to a forwarded port and offer them to the guest.
+/// UDP socket `id`'s socket here for one address family, made (with a
+/// thread taking its replies in) the first time.
+fn udp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> Option<Arc<UdpSocket>> {
+    let slot = if v4 { &u.v4 } else { &u.v6 };
+    let mut slot = slot.lock().unwrap();
+    if let Some(sock) = slot.as_ref() {
+        return Some(sock.clone());
+    }
+    if s.udp_threads.fetch_add(1, Ordering::Relaxed) >= MAX_UDP_THREADS {
+        s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    let any: SocketAddr = if v4 { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (Ipv6Addr::UNSPECIFIED, 0).into() };
+    let made =
+        UdpSocket::bind(any).and_then(|sock| sock.set_read_timeout(Some(Duration::from_millis(200))).map(|_| sock));
+    let Ok(sock) = made.map(Arc::new) else {
+        s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    };
+    let (shared, udp, rx) = (s.clone(), u.clone(), sock.clone());
+    let spawned = thread::Builder::new().spawn(move || {
+        // One more than a frame holds: anything that fills it is too big.
+        let mut buf = vec![0u8; link::MAX_UDP + 1];
+        while !udp.closed.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
+            match rx.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    // Only from where the guest sent, and what one frame holds.
+                    let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+                    let Some(&(addr, port)) = udp.reverse.lock().unwrap().get(&from) else { continue };
+                    if n <= link::MAX_UDP {
+                        shared.outbox.offer_lossy(frame(ToGuest::UdpRecv { id, addr, port, data: &buf[..n] }));
+                    }
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                Err(_) => break,
+            }
+        }
+        shared.udp_threads.fetch_sub(1, Ordering::Relaxed);
+    });
+    if spawned.is_err() {
+        s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    *slot = Some(sock.clone());
+    Some(sock)
+}
+
 fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &AtomicU32) {
     while !s.stop.load(Ordering::Relaxed) {
         match listener.accept() {

@@ -62,7 +62,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     lazily (needs its layers unpacked on the host: item 15's cache);
     reading is about 30 MB/s (one 64 KiB request at a time); copying up a
     directory too large to hold fails with ENOSPC.
-13. **Networking**: UDP beyond DNS; AF_UNIX sockets bound to paths.
+13. [x] **Networking**: UDP beyond DNS (through the host, policed per
+    destination; between the guest's own sockets in it), AF_UNIX sockets
+    bound to paths, abstract names, datagrams, seqpackets and SCM_RIGHTS.
+    Left: UDP port forwarding, datagrams over one frame (~4 KiB),
+    SO_PASSCRED.
 14. **Smaller syscalls**: pidfd, CPU-time timers, a vDSO for fast
     `clock_gettime`, stack growth and guard pages, `/proc/<pid>` for every
     process (`ps`).
@@ -246,7 +250,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       send/recv, nonblocking + epoll, `SO_ERROR` for async connect.
       Credit-based flow control (32 KiB per connection each way), half-close,
       `SO_RCVTIMEO`/`SO_SNDTIMEO`. Other socket options are accepted and ignored.
-- [ ] UDP beyond DNS, raw sockets, ICMP. Reported as unsupported.
+- [~] UDP beyond DNS, raw sockets, ICMP. UDP works (round 2, item 13);
+      raw sockets and ICMP are reported as unsupported.
 - [x] Listening sockets with port forwarding to the host (bind/listen/accept4).
       `forward` / `-p` / `[[forward]]`. Node and Python servers work.
 - [~] Host-side policy: allow-list for outbound connections

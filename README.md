@@ -297,8 +297,12 @@ let sandbox = Sandbox::builder()
 
 The CLI has `--allow-host RULE` and `-p/--publish [ADDR:]HOSTPORT:GUESTPORT`;
 manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host` and
-`guest`. Only TCP and DNS are supported: other UDP, raw sockets and ICMP are
-reported as unsupported.
+`guest`. TCP and UDP are supported (raw sockets and ICMP are reported as
+unsupported). A UDP socket's first datagram to a destination waits for the
+host's say; a refused one gets EPERM, as from a firewall, and only the
+destinations it sent to can answer it. Datagrams between the sandbox's own
+sockets stay in it; ones larger than about 4 KiB get EMSGSIZE (they'd be
+fragments on a real network), and forwarded ports are TCP only.
 
 ## MCP server and Python
 
@@ -591,7 +595,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 |---|---|
 | Static, static-PIE and dynamic executables, musl and glibc (Debian's bash, coreutils, perl, apt, git, curl; the official `python` and `node` images) | |
 | Terminals: pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`, Python's `pty`), termios, controlling terminals and `/dev/tty`, TTY mode (`grix run -t`, `tty`) with an interactive shell's job control | Packet mode (`TIOCPKT`), `TIOCSTI`; `VMIN` and `VTIME` together return at the first byte; orphaned process groups aren't treated specially |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | UDP other than DNS, raw sockets, ICMP (`ping`) |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Raw sockets, ICMP (`ping`); UDP port forwarding |
 | With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `pidfd_*`; `/proc/<pid>` for other processes |
