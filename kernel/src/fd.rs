@@ -53,6 +53,9 @@ pub enum FileKind {
     Inet(crate::inet::Inet),
     /// Either end of a pseudo-terminal, or the console's terminal (tty.rs).
     Pty(crate::tty::PtyEnd),
+    /// An AF_UNIX socket that's named, listening, or passes messages
+    /// (unix.rs; a connected stream is a `Socket`).
+    Unix(crate::unix::SockRef),
 }
 
 /// Watches are recorded but never fire (yet): the fd is never readable.
@@ -103,6 +106,7 @@ impl FileKind {
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
             FileKind::Pty(end) => end.tty.lock().poll(end.master),
+            FileKind::Unix(s) => s.lock().poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).
             FileKind::Epoll(_) => (0, 0),

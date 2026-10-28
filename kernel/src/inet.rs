@@ -316,7 +316,7 @@ fn conn(id: u32) -> Option<Arc<Mutex<Conn>>> {
 pub struct Slot(());
 
 impl Slot {
-    fn take() -> Option<Slot> {
+    pub fn take() -> Option<Slot> {
         if PENDING.fetch_add(1, Ordering::Relaxed) as usize >= MAX_PENDING {
             PENDING.fetch_sub(1, Ordering::Relaxed);
             return None;

@@ -1522,6 +1522,16 @@ fn lazy_imports() {
 }
 
 #[test]
+fn unix_sockets() {
+    // Paths, abstract names, datagrams, seqpackets, credentials, SCM_RIGHTS.
+    let b = with("unixsock").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/unixsock"]);
+    assert_eq!(out.stdout_str(), "unixsock ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn shebang_scripts() {
     let b = Sandbox::builder()
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")

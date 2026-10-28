@@ -38,6 +38,7 @@ pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
+pub const S_IFSOCK: u32 = 0o140000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_ISVTX: u32 = 0o1000;
 
@@ -561,6 +562,9 @@ pub enum Kind {
     Dev(Dev),
     /// Generated when opened.
     Proc(ProcFile),
+    /// An AF_UNIX socket's name (`unix::node_id`): connect finds the
+    /// socket bound to it.
+    Socket(u64),
 }
 
 pub struct Node {
@@ -1210,6 +1214,7 @@ impl Fs {
                 (S_IFCHR, 0, 1, ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64)
             }
             Kind::Proc(_) => (S_IFREG, 0, 1, 0),
+            Kind::Socket(_) => (S_IFSOCK, 0, n.nlink, 0),
         };
         StatInfo {
             ino: self.ino_number(ino),
@@ -1271,6 +1276,7 @@ impl Fs {
             Kind::Dir(_) => 4,
             Kind::Symlink(_) => 10,
             Kind::Dev(_) => 2,
+            Kind::Socket(_) => 12,
         }
     }
 

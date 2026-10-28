@@ -41,6 +41,7 @@ mod syscall;
 mod time;
 mod timer;
 mod tty;
+mod unix;
 mod uaccess;
 mod virtio;
 

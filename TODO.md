@@ -262,9 +262,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
       `os.networkInterfaces()` throws today.
       No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
-- [ ] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
-      datagram and seqpacket pairs, `SCM_RIGHTS` fd passing.
-      `socket(AF_UNIX)` works for ioctls. bind, connect and listen on it are reported as unimplemented.
+- [x] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
+      abstract names, datagrams and seqpackets, `SO_PEERCRED`, `SCM_RIGHTS`.
+      Left: `SO_PASSCRED`/`SCM_CREDENTIALS` on receive; a descriptor passed
+      through its own socket stays open (Linux collects those cycles).
 - [x] A fast host transport. virtio-console (port 1 of a
       `virtio-serial-device`) carries the framed channel. Networking adds
       `link` messages there.

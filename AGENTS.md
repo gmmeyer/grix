@@ -87,6 +87,15 @@ Docker, resolved by `container::resolve_user`). An image's kernel is the one tha
 so bump `grix_abi::ABI_VERSION` with any change to the boot image, wire,
 `link` or `hostfs` formats.
 
+AF_UNIX (`unix.rs`, `syscall/unix.rs`): a connected stream is a socket
+pair (`ipc::SocketEnd`, with `unix::StreamInfo` for its names and peer)
+however it was made; a named, listening or message (datagram, seqpacket)
+socket is a `unix::Sock`, found by name in `unix::NAMES` (a path is an
+`fs::Kind::Socket` node whose id is the key, so a reused inode can't be
+reached). Descriptors passed with SCM_RIGHTS are `unix::Rights` (at most
+`MAX_INFLIGHT`), attached to a message or to a stream's byte position
+(`Pipe::rights`); reads stop at them.
+
 Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 `crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):
 the guest has no TCP/IP stack. A TCP connect becomes `link::ToHost::Connect`
@@ -336,8 +345,10 @@ treated as deadlocked.
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
       zombies included), network connections (`inet::MAX_CONNS`),
       connections waiting to be accepted (`inet::MAX_PENDING`),
-      pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers) and
-      file locks (`locks::MAX_LOCKS`). argv and environment copies take a
+      pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers),
+      file locks (`locks::MAX_LOCKS`) and descriptors in flight over
+      AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
+      `kmem::Charge`). argv and environment copies take a
       `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,

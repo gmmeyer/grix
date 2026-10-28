@@ -37,6 +37,12 @@ pub struct Pipe {
     pub writers: usize,
     /// Bumped on every state change (for edge-triggered epoll).
     pub version: u64,
+    /// Bytes ever written and read (positions in the stream).
+    pub written: u64,
+    pub read: u64,
+    /// Descriptors passed with SCM_RIGHTS on a stream socket, at the
+    /// position of the first byte they came with.
+    pub rights: VecDeque<(u64, crate::unix::Rights)>,
 }
 
 impl Pipe {
@@ -94,6 +100,9 @@ pub fn pipe() -> (PipeEnd, PipeEnd) {
         readers: 1,
         writers: 1,
         version: 0,
+        written: 0,
+        read: 0,
+        rights: VecDeque::new(),
     }));
     (PipeEnd { pipe: p.clone(), write: false }, PipeEnd { pipe: p, write: true })
 }
@@ -118,7 +127,13 @@ impl Drop for PipeEnd {
         } else {
             p.readers -= 1;
         }
+        // Nobody will read the descriptors passed this way: they close (once
+        // the pipe's lock is given back, as one of them may be a socket
+        // writing to it).
+        let orphaned = if p.readers == 0 { core::mem::take(&mut p.rights) } else { VecDeque::new() };
         p.touch();
+        drop(p);
+        drop(orphaned);
     }
 }
 
@@ -155,12 +170,17 @@ impl EventFd {
 pub struct SocketEnd {
     pub rx: Option<PipeEnd>,
     pub tx: Option<PipeEnd>,
+    /// An AF_UNIX stream's names and peer (not a loopback TCP pair's).
+    pub unix: Option<alloc::boxed::Box<crate::unix::StreamInfo>>,
 }
 
 pub fn socketpair() -> (SocketEnd, SocketEnd) {
     let (a_read, a_write) = pipe();
     let (b_read, b_write) = pipe();
-    (SocketEnd { rx: Some(a_read), tx: Some(b_write) }, SocketEnd { rx: Some(b_read), tx: Some(a_write) })
+    (
+        SocketEnd { rx: Some(a_read), tx: Some(b_write), unix: None },
+        SocketEnd { rx: Some(b_read), tx: Some(a_write), unix: None },
+    )
 }
 
 pub const EPOLLRDHUP: u32 = 0x2000;

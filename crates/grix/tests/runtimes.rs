@@ -80,6 +80,41 @@ fn python() {
     assert_no_surprises(&out);
 }
 
+/// AF_UNIX sockets from Python: an asyncio server on a path, descriptors
+/// passed with send_fds, and a multiprocessing Manager (a listener on a
+/// path, in another process).
+#[test]
+fn unix_sockets_from_python() {
+    let script = r#"
+import asyncio, multiprocessing, os, socket, tempfile
+async def main():
+    path = os.path.join(tempfile.mkdtemp(), "srv.sock")
+    async def handle(r, w):
+        w.write((await r.readline()).upper()); await w.drain(); w.close()
+    srv = await asyncio.start_unix_server(handle, path)
+    r, w = await asyncio.open_unix_connection(path)
+    w.write(b"hello\n"); await w.drain()
+    print("asyncio", (await r.readline()).decode().strip())
+    srv.close()
+asyncio.run(main())
+a, b = socket.socketpair()
+rd, wr = os.pipe()
+socket.send_fds(a, [b"fd"], [wr])
+msg, fds, flags, addr = socket.recv_fds(b, 16, 1)
+os.write(fds[0], b"passed")
+print("send_fds", msg.decode(), os.read(rd, 16).decode())
+if __name__ == "__main__":
+    with multiprocessing.Manager() as m:
+        d = m.dict(); d["x"] = 42
+        print("manager", d["x"])
+"#;
+    let b =
+        sandbox("python").allow(Capability::Process).allow(Capability::FsWrite).file("/t.py", script, 0o644).unwrap();
+    let out = run(b, &["/usr/bin/python3", "/t.py"]);
+    assert_eq!(out.stdout_str(), "asyncio HELLO\nsend_fds fd passed\nmanager 42\n");
+    assert_no_surprises(&out);
+}
+
 /// Several processes writing one SQLite database in WAL mode: POSIX
 /// record locks between them, and the -shm file mapped shared.
 #[test]

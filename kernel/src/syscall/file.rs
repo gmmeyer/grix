@@ -138,7 +138,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
         FileKind::Pty(end) => fs::lock().stat(end.ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
-        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) => {
+        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_) => {
             anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0)
         }
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
@@ -261,6 +261,8 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
                 return p.fds.alloc(FdEntry { file, cloexec }, 0);
             }
             Kind::Symlink(_) => return Err(ELOOP), // O_NOFOLLOW on a symlink
+            // A socket is connected to, not opened.
+            Kind::Socket(_) => return Err(ENXIO),
             Kind::Dir(_) if writes => return Err(EISDIR),
             // Reading a directory needs read permission, as on Linux; a live
             // mount's must be one the host can list, too.
@@ -469,6 +471,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Pipe(end) if end.write => Err(EBADF),
         FileKind::Pipe(end) => pipe_read(p, end, buf, count, nonblock, false),
         FileKind::Pty(end) => super::tty::read(p, end, buf, count, nonblock),
+        FileKind::Unix(s) => super::unix::recv_msg(p, s, &[(buf, count)], 0, nonblock).map(|r| r.n),
         FileKind::Socket(s) => match &s.rx {
             Some(rx) => pipe_read(p, rx, buf, count, nonblock, false),
             None => Ok(0), // shut down for reading
@@ -660,6 +663,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
         FileKind::Pty(end) => return super::tty::write(p, end, buf, count, nonblock),
+        FileKind::Unix(s) => return super::unix::send_msg(p, s, &[(buf, count)], 0, nonblock, None, None),
         FileKind::Socket(s) => {
             return match &s.tx {
                 Some(tx) => pipe_write(p, tx, buf, count, nonblock, true),
@@ -730,6 +734,22 @@ fn stdio_write(p: &mut Process, ch: Channel, buf: u64, count: u64, nonblock: boo
 
 /// Read from a pipe (or one direction of a socket). `peek` leaves the data in place.
 pub(super) fn pipe_read(p: &mut Process, end: &PipeEnd, buf: u64, count: u64, nonblock: bool, peek: bool) -> SysResult {
+    // Descriptors passed this way are dropped (closed) by a plain read.
+    pipe_read_rights(p, end, buf, count, nonblock, peek, &mut Vec::new())
+}
+
+/// The same, taking the descriptors passed (SCM_RIGHTS) with the bytes
+/// read into `rights`. A read stops short of bytes that came with
+/// descriptors, so they arrive with the first of them, as on Linux.
+pub(super) fn pipe_read_rights(
+    p: &mut Process,
+    end: &PipeEnd,
+    buf: u64,
+    count: u64,
+    nonblock: bool,
+    peek: bool,
+    rights: &mut Vec<crate::unix::Rights>,
+) -> SysResult {
     let mut pipe = end.pipe.lock();
     if pipe.buf.is_empty() {
         if pipe.writers == 0 {
@@ -738,13 +758,27 @@ pub(super) fn pipe_read(p: &mut Process, end: &PipeEnd, buf: u64, count: u64, no
         drop(pipe);
         return would_block(p, nonblock);
     }
-    let n = (count as usize).min(pipe.buf.len());
+    let mut n = (count as usize).min(pipe.buf.len());
+    let at = pipe.read;
+    if let Some(&(pos, _)) = pipe.rights.front() {
+        if pos <= at {
+            if !peek {
+                rights.push(pipe.rights.pop_front().unwrap().1);
+            }
+            if let Some(&(next, _)) = pipe.rights.get(if peek { 1 } else { 0 }) {
+                n = n.min(next.saturating_sub(at).max(1) as usize);
+            }
+        } else {
+            n = n.min((pos - at) as usize);
+        }
+    }
     let (a, b) = pipe.buf.as_slices();
     let first = n.min(a.len());
     copy_out(&mut p.aspace, buf, &a[..first])?;
     copy_out(&mut p.aspace, buf + first as u64, &b[..n - first])?;
     if !peek {
         pipe.buf.drain(..n);
+        pipe.read += n as u64;
         pipe.drained();
         pipe.touch();
     }
@@ -781,6 +815,7 @@ pub(super) fn pipe_write(
     let mut tmp = alloc::vec![0u8; n];
     copy_in(&mut p.aspace, buf, &mut tmp)?;
     pipe.buf.extend(tmp);
+    pipe.written += n as u64;
     pipe.touch();
     Ok(n as u64)
 }
@@ -843,6 +878,19 @@ fn iovecs(p: &mut Process, iov: u64, cnt: u64) -> Result<Vec<(u64, u64)>, Errno>
 /// readv/writev/preadv/pwritev: one buffer after another until one comes up short.
 fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write: bool) -> SysResult {
     let file = p.fds.get(fd)?;
+    // A datagram or seqpacket socket: all of it is one message.
+    if let Some(sock) = super::unix::sock_of(&file) {
+        if at.is_some() {
+            return Err(ESPIPE);
+        }
+        let nonblock = file.lock().nonblocking();
+        let bufs = iovecs(p, iov, cnt)?;
+        return if write {
+            super::unix::send_msg(p, &sock, &bufs, 0, nonblock, None, None)
+        } else {
+            super::unix::recv_msg(p, &sock, &bufs, 0, nonblock).map(|r| r.n)
+        };
+    }
     let mut f = file.lock();
     if at.is_some() {
         match f.kind {
@@ -1897,7 +1945,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     let entry = p.fds.entry_mut(fd)?;
     let socket = matches!(
         entry.file.lock().kind,
-        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_)
+        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_)
     );
     if socket && req == SIOCGIFCONF {
         // struct ifconf { int ifc_len; char *ifc_buf; }: one entry, for lo.

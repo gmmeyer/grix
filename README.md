@@ -506,7 +506,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 | Files | Only imported paths exist (read-only), plus `/dev/{null,zero,random,urandom}`, `/proc/self/exe`, empty `/tmp` | `import` / `file`; `mount` / `mount_read_only` for a live host directory |
 | Environment | Empty | `env` |
 | Memory, time, randomness, stdout/stderr | Always available | `memory_mb`, `timeout` limit them |
-| Local IPC: pipes, eventfd, epoll, AF_UNIX socket pairs | Always available | — |
+| Local IPC: pipes, eventfd, epoll, AF_UNIX sockets (socket pairs, abstract names; a path needs `fs_write`) | Always available | — |
 | `fs_write` | Denied: the filesystem is read-only | `allow(Capability::FsWrite)`: the whole tree becomes writable in guest memory (copy-on-write over the imports, up to half of RAM). The host's files never change. |
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
@@ -593,10 +593,10 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Terminals: pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`, Python's `pty`), termios, controlling terminals and `/dev/tty`, TTY mode (`grix run -t`, `tty`) with an interactive shell's job control | Packet mode (`TIOCPKT`), `TIOCSTI`; `VMIN` and `VTIME` together return at the first byte; orphaned process groups aren't treated specially |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | UDP other than DNS, raw sockets, ICMP (`ping`) |
 | With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
-| Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |
+| Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | `pidfd_*`; `/proc/<pid>` for other processes |
 | With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec`. Job control: stopping and continuing, `WUNTRACED`/`WCONTINUED`, `CLD_STOPPED` | |
-| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX `socketpair`, `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
+| Pipes, eventfd, epoll (level/edge/oneshot), `poll`/`select`, AF_UNIX sockets (streams, datagrams and seqpackets; paths, abstract and autobound names; `SO_PEERCRED`; descriptors passed with `SCM_RIGHTS`, to other processes too), `signalfd`, `memfd_create` (with seals) | CPU-time timers (`ITIMER_VIRTUAL`/`PROF`, CPU-clock POSIX timers) |
 | Timers: `alarm`/`setitimer` (SIGALRM), POSIX timers (signal values, overruns, `SIGEV_THREAD_ID`, absolute times), `timerfd` (blocking, non-blocking, epoll) | |
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | |
 | Signals from the host: `RunControl::signal` and the CLI's Ctrl-C reach the program's process group (SIGTSTP and SIGCONT stop and continue it); a timeout sends SIGTERM and a grace period first, so exports still come back | |
