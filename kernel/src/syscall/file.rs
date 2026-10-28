@@ -227,6 +227,11 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         }
     };
     if flags & O_PATH != 0 {
+        // O_DIRECTORY still means "fail unless it's a directory" (GNU mv
+        // asks this way whether its target is one).
+        if flags & O_DIRECTORY != 0 && !fs::lock().is_dir(ino) {
+            return Err(ENOTDIR);
+        }
         let file = new_file(FileKind::Node(ino), O_RDONLY);
         let mut f = file.lock();
         (f.path_only, f.pin) = (true, Some(fs::lock().pin(ino)));

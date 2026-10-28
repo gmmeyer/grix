@@ -19,7 +19,7 @@ use crate::sched;
 use table::{Gate, nr};
 
 /// execve's dirfd for "relative to the working directory".
-const AT_FDCWD: i32 = -100;
+pub(crate) const AT_FDCWD: i32 = -100;
 
 pub fn handle(tf: &mut TrapFrame) {
     let n = tf.x[8];
@@ -174,6 +174,8 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::recvfrom => net::recvfrom(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sendmsg => net::sendmsg(p, a[0], a[1], a[2]),
         nr::recvmsg => net::recvmsg(p, a[0], a[1], a[2]),
+        nr::sendmmsg => net::sendmmsg(p, a[0], a[1], a[2], a[3]),
+        nr::recvmmsg => net::recvmmsg(p, a[0], a[1], a[2], a[3]),
         nr::getsockopt => net::getsockopt(p, a[0], a[1], a[2], a[3], a[4]),
         nr::setsockopt => net::setsockopt(p, a[0], a[1], a[2], a[3], a[4]),
         nr::shutdown => net::shutdown(p, a[0], a[1]),

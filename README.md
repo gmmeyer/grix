@@ -371,14 +371,20 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   layout), `docker-archive:FILE` (`docker save` output), `docker:NAME` or
   `dir:DIR`. Layers are applied with their whiteouts, every blob is checked
   against its digest, and the image's entrypoint, command, environment and
-  working directory become the grix image's. A command that's a bare name
-  is looked up on the image's `PATH`. `grix pull REF --oci DIR` saves an
+  working directory become the grix image's, and so does its user (root
+  unless it names one, as in Docker). A command that's a bare name is
+  looked up on the image's `PATH`. `grix pull REF --oci DIR` saves an
   image for offline builds.
 - Build steps (`run`) run in grix itself, with `fs_write`, `process`,
   `threads` and `net`. A string runs with `/bin/sh -c`; a list such as
   `["/bin/setup", "--fast"]` runs as it is, without a shell. The file tree
   a step leaves is the image's, minus what the kernel makes at boot
-  (`/etc/passwd`, `/tmp`, ...).
+  (`/etc/passwd`, `/tmp`, ...). `apt-get install` works in a Debian or
+  Ubuntu image. `user = "uid[:gid]"` (or names from the image's
+  `/etc/passwd`) says who the program runs as; build steps run as the base
+  image's user. Without one or the other, it's 1000:1000. Ids mean something only inside the sandbox:
+  root may switch to any user (`setuid` and friends follow Linux's rules),
+  and nothing honours setuid bits.
 - `grix build` flags (`--from`, `--copy`, `--env`, `--cwd`, `--allow`,
   `--run`, `--exec`, `--mem`, `-- COMMAND`) add to `./Grixfile`, or make the
   whole image without one. Like Docker's build context, a Grixfile reads
@@ -460,7 +466,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
 | `net` | Denied, and the VM has no network device | `allow(Capability::Net)`: TCP and DNS through the host, which checks `allow_host` rules; `forward` for servers |
-| Privileged (mount, ptrace, bpf, module loading, changing uid, …) | Always denied | — |
+| Privileged (mount, ptrace, bpf, module loading, capabilities, …) | Always denied | — |
 
 A program can't get around the policy by making the call itself (with
 `syscall()` or inline assembly). The policy is enforced by the kernel the
@@ -538,7 +544,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 
 | Works today | Not yet |
 |---|---|
-| Static, static-PIE and dynamic (musl `ld.so`) executables | glibc dynamic binaries (untested) |
+| Static, static-PIE and dynamic executables, musl and glibc (Debian's bash, coreutils, perl, apt, git, curl; the official `python` and `node` images) | Terminals: `posix_openpt`, a TTY for the program |
 | argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | UDP other than DNS, raw sockets, ICMP (`ping`) |
 | With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | AF_UNIX sockets bound to paths |

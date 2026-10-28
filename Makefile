@@ -32,6 +32,8 @@ fixtures:
 	# A Docker Hub image, as an OCI layout, for the image tests.
 	cargo build --release -p grix
 	./target/release/grix pull alpine:3.21 --oci fixtures/build/oci/alpine
+	# glibc programs: Debian.
+	./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci/debian
 
 test: kernel vmm fixtures
 	cargo test --workspace

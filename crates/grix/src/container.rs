@@ -42,6 +42,51 @@ pub struct ImageConfig {
     pub memory_mb: Option<u64>,
     /// Where its files came from: the Docker/OCI image (and its digest).
     pub source: Option<String>,
+    /// Who the program runs as: `uid[:gid]`, or names from the image's
+    /// /etc/passwd and /etc/group (Docker's `User`). None: grix's default
+    /// (1000:1000).
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// The uid and gid `spec` (`user[:group]`, numbers or names) names in
+/// `files`' /etc/passwd and /etc/group, as Docker resolves `User`: a user
+/// without a group gets its passwd entry's group (0 if it has none).
+pub(crate) fn resolve_user(spec: &str, files: &std::collections::BTreeMap<String, crate::image::Node>) -> Result<(u32, u32)> {
+    let table = |path: &str| -> Vec<Vec<String>> {
+        match files.get(path) {
+            Some(crate::image::Node::File { data, .. }) => String::from_utf8_lossy(data)
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.split(':').map(String::from).collect())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let (passwd, group) = (table("/etc/passwd"), table("/etc/group"));
+    let (user, grp) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let entry = passwd.iter().find(|e| e.len() > 3 && (e[0] == user || e[2] == user));
+    let uid = match user.parse::<u32>() {
+        Ok(n) => n,
+        Err(_) => entry
+            .and_then(|e| e[2].parse().ok())
+            .with_context(|| format!("user {user:?} isn't in the image's /etc/passwd"))?,
+    };
+    let gid = match grp {
+        Some(g) => match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => group
+                .iter()
+                .find(|e| e.len() > 2 && e[0] == g)
+                .and_then(|e| e[2].parse().ok())
+                .with_context(|| format!("group {g:?} isn't in the image's /etc/group"))?,
+        },
+        None => entry.and_then(|e| e[3].parse().ok()).unwrap_or(0),
+    };
+    Ok((uid, gid))
 }
 
 #[derive(Serialize, Deserialize)]

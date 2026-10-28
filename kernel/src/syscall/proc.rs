@@ -167,6 +167,8 @@ pub fn execve(
     p.exclusive_wanted = false;
     // The point of no return.
     let (entry, sp) = program.install(p);
+    // As on Linux, the saved ids become the effective ones.
+    (p.ids.suid, p.ids.sgid) = (p.uid, p.gid);
     // The other threads end (Linux's de_thread); this one takes the pid.
     let mut t = p.threads.remove(&p.current).unwrap();
     for (_, other) in core::mem::take(&mut p.threads) {

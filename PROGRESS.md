@@ -366,6 +366,19 @@ Next, in TODO.md order:
   and CPython (threads, hashlib) run with `QEMU_LD_PREFIX=/`.
   `tools/alpine.py --arch x86_64` fetches x86_64 packages.
 
+- **glibc programs** (round 2, item 9): Debian bookworm's bash, coreutils,
+  tar, perl, git and curl, `apt-get install` in a build step, and the
+  official python and node images. glibc's resolver sends its A and AAAA
+  queries in one sendmmsg (now with recvmmsg too); dpkg wants root, so an
+  OCI image's `User` (root by default, as in Docker) now sets the uid and
+  gid, resolved against the image's /etc/passwd and /etc/group
+  (`container::resolve_user`, Grixfile `user`); apt drops to `_apt` with
+  setgroups/setresgid/setresuid, so the kernel keeps real, effective and
+  saved ids and supplementary groups (`process::Ids`) by Linux's rules,
+  with execve resetting the saved ones. GNU mv's `O_PATH|O_DIRECTORY`
+  probe of a file must fail with ENOTDIR. The test pulls
+  `debian:bookworm-slim` once into `fixtures/build/oci/debian`.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
@@ -373,6 +386,11 @@ Next, in TODO.md order:
   non-interactive command. `cargo` lives in `~/.cargo/bin`, which isn't on
   the PATH that `make` sees: `export PATH="$HOME/.cargo/bin:$PATH"`.
 - `make fixtures` now also needs Go (cross-compiles `fixtures/go/*`).
+- Tests that time things can fail under the full suite's load, mostly on
+  TCG: `timers` (an itimer's remaining time), `stdout_backpressure`, and
+  once `snapshots_resume_where_the_program_waited` (its third restore
+  didn't answer `read -t 2` in time). Rerun them alone before suspecting
+  a change.
 - `make test` builds the kernel and fixtures (it downloads the Alpine
   runtimes, cached in `~/.cache/grix/alpine`) and runs everything.
 - When touching boot, MMU, timer or scheduler code, run the suite under

@@ -46,6 +46,8 @@ pub(crate) struct OciConfig {
     /// `KEY=VALUE`.
     pub env: Vec<String>,
     pub cwd: Option<String>,
+    /// Who it runs as (`uid[:gid]` or names); empty: root.
+    pub user: String,
 }
 
 /// An image's files and config.
@@ -309,6 +311,7 @@ fn parse_config(data: &[u8]) -> Result<OciConfig> {
         cmd: strings(&c["Cmd"]),
         env: strings(&c["Env"]),
         cwd: c["WorkingDir"].as_str().filter(|s| !s.is_empty()).map(String::from),
+        user: c["User"].as_str().unwrap_or("").to_string(),
     })
 }
 

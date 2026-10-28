@@ -564,3 +564,44 @@ fn x86_64_python_through_a_translator() {
     assert_eq!(out.stdout_str(), "X86_64 [\"837CCAB607AA\"]\n", "{}", out.stderr_str());
     assert_no_surprises(&out);
 }
+
+/// glibc programs (Debian's bash, coreutils, perl, util-linux), as a
+/// Docker image runs them: as the image's user, root, which may become
+/// another (as apt does to fetch packages).
+#[test]
+fn glibc_programs_from_debian() {
+    let mut g = grix::build::Grixfile::parse(&format!("from = \"oci:{}\"", runtime("oci/debian").display())).unwrap();
+    g.from_outside_context = true;
+    let image = g
+        .build(
+            std::path::Path::new("."),
+            grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
+        )
+        .unwrap();
+    let b = Sandbox::builder()
+        .image(&image)
+        .unwrap()
+        .timeout(Duration::from_secs(120))
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite);
+    let script = r#"
+        echo "bash ${BASH_VERSION%%(*}"
+        id
+        perl -e '$) = "1000 1000"; $( = 1000; $> = $< = 1000; print "now $< $> $(\n"; $< = 0; print "back? $<\n"'
+        perl -e '$> = 33; $< = 0; print "saved $< $>\n"'  # euid away and back: the saved id allows it
+        cd /tmp && echo one > a && echo two > b && mv -f a b && cat b
+        sort -r <<< $'x\ny' | tr '\n' ' '; echo
+        perl -e 'printf("perl %vd\n", $^V)'
+        getent passwd root | cut -d: -f1,3
+    "#;
+    let out = run(b, &["/bin/bash", "-c", script]);
+    assert_eq!(
+        out.stdout_str(),
+        "bash 5.2.15\nuid=0(root) gid=0(root) groups=0(root)\nnow 1000 1000 1000 1000\nback? 1000\n\
+         saved 0 33\none\ny x \nperl 5.36.0\nroot:0\n",
+        "{}",
+        out.stderr_str()
+    );
+    // Not even glibc asking for nscd's socket.
+    assert!(out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { .. })), "{:?}", out.events);
+}

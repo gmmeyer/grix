@@ -31,8 +31,15 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 ### Round 2 (2026-10-28), in this order
 
-9. **glibc programs** (Debian/Ubuntu arm64 images): most prebuilt Linux
-   tools are glibc-linked; only musl (Alpine) is tested.
+9. [x] **glibc programs** (Debian/Ubuntu arm64 images): bash, coreutils,
+   perl, `apt-get install` in a build step, curl over HTTPS, git, and the
+   official python/node images. Needed sendmmsg/recvmmsg (glibc's
+   resolver), the image's user (Docker's `User`, root by default), Linux's
+   real/effective/saved ids and setgroups, `O_PATH|O_DIRECTORY` on a file
+   (ENOTDIR), and ENOENT/ECONNREFUSED for AF_UNIX connects to nothing.
+   Left: `capset` (setpriv), supplementary groups in permission checks,
+   `posix_openpt` (apt's log; item 10), a `--user` flag for `grix build`
+   and `grix run`.
 10. **Interactive use**: a TTY mode (`grix run -t`), pseudo-terminals and
     termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
     host too).
@@ -275,8 +282,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 
 - [x] Report the syscall number for unknown syscalls. Today the event says
       only "unsupported unknown".
-- [ ] glibc dynamic executables (Debian/Ubuntu arm64). Most prebuilt Linux
-      tools are glibc-linked; untested so far.
+- [x] glibc dynamic executables (Debian/Ubuntu arm64): see round 2, item 9.
 - [ ] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
 - [ ] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
       and ignore, or implement.

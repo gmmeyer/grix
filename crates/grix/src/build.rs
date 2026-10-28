@@ -55,6 +55,9 @@ pub struct Grixfile {
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub memory_mb: Option<u64>,
+    /// Who the program runs as (`uid[:gid]`, or names from the image's
+    /// /etc/passwd); build steps run as the base image's user.
+    pub user: Option<String>,
     #[serde(default, rename = "copy")]
     pub copies: Vec<Copy>,
     #[serde(default, rename = "file")]
@@ -205,6 +208,8 @@ impl Grixfile {
                 config.command = c.entrypoint.into_iter().chain(c.cmd).collect();
                 config.env = c.env;
                 config.cwd = c.cwd;
+                // Docker's default user is root.
+                config.user = Some(if c.user.is_empty() { "0".into() } else { c.user });
                 config.source = Some(if pulled.digest.is_empty() {
                     source.to_string()
                 } else {
@@ -254,6 +259,12 @@ impl Grixfile {
         let mut image = Image::new(files, config, kernel);
         for step in &self.run {
             image = run_step(image, step, &opts.policy, opts.on_output)?;
+        }
+        // Steps run as the base image's user (root, for most): they're
+        // what installs software and adds users. The program runs as this.
+        if let Some(user) = &self.user {
+            crate::container::resolve_user(user, &image.files)?;
+            image.config.user = Some(user.clone());
         }
         Ok(image)
     }

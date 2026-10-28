@@ -149,6 +149,26 @@ pub fn connect(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
         FileKind::Socket(_) => return Err(EISCONN),
         _ => {}
     }
+    // AF_UNIX to a path or an abstract name: nothing can be listening
+    // there (binding is what's missing), so Linux's answers for nobody
+    // listening. glibc asks for nscd's socket in every program.
+    if (2..=110).contains(&len) {
+        let mut sa = [0u8; 110];
+        copy_in(&mut p.aspace, addr, &mut sa[..len as usize])?;
+        if u16::from_le_bytes([sa[0], sa[1]]) == 1 {
+            let path = &sa[2..len as usize];
+            if path.first() == Some(&0) {
+                return Err(ECONNREFUSED); // abstract
+            }
+            let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+            let path = core::str::from_utf8(&path[..end]).map_err(|_| ENOENT)?;
+            let base = super::file::base_of(p, super::AT_FDCWD as u64, path)?;
+            return match crate::fs::lock().lookup(base, path, true) {
+                Ok(_) => Err(ECONNREFUSED),
+                Err(e) => Err(e),
+            };
+        }
+    }
     p.unimplemented(nr::connect, "connect", UNIX_PATHS, EOPNOTSUPP)
 }
 
@@ -419,6 +439,51 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         }
     }
     Ok(total)
+}
+
+/// struct mmsghdr: a msghdr, then the length sent or received (padded to 64).
+const MMSGHDR: u64 = 64;
+/// Linux's UIO_MAXIOV: the most messages one call takes.
+const MAX_MMSG: u64 = 1024;
+
+/// sendmmsg: sendmsg for each message, stopping at the first that can't go
+/// now (only the first may block). glibc's resolver sends its A and AAAA
+/// queries this way.
+pub fn sendmmsg(p: &mut Process, fd: u64, vec: u64, vlen: u64, flags: u64) -> SysResult {
+    let mut sent = 0;
+    for i in 0..vlen.min(MAX_MMSG) {
+        let msg = vec + i * MMSGHDR;
+        let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
+        match sendmsg(p, fd, msg, flags).and_then(|n| write_u32(&mut p.aspace, msg + 56, n as u32)) {
+            Ok(_) => {}
+            Err(e) if sent == 0 => return Err(e),
+            Err(_) => break,
+        }
+        sent += 1;
+    }
+    Ok(sent)
+}
+
+/// recvmmsg: recvmsg for each message, waiting only for the first (as with
+/// MSG_WAITFORONE; a caller always has to handle fewer than `vlen`, which a
+/// timeout gives on Linux too).
+pub fn recvmmsg(p: &mut Process, fd: u64, vec: u64, vlen: u64, flags: u64) -> SysResult {
+    const MSG_WAITFORONE: u64 = 0x1_0000;
+    let flags = flags & !MSG_WAITFORONE;
+    let mut got = 0;
+    for i in 0..vlen.min(MAX_MMSG) {
+        let msg = vec + i * MMSGHDR;
+        let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
+        // Once something was received, an error ends the batch with what
+        // was (Linux reports the error on the next call).
+        match recvmsg(p, fd, msg, flags).and_then(|n| write_u32(&mut p.aspace, msg + 56, n as u32)) {
+            Ok(_) => {}
+            Err(e) if got == 0 => return Err(e),
+            Err(_) => break,
+        }
+        got += 1;
+    }
+    Ok(got)
 }
 
 pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {

@@ -1,6 +1,6 @@
 // Assorted Linux interfaces: memfd_create (with seals), signalfd, CPU-time
-// clocks, membarrier, mincore, prctl, and /etc/localtime. No capabilities
-// beyond `threads` are needed for any of them.
+// clocks, membarrier, mincore, prctl, /etc/localtime, sendmmsg/recvmmsg and
+// user ids. No capabilities beyond `threads` are needed for any of them.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +16,10 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <grp.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -178,11 +182,87 @@ static int test_misc(void) {
     return 0;
 }
 
+static int sock[2];
+static volatile sig_atomic_t alarms;
+static void on_alarm(int sig) { (void)sig; alarms++; }
+static void *late_writer(void *arg) {
+    (void)arg;
+    usleep(200 * 1000);
+    write(sock[1], "late", 4);
+    return 0;
+}
+
+// glibc's resolver sends its A and AAAA queries with one sendmmsg.
+static int test_mmsg(void) {
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sock) == 0);
+    char *out[] = {"a", "bb", "ccc"};
+    struct iovec oiov[3];
+    struct mmsghdr omsg[3];
+    memset(omsg, 0, sizeof omsg);
+    for (int i = 0; i < 3; i++) {
+        oiov[i] = (struct iovec){out[i], strlen(out[i])};
+        omsg[i].msg_hdr.msg_iov = &oiov[i];
+        omsg[i].msg_hdr.msg_iovlen = 1;
+    }
+    CHECK(sendmmsg(sock[0], omsg, 3, 0) == 3);
+    CHECK(omsg[0].msg_len == 1 && omsg[1].msg_len == 2 && omsg[2].msg_len == 3);
+
+    // A stream: each message takes what its buffer holds; the fourth finds
+    // nothing left and isn't waited for.
+    char in[4][8];
+    size_t sizes[4] = {1, 2, 3, 8};
+    struct iovec iiov[4];
+    struct mmsghdr imsg[4];
+    memset(imsg, 0, sizeof imsg);
+    for (int i = 0; i < 4; i++) {
+        iiov[i] = (struct iovec){in[i], sizes[i]};
+        imsg[i].msg_hdr.msg_iov = &iiov[i];
+        imsg[i].msg_hdr.msg_iovlen = 1;
+    }
+    CHECK(recvmmsg(sock[1], imsg, 4, 0, 0) == 3);
+    CHECK(imsg[0].msg_len == 1 && imsg[1].msg_len == 2 && imsg[2].msg_len == 3);
+    CHECK(memcmp(in[0], "a", 1) == 0 && memcmp(in[1], "bb", 2) == 0 && memcmp(in[2], "ccc", 3) == 0);
+    CHECK(recvmmsg(sock[1], imsg, 4, MSG_DONTWAIT, 0) == -1 && errno == EAGAIN);
+
+    // A blocked recvmmsg restarts after an SA_RESTART handler, and wakes
+    // for data (the other way round: sock[0] reads what sock[1] writes).
+    struct sigaction sa = {.sa_handler = on_alarm, .sa_flags = SA_RESTART};
+    CHECK(sigaction(SIGALRM, &sa, 0) == 0);
+    struct itimerval it = {.it_value = {0, 50 * 1000}};
+    CHECK(setitimer(ITIMER_REAL, &it, 0) == 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, 0, late_writer, 0) == 0);
+    iiov[0] = (struct iovec){in[3], 8};
+    CHECK(recvmmsg(sock[0], imsg, 1, 0, 0) == 1);
+    CHECK(alarms == 1 && imsg[0].msg_len == 4 && memcmp(in[3], "late", 4) == 0);
+    pthread_join(t, 0);
+    close(sock[0]);
+    close(sock[1]);
+    return 0;
+}
+
+// Not root: ids can only move among the real, effective and saved ones.
+static int test_ids(void) {
+    uid_t r, e, s;
+    CHECK(getresuid(&r, &e, &s) == 0 && r == 1000 && e == 1000 && s == 1000);
+    CHECK(setuid(1000) == 0 && setresuid(-1, -1, -1) == 0 && setreuid(1000, 1000) == 0);
+    CHECK(setuid(0) == -1 && errno == EPERM);
+    CHECK(seteuid(0) == -1 && errno == EPERM);
+    CHECK(setgid(0) == -1 && errno == EPERM);
+    CHECK(syscall(SYS_setuid, -1) == -1 && errno == EINVAL);
+    gid_t groups[4];
+    CHECK(getgroups(0, 0) == 1 && getgroups(4, groups) == 1 && groups[0] == 1000);
+    CHECK(setgroups(1, groups) == -1 && errno == EPERM);
+    return 0;
+}
+
 int main(void) {
     RUN(test_memfd);
     RUN(test_signalfd);
     RUN(test_cpu_clocks);
     RUN(test_misc);
+    RUN(test_mmsg);
+    RUN(test_ids);
     printf("linux ok\n");
     return 0;
 }

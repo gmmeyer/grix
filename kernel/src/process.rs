@@ -146,6 +146,23 @@ impl Thread {
     }
 }
 
+/// The ids besides the effective ones (`Process::uid`/`gid`, which
+/// permission checks and new files use), as Linux keeps them: real, saved
+/// and supplementary groups. They mean nothing outside the sandbox; uid 0
+/// may set them as on Linux, others only shuffle what they have.
+#[derive(Clone, Debug, Default)]
+pub struct Ids {
+    pub ruid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub sgid: u32,
+    pub groups: Vec<u32>,
+}
+
+/// At most this many supplementary groups (Linux allows 65536; each process
+/// keeps its own, and fork copies them).
+pub const MAX_GROUPS: usize = 64;
+
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
@@ -173,6 +190,7 @@ pub struct Process {
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
+    pub ids: Ids,
     pub umask: u32,
     pub sigactions: [SigAction; 65],
     /// Signals sent to the whole process (kill), taken by any thread that doesn't block them.
@@ -250,6 +268,7 @@ impl Process {
             policy,
             uid,
             gid,
+            ids: Ids { ruid: uid, suid: uid, rgid: gid, sgid: gid, groups: alloc::vec![gid] },
             umask: 0o022,
             sigactions: [SigAction::default(); 65],
             shared_pending: SigQueue::default(),
@@ -291,6 +310,7 @@ impl Process {
         c.cwd = self.cwd;
         c.cwd_pin = self.cwd_pin.clone();
         c.umask = self.umask;
+        c.ids = self.ids.clone();
         c.sigactions = self.sigactions;
         c.rlimits = self.rlimits;
         c.name = self.name;
@@ -676,10 +696,10 @@ pub fn load_program(
         (7, interp_base),  // AT_BASE
         (8, 0),            // AT_FLAGS
         (9, loaded.entry), // AT_ENTRY
-        (11, p.uid as u64),
-        (12, p.uid as u64),
-        (13, p.gid as u64),
-        (14, p.gid as u64),
+        (11, p.ids.ruid as u64), // AT_UID
+        (12, p.uid as u64),      // AT_EUID
+        (13, p.ids.rgid as u64), // AT_GID
+        (14, p.gid as u64),      // AT_EGID
         (16, arch::hwcap()), // AT_HWCAP
         (17, 100),           // AT_CLKTCK
         (23, 0),             // AT_SECURE

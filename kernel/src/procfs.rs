@@ -244,12 +244,14 @@ fn status(p: &Process, s: &mut String) {
     let (blocked, pending) = p.threads.get(&p.current).map_or((0, 0), |t| (t.sigmask, t.pending.mask));
     let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
     let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
-    let (u, g) = (p.uid, p.gid);
+    let (ru, u, su) = (p.ids.ruid, p.uid, p.ids.suid);
+    let (rg, g, sg) = (p.ids.rgid, p.gid, p.ids.sgid);
+    let groups = p.ids.groups.iter().map(|g| alloc::format!("{g}")).collect::<alloc::vec::Vec<_>>().join(" ");
     let (pid, ppid) = (p.pid, p.ppid);
     let _ = write!(
         s,
         "Name:\t{}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
-         TracerPid:\t0\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nFDSize:\t{}\nGroups:\t{g}\n\
+         TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n\
          VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/0\n\
          SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
          SigCgt:\t{caught:016x}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\

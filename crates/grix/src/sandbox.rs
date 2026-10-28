@@ -621,6 +621,9 @@ impl SandboxBuilder {
         if let Some(cwd) = &image.config.cwd {
             self.cwd = cwd.clone();
         }
+        if let Some(user) = &image.config.user {
+            (self.uid, self.gid) = crate::container::resolve_user(user, &image.files)?;
+        }
         self.kernel = image.kernel_path()?;
         Ok(self)
     }

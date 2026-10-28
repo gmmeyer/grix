@@ -434,6 +434,9 @@ fn restartable(regs: &TrapFrame) -> bool {
     match regs.x[8] as u32 {
         nr::read | nr::readv | nr::write | nr::writev | nr::pread64 | nr::pwrite64 | nr::preadv | nr::pwritev => true,
         nr::recvfrom | nr::recvmsg | nr::sendto | nr::sendmsg | nr::openat | nr::flock | nr::getrandom => true,
+        nr::sendmmsg => true,
+        // recvmmsg with a timeout is EINTR, as the other timed waits.
+        nr::recvmmsg => regs.x[4] == 0,
         nr::wait4 | nr::waitid => true,
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
         nr::futex => matches!(regs.x[1] & 127, 0 | 9) && regs.x[3] == 0,

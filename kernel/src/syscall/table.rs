@@ -157,13 +157,13 @@ syscalls! {
     140 setpriority Core;
     141 getpriority Core;
     142 reboot Privileged;
-    143 setregid Core; // no-op to the current id, else EPERM
-    144 setgid Core; // no-op to the current id, else EPERM
-    145 setreuid Core; // no-op to the current id, else EPERM
-    146 setuid Core; // no-op to the current id, else EPERM
-    147 setresuid Core; // no-op to the current id, else EPERM
+    143 setregid Core; // Linux's rules; ids mean nothing outside the sandbox
+    144 setgid Core;
+    145 setreuid Core;
+    146 setuid Core;
+    147 setresuid Core;
     148 getresuid Core;
-    149 setresgid Core; // no-op to the current id, else EPERM
+    149 setresgid Core;
     150 getresgid Core;
     153 times Core;
     154 setpgid Cap(Process);
@@ -171,7 +171,7 @@ syscalls! {
     156 getsid Core;
     157 setsid Cap(Process);
     158 getgroups Core;
-    159 setgroups Privileged;
+    159 setgroups Core; // uid 0 only, as on Linux
     160 uname Core;
     161 sethostname Privileged;
     162 setdomainname Privileged;
@@ -229,11 +229,11 @@ syscalls! {
     240 rt_tgsigqueueinfo Core;
     241 perf_event_open Privileged;
     242 accept4 Core; // acts on existing sockets; see net.rs
-    243 recvmmsg Cap(Net);
+    243 recvmmsg Core; // acts on existing sockets, like recvmsg
     260 wait4 Cap(Process);
     261 prlimit64 Core;
     268 setns Privileged;
-    269 sendmmsg Cap(Net);
+    269 sendmmsg Core; // acts on existing sockets, like sendmsg
     270 process_vm_readv Privileged;
     271 process_vm_writev Privileged;
     272 kcmp Privileged;

@@ -81,7 +81,9 @@ Docker/OCI image (`oci.rs` pulls from registries and reads OCI layouts and
 `docker save` archives, applying layers with whiteouts and checking
 digests), copies, files, and build steps. Steps run in grix itself and
 export `/`; nodes the kernel made at boot (`Node::generated`) stay out
-unless the step changed them. An image's kernel is the one that boots it,
+unless the step changed them. They run as the image's user
+(`ImageConfig::user`, an OCI image's `User`, root by default as in
+Docker, resolved by `container::resolve_user`). An image's kernel is the one that boots it,
 so bump `grix_abi::ABI_VERSION` with any change to the boot image, wire,
 `link` or `hostfs` formats.
 
@@ -125,7 +127,12 @@ Every way a process ends goes through `Process::terminate`: for init (pid
 ended process) closes its files, leaves a zombie, gives its children to
 init and sends the exit signal. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
-caller running.
+caller running. Credentials: `Process::uid`/`gid` are the effective ids
+(permission checks, new files); `Process::ids` keeps the real and saved
+ones and supplementary groups, changed by Linux's rules (uid 0 may set
+anything). They only matter inside the guest filesystem: root bypasses
+mode bits but not `Node::system`, and nothing honours setuid bits, so
+keep it that way rather than giving uid 0 anything else.
 
 Threads (`sched.rs`): one kernel stack per CPU. Each thread keeps its user
 registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must

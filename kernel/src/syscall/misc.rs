@@ -43,20 +43,50 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(len)
         }
-        nr::getuid | nr::geteuid => Ok(p.uid as u64),
-        nr::getgid | nr::getegid => Ok(p.gid as u64),
+        nr::getuid => Ok(p.ids.ruid as u64),
+        nr::geteuid => Ok(p.uid as u64),
+        nr::getgid => Ok(p.ids.rgid as u64),
+        nr::getegid => Ok(p.gid as u64),
         nr::getresuid | nr::getresgid => {
-            let id = if n == nr::getresuid { p.uid } else { p.gid };
-            for ptr in &a[..3] {
+            let ids = if n == nr::getresuid {
+                [p.ids.ruid, p.uid, p.ids.suid]
+            } else {
+                [p.ids.rgid, p.gid, p.ids.sgid]
+            };
+            for (ptr, id) in a[..3].iter().zip(ids) {
                 write_u32(&mut p.aspace, *ptr, id)?;
             }
             Ok(0)
         }
+        nr::setgroups => {
+            if p.uid != 0 {
+                return Err(EPERM);
+            }
+            let n = a[0] as usize;
+            if n > crate::process::MAX_GROUPS {
+                return Err(EINVAL);
+            }
+            let mut groups = alloc::vec::Vec::with_capacity(n);
+            for i in 0..n as u64 {
+                groups.push(read_u32(&mut p.aspace, a[1] + 4 * i)?);
+            }
+            p.ids.groups = groups;
+            Ok(0)
+        }
         // The primary group, as after a normal login (initgroups).
-        nr::getgroups => match a[0] {
-            0 => Ok(1),
-            _ => write_u32(&mut p.aspace, a[1], p.gid).map(|_| 1),
-        },
+        nr::getgroups => {
+            let groups = p.ids.groups.clone();
+            match a[0] as usize {
+                0 => Ok(groups.len() as u64),
+                n if n < groups.len() => Err(EINVAL),
+                _ => {
+                    for (i, g) in groups.iter().enumerate() {
+                        write_u32(&mut p.aspace, a[1] + 4 * i as u64, *g)?;
+                    }
+                    Ok(groups.len() as u64)
+                }
+            }
+        }
         nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
         nr::umask => {
             let old = p.umask;
@@ -181,22 +211,57 @@ fn sysinfo(p: &mut Process, buf: u64) -> SysResult {
     copy_out(&mut p.aspace, buf, &b).map(|_| 0)
 }
 
-/// An unprivileged process may only "change" its ids to the ones it already
-/// has (programs do this to drop privileges); anything else is EPERM.
-fn set_ids(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
-    let (current, count) = match n {
-        nr::setuid => (p.uid, 1),
-        nr::setreuid => (p.uid, 2),
-        nr::setresuid => (p.uid, 3),
-        nr::setgid => (p.gid, 1),
-        nr::setregid => (p.gid, 2),
-        _ => (p.gid, 3),
+/// setuid and friends, by Linux's rules (credentials(7)): uid 0 may set
+/// any ids; others may only move among their real, effective and saved
+/// ones. The ids mean nothing outside the sandbox: this is how programs
+/// started as root (apt, daemons) drop to another user.
+fn set_ids(p: &mut Process, n: u32, _name: &str, a: [u64; 6]) -> SysResult {
+    const KEEP: u32 = u32::MAX;
+    let privileged = p.uid == 0;
+    let users = matches!(n, nr::setuid | nr::setreuid | nr::setresuid);
+    let (r, e, s) = if users { (p.ids.ruid, p.uid, p.ids.suid) } else { (p.ids.rgid, p.gid, p.ids.sgid) };
+    let arg = |i: usize| a[i] as u32;
+    let mine = |id: u32| id == r || id == e || id == s;
+    let (nr_, ne, ns) = match n {
+        nr::setuid | nr::setgid => {
+            let id = arg(0);
+            if id == KEEP {
+                return Err(EINVAL);
+            } else if privileged {
+                (id, id, id)
+            } else if id == r || id == s {
+                (r, id, s)
+            } else {
+                return Err(EPERM);
+            }
+        }
+        nr::setreuid | nr::setregid => {
+            let (nr_, ne) = (arg(0), arg(1));
+            if !privileged && ((nr_ != KEEP && nr_ != r && nr_ != e) || (ne != KEEP && !mine(ne))) {
+                return Err(EPERM);
+            }
+            let nr_ = if nr_ == KEEP { r } else { nr_ };
+            let ne = if ne == KEEP { e } else { ne };
+            // The saved id follows the effective one when the real one is
+            // set, or the effective one changes to something not the real.
+            let ns = if arg(0) != KEEP || (arg(1) != KEEP && ne != r) { ne } else { s };
+            (nr_, ne, ns)
+        }
+        _ => {
+            let ids = [arg(0), arg(1), arg(2)];
+            if !privileged && ids.iter().any(|&id| id != KEEP && !mine(id)) {
+                return Err(EPERM);
+            }
+            let pick = |id: u32, old: u32| if id == KEEP { old } else { id };
+            (pick(ids[0], r), pick(ids[1], e), pick(ids[2], s))
+        }
     };
-    let keep = |id: u64| id as u32 == current || (count > 1 && id as u32 == u32::MAX);
-    if a[..count].iter().all(|&id| keep(id)) {
-        return Ok(0);
+    if users {
+        (p.ids.ruid, p.uid, p.ids.suid) = (nr_, ne, ns);
+    } else {
+        (p.ids.rgid, p.gid, p.ids.sgid) = (nr_, ne, ns);
     }
-    p.deny(n, name, "privileged", "changing user or group id")
+    Ok(0)
 }
 
 fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
