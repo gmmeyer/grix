@@ -565,6 +565,7 @@ pub fn start(img: Image<'static>) -> ! {
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
     let (stdin, gicr, cpus) = (img.stdin, img.gicr, img.cpus);
+    X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
     p.cwd = cwd;
@@ -714,9 +715,18 @@ impl Program {
     }
 }
 
+/// The translator for x86_64 programs (`Image::x86_64`).
+pub static X86_64: spin::Once<String> = spin::Once::new();
+
+/// A 64-bit little-endian ELF for x86_64 (EM_X86_64).
+fn is_x86_64_elf(head: &[u8]) -> bool {
+    head.len() >= 20 && head.starts_with(b"\x7fELF\x02\x01") && u16::from_le_bytes([head[18], head[19]]) == 62
+}
+
 /// Follow `#!` lines like Linux's binfmt_script: `#!interp [arg]` runs
-/// `interp [arg] script args...`. Returns the ELF to load (its path, node
-/// and bytes) and the final argv.
+/// `interp [arg] script args...`, and x86_64 programs through their
+/// translator. Returns the ELF to load (its path, node and bytes) and the
+/// final argv.
 fn resolve_interpreters(
     fs: &mut fs::Fs,
     cwd: Ino,
@@ -739,6 +749,24 @@ fn resolve_interpreters(
         let mut buf = [0u8; 256];
         let n = src.read(0, &mut buf);
         let head = &buf[..n];
+        // An x86_64 program: its translator runs it (binfmt_misc's way:
+        // the translator, the program's path, then its arguments).
+        if is_x86_64_elf(head) {
+            let Some(translator) = X86_64.get().filter(|t| !t.is_empty()) else {
+                return Err(exec_error(
+                    ENOEXEC,
+                    alloc::format!(
+                        "{path} is an x86_64 program, and grix runs arm64 ones: give the sandbox an x86_64 \
+                         translator (qemu-x86_64 or box64; `--x86-64`)"
+                    ),
+                ));
+            };
+            let mut next = alloc::vec![translator.clone(), path.clone()];
+            next.extend(argv.into_iter().skip(1));
+            argv = next;
+            path = translator.clone();
+            continue;
+        }
         let Some(rest) = head.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), ino, src, argv)) };
         let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
         let line = core::str::from_utf8(&line[..line.len().min(254)])

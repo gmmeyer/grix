@@ -80,6 +80,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/kernel/random/boot_id", ProcFile::BootId),
     ("/proc/sys/vm/overcommit_memory", ProcFile::Text("0\n")),
     ("/proc/sys/vm/max_map_count", ProcFile::Text("65530\n")),
+    ("/proc/sys/vm/mmap_min_addr", ProcFile::Text("65536\n")), // syscall::mem::MMAP_MIN_ADDR
     ("/proc/sys/fs/file-max", ProcFile::Text("1024\n")),
     ("/proc/sys/fs/nr_open", ProcFile::Text("1024\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),

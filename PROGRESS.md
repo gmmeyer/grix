@@ -357,6 +357,15 @@ Next, in TODO.md order:
   thread never entered the kernel again. 3.9× on 4 CPUs for CPU-bound
   threads.
 
+- **x86_64 programs**: binfmt_misc-style. `Image::x86_64` names an arm64
+  translator in the guest (`SandboxBuilder::x86_64(host_path)` imports it
+  at `/usr/libexec/grix/x86_64`); `resolve_interpreters` runs it for an
+  x86_64 ELF with the program's path and arguments. Alpine's static-pie
+  qemu-x86_64 needed only MREMAP_FIXED (now implemented) and
+  /proc/sys/vm/mmap_min_addr; dynamically linked x86_64 Alpine busybox
+  and CPython (threads, hashlib) run with `QEMU_LD_PREFIX=/`.
+  `tools/alpine.py --arch x86_64` fetches x86_64 packages.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

@@ -58,6 +58,10 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # More CPUs: a process's threads run in parallel (separate processes take turns).
 ./target/release/grix run --cpus 4 -a threads -i fixtures/build/smp:/bin/smp -- /bin/smp
 
+# x86_64 programs, through an x86_64 translator (here Alpine's arm64 qemu-x86_64).
+./target/release/grix run --x86-64 fixtures/build/qemu-x86_64/usr/bin/qemu-x86_64 -a threads \
+    -e QEMU_LD_PREFIX=/ -i fixtures/build/x86_64:/ -- /usr/bin/python3 -c 'import platform; print(platform.machine())'
+
 # Networking: only to example.com, port 443.
 ./target/release/grix run -a net -a threads --allow-host example.com:443 -i fixtures/build/python:/ -- \
     /usr/bin/python3 -c 'import urllib.request as u; print(u.urlopen("https://example.com").status)'
@@ -576,8 +580,11 @@ subshells.
    confined), with snapshots on macOS.
 5. ~~**Agent integrations**~~: images (`grix build`), the MCP server,
    Python bindings and snapshots for instant start are done.
-6. **SMP and x86_64 guests**: more CPUs are done (`--cpus N`, threads of a
-   process run in parallel). x86_64 guests are next.
+6. ~~**SMP and x86_64 guests**~~: more CPUs (`--cpus N`, threads of a
+   process run in parallel) and x86_64 programs, through a user-mode
+   translator in the arm64 sandbox (`--x86-64 qemu-x86_64`: x86_64 Alpine
+   and CPython run). Next: a native x86_64 kernel and grix-vmm on x86 KVM,
+   for x86 hosts.
 
 ## Repository layout
 

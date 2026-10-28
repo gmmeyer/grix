@@ -258,7 +258,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
-- [ ] x86_64 guests. Most prebuilt binaries are x86_64.
+- [x] x86_64 programs, through a user-mode translator in the arm64 guest
+      (`--x86-64`: qemu-x86_64; box64 untested; binfmt_misc-style). x86_64
+      Alpine busybox and CPython run.
+- [ ] A native x86_64 kernel (and grix-vmm on x86 KVM), for x86 hosts and
+      full speed there.
 
 ## Performance and scale
 

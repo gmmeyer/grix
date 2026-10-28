@@ -13,6 +13,9 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+/// Nothing is mapped below this (`/proc/sys/vm/mmap_min_addr`): a NULL
+/// pointer, in the kernel too, always faults.
+pub const MMAP_MIN_ADDR: u64 = 0x1_0000;
 
 fn aligned(a: u64) -> bool {
     a.is_multiple_of(PAGE_SIZE)
@@ -104,8 +107,11 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     let start = if fixed {
         let end = addr.checked_add(len).ok_or(ENOMEM)?;
-        if !aligned(addr) || end > USER_TOP || addr == 0 {
+        if !aligned(addr) || end > USER_TOP {
             return Err(EINVAL);
+        }
+        if addr < MMAP_MIN_ADDR {
+            return Err(EPERM);
         }
         if flags & MAP_FIXED_NOREPLACE != 0 && !a.is_free(addr, end) {
             return Err(EEXIST);
@@ -150,22 +156,34 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
     p.aspace.protect(addr, end, prot).map(|_| 0)
 }
 
-pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64) -> SysResult {
+pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> SysResult {
     const MREMAP_MAYMOVE: u64 = 1;
     const MREMAP_FIXED: u64 = 2;
     if !aligned(old) || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
         return Err(EINVAL);
-    }
-    if flags & MREMAP_FIXED != 0 {
-        return p.unimplemented(super::table::nr::mremap, "mremap", "MREMAP_FIXED", EINVAL);
     }
     let old_len = page_up(old_len).ok_or(EINVAL)?;
     let new_len = page_up(new_len).filter(|&l| l > 0).ok_or(EINVAL)?;
     if old_len == 0 {
         return Err(EINVAL); // duplicating shared mappings is not supported
     }
-    p.aspace.has_room(2)?;
-    p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0)
+    // MREMAP_FIXED: to exactly `new_addr` (it needs MREMAP_MAYMOVE), whatever
+    // is there unmapped first; the two ranges mustn't overlap.
+    let fixed = if flags & MREMAP_FIXED != 0 {
+        let end = new_addr.checked_add(new_len).filter(|&e| e <= USER_TOP).ok_or(EINVAL)?;
+        let old_end = old.checked_add(old_len).ok_or(EINVAL)?;
+        if flags & MREMAP_MAYMOVE == 0 || !aligned(new_addr) || (new_addr < old_end && old < end) {
+            return Err(EINVAL);
+        }
+        if new_addr < MMAP_MIN_ADDR {
+            return Err(EPERM);
+        }
+        Some(new_addr)
+    } else {
+        None
+    };
+    p.aspace.has_room(3)?;
+    p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
 }
 
 pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {

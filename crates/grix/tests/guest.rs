@@ -1511,3 +1511,37 @@ fn threads_run_in_parallel_on_more_cpus() {
     assert!(Sandbox::builder().cpus(0).build().is_err());
     assert!(Sandbox::builder().cpus(9).build().is_err());
 }
+
+/// x86_64 programs run through an x86_64 translator (here Alpine's static
+/// qemu-x86_64, user mode), the way binfmt_misc runs them on Linux.
+#[test]
+fn x86_64_programs_run_through_a_translator() {
+    let qemu = fixture("qemu-x86_64/usr/bin/qemu-x86_64");
+    let b = || with("hello-x86_64").env("GREETING", "from x86_64").allow(Capability::Threads);
+    let out = run(b().x86_64(&qemu).unwrap(), &["/bin/hello-x86_64", "world"]);
+    assert_eq!(out.status, ExitStatus::Exited(7), "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(
+        out.stdout_str(),
+        "hello from grix! argc=2\nargv[0]=/bin/hello-x86_64\nargv[1]=world\nGREETING=from x86_64\n"
+    );
+    assert!(out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { .. })), "{:?}", out.events);
+    // From a shell too (its execve).
+    let sh = b()
+        .x86_64(&qemu)
+        .unwrap()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process);
+    let out = run(sh, &["/bin/busybox", "sh", "-c", "/bin/hello-x86_64 a b; echo status $?"]);
+    assert_eq!(
+        out.stdout_str(),
+        "hello from grix! argc=3\nargv[0]=/bin/hello-x86_64\nargv[1]=a\nargv[2]=b\nGREETING=from x86_64\nstatus 7\n"
+    );
+    // The translator runs in the sandbox: an x86_64 one can't.
+    let err = b().x86_64(fixture("hello-x86_64")).err().expect("an x86_64 translator was taken");
+    assert!(err.to_string().contains("isn't an arm64 Linux program"), "{err}");
+    // Without one, it says what's missing.
+    let out = b().build().unwrap().run(&["/bin/hello-x86_64"]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(126));
+    assert!(out.events.iter().any(|e| e.to_string().contains("x86_64 translator")), "{:?}", out.events);
+}

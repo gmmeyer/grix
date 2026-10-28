@@ -243,6 +243,9 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                                 "description": "Sandbox directories whose contents to return when the program ends."},
                     "timeout_secs": {"type": "number"},
                     "memory_mb": {"type": "number"},
+                    "x86_64": {"type": "string",
+                               "description": "Run x86_64 Linux programs with this translator (a host file: an arm64 \
+                                               qemu-x86_64 in user mode (needs threads); box64 untested)."},
                     "cpus": {"type": "integer", "minimum": 1,
                              "description": "CPUs for the program's threads (default 1; a snapshot has 1)."}
                 }
@@ -352,6 +355,9 @@ fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
         bail!("{cpus} CPUs: the server allows at most {}", config.max_cpus);
     }
     let mut b = Sandbox::builder().max_output(OUTPUT_MAX * 4).cpus(cpus as u32);
+    if let Some(t) = args["x86_64"].as_str() {
+        b = b.x86_64(config.host_path(t)?)?;
+    }
     if let Some(image) = args["image"].as_str() {
         let image = crate::Image::open(config.host_path(image)?)?;
         for name in &image.config.capabilities {

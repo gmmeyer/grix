@@ -160,6 +160,9 @@ fn default_accel() -> &'static str {
     "tcg"
 }
 
+/// Where `SandboxBuilder::x86_64` puts the translator.
+const X86_64_TRANSLATOR: &str = "/usr/libexec/grix/x86_64";
+
 /// The macOS major version (`kern.osproductversion`).
 #[cfg(not(target_os = "macos"))]
 fn macos_major() -> Option<u32> {
@@ -252,6 +255,8 @@ pub struct SandboxBuilder {
     /// grix's own VMM, instead of QEMU.
     vmm: Option<PathBuf>,
     cpus: u32,
+    /// The guest path of the x86_64 translator, if any.
+    x86_64: Option<String>,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -287,6 +292,7 @@ impl Default for SandboxBuilder {
             accel: std::env::var("GRIX_ACCEL").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| default_accel().into()),
             vmm: default_vmm(),
             cpus: std::env::var("GRIX_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(1),
+            x86_64: None,
             command: Vec::new(),
         }
     }
@@ -342,6 +348,31 @@ impl SandboxBuilder {
     pub fn cwd(mut self, dir: impl Into<String>) -> Self {
         self.cwd = dir.into();
         self
+    }
+
+    /// Run x86_64 Linux programs with `translator`, an arm64 Linux
+    /// program that translates them (`qemu-x86_64` in user mode; box64
+    /// should work too, untested), copied in at `/usr/libexec/grix/x86_64`:
+    /// execve of an x86_64 ELF runs it with the program's path and
+    /// arguments, as binfmt_misc would. It needs what it needs to run (a
+    /// static `qemu-x86_64`: the `threads` capability), and dynamically
+    /// linked x86_64 programs their own libraries (`QEMU_LD_PREFIX` for
+    /// qemu).
+    pub fn x86_64(self, translator: impl AsRef<Path>) -> Result<Self> {
+        let path = translator.as_ref();
+        // The file itself (through links), and one that can run here.
+        let data = std::fs::read(path).with_context(|| format!("reading the x86_64 translator {}", path.display()))?;
+        let arm64 = data.starts_with(b"\x7fELF\x02\x01")
+            && data.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == 183);
+        if !arm64 {
+            bail!(
+                "the x86_64 translator {} isn't an arm64 Linux program (it runs inside the sandbox, which is arm64)",
+                path.display()
+            );
+        }
+        let mut b = self.file(X86_64_TRANSLATOR, data, 0o755)?;
+        b.x86_64 = Some(X86_64_TRANSLATOR.into());
+        Ok(b)
     }
 
     /// CPUs for the program's threads (1 by default, at most
@@ -799,6 +830,7 @@ impl Sandbox {
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
             snapshot: take.is_some(),
             cpus: cfg.cpus,
+            x86_64: cfg.x86_64.as_deref().unwrap_or(""),
         }
         .encode();
         let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);

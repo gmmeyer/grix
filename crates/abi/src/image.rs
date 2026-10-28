@@ -89,6 +89,11 @@ pub struct Image<'a> {
     /// CPUs the machine has (1..=`machine::MAX_CPUS`); the kernel starts
     /// the others with PSCI CPU_ON.
     pub cpus: u32,
+    /// A program (a path in the guest) that runs x86_64 Linux programs on
+    /// arm64, like `qemu-x86_64` or box64: execve of an x86_64 ELF runs it
+    /// with the program's path and arguments, as binfmt_misc would. Empty:
+    /// none.
+    pub x86_64: &'a str,
 }
 
 /// The hypervisor call (HVC, in SMCCC's OEM service range: Hypervisor.framework
@@ -171,6 +176,7 @@ impl<'a> Image<'a> {
         }
         w.u8(self.snapshot as u8);
         w.u32(self.cpus);
+        w.str(self.x86_64);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -231,6 +237,7 @@ impl<'a> Image<'a> {
         if cpus == 0 || cpus > crate::machine::MAX_CPUS {
             return Err(DecodeError);
         }
+        let x86_64 = r.str()?;
         Ok(Image {
             ram_size: header.ram_size,
             gicr: header.gicr,
@@ -252,6 +259,7 @@ impl<'a> Image<'a> {
             forwards,
             snapshot,
             cpus,
+            x86_64,
         })
     }
 }
@@ -288,6 +296,7 @@ mod tests {
             forwards: vec![8000, 80],
             snapshot: true,
             cpus: 4,
+            x86_64: "/usr/bin/qemu-x86_64",
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -319,6 +328,7 @@ mod tests {
             forwards: vec![],
             snapshot: false,
             cpus: 1,
+            x86_64: "",
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

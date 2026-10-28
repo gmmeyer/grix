@@ -536,3 +536,31 @@ fn python_from_a_snapshot() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// x86_64 Alpine (dynamically linked: busybox, CPython) through qemu-x86_64
+/// in user mode, which the kernel runs for every x86_64 program it execs.
+#[test]
+fn x86_64_python_through_a_translator() {
+    let qemu = runtime("qemu-x86_64/usr/bin/qemu-x86_64");
+    // Emulation in emulation under TCG: minutes.
+    let b = Sandbox::builder()
+        .timeout(Duration::from_secs(600))
+        .memory_mb(1024)
+        .allow(Capability::Threads)
+        .allow(Capability::Process)
+        .import(runtime("x86_64"), "/")
+        .unwrap()
+        .x86_64(&qemu)
+        .unwrap()
+        // The x86_64 programs' own libraries are at the root.
+        .env("QEMU_LD_PREFIX", "/");
+    let code = "import hashlib, json, platform, threading\n\
+                out = []\n\
+                t = threading.Thread(target=lambda: out.append(hashlib.sha256(b'grix').hexdigest()[:12]))\n\
+                t.start(); t.join()\n\
+                print(platform.machine(), json.dumps(out))";
+    let out =
+        run(b, &["/bin/busybox", "sh", "-c", &format!("/usr/bin/python3 -c \"{code}\" | /bin/busybox tr a-z A-Z")]);
+    assert_eq!(out.stdout_str(), "X86_64 [\"837CCAB607AA\"]\n", "{}", out.stderr_str());
+    assert_no_surprises(&out);
+}

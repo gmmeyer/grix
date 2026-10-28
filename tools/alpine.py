@@ -50,11 +50,16 @@ def gzip_members(data):
     return out
 
 
+def cache():
+    # aarch64's packages are where they always were; others by architecture.
+    return f"{CACHE}/{RELEASE}" + ("" if ARCH == "aarch64" else f"/{ARCH}")
+
+
 def load_index():
     pkgs, provides = {}, {}
     for repo in REPOS:
         raw = fetch(f"{MIRROR}/{RELEASE}/{repo}/{ARCH}/APKINDEX.tar.gz",
-                    f"{CACHE}/{RELEASE}/{repo}/APKINDEX.tar.gz")
+                    f"{cache()}/{repo}/APKINDEX.tar.gz")
         with tarfile.open(fileobj=io.BytesIO(raw)) as t:
             text = t.extractfile("APKINDEX").read().decode()
         for block in text.split("\n\n"):
@@ -97,7 +102,7 @@ def resolve(names, pkgs, provides):
 def install(name, pkg, out):
     filename = f"{name}-{pkg['V']}.apk"
     data = fetch(f"{MIRROR}/{RELEASE}/{pkg['repo']}/{ARCH}/{filename}",
-                 f"{CACHE}/{RELEASE}/{pkg['repo']}/{filename}")
+                 f"{cache()}/{pkg['repo']}/{filename}")
     members = gzip_members(data)
     # Members: [signature,] control, data. The index records SHA-1 of the control member.
     want = pkg.get("C", "")
@@ -142,8 +147,11 @@ def install(name, pkg, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="directory to install into")
+    ap.add_argument("--arch", default="aarch64", help="Alpine architecture (aarch64, x86_64)")
     ap.add_argument("packages", nargs="+")
     args = ap.parse_args()
+    global ARCH
+    ARCH = args.arch
     pkgs, provides = load_index()
     order = resolve(args.packages, pkgs, provides)
     os.makedirs(args.out, exist_ok=True)

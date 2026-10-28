@@ -397,9 +397,24 @@ impl AddressSpace {
     }
 
     /// mremap. `old`/`new_len`/`old_len` are page aligned.
-    pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool) -> Result<u64, Errno> {
+    /// `fixed`: move it to exactly there (MREMAP_FIXED), checked by the caller.
+    pub fn remap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        may_move: bool,
+        fixed: Option<u64>,
+    ) -> Result<u64, Errno> {
         let old_end = old.checked_add(old_len).ok_or(EINVAL)?;
         let vma = self.find(old).filter(|v| old_end <= v.end).ok_or(EFAULT)?.clone();
+        if let Some(to) = fixed {
+            self.unmap(to, to + new_len);
+            if new_len < old_len {
+                self.unmap(old + new_len, old_end);
+            }
+            return self.move_to(&vma, old, old_len.min(new_len), new_len, to);
+        }
         if new_len <= old_len {
             self.unmap(old + new_len, old_end);
             return Ok(old);
@@ -416,6 +431,13 @@ impl AddressSpace {
             return Err(ENOMEM);
         }
         let new = self.find_free(new_len).ok_or(ENOMEM)?;
+        self.move_to(&vma, old, old_len, new_len, new)
+    }
+
+    /// Move `[old, old + old_len)` of `vma`, pages and all, to `new`, as a
+    /// mapping `new_len` long.
+    fn move_to(&mut self, vma: &Vma, old: u64, old_len: u64, new_len: u64, new: u64) -> Result<u64, Errno> {
+        let old_end = old + old_len;
         // Move existing pages rather than copying them.
         let mut pages = Vec::new();
         self.pt.for_each_mapped(old, old_end, |va, pte| unsafe {

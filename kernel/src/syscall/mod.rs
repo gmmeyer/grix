@@ -191,7 +191,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::mmap => mem::mmap(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::munmap => mem::munmap(p, a[0], a[1]),
         nr::mprotect => mem::mprotect(p, a[0], a[1], a[2]),
-        nr::mremap => mem::mremap(p, a[0], a[1], a[2], a[3]),
+        nr::mremap => mem::mremap(p, a[0], a[1], a[2], a[3], a[4]),
         nr::madvise => mem::madvise(p, a[0], a[1], a[2]),
         nr::msync | nr::mlock | nr::munlock | nr::mlock2 | nr::mlockall | nr::munlockall => Ok(0),
 

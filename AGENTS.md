@@ -163,6 +163,13 @@ makes every other CPU running the process enter the kernel
 (`smp::barrier_others`). Secondaries start with PSCI CPU_ON (`boot.S`
 `secondary_entry`). Snapshots are of one CPU.
 
+x86_64 programs (`Image::x86_64`, `SandboxBuilder::x86_64`, `--x86-64`):
+the guest stays arm64; an x86_64 ELF that execve meets is run by the
+configured translator (an arm64 program: qemu-x86_64 in user mode;
+box64 should work, untested) with its path and arguments, as binfmt_misc would
+(`resolve_interpreters`). Whatever the translator needs is the program's
+to import (x86_64 libraries for dynamic programs, `QEMU_LD_PREFIX`).
+
 Snapshots (`kernel/src/snapshot.rs`, `crates/vmm/src/snapshot.rs`,
 `crates/grix/src/snapshot.rs`): with `Image::snapshot`, the first time the
 scheduler idles with a thread waiting for I/O, after the program found

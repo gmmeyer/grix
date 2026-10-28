@@ -170,6 +170,11 @@ struct RunArgs {
     /// CPUs for the program's threads (default 1).
     #[arg(long)]
     cpus: Option<u32>,
+    /// Run x86_64 programs with this translator (an arm64 Linux program:
+    /// qemu-x86_64 in user mode, which needs `-a threads`;
+    /// box64 untested).
+    #[arg(long = "x86-64", value_name = "TRANSLATOR")]
+    x86_64: Option<PathBuf>,
     /// After the time limit, how many seconds the program has to end after
     /// SIGTERM before it's stopped (default 5).
     #[arg(long, value_name = "SECS")]
@@ -417,6 +422,9 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
     }
     if let Some(n) = args.cpus {
         b = b.cpus(n);
+    }
+    if let Some(t) = &args.x86_64 {
+        b = b.x86_64(t)?;
     }
     if let Some(s) = args.grace {
         b = b.grace(Duration::from_secs(s));
