@@ -88,15 +88,18 @@ pub struct Image<'a> {
     pub snapshot: bool,
 }
 
-/// The hypervisor call (SMCCC vendor-specific hypervisor service, HVC) the
-/// kernel makes to have the VMM snapshot the whole machine. It returns
+/// The hypervisor call (HVC, in SMCCC's OEM service range: Hypervisor.framework
+/// answers the vendor-specific hypervisor range itself) the kernel makes to
+/// have the VMM snapshot the whole machine. It returns
 /// [`SNAPSHOT_TAKEN`] in x0 in the run that took it (whose VMM then stops
 /// it there), [`SNAPSHOT_RESTORED`] in each run restored from it, with 32
-/// bytes of fresh entropy in x1..x4, or PSCI's NOT_SUPPORTED (-1) when the
-/// VMM can't.
-pub const SNAPSHOT_CALL: u64 = 0xc600_0001;
+/// bytes of fresh entropy in x1..x4 and the nanoseconds since the snapshot
+/// in x5, [`SNAPSHOT_RETRY`] if input arrived meanwhile (call again when
+/// next idle), or PSCI's NOT_SUPPORTED (-1) when the VMM can't.
+pub const SNAPSHOT_CALL: u64 = 0xc300_0001;
 pub const SNAPSHOT_TAKEN: u64 = 0;
 pub const SNAPSHOT_RESTORED: u64 = 1;
+pub const SNAPSHOT_RETRY: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveMount<'a> {

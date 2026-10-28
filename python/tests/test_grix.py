@@ -29,6 +29,19 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(r.stdout, "hi\nalice\nbob\ncarol\nfrom stdin\n")
         self.assertEqual(r.events, [])
 
+    def test_snapshots(self):
+        if sys.platform != "darwin":
+            self.skipTest("snapshots need grix-vmm on macOS")
+        with tempfile.TemporaryDirectory() as tmp:
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
+            snap = sb.snapshot(Path(tmp) / "sh.snap", ["/bin/busybox", "sh", "-c", 'read x; echo "got $x"'])
+            for word in ["a", "b"]:
+                r = snap.run(stdin=f"{word}\n")
+                self.assertTrue(r.ok, r)
+                self.assertEqual(r.stdout, f"got {word}\n")
+            with self.assertRaises(grix.GrixError):
+                sb.snapshot(Path(tmp) / "none.snap", ["/bin/busybox", "true"])
+
     def test_denials_and_missing_capabilities(self):
         r = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}).run(["/bin/busybox", "wget", "-q", "-O-", "http://example.com"])
         self.assertFalse(r.ok)

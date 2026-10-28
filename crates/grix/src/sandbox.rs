@@ -17,7 +17,7 @@ use crate::hostfs::LiveMount;
 use crate::image::{self, Node};
 use crate::mount::{Mount, MountChanges};
 use crate::net::{ForwardFrom, HostRule, NetPolicy};
-use crate::vmm::{self, VmConfig, VmEnd};
+use crate::vmm::{self, SnapshotFile, VmConfig, VmEnd};
 
 /// Room the kernel needs below the boot image (kernel, heap, page tables).
 const RESERVED_LOW: u64 = IMAGE_BASE - RAM_BASE;
@@ -192,7 +192,7 @@ fn macos_major() -> Option<u32> {
 /// and is installed: `GRIX_VMM`, next to the running program, or this
 /// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
 /// means QEMU.
-fn default_vmm() -> Option<PathBuf> {
+pub(crate) fn default_vmm() -> Option<PathBuf> {
     if std::env::var_os("GRIX_ACCEL").is_some() {
         return None;
     }
@@ -712,8 +712,20 @@ impl Sandbox {
         &self,
         argv: &[S],
         stdin: Option<Box<dyn Read + Send>>,
-        mut on_output: impl FnMut(Stream, &[u8]),
+        on_output: impl FnMut(Stream, &[u8]),
     ) -> Result<RunOutput> {
+        Ok(self.run_mode(argv, stdin, None, on_output)?.0)
+    }
+
+    /// A run; with `take`, one that ends in a snapshot written there (and
+    /// whether it did).
+    fn run_mode<S: AsRef<str>>(
+        &self,
+        argv: &[S],
+        stdin: Option<Box<dyn Read + Send>>,
+        take: Option<std::fs::File>,
+        on_output: impl FnMut(Stream, &[u8]),
+    ) -> Result<(RunOutput, bool)> {
         let cfg = &self.cfg;
         let argv: Vec<&str> = argv.iter().map(|s| s.as_ref()).collect();
         let exe = *argv.first().context("empty command")?;
@@ -758,7 +770,7 @@ impl Sandbox {
             uid: cfg.uid,
             gid: cfg.gid,
             cwd: &cfg.cwd,
-            stdin: stdin.is_some(),
+            stdin: stdin.is_some() || take.is_some(),
             exe,
             argv: argv.clone(),
             envp: env.iter().map(String::as_str).collect(),
@@ -772,11 +784,10 @@ impl Sandbox {
                 .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable })
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
-            snapshot: false,
+            snapshot: take.is_some(),
         }
         .encode();
-        let mut exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
-
+        let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
         let mut net = cfg.net.clone();
         net.enabled = cfg.policy.allows(Capability::Net);
         let vm = VmConfig {
@@ -789,69 +800,203 @@ impl Sandbox {
             memory_mb: cfg.memory_mb,
             accel: cfg.accel.clone(),
             vmm: cfg.vmm.clone(),
+            snapshot: take.map(SnapshotFile::Take),
         };
-        let mut out = RunOutput {
-            status: ExitStatus::Timeout,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            events: Vec::new(),
-            exports: Vec::new(),
-            mount_changes: Vec::new(),
-            kernel_log: String::new(),
-            duration: Duration::ZERO,
-        };
-        let started = Instant::now();
-        let max = cfg.max_output;
-        // Keep up to `max` bytes; mark the stream once anything is dropped.
-        let keep = |buf: &mut Vec<u8>, truncated: &mut bool, payload: &[u8]| -> usize {
-            let room = max.saturating_sub(buf.len()).min(payload.len());
-            buf.extend_from_slice(&payload[..room]);
-            *truncated |= room < payload.len();
-            room
-        };
-        let run = vmm::run(&vm, &bytes, cfg.timeout, stdin, |ch, payload| match ch {
-            Channel::Stdout => {
-                let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
-                on_output(Stream::Stdout, &payload[..n]);
-            }
-            Channel::Stderr => {
-                let n = keep(&mut out.stderr, &mut out.stderr_truncated, payload);
-                on_output(Stream::Stderr, &payload[..n]);
-            }
-            Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
-            Channel::Event => match Event::decode(payload) {
-                Ok(e) => out.events.push(e.into()),
-                Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
-            },
-            Channel::Export => exports.push(payload),
-            Channel::Exit | Channel::Link | Channel::Fs => {}
-        })?;
-        out.events.extend(run.events);
-        let run_timed_out = run.timed_out;
-        let end = run.end;
-        let (exported, changes) = exports.finish();
-        out.exports = exported;
+        // A snapshot is taken while the program waits for stdin, which
+        // must neither come nor end.
+        let stdin = if vm.snapshot.is_some() { None } else { stdin };
+        let (mut out, changes, taken) = execute(&vm, &bytes, cfg.timeout, stdin, exports, cfg.max_output, on_output)?;
         out.mount_changes = cfg.mounts.iter().zip(&mounted).zip(changes).map(|((m, i), c)| i.apply(m, c)).collect();
-        out.duration = started.elapsed();
-        out.status = match end {
-            // Out of time, even if the program then ended on the SIGTERM;
-            // a kernel panic or a lost VM still says so.
-            VmEnd::Exited { kind: ExitKind::Exited | ExitKind::Signaled, .. } | VmEnd::Stopped if run_timed_out => {
-                ExitStatus::Timeout
-            }
-            VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),
-            VmEnd::Exited { kind: ExitKind::Signaled, code } => ExitStatus::Signaled(code),
-            VmEnd::Exited { kind: ExitKind::Panic, .. } => ExitStatus::KernelPanic,
-            VmEnd::Timeout => ExitStatus::Timeout,
-            VmEnd::Stopped => ExitStatus::Stopped,
-            VmEnd::Lost { vmm_status, vmm_stderr } => ExitStatus::VmFailed(format!(
-                "{} exited ({vmm_status:?}) without a guest status: {}",
-                if cfg.vmm.is_some() { "grix-vmm" } else { "qemu" },
-                vmm_stderr.trim()
-            )),
-        };
-        Ok(out)
+        Ok((out, taken))
     }
+
+    /// Run `argv` until it first waits for input, and save the whole machine
+    /// to `path` there: each [`Snapshot::run`](crate::Snapshot::run) then
+    /// starts from that moment (see [`crate::snapshot`]). Needs grix-vmm
+    /// on macOS; the sandbox can't have mounts, or listeners from
+    /// [`forward_listener`](SandboxBuilder::forward_listener).
+    pub fn snapshot<S: AsRef<str>>(&self, argv: &[S], path: impl AsRef<Path>) -> Result<crate::Snapshot> {
+        let cfg = &self.cfg;
+        let path = path.as_ref();
+        if cfg.vmm.is_none() || !cfg!(target_os = "macos") {
+            bail!("snapshots need grix's own VMM on macOS 15+ (Hypervisor.framework), not QEMU or KVM");
+        }
+        if !cfg.mounts.is_empty() || !cfg.live.is_empty() {
+            bail!("a sandbox with mounts can't be snapshotted: what the host holds for them isn't saved");
+        }
+        let mut forwards = Vec::new();
+        for (from, port) in &cfg.net.forwards {
+            match from {
+                ForwardFrom::Addr(a) => forwards.push((a.to_string(), *port)),
+                ForwardFrom::Listener(_) => bail!("a forwarded listener can't be saved in a snapshot (use forward)"),
+            }
+        }
+        let settings = crate::snapshot::Settings {
+            abi: grix_abi::ABI_VERSION,
+            net: cfg.policy.allows(Capability::Net),
+            allow_hosts: cfg.net.allow.as_ref().map(|rules| rules.iter().map(|r| r.to_string()).collect()),
+            forwards,
+            exports: cfg.exports.clone(),
+            max_export: cfg.max_export,
+            max_output: cfg.max_output,
+            timeout_ms: cfg.timeout.as_millis() as u64,
+            grace_ms: cfg.grace.as_millis() as u64,
+            memory_mb: cfg.memory_mb,
+        };
+        // Written to a new file of our own (it holds the program's memory:
+        // only we may read it), then renamed into place: never through a
+        // link, and never over a snapshot runs may still be mapping.
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = path.file_name().context("the snapshot needs a file name")?.to_string_lossy();
+        let temp = dir.join(format!(".{name}.{}.tmp", crate::container::random_suffix()));
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&temp)
+        }
+        .with_context(|| format!("creating {}", temp.display()))?;
+        let cleanup = TempFile(temp.clone());
+        let mut keep = file.try_clone()?;
+        let (out, taken) = self.run_mode(argv, None, Some(file), |_, _| {})?;
+        // The VMM ends the run once it has written the machine out; the
+        // program ending, the time running out (or anything else) means
+        // there's no snapshot.
+        if !taken {
+            let events: Vec<String> = out.events.iter().map(|e| e.to_string()).collect();
+            bail!(
+                "no snapshot: the program didn't wait for input ({:?})\n{}{}",
+                out.status,
+                events.join("\n"),
+                out.stderr_str()
+            );
+        }
+        crate::snapshot::finish(&mut keep, &settings)?;
+        std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))?;
+        std::mem::forget(cleanup);
+        crate::Snapshot::open(path)
+    }
+}
+
+/// Removes a file unless forgotten.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run `vm` with `image` (or its snapshot) and collect what the program
+/// said and sent back; and whether the VMM ended the run having taken a
+/// snapshot (in time).
+fn execute(
+    vm: &VmConfig,
+    image: &[u8],
+    timeout: Duration,
+    stdin: Option<Box<dyn Read + Send>>,
+    mut exports: Collector,
+    max_output: usize,
+    mut on_output: impl FnMut(Stream, &[u8]),
+) -> Result<(RunOutput, Vec<crate::export::Changes>, bool)> {
+    let mut out = RunOutput {
+        status: ExitStatus::Timeout,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        events: Vec::new(),
+        exports: Vec::new(),
+        mount_changes: Vec::new(),
+        kernel_log: String::new(),
+        duration: Duration::ZERO,
+    };
+    let started = Instant::now();
+    let max = max_output;
+    // Keep up to `max` bytes; mark the stream once anything is dropped.
+    let keep = |buf: &mut Vec<u8>, truncated: &mut bool, payload: &[u8]| -> usize {
+        let room = max.saturating_sub(buf.len()).min(payload.len());
+        buf.extend_from_slice(&payload[..room]);
+        *truncated |= room < payload.len();
+        room
+    };
+    let run = vmm::run(vm, image, timeout, stdin, |ch, payload| match ch {
+        Channel::Stdout => {
+            let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
+            on_output(Stream::Stdout, &payload[..n]);
+        }
+        Channel::Stderr => {
+            let n = keep(&mut out.stderr, &mut out.stderr_truncated, payload);
+            on_output(Stream::Stderr, &payload[..n]);
+        }
+        Channel::Log => out.kernel_log.push_str(&String::from_utf8_lossy(payload)),
+        Channel::Event => match Event::decode(payload) {
+            Ok(e) => out.events.push(e.into()),
+            Err(_) => out.kernel_log.push_str("[grix] undecodable event from guest\n"),
+        },
+        Channel::Export => exports.push(payload),
+        Channel::Exit | Channel::Link | Channel::Fs => {}
+    })?;
+    out.events.extend(run.events);
+    let run_timed_out = run.timed_out;
+    let (exported, changes) = exports.finish();
+    out.exports = exported;
+    out.duration = started.elapsed();
+    let taken = vm.snapshot.is_some() && !run_timed_out && matches!(run.end, VmEnd::Lost { vmm_status: Some(0), .. });
+    out.status = match run.end {
+        // Out of time, even if the program then ended on the SIGTERM;
+        // a kernel panic or a lost VM still says so.
+        VmEnd::Exited { kind: ExitKind::Exited | ExitKind::Signaled, .. } | VmEnd::Stopped if run_timed_out => {
+            ExitStatus::Timeout
+        }
+        VmEnd::Exited { kind: ExitKind::Exited, code } => ExitStatus::Exited(code),
+        VmEnd::Exited { kind: ExitKind::Signaled, code } => ExitStatus::Signaled(code),
+        VmEnd::Exited { kind: ExitKind::Panic, .. } => ExitStatus::KernelPanic,
+        VmEnd::Timeout => ExitStatus::Timeout,
+        VmEnd::Stopped => ExitStatus::Stopped,
+        VmEnd::Lost { vmm_status, vmm_stderr } => ExitStatus::VmFailed(format!(
+            "{} exited ({vmm_status:?}) without a guest status: {}",
+            if vm.vmm.is_some() { "grix-vmm" } else { "qemu" },
+            vmm_stderr.trim()
+        )),
+    };
+    Ok((out, changes, taken))
+}
+
+/// A run restored from `snap`, with `stdin`.
+pub(crate) fn run_snapshot(
+    snap: &crate::Snapshot,
+    stdin: Box<dyn Read + Send>,
+    on_output: impl FnMut(Stream, &[u8]),
+) -> Result<RunOutput> {
+    if !cfg!(target_os = "macos") {
+        bail!("snapshots need grix's own VMM on macOS 15+ (Hypervisor.framework)");
+    }
+    let s = &snap.settings;
+    let file = std::fs::File::open(snap.path()).with_context(|| format!("opening {}", snap.path().display()))?;
+    let mut net = NetPolicy {
+        enabled: s.net,
+        allow: s
+            .allow_hosts
+            .as_ref()
+            .map(|rules| rules.iter().map(|r| HostRule::parse(r)).collect::<Result<Vec<_>>>())
+            .transpose()?,
+        forwards: Vec::new(),
+    };
+    for (addr, port) in &s.forwards {
+        let a = addr.parse().with_context(|| format!("forward address {addr:?} in the snapshot"))?;
+        net.forwards.push((ForwardFrom::Addr(a), *port));
+    }
+    let vm = VmConfig {
+        net,
+        control: snap.control.clone(),
+        grace: Duration::from_millis(s.grace_ms),
+        live: Vec::new(),
+        qemu: PathBuf::new(),
+        kernel: PathBuf::new(),
+        memory_mb: s.memory_mb,
+        accel: String::new(),
+        vmm: Some(snap.vmm.clone().context("snapshots need grix's own VMM (grix-vmm, on macOS 15+)")?),
+        snapshot: Some(SnapshotFile::Restore(file)),
+    };
+    let exports = Collector::new(&s.exports, &[], s.max_export as u64);
+    Ok(execute(&vm, &[], snap.timeout, Some(stdin), exports, s.max_output, on_output)?.0)
 }

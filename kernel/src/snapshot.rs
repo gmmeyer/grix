@@ -3,15 +3,16 @@
 //! restored from it continues from that moment, with fresh entropy, so a
 //! runtime that took seconds to start answers its first input at once.
 //!
-//! What the host held for this run doesn't come along, so the snapshot is
-//! refused while any of it is in use: connections and DNS lookups through
-//! the host. (The host refuses live mounts, and stdin hasn't been touched:
-//! nothing has been sent yet.)
+//! What the host held for this run doesn't come along, so the snapshot
+//! waits while any of it is in use (connections and DNS lookups through the
+//! host), and is put off if input arrived while it was being taken. (The
+//! host refuses live mounts, and stdin hasn't been touched: nothing has been
+//! sent yet.)
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use grix_abi::image::{SNAPSHOT_CALL, SNAPSHOT_RESTORED, SNAPSHOT_TAKEN};
+use grix_abi::image::{SNAPSHOT_CALL, SNAPSHOT_RESTORED, SNAPSHOT_RETRY, SNAPSHOT_TAKEN};
 use grix_abi::wire::{Event, ExitKind};
 
 use crate::console::{self, klog};
@@ -22,34 +23,46 @@ pub fn init(wanted: bool) {
     WANTED.store(wanted, Ordering::Relaxed);
 }
 
-/// Every thread is blocked and some wait for input: take the snapshot, if
-/// this run should and hasn't yet.
+/// Every thread is blocked and some wait for I/O: take the snapshot, if
+/// this run should, hasn't yet, and the program has found stdin empty.
 pub fn take_if_wanted() {
-    if !WANTED.swap(false, Ordering::Relaxed) {
+    if !WANTED.load(Ordering::Relaxed) || !console::stdin_waited() {
         return;
     }
+    // A lookup or connection through the host may be what it waits for;
+    // it'll come back to stdin.
     if crate::inet::host_state() > 0 {
-        refuse("the program has connections or DNS lookups open through the host");
+        return;
     }
-    // Everything said so far reaches the host first: it's this run's.
+    // Everything said so far reaches the host first: it's this run's. And
+    // everything the host sent is taken: if anything had come, it isn't
+    // the moment.
     console::flush();
-    let (x0, x1, x2, x3, x4): (u64, u64, u64, u64, u64);
+    if !console::take_all_input() {
+        return;
+    }
+    let (x0, x1, x2, x3, x4, x5): (u64, u64, u64, u64, u64, u64);
     // SAFETY: a hypervisor call. The VMM saves every register; a restored
-    // run returns here with x0..x4 set and the rest as they were.
+    // run returns here with x0..x5 set and the rest as they were.
     unsafe {
-        asm!("hvc #0", inout("x0") SNAPSHOT_CALL => x0, out("x1") x1, out("x2") x2, out("x3") x3, out("x4") x4);
+        asm!("hvc #0", inout("x0") SNAPSHOT_CALL => x0, out("x1") x1, out("x2") x2, out("x3") x3, out("x4") x4,
+             out("x5") x5);
     }
     match x0 {
         SNAPSHOT_RESTORED => {
+            WANTED.store(false, Ordering::Relaxed);
             let mut entropy = [0u8; 32];
             for (i, v) in [x1, x2, x3, x4].iter().enumerate() {
                 entropy[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
             crate::rng::reseed(&entropy);
+            crate::time::resumed_after(x5);
             klog!("restored from a snapshot\n");
         }
-        SNAPSHOT_TAKEN => {}
-        _ => refuse("this VMM can't take snapshots (grix-vmm can)"),
+        // Input arrived as it was being taken: next time.
+        SNAPSHOT_RETRY => {}
+        SNAPSHOT_TAKEN => WANTED.store(false, Ordering::Relaxed),
+        _ => refuse("this VMM can't take snapshots (grix-vmm on macOS can)"),
     }
 }
 

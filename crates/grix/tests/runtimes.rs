@@ -501,3 +501,38 @@ fn python_from_live_mounts() {
     assert!(db.starts_with(b"SQLite format 3\0"));
     std::fs::remove_dir_all(&work).unwrap();
 }
+
+/// Python started once, its libraries imported, then snapshotted: each run
+/// from the snapshot runs new code at once.
+#[test]
+fn python_from_a_snapshot() {
+    let b = sandbox("python");
+    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+        return; // Only grix-vmm on macOS can (the guest tests check the others say so).
+    }
+    let dir = std::env::temp_dir().join(format!("grix-pysnap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("python.snap");
+    let started = std::time::Instant::now();
+    let snap = b
+        .build()
+        .unwrap()
+        .snapshot(
+            &["/usr/bin/python3", "-c", "import json, decimal, email, asyncio, sys; exec(sys.stdin.read())"],
+            &path,
+        )
+        .unwrap();
+    let took = started.elapsed();
+    for (code, want) in [
+        ("print(json.dumps({'sum': sum(range(10))}))", "{\"sum\": 45}\n"),
+        ("print(decimal.Decimal(1) / decimal.Decimal(8))", "0.125\n"),
+    ] {
+        let started = std::time::Instant::now();
+        let out = snap.run(code).unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+        assert_eq!(out.stdout_str(), want);
+        assert_no_surprises(&out);
+        eprintln!("python: snapshot taken in {took:?}, a run from it took {:?}", started.elapsed());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

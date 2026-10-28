@@ -107,6 +107,11 @@ impl Default for InputDecoder {
 }
 
 impl InputDecoder {
+    /// Between frames (nothing of one taken yet).
+    pub fn idle(&self) -> bool {
+        self.have == 0
+    }
+
     /// Feed one byte. Returns a complete frame when this byte ends one.
     pub fn push(&mut self, b: u8) -> Option<(Input, &[u8])> {
         if self.have < FRAME_HEADER {

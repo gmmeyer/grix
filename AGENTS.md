@@ -138,6 +138,27 @@ Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
 the scheduler programs the CPU timer for the earliest one and calls
 `timer::fire` from the timer interrupt and the idle loop.
 
+Snapshots (`kernel/src/snapshot.rs`, `crates/vmm/src/snapshot.rs`,
+`crates/grix/src/snapshot.rs`): with `Image::snapshot`, the first time the
+scheduler idles with a thread waiting for I/O, after the program found
+stdin empty (`console::stdin_waited`) and with nothing open through the
+host (`inet::host_state`), the kernel flushes the console, takes whatever
+the host sent (`console::take_all_input`: anything there means not now)
+and makes `SNAPSHOT_CALL` (an HVC in SMCCC's OEM range: Hypervisor.framework
+answers the vendor-hypervisor range itself). grix-vmm, holding the
+console's lock so its threads can't touch guest memory, writes the vCPU,
+GIC, console device and RAM to its fd 3 and exits, or answers
+`SNAPSHOT_RETRY` if input is on its way. A `--restore` run maps that RAM
+copy-on-write, puts the rest back with the guest's counter continuous (as
+after a suspend), and returns `SNAPSHOT_RESTORED`, fresh entropy
+(`rng::reseed`) and the time since, which moves the kernel's time of day
+on (`time::resumed_after`). The host writes the file privately and renames
+it into place, and appends its settings for restored runs (network
+policy, exports, limits) as JSON: a file may come from anyone, so MCP
+replaces the network policy and caps the limits. Nothing the host held is
+saved, and the host refuses mounts. Anything new that lives on the host
+side of a run needs the same treatment.
+
 Signals (`signal.rs`): actions are per process; masks, pending queues and
 sigaltstacks are per thread. `kill` picks a receiver like Linux (the main
 thread first, then any thread that doesn't block the signal) and queues it

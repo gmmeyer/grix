@@ -1,5 +1,7 @@
 //! Clocks backed by the ARM generic timer.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use spin::Once;
 
 use crate::arch;
@@ -11,6 +13,20 @@ struct Clock {
 }
 
 static CLOCK: Once<Clock> = Once::new();
+/// How far the time of day has moved without the monotonic clock: the time
+/// a snapshot sat before this run was restored from it (like a suspend:
+/// CLOCK_MONOTONIC doesn't count it, CLOCK_REALTIME does).
+static SUSPENDED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The machine was saved and is now restored, `ns` later.
+pub fn resumed_after(ns: u64) {
+    SUSPENDED_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// The time of day at boot, as the monotonic clock sees it.
+fn boot_time_ns() -> u64 {
+    clock().boot_time_ns + SUSPENDED_NS.load(Ordering::Relaxed)
+}
 
 pub fn init(boot_time_ns: u64) {
     CLOCK.call_once(|| Clock { counter0: arch::counter(), freq: arch::counter_freq().max(1), boot_time_ns });
@@ -29,17 +45,17 @@ pub fn monotonic_ns() -> u64 {
 
 /// Nanoseconds since the Unix epoch.
 pub fn realtime_ns() -> u64 {
-    clock().boot_time_ns + monotonic_ns()
+    boot_time_ns() + monotonic_ns()
 }
 
 /// Boot time in nanoseconds since the Unix epoch.
 pub fn boot_realtime_ns() -> u64 {
-    clock().boot_time_ns
+    boot_time_ns()
 }
 
 /// Boot time in seconds since the Unix epoch.
 pub fn realtime_to_boot_secs() -> u64 {
-    clock().boot_time_ns / 1_000_000_000
+    boot_time_ns() / 1_000_000_000
 }
 
 static BOOT_ID: Once<[u8; 16]> = Once::new();
@@ -62,5 +78,5 @@ pub fn counter_at(ns: u64) -> u64 {
 
 /// Convert an absolute CLOCK_REALTIME time to monotonic time.
 pub fn realtime_to_monotonic(ns: u64) -> u64 {
-    ns.saturating_sub(clock().boot_time_ns)
+    ns.saturating_sub(boot_time_ns())
 }

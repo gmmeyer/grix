@@ -291,6 +291,48 @@ grix.build("app.grix", grixfile="Grixfile")        # images too
 print(grix.Sandbox(image="app.grix").run().stdout)
 ```
 
+## Snapshots
+
+A runtime that takes seconds to start can be started once and snapshotted
+the moment it first waits for input. Each run from the snapshot then goes on
+from there, with its own stdin, in a tenth of a second:
+
+```sh
+# Python with its libraries imported, waiting for code on stdin: 2.6 s, once.
+grix snapshot -o py.snap -a threads -i fixtures/build/python:/ -- \
+    /usr/bin/python3 -c 'import json, decimal, asyncio, sys; exec(sys.stdin.read())'
+
+echo 'print(json.dumps({"sum": sum(range(10))}))' | grix run --snapshot py.snap   # 0.13 s
+```
+
+```rust
+let snap = sandbox.snapshot(&["/usr/bin/python3", "-c", "...; exec(sys.stdin.read())"], "py.snap")?;
+let out = snap.run("print(6 * 7)")?;                       // or grix::Snapshot::open("py.snap")?
+```
+
+Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
+(`Sandbox.snapshot()`, `Snapshot.run()`).
+
+- The VMM saves the vCPU, the GIC, the console device and RAM. A run maps
+  that RAM copy-on-write from the file, so runs never see each other's
+  changes, and only what a run touches is read. The file is sparse: 80 MB
+  on disk for that Python.
+- Each run gets fresh entropy for the kernel's random number generator.
+  As after a suspend, the time of day moves on by however long the
+  snapshot sat there, and the monotonic clock doesn't (so a `read -t 5`
+  that was waiting still has its 5 seconds). What the program drew for
+  itself before the snapshot (a random seed, say) is the same in every
+  run.
+- The snapshot is taken once the program has found stdin empty and waits.
+  What the host holds for a run isn't saved, so it waits until the
+  program has no connections or DNS lookups open through the host, and
+  sandboxes with mounts can't take one.
+- The file holds the program's memory, so it's created readable only by
+  you, and written fully before it replaces the old one.
+- Snapshots need grix-vmm on macOS (Hypervisor.framework). Runs from a
+  snapshot get the sandbox's network policy as it was. Over MCP they get
+  the server's, whoever wrote the file.
+
 ## Images
 
 A grix image is a file tree, the settings to run it with, and the grix
@@ -528,9 +570,9 @@ subshells.
    SIGTERM and a grace period on timeout).
 4. ~~**Own VMM**~~: `grix-vmm` on Hypervisor.framework and KVM is done
    (the default where it runs: about twice as fast to start as QEMU, and
-   confined). Next: snapshots.
-5. ~~**Agent integrations**~~: images (`grix build`), the MCP server and
-   Python bindings are done. Next: snapshots for instant start.
+   confined), with snapshots on macOS.
+5. ~~**Agent integrations**~~: images (`grix build`), the MCP server,
+   Python bindings and snapshots for instant start are done.
 6. **SMP and x86_64 guests**.
 
 ## Repository layout

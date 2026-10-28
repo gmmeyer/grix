@@ -52,6 +52,21 @@ enum Pattern {
     Net(IpAddr, u8),
 }
 
+/// The rule as `parse` takes it.
+impl std::fmt::Display for HostRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let host = match &self.host {
+            Pattern::Name(n) => n.clone(),
+            Pattern::Net(ip, prefix) => format!("{ip}/{prefix}"),
+        };
+        match self.port {
+            Some(port) if host.contains(':') => write!(f, "[{host}]:{port}"),
+            Some(port) => write!(f, "{host}:{port}"),
+            None => f.write_str(&host),
+        }
+    }
+}
+
 impl HostRule {
     /// `example.com`, `*.example.com`, `1.2.3.4`, `10.0.0.0/8`, `::1`,
     /// `[::1]:80`, each optionally with `:port`.

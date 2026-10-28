@@ -356,9 +356,3 @@ pub fn ticks_to_ns(ticks: u64) -> u64 {
     let (numer, denom) = timebase();
     (ticks as u128 * numer as u128 / denom as u128) as u64
 }
-
-/// Nanoseconds to counter ticks.
-pub fn ns_to_ticks(ns: u64) -> u64 {
-    let (numer, denom) = timebase();
-    (ns as u128 * denom as u128 / numer as u128) as u64
-}

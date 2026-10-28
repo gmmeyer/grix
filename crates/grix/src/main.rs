@@ -22,6 +22,10 @@ struct Cli {
 enum Cmd {
     /// Run a program in a fresh sandbox.
     Run(Box<RunArgs>),
+    /// Start a program and save the whole machine when it first waits for
+    /// input; `grix run --snapshot FILE` then starts each run from there.
+    /// Takes `run`'s options.
+    Snapshot(Box<SnapshotArgs>),
     /// Build a grix image (the files, settings and kernel to run) from a Grixfile.
     Build(Box<BuildArgs>),
     /// Pull a Docker/OCI image (linux/arm64) into an OCI image layout directory.
@@ -114,6 +118,12 @@ struct BuildArgs {
 
 #[derive(Parser)]
 struct RunArgs {
+    /// Run from a snapshot (`grix snapshot`): the program goes on from where
+    /// it waited for input, with this run's stdin. Of the other options,
+    /// only --timeout, --json, -v, -q, --no-stdin and --export apply (to say
+    /// where the snapshot's exports go).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["image", "manifest", "imports", "mounts", "command"])]
+    snapshot: Option<PathBuf>,
     /// Run a grix image (`grix build`): its files, settings, command and kernel.
     #[arg(long, value_name = "IMAGE")]
     image: Option<PathBuf>,
@@ -187,6 +197,15 @@ struct RunArgs {
     command: Vec<String>,
 }
 
+#[derive(Parser)]
+struct SnapshotArgs {
+    /// Where to write the snapshot.
+    #[arg(short, long, value_name = "FILE")]
+    output: PathBuf,
+    #[command(flatten)]
+    run: RunArgs,
+}
+
 fn main() -> ExitCode {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
@@ -198,6 +217,7 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Cmd::Run(args) => run(*args),
+        Cmd::Snapshot(args) => snapshot(*args),
         Cmd::Build(args) => build(*args, matches.subcommand_matches("build")),
         Cmd::Mcp(args) => mcp(args),
         Cmd::Pull { reference, oci } => grix::pull(&reference, &oci).map(|digest| {
@@ -220,7 +240,86 @@ fn main() -> ExitCode {
     }
 }
 
+/// A sandbox from `run`'s options, the command to run in it, and where its
+/// exports go.
+struct Prepared {
+    sandbox: Sandbox,
+    command: Vec<String>,
+    exports: Vec<(String, PathBuf)>,
+    control: RunControl,
+}
+
+fn snapshot(args: SnapshotArgs) -> Result<i32> {
+    let p = prepare(&args.run)?;
+    let started = std::time::Instant::now();
+    let snap = p.sandbox.snapshot(&p.command, &args.output)?;
+    if !args.run.quiet {
+        let size = std::fs::metadata(snap.path()).map_or(0, |m| m.len());
+        eprintln!(
+            "grix: saved {} ({} MiB) after {} ms; run it with `grix run --snapshot {}`",
+            snap.path().display(),
+            size >> 20,
+            started.elapsed().as_millis(),
+            snap.path().display()
+        );
+    }
+    Ok(0)
+}
+
 fn run(args: RunArgs) -> Result<i32> {
+    if let Some(path) = &args.snapshot {
+        let control = RunControl::new();
+        let mut snap = grix::Snapshot::open(path)?.control(&control);
+        if let Some(s) = args.timeout {
+            snap = snap.timeout(Duration::from_secs(s));
+        }
+        forward_signals(control, args.quiet);
+        let exports: Vec<(String, PathBuf)> = args
+            .exports
+            .iter()
+            .map(|spec| {
+                let (g, h) = spec.split_once(':').with_context(|| format!("--export {spec:?} must be GUEST:HOST"))?;
+                Ok((g.to_string(), PathBuf::from(h)))
+            })
+            .collect::<Result<_>>()?;
+        for (guest, host) in &exports {
+            if !snap.exports().contains(guest) {
+                bail!("the snapshot doesn't export {guest} (it exports {:?})", snap.exports());
+            }
+            Export::check_destination(host).context("export destination")?;
+        }
+        let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
+        let input: Box<dyn std::io::Read + Send> =
+            if stdin { Box::new(std::io::stdin()) } else { Box::new(std::io::empty()) };
+        let out =
+            if args.json { snap.run_streaming(input, |_, _| {})? } else { snap.run_streaming(input, write_stream)? };
+        return report(&args, out, &exports);
+    }
+    let p = prepare(&args)?;
+    forward_signals(p.control.clone(), args.quiet);
+    // Piped or redirected input goes to the program; a terminal doesn't
+    // (there's no interactive mode yet), so the program sees end-of-file.
+    let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
+    let (sandbox, command) = (&p.sandbox, &p.command);
+    let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
+        if stdin {
+            sandbox.run_streaming_with_stdin(command, std::io::stdin(), on_output)
+        } else {
+            sandbox.run_streaming(command, on_output)
+        }
+    };
+    let out = if args.json { run(&mut |_, _| {})? } else { run(&mut write_stream)? };
+    report(&args, out, &p.exports)
+}
+
+fn write_stream(stream: Stream, data: &[u8]) {
+    let _ = match stream {
+        Stream::Stdout => std::io::stdout().write_all(data),
+        Stream::Stderr => std::io::stderr().write_all(data),
+    };
+}
+
+fn prepare(args: &RunArgs) -> Result<Prepared> {
     let manifest = match &args.manifest {
         Some(p) => Manifest::load(p)?,
         None => Manifest::default(),
@@ -333,33 +432,19 @@ fn run(args: RunArgs) -> Result<i32> {
         .find(|c| !c.is_empty())
         .cloned()
         .context("no command given (pass it after `--`, or set `command` in the manifest or image)")?;
-    forward_signals(control, args.quiet);
-    // Piped or redirected input goes to the program; a terminal doesn't
-    // (there's no interactive mode yet), so the program sees end-of-file.
-    let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
-    let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
-        if stdin {
-            sandbox.run_streaming_with_stdin(&command, std::io::stdin(), on_output)
-        } else {
-            sandbox.run_streaming(&command, on_output)
-        }
-    };
+    Ok(Prepared { sandbox, command, exports, control })
+}
+
+/// What a run did, for the user; the exit code.
+fn report(args: &RunArgs, out: RunOutput, exports: &[(String, PathBuf)]) -> Result<i32> {
     if args.json {
-        let out = run(&mut |_, _| {})?;
         let mut json = serde_json::to_value(&out)?;
         json["missing_capabilities"] = serde_json::json!(out.missing_capabilities());
         println!("{}", serde_json::to_string_pretty(&json)?);
-        let wrote = write_exports(&out, &exports, args.quiet);
+        let wrote = write_exports(&out, exports, args.quiet);
         let applied = report_mounts(&out, true);
         return Ok(if wrote && applied { out.status.code() } else { 125 });
     }
-
-    let out = run(&mut |stream, data| {
-        let _ = match stream {
-            Stream::Stdout => std::io::stdout().write_all(data),
-            Stream::Stderr => std::io::stderr().write_all(data),
-        };
-    })?;
     let _ = std::io::stdout().flush();
     if args.verbose && !out.kernel_log.is_empty() {
         eprint!("{}", out.kernel_log);
@@ -389,7 +474,7 @@ fn run(args: RunArgs) -> Result<i32> {
         grix::ExitStatus::VmFailed(why) => eprintln!("grix: {why}"),
         _ => {}
     }
-    let wrote = write_exports(&out, &exports, args.quiet);
+    let wrote = write_exports(&out, exports, args.quiet);
     let applied = report_mounts(&out, args.quiet);
     Ok(if wrote && applied { out.status.code() } else { 125 })
 }

@@ -33,6 +33,7 @@ mod mount;
 mod net;
 mod oci;
 mod sandbox;
+pub mod snapshot;
 mod vmm;
 
 pub use container::{Image, ImageConfig};
@@ -44,3 +45,4 @@ pub use manifest::{ExportTo, Manifest};
 pub use mount::{MountChanges, MountState};
 pub use oci::pull_to_layout as pull;
 pub use sandbox::{ExitStatus, MountMode, RunOutput, Sandbox, SandboxBuilder, Stream};
+pub use snapshot::Snapshot;

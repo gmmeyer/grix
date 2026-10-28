@@ -19,6 +19,7 @@ use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+#[cfg(target_os = "macos")]
 use grix_abi::codec::{Reader, Writer};
 use grix_abi::machine::{CONSOLE_RX, CONSOLE_TX};
 
@@ -73,6 +74,7 @@ struct State {
     input_pending: bool,
 }
 
+#[cfg(target_os = "macos")]
 impl State {
     /// The device as the driver set it up, for a snapshot.
     fn save(&self) -> Vec<u8> {
@@ -146,6 +148,7 @@ impl Console {
     }
 
     /// The device as `save` left it, for a run restored from a snapshot.
+    #[cfg(target_os = "macos")]
     pub fn restore(mem: Arc<GuestMemory>, line: Line, saved: &[u8]) -> Result<Arc<Console>, String> {
         let state = State::load(saved).ok_or("the snapshot's console state is malformed")?;
         let raised = state.interrupt_status != 0;
@@ -154,14 +157,18 @@ impl Console {
         Ok(console)
     }
 
-    /// The device's state for a snapshot: only when nothing is on its way
-    /// through it, so there's nothing more to save.
-    pub fn save(&self) -> Result<Vec<u8>, String> {
+    /// Take a snapshot with `f`, given the device's state, while nothing
+    /// moves through the device (the lock keeps the reader and writer from
+    /// touching guest memory). `None` if something is on its way (output,
+    /// or input the guest hasn't seen: try again later).
+    #[cfg(target_os = "macos")]
+    pub fn save_with<R>(&self, f: impl FnOnce(Vec<u8>) -> R) -> Option<R> {
         let s = self.lock();
-        if s.tx_in_flight != 0 || s.input_pending {
-            return Err("console data was on its way during the snapshot".into());
+        if s.tx_in_flight != 0 || s.input_pending || s.interrupt_status != 0 {
+            return None;
         }
-        Ok(s.save())
+        let state = s.save();
+        Some(f(state))
     }
 
     fn start_with(mem: Arc<GuestMemory>, line: Line, state: State) -> Arc<Console> {

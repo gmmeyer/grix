@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence, Union
 
-__all__ = ["Sandbox", "Result", "GrixError", "build", "find_grix"]
+__all__ = ["Sandbox", "Snapshot", "Result", "GrixError", "build", "find_grix"]
 
 PathLike = Union[str, os.PathLike]
 
@@ -144,25 +144,61 @@ class Sandbox:
                 argv.append("--no-stdin")
             if command:
                 argv += ["--", *command]
-            data = stdin.encode() if isinstance(stdin, str) else stdin
-            proc = subprocess.run(argv, input=data, capture_output=True)
-        try:
-            out = json.loads(proc.stdout)
-        except ValueError:
-            raise GrixError(proc.stderr.decode(errors="replace").strip() or f"grix exited with {proc.returncode}")
-        return Result(
-            status=out["status"],
-            exit_code=proc.returncode,
-            stdout=out["stdout"],
-            stderr=out["stderr"],
-            events=out["events"],
-            missing_capabilities=out.get("missing_capabilities", []),
-            duration_ms=out["duration"],
-            exports=out.get("exports", []),
-            mount_changes=out.get("mount_changes", []),
-            messages=proc.stderr.decode(errors="replace"),
-            raw=out,
-        )
+            return _run(argv, stdin)
+
+    def snapshot(self, path: PathLike, command: Optional[Sequence[str]] = None) -> "Snapshot":
+        """Start ``command`` (or the image's) and save the whole machine to
+        ``path`` when it first waits for input; each :meth:`Snapshot.run`
+        then starts from there, in milliseconds. Needs grix's own VMM
+        (macOS 15+); the sandbox can't have mounts."""
+        with tempfile.TemporaryDirectory(prefix="grix-py-") as tmp:
+            argv = [find_grix(self.grix), "snapshot", "--quiet", "-o", os.fspath(path)] + self._args(Path(tmp))
+            if command:
+                argv += ["--", *command]
+            proc = subprocess.run(argv, capture_output=True)
+        if proc.returncode != 0:
+            raise GrixError(proc.stderr.decode(errors="replace").strip())
+        return Snapshot(path, grix=self.grix)
+
+
+@dataclass
+class Snapshot:
+    """A machine :meth:`Sandbox.snapshot` saved: each :meth:`run` goes on
+    from where the program waited for input, with its own stdin."""
+
+    path: PathLike
+    timeout: Optional[float] = None
+    grix: Optional[PathLike] = None
+
+    def run(self, stdin: Union[str, bytes, None] = None) -> Result:
+        argv = [find_grix(self.grix), "run", "--json", "--quiet", "--snapshot", os.fspath(self.path)]
+        if self.timeout is not None:
+            argv += ["--timeout", str(max(1, int(round(self.timeout))))]
+        if stdin is None:
+            argv.append("--no-stdin")
+        return _run(argv, stdin)
+
+
+def _run(argv: list, stdin: Union[str, bytes, None]) -> Result:
+    data = stdin.encode() if isinstance(stdin, str) else stdin
+    proc = subprocess.run(argv, input=data, capture_output=True)
+    try:
+        out = json.loads(proc.stdout)
+    except ValueError:
+        raise GrixError(proc.stderr.decode(errors="replace").strip() or f"grix exited with {proc.returncode}")
+    return Result(
+        status=out["status"],
+        exit_code=proc.returncode,
+        stdout=out["stdout"],
+        stderr=out["stderr"],
+        events=out["events"],
+        missing_capabilities=out.get("missing_capabilities", []),
+        duration_ms=out["duration"],
+        exports=out.get("exports", []),
+        mount_changes=out.get("mount_changes", []),
+        messages=proc.stderr.decode(errors="replace"),
+        raw=out,
+    )
 
 
 def build(

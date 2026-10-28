@@ -316,7 +316,10 @@ mod hvf_loop {
                         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(()),
                         // Saved, this run ends there; restored runs go on.
                         grix_abi::image::SNAPSHOT_CALL if args.snapshot && ec == EC_HVC => {
-                            return snapshot::save(&cpu, &m.mem, console.save()?);
+                            match console.save_with(|state| snapshot::save(&cpu, &m.mem, state)) {
+                                Some(saved) => return saved,
+                                None => cpu.set_reg(0, grix_abi::image::SNAPSHOT_RETRY),
+                            }
                         }
                         PSCI_VERSION => cpu.set_reg(0, 0x1_0000),
                         _ => cpu.set_reg(0, PSCI_NOT_SUPPORTED),
@@ -349,6 +352,10 @@ mod hvf_loop {
 #[cfg(target_os = "linux")]
 pub fn run(args: &Args) -> Result<(), String> {
     use crate::kvm::{self, Exit};
+
+    if args.snapshot || args.restore {
+        return Err("snapshots need Hypervisor.framework (macOS) for now, not KVM".into());
+    }
 
     let mut m = Machine::new(args)?;
     // SAFETY: `m.mem` is never unmapped, and lives until the process ends.

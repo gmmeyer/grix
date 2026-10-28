@@ -170,6 +170,24 @@ fn a_writable_server_builds_images_and_writes_mounts() {
     assert_eq!(r["isError"], false, "{r}");
     let r = server.tool("run", json!({"image": dir.join("x.grix")}));
     assert_eq!(r["structuredContent"]["stdout"], "built\n", "{r}");
+    // A snapshot of a shell waiting for a line, and runs from it.
+    let r = server.tool(
+        "snapshot",
+        json!({
+            "imports": [{"host": busybox, "guest": "/bin/busybox"}],
+            "command": ["/bin/busybox", "sh", "-c", "read line; echo \"hello $line\""],
+            "output": dir.join("sh.snap"),
+        }),
+    );
+    if grix::Sandbox::builder().vmm_path().is_some() && cfg!(target_os = "macos") {
+        assert_eq!(r["isError"], false, "{r}");
+        for who in ["agent", "again"] {
+            let r = server.tool("run", json!({"snapshot": dir.join("sh.snap"), "stdin": format!("{who}\n")}));
+            assert_eq!(r["structuredContent"]["stdout"], format!("hello {who}\n"), "{r}");
+        }
+    } else {
+        assert!(text(&r).contains("grix's own VMM"), "{}", text(&r));
+    }
     // An image may ask only for what the server allows.
     std::fs::write(
         dir.join("ctx/Grixfile"),

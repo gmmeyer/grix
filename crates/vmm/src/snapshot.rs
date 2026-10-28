@@ -217,12 +217,11 @@ impl State {
         for (reg, v) in icc {
             cpu.set_icc_reg(reg, v).map_err(|e| e.to_string())?;
         }
-        // The guest's counter goes on from where it was, plus the time
-        // since (so its idea of the time of day stays right).
+        // The guest's counter goes on from where it was, as after a
+        // suspend; the kernel moves its time of day on by the time since.
         let (counter, then) = (r.u64().map_err(bad)?, r.u64().map_err(bad)?);
-        let since = hvf::ns_to_ticks(now_ns().saturating_sub(then));
-        cpu.set_vtimer_offset(hvf::now().wrapping_sub(counter.wrapping_add(since)))
-            .map_err(|e| e.to_string())?;
+        cpu.set_vtimer_offset(hvf::now().wrapping_sub(counter)).map_err(|e| e.to_string())?;
+        cpu.set_reg(5, now_ns().saturating_sub(then));
         let console = r.bytes().map_err(bad)?.to_vec();
         // The kernel's call returns: restored, with fresh entropy.
         let mut entropy = [0u8; 32];

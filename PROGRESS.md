@@ -332,6 +332,17 @@ Next, in TODO.md order:
   kernel in QEMU with nested virtualization (HVF, M3+) and runs static
   musl builds of grix and grix-vmm there.
 
+- **Snapshots** (`grix snapshot`, `grix run --snapshot`,
+  `Sandbox::snapshot`, `Snapshot::run`, MCP, Python): the kernel makes
+  `SNAPSHOT_CALL` the first time it idles with a thread waiting for
+  input; grix-vmm saves registers (general, system, FP/SIMD, GIC CPU
+  interface), the framework's GIC state, the console device and sparse
+  RAM to fd 3, and restored runs map RAM copy-on-write. Python with a few
+  imports: 2.0 s cold, 0.13 s from a snapshot. The call had to move out
+  of SMCCC's vendor-hypervisor range (0xC6...), which
+  Hypervisor.framework answers itself with NOT_SUPPORTED; set_simd_fp_reg
+  takes a vector by value, so it's called from inline assembly.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

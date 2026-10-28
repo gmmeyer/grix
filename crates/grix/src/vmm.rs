@@ -37,6 +37,16 @@ pub(crate) struct VmConfig {
     pub accel: String,
     /// grix-vmm, instead of QEMU.
     pub vmm: Option<PathBuf>,
+    /// Take a snapshot into this file, or run the one in it.
+    pub snapshot: Option<SnapshotFile>,
+}
+
+/// A snapshot file for the VMM (as its fd 3).
+pub(crate) enum SnapshotFile {
+    /// Save the machine here when the kernel asks; the run ends there.
+    Take(std::fs::File),
+    /// Run this one instead of booting.
+    Restore(std::fs::File),
 }
 
 pub(crate) enum VmEnd {
@@ -187,16 +197,25 @@ pub(crate) fn run(
     stdin: Option<Box<dyn Read + Send>>,
     mut on_frame: impl FnMut(Channel, &[u8]),
 ) -> Result<VmRun> {
-    if !cfg.kernel.exists() {
-        anyhow::bail!(
-            "grix kernel not found at {} (build it with `make kernel` or set GRIX_KERNEL)",
-            cfg.kernel.display()
-        );
+    let restore = matches!(cfg.snapshot, Some(SnapshotFile::Restore(_)));
+    if cfg.snapshot.is_some() && cfg.vmm.is_none() {
+        anyhow::bail!("snapshots need grix's own VMM (grix-vmm, on macOS 15+), not QEMU");
     }
-    // A kernel that speaks another ABI would only garble the conversation.
-    let kernel = std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?;
-    crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
-    let img = write_temp("img", image)?;
+    // A restored run's kernel is in the snapshot (whose ABI the caller checked).
+    let img = if restore {
+        None
+    } else {
+        if !cfg.kernel.exists() {
+            anyhow::bail!(
+                "grix kernel not found at {} (build it with `make kernel` or set GRIX_KERNEL)",
+                cfg.kernel.display()
+            );
+        }
+        // A kernel that speaks another ABI would only garble the conversation.
+        let kernel = std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?;
+        crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
+        Some(write_temp("img", image)?)
+    };
     // Everything for the guest's console input (stdin, networking) goes
     // through one writer, a frame at a time. Forwarded ports are bound
     // before QEMU starts, so a busy one fails the run at once.
@@ -207,15 +226,44 @@ pub(crate) fn run(
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
     let _uart_path = TempFile(uart_path.clone());
-    let mut cmd = match &cfg.vmm {
-        Some(vmm) => {
+    let mut cmd = match (&cfg.vmm, &img) {
+        (Some(vmm), _) => {
             let mut cmd = Command::new(vmm);
-            cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(&img.0);
-            cmd.args(["--mem", &cfg.memory_mb.to_string()]).arg("--uart").arg(&uart_path);
+            match &img {
+                Some(img) => {
+                    cmd.arg("--kernel").arg(&cfg.kernel).arg("--image").arg(&img.0);
+                    cmd.args(["--mem", &cfg.memory_mb.to_string()]);
+                }
+                None => {
+                    cmd.arg("--restore");
+                }
+            }
+            if matches!(cfg.snapshot, Some(SnapshotFile::Take(_))) {
+                cmd.arg("--snapshot");
+            }
+            cmd.arg("--uart").arg(&uart_path);
             cmd
         }
-        None => qemu_command(cfg, &uart_path, &img.0),
+        (None, Some(img)) => qemu_command(cfg, &uart_path, &img.0),
+        (None, None) => unreachable!("checked above"),
     };
+    // The snapshot file is the VMM's fd 3 (which it can still use once it
+    // has confined itself).
+    if let Some(SnapshotFile::Take(f) | SnapshotFile::Restore(f)) = &cfg.snapshot {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(f);
+        // SAFETY: dup2 is async-signal-safe, as pre_exec requires; the
+        // copy doesn't close on exec, the original does.
+        unsafe {
+            cmd.pre_exec(move || {
+                // Already 3: just keep it open across exec.
+                let r = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     cmd
         // Piped even without input: QEMU disconnects the port when its
         // stdin ends, and then discards what the guest writes.

@@ -103,8 +103,10 @@ int main(void) {
     long t0 = now_ms();
     CHECK(epoll_wait(ep, out, 4, 30) == 0);  // times out
     CHECK(now_ms() - t0 >= 25);
-    CHECK(pthread_create(&t, 0, delayed_write, (void *)(intptr_t)efd) == 0);
+    // From before the writer starts its 20 ms sleep: a slow machine may run
+    // it before we get back from pthread_create.
     t0 = now_ms();
+    CHECK(pthread_create(&t, 0, delayed_write, (void *)(intptr_t)efd) == 0);
     CHECK(epoll_wait(ep, out, 4, 5000) == 1);
     CHECK(out[0].data.u64 == 42 && (out[0].events & EPOLLIN));
     CHECK(now_ms() - t0 >= 15);

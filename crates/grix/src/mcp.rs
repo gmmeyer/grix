@@ -85,6 +85,8 @@ const PROTOCOL: &str = "2025-06-18";
 /// What a tool answer carries of stdout/stderr and exported files.
 const OUTPUT_MAX: usize = 256 * 1024;
 const EXPORT_MAX: usize = 1 << 20;
+/// The most a run from a snapshot may export (a sandbox's default).
+const EXPORT_LIMIT: usize = 256 << 20;
 /// The longest message read (inline files and stdin come in them).
 const MESSAGE_MAX: usize = 64 << 20;
 
@@ -143,6 +145,7 @@ fn handle(config: &McpConfig, msg: &Value) -> Option<Value> {
             let args = &msg["params"]["arguments"];
             let outcome = match name {
                 "run" => run(config, args),
+                "snapshot" => snapshot(config, args),
                 "build_image" => build_image(config, args),
                 _ => return Some(error(id, -32602, &format!("unknown tool {name:?}"))),
             };
@@ -162,6 +165,16 @@ fn handle(config: &McpConfig, msg: &Value) -> Option<Value> {
 
 fn tools(config: &McpConfig) -> Value {
     let caps: Vec<&str> = config.capabilities.iter().map(|c| c.name()).collect();
+    let mut snapshot_schema = sandbox_schema(&caps);
+    snapshot_schema["properties"]["output"] =
+        json!({"type": "string", "description": "Where to write the snapshot (under an allowed directory)."});
+    snapshot_schema["required"] = json!(["output"]);
+    let mut run_schema = sandbox_schema(&caps);
+    run_schema["properties"]["stdin"] = json!({"type": "string"});
+    run_schema["properties"]["snapshot"] = json!({"type": "string",
+        "description": "Run from this snapshot (from the `snapshot` tool) instead: the program goes on from where it \
+                        waited, with `stdin`. Then only stdin and timeout_secs apply; what comes back is what the \
+                        snapshot's sandbox exported."});
     json!([
         {
             "name": "run",
@@ -173,7 +186,36 @@ fn tools(config: &McpConfig) -> Value {
                 caps.join(", "),
                 config.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
             ),
+            "inputSchema": run_schema
+        },
+        {
+            "name": "snapshot",
+            "description": "Start a program in a sandbox (the same options as `run`, but no mounts) and save the whole \
+                            machine when it first waits for input, so each `run` with `snapshot` starts from there in \
+                            milliseconds: start an interpreter that reads code from stdin, say, once its libraries are \
+                            loaded. Needs a writable server.",
+            "inputSchema": snapshot_schema
+        },
+        {
+            "name": "build_image",
+            "description": "Build a grix image (.grix: files, settings and the grix kernel) from a Grixfile on the host, \
+                            for `run`'s `image`. The Grixfile's `from` may name a Docker/OCI image (e.g. python:3.12-alpine) \
+                            or nothing.",
             "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "grixfile": {"type": "string", "description": "Path of the Grixfile."},
+                    "output": {"type": "string", "description": "Where to write the image (under an allowed directory)."}
+                },
+                "required": ["grixfile", "output"]
+            }
+        }
+    ])
+}
+
+/// What a sandbox is made of, for `run` and `snapshot`.
+fn sandbox_schema(caps: &[&str]) -> Value {
+    json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "array", "items": {"type": "string"},
@@ -193,30 +235,13 @@ fn tools(config: &McpConfig) -> Value {
                                         both only if the server is writable)."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                     "cwd": {"type": "string"},
-                    "stdin": {"type": "string"},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
                     "exports": {"type": "array", "items": {"type": "string"},
                                 "description": "Sandbox directories whose contents to return when the program ends."},
                     "timeout_secs": {"type": "number"},
                     "memory_mb": {"type": "number"}
                 }
-            }
-        },
-        {
-            "name": "build_image",
-            "description": "Build a grix image (.grix: files, settings and the grix kernel) from a Grixfile on the host, \
-                            for `run`'s `image`. The Grixfile's `from` may name a Docker/OCI image (e.g. python:3.12-alpine) \
-                            or nothing.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "grixfile": {"type": "string", "description": "Path of the Grixfile."},
-                    "output": {"type": "string", "description": "Where to write the image (under an allowed directory)."}
-                },
-                "required": ["grixfile", "output"]
-            }
-        }
-    ])
+    })
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -234,7 +259,86 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}\n[... {} more bytes]", &s[..end], s.len() - end)
 }
 
+/// The time limit an agent asks for, within the server's.
+fn timeout(config: &McpConfig, args: &Value, default: Duration) -> Result<Duration> {
+    let t = match &args["timeout_secs"] {
+        Value::Null => default,
+        v => {
+            let secs = v.as_f64().filter(|s| *s >= 0.0).context("timeout_secs must be a number of seconds")?;
+            Duration::try_from_secs_f64(secs.min(config.max_timeout.as_secs_f64()))?
+        }
+    };
+    Ok(t.min(config.max_timeout))
+}
+
 fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
+    let stdin = args["stdin"].as_str().unwrap_or("").as_bytes().to_vec();
+    let out = match args["snapshot"].as_str() {
+        Some(path) => {
+            // Whoever wrote the file, runs from it get only the network
+            // this server allows.
+            let snap = crate::Snapshot::open(config.host_path(path)?)?
+                .restrict_net(config.capabilities.contains(&Capability::Net), &config.allow_hosts)?
+                .limits(OUTPUT_MAX * 4, EXPORT_LIMIT, Duration::from_secs(5));
+            // It sends back what it was made to export.
+            for e in strings(&args["exports"]) {
+                if !snap.exports().contains(&e) {
+                    bail!("the snapshot doesn't export {e} (it exports {:?})", snap.exports());
+                }
+            }
+            if snap.memory_mb() > config.max_memory_mb {
+                bail!(
+                    "the snapshot has {} MiB of memory; the server allows at most {} MiB",
+                    snap.memory_mb(),
+                    config.max_memory_mb
+                );
+            }
+            let t = timeout(config, args, snap.default_timeout())?;
+            snap.timeout(t).run(stdin)?
+        }
+        None => {
+            let (sandbox, command) = sandbox(config, args)?;
+            match args["stdin"].as_str() {
+                Some(_) => sandbox.run_with_stdin(&command, stdin)?,
+                None => sandbox.run(&command)?,
+            }
+        }
+    };
+    Ok(describe(&out))
+}
+
+fn snapshot(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
+    if !config.writable {
+        bail!("this server doesn't write host files (it isn't --writable), so it can't save snapshots");
+    }
+    if args["mounts"].as_array().is_some_and(|m| !m.is_empty()) {
+        bail!("a snapshot can't have mounts");
+    }
+    let out = output_path(config, args)?;
+    let (sandbox, command) = sandbox(config, args)?;
+    let started = std::time::Instant::now();
+    let snap = sandbox.snapshot(&command, &out)?;
+    let size = std::fs::metadata(&out).map_or(0, |m| m.len());
+    let text = format!(
+        "saved {} ({} MiB of memory) after {} ms: pass it as `snapshot` to `run`",
+        out.display(),
+        snap.memory_mb(),
+        started.elapsed().as_millis()
+    );
+    Ok((text, json!({"snapshot": out, "bytes": size, "memory_mb": snap.memory_mb()}), false))
+}
+
+/// `args["output"]`: a new file in an allowed directory.
+fn output_path(config: &McpConfig, args: &Value) -> Result<PathBuf> {
+    let output = args["output"].as_str().context("no output")?;
+    let out_path = Path::new(output);
+    let dir = out_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = config.host_path(&dir.to_string_lossy())?;
+    Ok(dir.join(out_path.file_name().context("output needs a file name")?))
+}
+
+/// The sandbox `args` describe, within the server's policy, and its command.
+fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
     let mut b = Sandbox::builder().max_output(OUTPUT_MAX * 4);
     if let Some(image) = args["image"].as_str() {
         let image = crate::Image::open(config.host_path(image)?)?;
@@ -292,14 +396,7 @@ fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
     for e in &exports {
         b = b.export(e)?;
     }
-    let timeout = match &args["timeout_secs"] {
-        Value::Null => Duration::from_secs(60),
-        v => {
-            let secs = v.as_f64().filter(|s| *s >= 0.0).context("timeout_secs must be a number of seconds")?;
-            Duration::try_from_secs_f64(secs.min(config.max_timeout.as_secs_f64()))?
-        }
-    };
-    b = b.timeout(timeout.min(config.max_timeout));
+    b = b.timeout(timeout(config, args, Duration::from_secs(60))?);
     // What it asks for (within the cap), or more if the files need it.
     let asked = match &args["memory_mb"] {
         Value::Null => 0,
@@ -321,11 +418,11 @@ fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
     if command.is_empty() {
         bail!("no command (and the image has none)");
     }
-    let out = match args["stdin"].as_str() {
-        Some(input) => sandbox.run_with_stdin(&command, input.as_bytes().to_vec())?,
-        None => sandbox.run(&command)?,
-    };
+    Ok((sandbox, command))
+}
 
+/// A run's result, for the agent: text, structured, and whether it's an error.
+fn describe(out: &crate::RunOutput) -> (String, Value, bool) {
     let stdout = truncate(&out.stdout_str(), OUTPUT_MAX);
     let stderr = truncate(&out.stderr_str(), OUTPUT_MAX);
     let events: Vec<String> = out.events.iter().map(|e| e.to_string()).collect();
@@ -398,7 +495,7 @@ fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
         "duration_ms": out.duration.as_millis() as u64,
     });
     // A program that failed is a result to show, not a tool error.
-    Ok((text, structured, lost))
+    (text, structured, lost)
 }
 
 fn build_image(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
@@ -406,11 +503,7 @@ fn build_image(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)
         bail!("this server doesn't write host files (it isn't --writable), so it can't build images");
     }
     let grixfile = config.host_path(args["grixfile"].as_str().context("no grixfile")?)?;
-    let output = args["output"].as_str().context("no output")?;
-    let out_path = Path::new(output);
-    let dir = out_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let dir = config.host_path(&dir.to_string_lossy())?;
-    let out = dir.join(out_path.file_name().context("output needs a file name")?);
+    let out = output_path(config, args)?;
     let mut log = Vec::new();
     let image = Grixfile::build_file(
         &grixfile,
@@ -462,7 +555,7 @@ mod tests {
         assert_eq!(replies[0]["result"]["serverInfo"]["name"], "grix");
         let names: Vec<&str> =
             replies[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["run", "build_image"]);
+        assert_eq!(names, ["run", "snapshot", "build_image"]);
         // net isn't allowed by default; paths outside the roots aren't either.
         assert_eq!(replies[2]["result"]["isError"], true);
         assert!(replies[2]["result"]["content"][0]["text"].as_str().unwrap().contains("doesn't allow the net"));

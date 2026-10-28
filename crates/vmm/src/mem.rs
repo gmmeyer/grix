@@ -38,12 +38,20 @@ impl GuestMemory {
         Ok(GuestMemory { host: host.cast(), base, size })
     }
 
+    #[cfg(target_os = "macos")]
     /// `size` bytes of `fd` from `offset`, copy-on-write: a snapshot's RAM,
     /// paged in as the guest touches it.
     pub fn map_file(fd: i32, offset: u64, base: u64, size: usize) -> std::io::Result<GuestMemory> {
         // SAFETY: a fresh private mapping of a file we hold.
         let host = unsafe {
-            libc::mmap(ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE, fd, offset as libc::off_t)
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                fd,
+                offset as libc::off_t,
+            )
         };
         if host == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());

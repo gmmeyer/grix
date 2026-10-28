@@ -1397,3 +1397,79 @@ fn the_default_vmm() {
     }
     assert!(Sandbox::builder().accel("hvf").vmm_path().is_none(), "an accelerator means QEMU");
 }
+
+/// A machine saved when its program first waits for input, and runs from
+/// there: each its own (stdin, randomness), at the right time of day.
+#[test]
+fn snapshots_resume_where_the_program_waited() {
+    let b = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .timeout(Duration::from_secs(30));
+    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+        // QEMU and KVM can't: say so clearly.
+        let err =
+            b.clone().build().unwrap().snapshot(&["/bin/busybox", "true"], temp_dir("nosnap").join("s")).unwrap_err();
+        assert!(err.to_string().contains("grix's own VMM on macOS"), "{err}");
+        return;
+    }
+    let dir = temp_dir("snapshot");
+    let path = dir.join("sh.snap");
+    // It waits on a pipe first: that isn't the moment. And `read -t 2`'s
+    // deadline is monotonic time, which mustn't jump over the 2 s the
+    // snapshot sits there.
+    let script = "/bin/busybox echo before | /bin/busybox cat; read -t 2 line; echo \"got $line\"; \
+                  /bin/busybox head -c 8 /dev/urandom | /bin/busybox od -An -tx1; /bin/busybox date +%s";
+    let snap = b.clone().build().unwrap().snapshot(&["/bin/busybox", "sh", "-c", script], &path).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let mut randoms = Vec::new();
+    let unix_now = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    for word in ["one", "two"] {
+        let before = unix_now();
+        let out = snap.run(format!("{word}\n")).unwrap();
+        let after = unix_now();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+        let stdout = out.stdout_str();
+        let lines: Vec<&str> = stdout.lines().collect();
+        // What the program said before the snapshot isn't said again.
+        assert_eq!(lines[0], format!("got {word}"), "{stdout}");
+        randoms.push(lines[1].to_string());
+        // The clock ran on while the snapshot sat there (2 s and more).
+        let guest_time: u64 = lines[2].trim().parse().unwrap();
+        assert!((before - 1..=after + 1).contains(&guest_time), "guest time {guest_time}, host {before}..{after}");
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+    assert_ne!(randoms[0], randoms[1], "every run from a snapshot draws its own randomness");
+    // The file can be opened again later.
+    let again = grix::Snapshot::open(&path).unwrap().run("three\n").unwrap();
+    assert!(again.stdout_str().starts_with("got three\n"), "{}", again.stdout_str());
+    // While a connection through the host is open it isn't the moment
+    // (the host's end wouldn't come with it): the snapshot waits until the
+    // program is done with it and waits for stdin alone.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        use std::io::Write;
+        let (mut s, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        s.write_all(b"fetched\n").unwrap();
+    });
+    let fetch = format!("/bin/busybox nc host.grix.internal {port} </dev/null; read line; echo \"got $line\"");
+    let snap = b
+        .clone()
+        .allow(Capability::Net)
+        .allow_host(&format!("host.grix.internal:{port}"))
+        .unwrap()
+        .build()
+        .unwrap()
+        .snapshot(&["/bin/busybox", "sh", "-c", &fetch], dir.join("conn"))
+        .unwrap();
+    server.join().unwrap();
+    let out = snap.run("after\n").unwrap();
+    assert_eq!(out.stdout_str(), "got after\n", "{}", out.stderr_str());
+    // A program that never waits for input leaves no snapshot.
+    let err = b.build().unwrap().snapshot(&["/bin/busybox", "true"], dir.join("none")).unwrap_err();
+    assert!(err.to_string().contains("didn't wait for input"), "{err}");
+    assert!(!dir.join("none").exists());
+}

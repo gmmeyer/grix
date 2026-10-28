@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 use grix_abi::hostfs::Assembler;
 use grix_abi::wire::{self, Channel, ExitKind, Input, InputDecoder};
 use spin::Mutex;
@@ -338,6 +339,28 @@ pub enum StdinRead {
     Empty,
 }
 
+/// A program found stdin empty (read or polled it): it waits for input.
+static STDIN_WAITED: AtomicBool = AtomicBool::new(false);
+
+pub fn stdin_waited() -> bool {
+    STDIN_WAITED.load(Ordering::Relaxed)
+}
+
+/// Before a snapshot: take everything the host has sent. True if there was
+/// nothing (no input, signal or message, and no frame half-received), so
+/// the machine carries nothing of the host's into the snapshot.
+pub fn take_all_input() -> bool {
+    let mut guard = CONSOLE.lock();
+    let Some(c) = guard.as_mut() else { return true };
+    c.dev.ack_interrupt();
+    let (version, signals) = (c.stdin.version, c.signals.len());
+    let link = drain(c);
+    let quiet = link.is_empty() && c.stdin.version == version && c.signals.len() == signals && c.stdin.decoder.idle();
+    drop(guard);
+    dispatch(link);
+    quiet
+}
+
 /// Take stdin bytes into `out`.
 pub fn stdin_read(out: &mut [u8]) -> StdinRead {
     let mut guard = CONSOLE.lock();
@@ -346,7 +369,12 @@ pub fn stdin_read(out: &mut [u8]) -> StdinRead {
     let link = drain(c);
     let s = &mut c.stdin;
     let result = if s.buf.is_empty() {
-        if s.eof { StdinRead::Eof } else { StdinRead::Empty }
+        if s.eof {
+            StdinRead::Eof
+        } else {
+            STDIN_WAITED.store(true, Ordering::Relaxed);
+            StdinRead::Empty
+        }
     } else {
         let n = out.len().min(s.buf.len());
         for (o, b) in out.iter_mut().zip(s.buf.drain(..n)) {
@@ -371,10 +399,14 @@ pub fn stdin_read(out: &mut [u8]) -> StdinRead {
 /// (bytes ready to read, readable: data or end-of-file, version)
 pub fn stdin_state() -> (usize, bool, u64) {
     let guard = CONSOLE.lock();
-    guard.as_ref().map_or((0, true, 0), |c| {
+    let state = guard.as_ref().map_or((0, true, 0), |c| {
         let s = &c.stdin;
         (s.buf.len(), !s.buf.is_empty() || s.eof, s.version)
-    })
+    });
+    if !state.1 {
+        STDIN_WAITED.store(true, Ordering::Relaxed);
+    }
+    state
 }
 
 /// Can the host still wake a thread waiting for I/O, by sending stdin or

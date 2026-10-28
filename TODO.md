@@ -35,6 +35,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       roots, an allowed capability set and time/memory caps; host writes
       only with `--writable`.
 - [x] Python bindings (`python/`), over `grix run --json`.
+- [x] Snapshots: the `snapshot` tool and `run`'s `snapshot` (with the
+      server's network policy, whoever wrote the file).
 - [ ] Streaming output and signals over MCP (progress notifications,
       cancellation into `RunControl`).
 - [ ] Native Python bindings (PyO3) instead of driving the CLI.
@@ -264,5 +266,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s
       per run. `make test-kvm` tests KVM from a Mac.
-- [ ] Snapshots of booted runtimes for instant start.
+- [x] Snapshots for instant start (`grix snapshot`, `Sandbox::snapshot`,
+      MCP, Python): grix-vmm on macOS.
+- [ ] Snapshots on KVM (vCPU and vGIC state through KVM's device
+      attributes, and an SMCCC filter to forward the call).
+- [ ] Snapshots with live mounts (the host's open files would need
+      saving too).
 - [x] `getdents64` is O(n²) on large directories.
