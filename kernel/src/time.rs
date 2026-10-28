@@ -83,6 +83,7 @@ pub fn boot_id() -> [u8; 16] {
     })
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 /// The counter value at monotonic time `ns` (for programming the timer):
 /// the first at which `monotonic_ns` reads `ns` or more.
 pub fn counter_at(ns: u64) -> u64 {

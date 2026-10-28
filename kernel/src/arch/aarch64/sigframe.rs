@@ -49,6 +49,10 @@ pub struct Context {
     /// The mask to restore when the handler returns.
     pub mask: u64,
     pub fault: Option<Fault>,
+    /// Where the handler returns: SA_RESTORER's, or the sigpage's. x86_64's
+    /// frame holds it; here it goes in x30 (`enter_handler`).
+    #[allow(dead_code)]
+    pub restorer: u64,
 }
 
 fn put_u32(b: &mut [u8], off: usize, v: u32) {

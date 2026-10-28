@@ -6,7 +6,8 @@ what the project is and how to use it, see [README.md](README.md).
 ## Build and test
 
 ```sh
-make kernel      # guest kernel  -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
+make kernel      # guest kernels -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
+                 #                  and kernel/target/x86_64-unknown-none/release/grix-kernel
 make host        # host CLI      -> target/release/grix
 make vmm         # our own VMM   -> target/release/grix-vmm (arm64 macOS 15+ / Linux KVM; codesigned on macOS)
 make python      # grix's native Python module -> python/grix/_native.abi3.so (PyO3)
@@ -86,14 +87,35 @@ without following links and skips anything that changed on the host during
 the run. Mount points are `Node::mount_point` (EBUSY to remove or rename).
 
 Architectures: everything a CPU decides is in `kernel/src/arch/<arch>/`
-(today `aarch64`): boot and the linker script, exception entry and the
+(`aarch64`, `x86_64`): boot and the linker script, exception entry and the
 return to user mode, `TrapFrame` and its accessors (the system call's
 number, arguments and result, pc, sp, rewinding to the call), the FP and
-TLS registers, page-table entries (`pte`), the interrupt controller and
-timer (`irq`), the early UART (`uart`), the signal frame (`sigframe`), the
-vDSO's code, PSCI and the VMM calls, and `/proc/cpuinfo`. Code outside
-`arch` uses only that interface; the syscall table (`syscall/table.rs`)
-and the structures system calls copy are still arm64's.
+TLS registers, page-table entries (`pte`, and `USER_ROOT_ENTRIES`: an x86
+root's upper half is the kernel's), the interrupt controller and timer
+(`irq`), the early UART (`uart`), the signal frame (`sigframe`), the
+structures Linux lays out per architecture (`abi`: `stat`,
+`epoll_event`, the `O_*` flags that differ), the vDSO's code, the
+machine's layout (`machine`), USER_TOP and ELF_DYN_BASE, the VMM calls,
+and `/proc/cpuinfo`. Code outside `arch` uses only that interface. The
+syscall table (`syscall/table.rs`) has each architecture's numbers for
+the same names; x86_64's older calls (`open`, `stat`, `fork`, ...) are
+turned into the calls that replaced them (`syscall/x86.rs`), gated as
+those are. Test with both: `GRIX_ARCH=x86_64 cargo test -p grix --test
+guest --test runtimes` runs the end-to-end tests on the x86_64 kernel
+(fixtures in `fixtures/build/amd64`, and `<name>-x86_64` roots).
+
+x86_64 (`kernel/src/arch/x86_64`): PVH entry (32-bit, the ELF note) to
+long mode in `boot.S`; the high half at `0xffff8000_00000000` (static,
+large code model). User mode is CPL 3 with IF set; every trap from it
+lands at the top of the CPU's stack (TSS.rsp0, or `syscall_entry` by
+hand, with `swapgs`) and leaves by `iretq` (`sanitize` makes a
+non-canonical rip fault at 0 in user mode instead of in the kernel). The
+idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
+it's noted for `irq::ack` (which lets one still in the APIC in for an
+instruction), as a masked one waits in the GIC on arm64. The TSC is the
+counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
+PIT; the APIC timer is one-shot. FP state is fxsave's (no AVX). One CPU,
+QEMU only (no grix-vmm, no snapshots) for now.
 
 Images (`crates/grix/src/container.rs`, `build.rs`, `oci.rs`): a `.grix`
 file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),

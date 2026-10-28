@@ -78,9 +78,9 @@ pub fn init_cpu(cpu: usize) {
     timer_off();
 }
 
-/// Route shared peripheral interrupt `intid` to this CPU (group 1, mid
-/// priority, level-triggered).
-pub fn enable_spi(intid: u32) {
+/// Route a device's interrupt (shared peripheral interrupt `intid`) to CPU
+/// 0 (group 1, mid priority, level-triggered).
+pub fn enable_device_irq(intid: u32) {
     let n = intid as u64;
     // SAFETY: GIC distributor registers, mapped at GICD.
     unsafe {

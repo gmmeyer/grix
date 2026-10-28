@@ -34,8 +34,7 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
-const O_DIRECTORY: u32 = 0o40000;
-const O_NOFOLLOW: u32 = 0o100000;
+use crate::arch::abi::{O_DIRECT, O_DIRECTORY, O_NOFOLLOW};
 const O_CLOEXEC: u32 = 0o2000000;
 const O_PATH: u32 = 0o10000000;
 const O_TMPFILE: u32 = 0o20000000;
@@ -1028,35 +1027,14 @@ fn split_ns(ns: u64) -> (u64, u64) {
     (ns / 1_000_000_000, ns % 1_000_000_000)
 }
 
-fn stat_bytes(st: &StatInfo) -> [u8; 128] {
-    let mut b = [0u8; 128];
-    let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
-    put(0, &1u64.to_le_bytes()); // st_dev
-    put(8, &st.ino.to_le_bytes());
-    put(16, &st.mode.to_le_bytes());
-    put(20, &st.nlink.to_le_bytes());
-    put(24, &st.uid.to_le_bytes());
-    put(28, &st.gid.to_le_bytes());
-    put(32, &st.rdev.to_le_bytes());
-    put(48, &st.size.to_le_bytes());
-    put(56, &4096u32.to_le_bytes()); // st_blksize
-    put(64, &st.blocks.to_le_bytes());
-    for (off, t) in [(72, st.atime), (88, st.mtime), (104, st.ctime)] {
-        let (sec, nsec) = split_ns(t);
-        put(off, &sec.to_le_bytes());
-        put(off + 8, &nsec.to_le_bytes());
-    }
-    b
-}
-
 pub fn fstat(p: &mut Process, fd: u64, buf: u64) -> SysResult {
     let st = fd_stat(p, fd)?;
-    copy_out(&mut p.aspace, buf, &stat_bytes(&st)).map(|_| 0)
+    copy_out(&mut p.aspace, buf, &crate::arch::abi::stat(&st)).map(|_| 0)
 }
 
 pub fn newfstatat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, flags: u64) -> SysResult {
     let st = path_stat(p, dirfd, pathp, flags)?;
-    copy_out(&mut p.aspace, buf, &stat_bytes(&st)).map(|_| 0)
+    copy_out(&mut p.aspace, buf, &crate::arch::abi::stat(&st)).map(|_| 0)
 }
 
 pub fn statx(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, buf: u64) -> SysResult {
@@ -2053,10 +2031,15 @@ fn timespec_timeout(p: &mut Process, ts: u64) -> Result<Option<u64>, Errno> {
 }
 
 pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
+    let timeout = timespec_timeout(p, timeout)?;
+    poll_ns(p, fds, nfds, timeout)
+}
+
+/// ppoll with its timeout in ns (None = forever), poll's too.
+pub fn poll_ns(p: &mut Process, fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
     if nfds > 1024 {
         return Err(EINVAL);
     }
-    let timeout = timespec_timeout(p, timeout)?;
     let mut raw = alloc::vec![0u8; nfds as usize * 8];
     copy_in(&mut p.aspace, fds, &mut raw)?;
     // A re-run after the deadline passed reports what's ready (perhaps
@@ -2103,10 +2086,15 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
 }
 
 pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, timeout: u64) -> SysResult {
+    let timeout = timespec_timeout(p, timeout)?;
+    select_ns(p, nfds, rfds, wfds, efds, timeout)
+}
+
+/// pselect6 with its timeout in ns (None = forever), select's too.
+pub fn select_ns(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, timeout: Option<u64>) -> SysResult {
     if nfds > 1024 {
         return Err(EINVAL);
     }
-    let timeout = timespec_timeout(p, timeout)?;
     // As ppoll: after the deadline, the sets come back (cleared if nothing
     // is ready), as Linux returns them.
     let deadline = p.timeout_deadline(timeout);
@@ -2155,8 +2143,6 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
 }
 
 // ---------------------------------------------------------------- pipes, eventfd, epoll
-
-const O_DIRECT: u32 = 0o200000;
 
 pub fn pipe2(p: &mut Process, fdsp: u64, flags: u64) -> SysResult {
     let flags = flags as u32;
@@ -2232,9 +2218,9 @@ pub fn epoll_ctl(p: &mut Process, epfd: u64, op: u64, fd: u64, eventp: u64) -> S
     let (events, data) = if op == DEL {
         (0, 0)
     } else {
-        let mut b = [0u8; 16]; // arm64 struct epoll_event is not packed: u32 events, pad, u64 data
+        let mut b = [0u8; EPOLL_EVENT];
         copy_in(&mut p.aspace, eventp, &mut b)?;
-        (u32::from_le_bytes(b[..4].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()))
+        crate::arch::abi::epoll_event_get(&b)
     };
     let mut e = ep.lock();
     let key = fd as i32 as u64;
@@ -2261,6 +2247,9 @@ pub fn epoll_ctl(p: &mut Process, epfd: u64, op: u64, fd: u64, eventp: u64) -> S
     Ok(0)
 }
 
+/// The architecture's struct epoll_event.
+const EPOLL_EVENT: usize = crate::arch::abi::EPOLL_EVENT;
+
 /// epoll_pwait / epoll_pwait2. `timeout`: None = forever.
 pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Option<u64>) -> SysResult {
     let max = max as i32;
@@ -2273,7 +2262,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
         let mut e = ep.lock();
         let mut dead = Vec::new();
         for (fd, reg) in e.interest.iter_mut() {
-            if out.len() / 16 >= max as usize {
+            if out.len() / EPOLL_EVENT >= max as usize {
                 break;
             }
             let Some(file) = reg.file.upgrade() else {
@@ -2294,9 +2283,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
             if reg.events & EPOLLONESHOT != 0 {
                 reg.events &= EPOLLET | EPOLLONESHOT; // disabled until EPOLL_CTL_MOD
             }
-            out.extend_from_slice(&ready.to_le_bytes());
-            out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&reg.data.to_le_bytes());
+            out.extend_from_slice(&crate::arch::abi::epoll_event(ready, reg.data));
         }
         for fd in dead {
             e.interest.remove(&fd);
@@ -2304,7 +2291,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
     }
     if !out.is_empty() || timeout == Some(0) {
         copy_out(&mut p.aspace, evp, &out)?;
-        return Ok(out.len() as u64 / 16);
+        return Ok((out.len() / EPOLL_EVENT) as u64);
     }
     let deadline = p.timeout_deadline(timeout);
     p.block_io(deadline, Ok(0))

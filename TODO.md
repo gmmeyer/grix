@@ -91,11 +91,13 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
 19. [~] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
-    Done: the kernel's arm64 code is all under `arch/aarch64` behind one
-    interface. Left: `arch/x86_64` (boot, traps, paging, LAPIC/IOAPIC,
-    the 16550 UART, signal frame, vDSO), the x86_64 syscall table and
-    structure layouts, grix-vmm on x86 KVM, QEMU x86_64, fixtures and CI
-    on x86 runners.
+    Done: the kernel's arm64 code under `arch/aarch64`, and `arch/x86_64`
+    (PVH boot, traps and `syscall`, paging, LAPIC/IOAPIC, the 16550, the
+    signal frame, the vDSO), the x86_64 syscall table, its older calls
+    and structure layouts; QEMU microvm (`--arch x86_64`); every
+    end-to-end test passes on it. Left: SMP (INIT/SIPI), AVX state
+    (xsave), grix-vmm on x86 KVM (and snapshots there), x86 hosts'
+    releases and CI with KVM.
 20. **An outside security review** (after the above).
 
 ## Agent integrations

@@ -5,8 +5,15 @@ use core::arch::{asm, global_asm};
 use crate::signal::{self, *};
 use crate::{process, sched, syscall};
 
+pub mod abi;
 pub mod irq;
 pub mod pte;
+
+/// Where this machine's RAM, boot image and devices are (QEMU `virt`'s).
+pub mod machine {
+    pub use grix_abi::image::{IMAGE_BASE, RAM_BASE};
+    pub use grix_abi::machine::{VIRTIO, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE};
+}
 pub mod sigframe;
 pub mod uart;
 
@@ -144,12 +151,24 @@ pub fn tls() -> u64 {
     v
 }
 
+/// Can `v` be a thread pointer? Any value can be TPIDR_EL0's.
+pub fn valid_tls(_v: u64) -> bool {
+    true
+}
+
 pub fn set_tls(v: u64) {
     unsafe { asm!("msr tpidr_el0, {}", in(reg) v) };
 }
 
 /// Physical memory is mapped linearly here, in TTBR1's half (as linker.ld).
 pub const KERNEL_OFFSET: u64 = 0xFFFF_0000_0000_0000;
+
+/// The end of user addresses: TTBR0's 48 bits.
+pub const USER_TOP: u64 = 1 << 48;
+
+/// Where position-independent executables go (ELF_ET_DYN_BASE: two thirds
+/// of the way up).
+pub const ELF_DYN_BASE: u64 = 0x0000_aaaa_aaa0_0000;
 
 /// ELF's e_machine for the programs this kernel runs.
 pub const ELF_MACHINE: u16 = 183; // EM_AARCH64

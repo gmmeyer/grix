@@ -28,13 +28,19 @@ jobs:
           command -v rustup || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" toolchain install stable --profile minimal
-          "$HOME/.cargo/bin/rustup" target add aarch64-unknown-none-softfloat
-      - name: Build the kernel
-        run: cd kernel && cargo build --release
+          "$HOME/.cargo/bin/rustup" target add aarch64-unknown-none-softfloat x86_64-unknown-none
+      - name: Build the kernels (arm64, and x86_64 for GRIX_ARCH=x86_64)
+        run: |
+          cd kernel
+          cargo build --release
+          cargo build --release --target x86_64-unknown-none
+          mkdir -p ../kernel-out
+          cp target/aarch64-unknown-none-softfloat/release/grix-kernel ../kernel-out/grix-kernel
+          cp target/x86_64-unknown-none/release/grix-kernel ../kernel-out/grix-kernel-x86_64
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kernel
-          path: kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
+          path: kernel-out/
           if-no-files-found: error
 
   linux-arm64:
@@ -68,7 +74,7 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -y -q qemu-system-arm
           printf '#include <stdio.h>\nint main(int c, char **v) { printf("hello from %%s\\n", v[1]); return 7; }\n' > hello.c
           gcc -static -O2 -o hello hello.c
-          cp kernel-out/grix-kernel out-bin/
+          cp kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 out-bin/
           set +e
           out=$(GRIX_ACCEL=tcg ./out-bin/grix run --timeout 120 -i ./hello:/bin/hello -- /bin/hello grix)
           code=$?
@@ -76,12 +82,27 @@ jobs:
           echo "$out (exit $code)"
           [ "$out" = "hello from grix" ] && [ "$code" = 7 ]
           ./out-bin/grix --version
+      # The x86_64 kernel (GRIX_ARCH=x86_64: QEMU microvm, emulated here),
+      # with a static x86_64 program Rust builds (no x86 C toolchain here).
+      - name: Smoke test, x86_64
+        run: |
+          sudo apt-get install -y -q qemu-system-x86
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add x86_64-unknown-linux-musl
+          printf 'fn main() { let a: Vec<String> = std::env::args().collect(); println!("hello from {}", a[1]); std::process::exit(7); }\n' > hello.rs
+          rustc --target x86_64-unknown-linux-musl -C linker=rust-lld -C opt-level=2 hello.rs -o hello-x86_64
+          set +e
+          out=$(GRIX_ARCH=x86_64 ./out-bin/grix run --timeout 120 -i ./hello-x86_64:/bin/hello -- /bin/hello grix)
+          code=$?
+          set -e
+          echo "$out (exit $code)"
+          [ "$out" = "hello from grix" ] && [ "$code" = 7 ]
       - name: Package
         run: |
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-linux-arm64
           mkdir -p "$d/python/grix"
-          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md "$d/"
           cp python/grix/__init__.py "$d/python/grix/"
           cp target/release/lib_native.so "$d/python/grix/_native.abi3.so"
           PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'
@@ -118,7 +139,7 @@ jobs:
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-macos-arm64
           mkdir -p "$d/python/grix"
-          cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel README.md "$d/"
+          cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md "$d/"
           cp python/grix/__init__.py "$d/python/grix/"
           cp target/release/lib_native.dylib "$d/python/grix/_native.abi3.so"
           PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'

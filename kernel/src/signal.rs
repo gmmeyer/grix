@@ -61,6 +61,7 @@ pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const BUS_ADRALN: i32 = 1;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const ILL_ILLOPC: i32 = 1;
 pub const TRAP_BRKPT: i32 = 1;
 pub const FPE_FLTUNK: i32 = 14;
@@ -520,6 +521,9 @@ fn restartable(regs: &TrapFrame) -> bool {
         // recvmmsg with a timeout is EINTR, as the other timed waits.
         nr::recvmmsg => regs.arg(4) == 0,
         nr::wait4 | nr::waitid => true,
+        // x86_64's older calls keep their own numbers (`syscall::x86`).
+        #[cfg(target_arch = "x86_64")]
+        nr::open | nr::creat => true,
         // F_SETLKW and F_OFD_SETLKW.
         nr::fcntl => matches!(regs.arg(1), 7 | 38),
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
@@ -700,11 +704,13 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     let sp = tf.sp();
     let alt = t.altstack;
     let top = if act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0 { alt.sp.wrapping_add(alt.size) } else { sp };
+    let restorer = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
     let ctx = arch::sigframe::Context {
         info: info.bytes(),
         stack: (alt.sp, alt.flags, alt.size),
         mask: t.saved_sigmask.unwrap_or(t.sigmask),
         fault: info.fault,
+        restorer,
     };
     let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, &ctx)?;
 
@@ -723,7 +729,6 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     if act.flags & SA_RESETHAND != 0 {
         p.sigactions[sig as usize].handler = SIG_DFL;
     }
-    let restorer = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
     arch::sigframe::enter_handler(tf, frame, sig, act.handler, restorer, act.flags & SA_SIGINFO != 0);
     Ok(())
 }

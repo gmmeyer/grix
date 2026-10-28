@@ -195,6 +195,35 @@ static int test_altstack(void) {
     return 0;
 }
 
+static volatile uint32_t fp_magic;
+
+#if defined(__x86_64__)
+static void on_clobber(int sig) {
+    // Caller-saved SSE registers the compiler won't preserve for us.
+    __asm__ volatile("pxor %%xmm7, %%xmm7\n pxor %%xmm15, %%xmm15" ::: "xmm7", "xmm15");
+    got[sig]++;
+}
+
+// Hold a pattern in xmm7 across a tkill whose handler zeroes it.
+static uint64_t fp_across_signal(uint64_t pattern) {
+    uint64_t out;
+    long ret;
+    __asm__ volatile("movq %[pat], %%xmm7\n syscall\n movq %%xmm7, %[out]"
+                     : [out] "=r"(out), "=a"(ret)
+                     : [pat] "r"(pattern), "1"((long)SYS_tkill), "D"((long)gettid()), "S"((long)SIGUSR1)
+                     : "rcx", "r11", "xmm7", "memory");
+    return out;
+}
+
+static void on_trap(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    got[sig]++;
+    last_addr = si->si_addr;
+    // The frame points at its saved FP state. int3 has gone by already.
+    fp_magic = uc->uc_mcontext.fpregs ? 0x46508001 : 0;
+}
+#define TRAP() __asm__ volatile("int3")
+#else
 static void on_clobber(int sig) {
     // Caller-saved FP/SIMD registers the compiler won't preserve for us.
     __asm__ volatile("movi v16.2d, #0\n movi v31.2d, #0\n" ::: "v16", "v31");
@@ -214,7 +243,6 @@ static uint64_t fp_across_signal(uint64_t pattern) {
     return out;
 }
 
-static volatile uint32_t fp_magic;
 static void on_trap(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
     got[sig]++;
@@ -223,6 +251,8 @@ static void on_trap(int sig, siginfo_t *si, void *ctx) {
     memcpy((void *)&fp_magic, &uc->uc_mcontext.__reserved, 4);
     uc->uc_mcontext.pc += 4;  // skip the brk
 }
+#define TRAP() __asm__ volatile("brk #7")
+#endif
 
 static int test_context(void) {
     reset();
@@ -231,7 +261,7 @@ static int test_context(void) {
     CHECK(got[SIGUSR1] == 1);
     // A handler can resume somewhere else by editing the saved pc.
     handle(SIGTRAP, on_trap, 0);
-    __asm__ volatile("brk #7");
+    TRAP();
     CHECK(got[SIGTRAP] == 1 && fp_magic == 0x46508001);
     return 0;
 }

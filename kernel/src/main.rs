@@ -46,7 +46,8 @@ mod unix;
 mod vdso;
 mod virtio;
 
-use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};
+use arch::machine::IMAGE_BASE;
+use grix_abi::image::{self, HEADER_LEN, Image};
 
 use console::klog;
 

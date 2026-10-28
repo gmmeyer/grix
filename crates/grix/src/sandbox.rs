@@ -146,10 +146,67 @@ impl RunOutput {
     }
 }
 
-/// Hardware virtualization if this host can run an arm64 guest natively,
+/// The guest's architecture: what its kernel and the programs it runs are
+/// built for. The host's own by default (`GRIX_ARCH` says otherwise), as
+/// only that one has hardware virtualization; another is emulated (QEMU's
+/// TCG).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    Aarch64,
+    X86_64,
+}
+
+impl Arch {
+    /// The host's.
+    pub fn host() -> Arch {
+        if cfg!(target_arch = "x86_64") { Arch::X86_64 } else { Arch::Aarch64 }
+    }
+
+    /// `GRIX_ARCH` (`aarch64`/`arm64` or `x86_64`/`amd64`), or the host's.
+    pub fn from_env() -> Arch {
+        match std::env::var("GRIX_ARCH").as_deref() {
+            Ok("x86_64" | "amd64") => Arch::X86_64,
+            Ok("aarch64" | "arm64") => Arch::Aarch64,
+            _ => Arch::host(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::Aarch64 => "aarch64",
+            Arch::X86_64 => "x86_64",
+        }
+    }
+
+    /// Where its machine loads the boot image.
+    pub(crate) fn image_base(self) -> u64 {
+        match self {
+            Arch::Aarch64 => IMAGE_BASE,
+            Arch::X86_64 => machine::x86_64::IMAGE_BASE,
+        }
+    }
+
+    /// The kernel's name in an installation, and its build in this source tree.
+    fn kernel_names(self) -> (&'static str, &'static str) {
+        match self {
+            Arch::Aarch64 => ("grix-kernel", "kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"),
+            Arch::X86_64 => ("grix-kernel-x86_64", "kernel/target/x86_64-unknown-none/release/grix-kernel"),
+        }
+    }
+
+    fn default_qemu(self) -> PathBuf {
+        let (var, name) = match self {
+            Arch::Aarch64 => ("GRIX_QEMU", "qemu-system-aarch64"),
+            Arch::X86_64 => ("GRIX_QEMU_X86_64", "qemu-system-x86_64"),
+        };
+        std::env::var_os(var).map_or_else(|| name.into(), PathBuf::from)
+    }
+}
+
+/// Hardware virtualization if this host can run `arch`'s guests natively,
 /// otherwise emulation.
-fn default_accel() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
+fn default_accel_for(arch: Arch) -> &'static str {
+    if arch == Arch::host() {
         if cfg!(target_os = "macos") {
             return "hvf";
         }
@@ -158,6 +215,10 @@ fn default_accel() -> &'static str {
         }
     }
     "tcg"
+}
+
+fn default_accel() -> &'static str {
+    default_accel_for(Arch::from_env())
 }
 
 /// Where `SandboxBuilder::x86_64` puts the translator.
@@ -236,28 +297,32 @@ pub(crate) fn vmm_in(dir: Option<&Path>) -> Option<PathBuf> {
     dir.map(|d| d.join("grix-vmm")).into_iter().chain(built).find(|p| p.is_file())
 }
 
-/// The kernel in `dir` (an installation), or this source tree's build,
-/// unless `GRIX_KERNEL` says otherwise.
-fn kernel_in(dir: Option<&Path>) -> PathBuf {
+/// `arch`'s kernel in `dir` (an installation), or this source tree's
+/// build, unless `GRIX_KERNEL` says otherwise.
+fn kernel_in(dir: Option<&Path>, arch: Arch) -> PathBuf {
     if let Some(k) = std::env::var_os("GRIX_KERNEL") {
         return k.into();
     }
-    let built =
-        SOURCE_TREE.map(|t| Path::new(t).join("kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel"));
-    let candidates: Vec<PathBuf> = dir.map(|d| d.join("grix-kernel")).into_iter().chain(built).collect();
+    let (name, built) = arch.kernel_names();
+    let built = SOURCE_TREE.map(|t| Path::new(t).join(built));
+    let candidates: Vec<PathBuf> = dir.map(|d| d.join(name)).into_iter().chain(built).collect();
     // The first that's there; if none is, the one an error should name.
     candidates.iter().find(|p| p.is_file()).or(candidates.first()).cloned().unwrap_or_else(|| "grix-kernel".into())
 }
 
 /// The grix kernel: `GRIX_KERNEL`, beside the running program (as a
 /// release unpacks), or this source tree's build.
-fn default_kernel() -> PathBuf {
-    kernel_in(home_dir("kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel").as_deref())
+fn default_kernel(arch: Arch) -> PathBuf {
+    kernel_in(home_dir(arch.kernel_names().1).as_deref(), arch)
 }
 
 /// Does grix-vmm run here, unless told otherwise (`GRIX_ACCEL`)?
 fn vmm_runs_here() -> bool {
     if std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    // grix-vmm runs arm64 guests only (yet).
+    if Arch::from_env() != Arch::Aarch64 {
         return false;
     }
     // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
@@ -301,6 +366,7 @@ pub struct SandboxBuilder {
     grace: Duration,
     uid: u32,
     gid: u32,
+    arch: Arch,
     kernel: PathBuf,
     qemu: PathBuf,
     accel: String,
@@ -317,7 +383,7 @@ pub struct SandboxBuilder {
 
 impl Default for SandboxBuilder {
     fn default() -> Self {
-        let env_path = |var: &str, default: &str| std::env::var_os(var).map_or_else(|| default.into(), PathBuf::from);
+        let arch = Arch::from_env();
         SandboxBuilder {
             files: BTreeMap::new(),
             policy: Policy::default(),
@@ -335,8 +401,9 @@ impl Default for SandboxBuilder {
             grace: DEFAULT_GRACE,
             uid: 1000,
             gid: 1000,
-            kernel: default_kernel(),
-            qemu: env_path("GRIX_QEMU", "qemu-system-aarch64"),
+            arch,
+            kernel: default_kernel(arch),
+            qemu: arch.default_qemu(),
             accel: std::env::var("GRIX_ACCEL").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| default_accel().into()),
             vmm: default_vmm(),
             cpus: std::env::var("GRIX_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(1),
@@ -661,7 +728,7 @@ impl SandboxBuilder {
     /// `GRIX_KERNEL` or `GRIX_VMM` say otherwise.
     pub fn install_dir(mut self, dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref();
-        self.kernel = kernel_in(Some(dir));
+        self.kernel = kernel_in(Some(dir), self.arch);
         self.vmm = vmm_in(Some(dir));
         self
     }
@@ -733,6 +800,23 @@ impl SandboxBuilder {
     pub fn accel(mut self, accel: impl Into<String>) -> Self {
         self.accel = accel.into();
         self.vmm = None;
+        self
+    }
+
+    /// The guest's architecture (the host's by default, or `GRIX_ARCH`'s):
+    /// its kernel, QEMU and accelerator follow. Programs must be built for
+    /// it. Another architecture than the host's is emulated (slowly).
+    pub fn arch(mut self, arch: Arch) -> Self {
+        if arch != self.arch {
+            self.arch = arch;
+            self.kernel = default_kernel(arch);
+            self.qemu = arch.default_qemu();
+            self.accel = default_accel_for(arch).into();
+            // grix-vmm runs arm64 guests only (yet).
+            if arch != Arch::Aarch64 {
+                self.vmm = None;
+            }
+        }
         self
     }
 
@@ -898,7 +982,12 @@ impl Sandbox {
             entries.extend(image::entries(&i.files));
         }
         let boot_time_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-        let gicr = if cfg.vmm.is_some() { machine::GICR_GRIX_VMM } else { machine::GICR_QEMU };
+        // Where the GIC's redistributors are (arm64 only).
+        let gicr = match cfg.arch {
+            Arch::X86_64 => 0,
+            _ if cfg.vmm.is_some() => machine::GICR_GRIX_VMM,
+            _ => machine::GICR_QEMU,
+        };
         let bytes = Image {
             ram_size: cfg.memory_mb << 20,
             gicr,
@@ -936,6 +1025,7 @@ impl Sandbox {
             control: cfg.control.clone(),
             grace: cfg.grace,
             live: cfg.live.clone(),
+            arch: cfg.arch,
             qemu: cfg.qemu.clone(),
             kernel: cfg.kernel.clone(),
             memory_mb: cfg.memory_mb,
@@ -1164,6 +1254,7 @@ pub(crate) fn run_snapshot(
         control: snap.control.clone(),
         grace: Duration::from_millis(s.grace_ms),
         live,
+        arch: Arch::Aarch64,
         qemu: PathBuf::new(),
         kernel: PathBuf::new(),
         memory_mb: s.memory_mb,

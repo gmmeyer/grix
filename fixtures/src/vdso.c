@@ -74,11 +74,25 @@ static void *vdso_sym(const char *want, const char *version) {
 static long long ns(struct timespec t) { return t.tv_sec * 1000000000LL + t.tv_nsec; }
 
 int main(void) {
-    int (*gettime)(clockid_t, struct timespec *) = vdso_sym("__kernel_clock_gettime", "LINUX_2.6.39");
-    int (*gtod)(struct timeval *, void *) = vdso_sym("__kernel_gettimeofday", "LINUX_2.6.39");
-    int (*getres)(clockid_t, struct timespec *) = vdso_sym("__kernel_clock_getres", "LINUX_2.6.39");
-    CHECK(gettime && gtod && getres && vdso_sym("__kernel_rt_sigreturn", "LINUX_2.6.39"));
-    CHECK(!vdso_sym("__kernel_clock_gettime", "LINUX_2.6.15") && !vdso_sym("__kernel_nope", "LINUX_2.6.39"));
+    // Each architecture's names and version, as Linux's vDSO has them.
+#if defined(__x86_64__)
+#define SYM(name) "__vdso_" name
+#define VERSION "LINUX_2.6"
+#else
+#define SYM(name) "__kernel_" name
+#define VERSION "LINUX_2.6.39"
+#endif
+    int (*gettime)(clockid_t, struct timespec *) = vdso_sym(SYM("clock_gettime"), VERSION);
+    int (*gtod)(struct timeval *, void *) = vdso_sym(SYM("gettimeofday"), VERSION);
+    int (*getres)(clockid_t, struct timespec *) = vdso_sym(SYM("clock_getres"), VERSION);
+    CHECK(gettime && gtod && getres);
+#if defined(__x86_64__)
+    time_t (*vtime)(time_t *) = vdso_sym(SYM("time"), VERSION);
+    CHECK(vtime && vtime(NULL) == time(NULL));
+#else
+    CHECK(vdso_sym("__kernel_rt_sigreturn", VERSION));
+#endif
+    CHECK(!vdso_sym(SYM("clock_gettime"), "LINUX_2.6.15") && !vdso_sym(SYM("nope"), VERSION));
 
     // Between two system calls, on every clock it handles itself.
     clockid_t clocks[] = {CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,

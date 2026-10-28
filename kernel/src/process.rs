@@ -841,9 +841,13 @@ impl Program {
 /// The translator for x86_64 programs (`Image::x86_64`).
 pub static X86_64: spin::Once<String> = spin::Once::new();
 
-/// A 64-bit little-endian ELF for x86_64 (EM_X86_64).
+/// A 64-bit little-endian ELF for x86_64 (EM_X86_64), on a kernel that
+/// isn't x86_64's: one for a translator.
 fn is_x86_64_elf(head: &[u8]) -> bool {
-    head.len() >= 20 && head.starts_with(b"\x7fELF\x02\x01") && u16::from_le_bytes([head[18], head[19]]) == 62
+    crate::arch::ELF_MACHINE != 62
+        && head.len() >= 20
+        && head.starts_with(b"\x7fELF\x02\x01")
+        && u16::from_le_bytes([head[18], head[19]]) == 62
 }
 
 /// Follow `#!` lines like Linux's binfmt_script: `#!interp [arg]` runs

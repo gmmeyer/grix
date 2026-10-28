@@ -14,6 +14,13 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
+/// A root's entries that are the process's: all of TTBR0's (the kernel has
+/// TTBR1).
+pub const USER_ROOT_ENTRIES: u64 = 512;
+
+/// A new root (zeroed): nothing of the kernel's goes in it.
+pub fn new_root(_root_pa: u64) {}
+
 /// An entry pointing at the next level's table.
 pub fn table(next_pa: u64) -> u64 {
     next_pa | VALID | TABLE_OR_PAGE

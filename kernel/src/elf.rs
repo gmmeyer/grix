@@ -16,8 +16,9 @@ const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
 const PHDR_SIZE: usize = 56;
 
-/// Where position-independent main executables go (like Linux's ELF_ET_DYN_BASE).
-pub const DYN_BASE: u64 = 0x0000_aaaa_aaa0_0000;
+/// Where position-independent main executables go (Linux's
+/// ELF_ET_DYN_BASE for the architecture).
+pub const DYN_BASE: u64 = crate::arch::ELF_DYN_BASE;
 
 /// An executable's bytes: imported and unchanged (in the boot image), or
 /// written in the sandbox.

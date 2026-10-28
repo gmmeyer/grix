@@ -19,7 +19,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use grix_abi::image::IMAGE_BASE;
 use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder, Input};
 
 use crate::event::GuestEvent;
@@ -31,6 +30,7 @@ pub(crate) struct VmConfig {
     /// How long the program has to end after the SIGTERM a timeout sends.
     pub grace: Duration,
     pub live: Vec<crate::hostfs::LiveMount>,
+    pub arch: crate::sandbox::Arch,
     pub qemu: PathBuf,
     pub kernel: PathBuf,
     pub memory_mb: u64,
@@ -313,10 +313,20 @@ pub(crate) fn run(
 
 /// QEMU's command line for the machine.
 fn qemu_command(cfg: &VmConfig, uart_path: &std::path::Path, image: &std::path::Path) -> Command {
+    use crate::sandbox::Arch;
     // Under emulation use QEMU's richest CPU model; with hardware virtualization, the host CPU.
-    let cpu = if cfg.accel == "tcg" { "max,pauth-impdef=on" } else { "host" };
+    let (machine, cpu) = match (cfg.arch, cfg.accel == "tcg") {
+        (Arch::Aarch64, true) => ("virt,gic-version=3", "max,pauth-impdef=on"),
+        (Arch::Aarch64, false) => ("virt,gic-version=3", "host"),
+        // microvm: virtio-mmio, an IOAPIC, COM1 and a PIT (to measure the
+        // TSC by), and nothing else.
+        (Arch::X86_64, tcg) => (
+            "microvm,pit=on,pic=off,rtc=off,isa-serial=on,ioapic2=off,acpi=off,auto-kernel-cmdline=off",
+            if tcg { "max" } else { "host" },
+        ),
+    };
     let mut cmd = Command::new(&cfg.qemu);
-    cmd.args(["-machine", "virt,gic-version=3", "-cpu", cpu, "-smp", &cfg.cpus.to_string()])
+    cmd.args(["-machine", machine, "-cpu", cpu, "-smp", &cfg.cpus.to_string()])
         .args(["-m", &format!("{}M", cfg.memory_mb)])
         .args(["-accel", &cfg.accel])
         .args(["-nodefaults", "-no-user-config", "-display", "none", "-no-reboot"])
@@ -332,7 +342,7 @@ fn qemu_command(cfg: &VmConfig, uart_path: &std::path::Path, image: &std::path::
         .arg("-kernel")
         .arg(&cfg.kernel)
         .arg("-device")
-        .arg(format!("loader,file={},addr={IMAGE_BASE:#x},force-raw=on", image.display()));
+        .arg(format!("loader,file={},addr={:#x},force-raw=on", image.display(), cfg.arch.image_base()));
     cmd
 }
 

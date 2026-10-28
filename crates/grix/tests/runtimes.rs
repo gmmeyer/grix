@@ -6,8 +6,15 @@ use std::time::Duration;
 
 use grix::{Capability, ExitStatus, ExportContent, ExportState, GuestEvent, RunOutput, Sandbox, SandboxBuilder};
 
+/// A runtime's root (or a fixture) for the guest's architecture
+/// (`GRIX_ARCH`): x86_64's are `<name>-x86_64`.
 fn runtime(name: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build");
+    let p = match (grix::Arch::from_env(), name.split_once('/')) {
+        (grix::Arch::X86_64, Some((root, rest))) => base.join(format!("{root}-x86_64")).join(rest),
+        (grix::Arch::X86_64, None) => base.join(format!("{name}-x86_64")),
+        _ => base.join(name),
+    };
     assert!(p.exists(), "missing runtime {} — run `make fixtures`", p.display());
     p
 }
@@ -677,6 +684,10 @@ fn python_from_a_snapshot() {
 /// in user mode, which the kernel runs for every x86_64 program it execs.
 #[test]
 fn x86_64_python_through_a_translator() {
+    // An x86_64 kernel runs it itself.
+    if grix::Arch::from_env() == grix::Arch::X86_64 {
+        return;
+    }
     let qemu = runtime("qemu-x86_64/usr/bin/qemu-x86_64");
     // Emulation in emulation under TCG: minutes.
     let b = Sandbox::builder()
@@ -706,6 +717,10 @@ fn x86_64_python_through_a_translator() {
 /// another (as apt does to fetch packages).
 #[test]
 fn glibc_programs_from_debian() {
+    // The Debian fixture is an arm64 image.
+    if grix::Arch::from_env() == grix::Arch::X86_64 {
+        return;
+    }
     let mut g = grix::build::Grixfile::parse(&format!("from = \"oci:{}\"", runtime("oci/debian").display())).unwrap();
     g.from_outside_context = true;
     let image = g

@@ -586,6 +586,38 @@ Next, in TODO.md order:
   `arch`: the syscall table and the layouts system calls copy (`stat`,
   ...), which x86_64 gets as its own.
 
+- **A native x86_64 kernel** (round 2, item 19): `kernel/src/arch/x86_64`
+  boots by PVH under QEMU microvm (32-bit entry, page tables for the first
+  4 GiB twice, long mode, the high half), sets up the GDT, a TSS per CPU,
+  the IDT and `syscall`, and runs user code at CPL 3. The rest of the
+  kernel is shared: the x86_64 syscall table has the same names with
+  Linux's x86 numbers (`syscall_64.tbl`), and x86's older calls become
+  the calls that replaced them (`syscall/x86.rs`); `struct stat`,
+  `epoll_event` and three `O_*` flags are per architecture (`arch::abi`),
+  as are USER_TOP (2^47 on x86) and ELF_DYN_BASE, and clone's last two
+  arguments swap. The signal frame is Linux's x86_64 one (fxsave state,
+  the red zone skipped, rt_sigreturn forcing user selectors and flags and
+  refusing a kernel rip); the vDSO has `__vdso_clock_gettime`,
+  `gettimeofday`, `time` and `clock_getres` (LINUX_2.6) on the TSC. On
+  the host, `Arch` (`--arch`, `GRIX_ARCH`, `SandboxBuilder::arch`) picks
+  the kernel, `qemu-system-x86_64 -machine microvm` and the accelerator.
+  The end-to-end tests take `GRIX_ARCH` (fixtures for x86_64 in
+  `fixtures/build/amd64`, Alpine's in `alpine-x86_64`, `python-x86_64`,
+  `node-x86_64`): all 81 guest and 21 runtime tests pass (CPython and
+  Node with threads, signals, sockets and networking, a shell on a pty),
+  the ones for what x86_64 doesn't have yet (SMP, the translator, arm64
+  OCI images, snapshots) returning early. Traps on the way: QEMU microvm has no port
+  0x61, so the TSC is measured against the PIT's latched counter; the
+  large code model's `.ltext` sections need naming in the linker script;
+  global pages can't be used while the identity map shares the boot
+  tables; and code in the high half can't reach low symbols RIP-relative
+  (the boot tables' addresses come from `movabs` helpers). From the
+  review: `syscall` now masks RFLAGS.NT (and IOPL, RF, ID) as Linux does,
+  since user code may set NT and the kernel's own iretq would fault on it;
+  and clone's TLS must be a user address (`arch::valid_tls`, EPERM), since
+  wrmsr(FS_BASE) faults on a non-canonical one (the `regs` fixture checks
+  both).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

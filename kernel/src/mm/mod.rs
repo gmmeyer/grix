@@ -4,7 +4,8 @@ pub mod aspace;
 pub mod frame;
 pub mod paging;
 
-use grix_abi::image::{MAX_RAM, RAM_BASE};
+use crate::arch::machine::RAM_BASE;
+use grix_abi::image::MAX_RAM;
 
 pub const PAGE_SIZE: u64 = 4096;
 /// Physical memory is mapped linearly at this offset (the arch's high half,

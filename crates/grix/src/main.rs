@@ -198,6 +198,11 @@ struct RunArgs {
     /// CPUs for the program's threads (default 1).
     #[arg(long)]
     cpus: Option<u32>,
+    /// The guest's architecture: aarch64 or x86_64 (default: the host's,
+    /// or GRIX_ARCH). Programs must be built for it; another than the
+    /// host's is emulated.
+    #[arg(long, value_name = "ARCH")]
+    arch: Option<String>,
     /// Run x86_64 programs with this translator (an arm64 Linux program:
     /// qemu-x86_64 in user mode, which needs `-a threads`;
     /// box64 untested).
@@ -504,6 +509,13 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
         None => Manifest::default(),
     };
     let mut b = Sandbox::builder();
+    if let Some(a) = &args.arch {
+        b = b.arch(match a.as_str() {
+            "aarch64" | "arm64" => grix::Arch::Aarch64,
+            "x86_64" | "amd64" => grix::Arch::X86_64,
+            _ => bail!("--arch {a}: aarch64 or x86_64"),
+        });
+    }
     if let Some(path) = args.image.as_ref().or(manifest.image.as_ref()) {
         let image = grix::Image::open(path)?;
         // net reaches beyond the sandbox: the image may only ask for it.

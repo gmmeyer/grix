@@ -58,7 +58,9 @@ fn entry(table_pa: u64, idx: u64) -> *mut u64 {
 
 impl PageTable {
     pub fn new() -> Option<Self> {
-        Some(Self { root: frame::alloc()? })
+        let root = frame::alloc()?;
+        pte::new_root(root);
+        Some(Self { root })
     }
 
     /// Pointer to the level-3 entry for `va`, creating intermediate tables if asked.
@@ -113,7 +115,9 @@ impl Drop for PageTable {
     fn drop(&mut self) {
         fn free_level(table: u64, level: u32) {
             if level < 3 {
-                for idx in 0..512 {
+                // The root's upper entries may be the kernel's: not ours to free.
+                let entries = if level == 0 { pte::USER_ROOT_ENTRIES } else { 512 };
+                for idx in 0..entries {
                     let v = unsafe { *entry(table, idx) };
                     if v & VALID != 0 {
                         free_level(v & ADDR_MASK, level + 1);

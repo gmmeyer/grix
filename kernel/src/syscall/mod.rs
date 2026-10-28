@@ -11,6 +11,8 @@ mod thread;
 mod timer;
 mod tty;
 mod unix;
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 use grix_abi::policy::Capability;
 
@@ -66,6 +68,12 @@ pub fn handle(tf: &mut TrapFrame) {
     }
 }
 
+/// clone's arguments in arm64's order (flags, stack, parent_tid, tls,
+/// child_tid): x86_64 has the last two the other way round.
+fn clone_args(a: [u64; 6]) -> [u64; 6] {
+    if cfg!(target_arch = "x86_64") { [a[0], a[1], a[2], a[4], a[3], a[5]] } else { a }
+}
+
 /// Check a capability needed for a specific use of a syscall (e.g. clone flags).
 pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) -> Result<(), Errno> {
     if p.policy.allows(cap) {
@@ -85,6 +93,10 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
             }
         }
         Gate::Privileged => return p.deny(n, name, "privileged", ""),
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = x86::legacy(p, tf, n, a) {
+        return r;
     }
 
     #[allow(non_upper_case_globals)]
@@ -200,7 +212,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::msync | nr::mlock | nr::munlock | nr::mlock2 | nr::mlockall | nr::munlockall => Ok(0),
 
         // threads (processes are gated in clone, not implemented yet)
-        nr::clone => thread::clone(p, tf, a),
+        nr::clone => thread::clone(p, tf, clone_args(a)),
         nr::clone3 => thread::clone3(p, tf, a[0], a[1]),
         nr::exit => thread::exit_thread(p, (a[0] & 0xff) as i32),
         nr::exit_group => {

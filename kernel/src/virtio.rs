@@ -13,13 +13,13 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
-use grix_abi::machine::{
-    CONSOLE_CONTROL_TX, CONSOLE_PORT, CONSOLE_RX, CONSOLE_TX, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE,
-};
+use grix_abi::machine::{CONSOLE_CONTROL_TX, CONSOLE_PORT, CONSOLE_RX, CONSOLE_TX};
+
+use crate::arch::machine::{VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE};
 
 use crate::mm::{KERNEL_OFFSET, PAGE_SIZE, frame, p2v};
 
-const MMIO_BASE: u64 = KERNEL_OFFSET + grix_abi::machine::VIRTIO;
+const MMIO_BASE: u64 = KERNEL_OFFSET + crate::arch::machine::VIRTIO;
 
 const MAGIC: u64 = 0x000;
 const VERSION: u64 = 0x004;

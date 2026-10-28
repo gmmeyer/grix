@@ -47,5 +47,5 @@ pub use grix_abi::policy::{Capability, DenyAction};
 pub use manifest::{ExportTo, Manifest};
 pub use mount::{MountChanges, MountState};
 pub use oci::pull_to_layout as pull;
-pub use sandbox::{ExitStatus, MountMode, RunOutput, Sandbox, SandboxBuilder, Stream};
+pub use sandbox::{Arch, ExitStatus, MountMode, RunOutput, Sandbox, SandboxBuilder, Stream};
 pub use snapshot::Snapshot;

@@ -5,8 +5,9 @@ VMM := target/release/grix-vmm
 
 all: kernel host vmm python fixtures
 
+# The arm64 kernel, and the x86_64 one (GRIX_ARCH=x86_64; QEMU microvm).
 kernel:
-	cd kernel && cargo build --release
+	cd kernel && cargo build --release && cargo build --release --target x86_64-unknown-none
 
 host:
 	cargo build --release -p grix
@@ -34,6 +35,10 @@ fixtures:
 	# Alpine to run with it.
 	python3 -I tools/alpine.py --out fixtures/build/qemu-x86_64 qemu-x86_64
 	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/x86_64 busybox python3
+	# x86_64's own, for the x86_64 kernel (GRIX_ARCH=x86_64).
+	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/alpine-x86_64 busybox-static busybox
+	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/python-x86_64 python3 ca-certificates-bundle
+	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/node-x86_64 nodejs
 	# A Docker Hub image, as an OCI layout, for the image tests.
 	cargo build --release -p grix
 	./target/release/grix pull alpine:3.21 --oci fixtures/build/oci/alpine
@@ -52,7 +57,7 @@ test-kvm: kernel fixtures
 # Lints for host and kernel.
 check:
 	cargo clippy --workspace --all-targets
-	cd kernel && cargo clippy --release
+	cd kernel && cargo clippy --release && cargo clippy --release --target x86_64-unknown-none
 
 clean:
 	cargo clean

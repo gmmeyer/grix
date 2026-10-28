@@ -68,7 +68,11 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # More CPUs: a process's threads run in parallel (separate processes take turns).
 ./target/release/grix run --cpus 4 -a threads -i fixtures/build/smp:/bin/smp -- /bin/smp
 
-# x86_64 programs, through an x86_64 translator (here Alpine's arm64 qemu-x86_64).
+# An x86_64 guest: the x86_64 kernel, in QEMU microvm (emulated on an arm64
+# host; KVM on an x86 one). Programs built for x86_64 run as they are.
+./target/release/grix run --arch x86_64 -i fixtures/build/amd64/hello:/bin/hello -- /bin/hello world
+
+# x86_64 programs in the arm64 guest, through a translator (here Alpine's arm64 qemu-x86_64).
 ./target/release/grix run --x86-64 fixtures/build/qemu-x86_64/usr/bin/qemu-x86_64 -a threads \
     -e QEMU_LD_PREFIX=/ -i fixtures/build/x86_64:/ -- /usr/bin/python3 -c 'import platform; print(platform.machine())'
 
@@ -656,8 +660,9 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`) | inotify events for host changes |
 | With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files, `MAP_SHARED` file mappings (the file's own pages, across fork too). `flock`, POSIX record locks and OFD locks, between processes (SQLite in WAL mode from several). Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` mappings of live-mounted files (reported); locks the host sees; `inotify` events; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging), a stack as big as `RLIMIT_STACK` says; more CPUs (`--cpus`): threads and processes run in parallel | `MAP_GROWSDOWN`; finer locking than one kernel lock |
-| Clocks (including per-thread and per-process CPU time; a vDSO reads them without a system call), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | A native x86_64 kernel (x86_64 programs run through a translator, `--x86-64`) |
-| Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | x86 hosts |
+| Clocks (including per-thread and per-process CPU time; a vDSO reads them without a system call), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | |
+| Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | |
+| x86_64 guests (`--arch x86_64`, `GRIX_ARCH`, `SandboxBuilder::arch`): the same kernel built for x86_64, in QEMU microvm, with x86_64's system calls (the older ones too) and structures; every end-to-end test passes on it, CPython and Node included | More than one CPU, snapshots and grix-vmm on x86_64; AVX state (x87/SSE only); the old `getdents` and `utime*` calls |
 
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
 and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
@@ -687,8 +692,9 @@ subshells.
 6. ~~**SMP and x86_64 guests**~~: more CPUs (`--cpus N`, threads of a
    process run in parallel) and x86_64 programs, through a user-mode
    translator in the arm64 sandbox (`--x86-64 qemu-x86_64`: x86_64 Alpine
-   and CPython run). Next: a native x86_64 kernel and grix-vmm on x86 KVM,
-   for x86 hosts.
+   and CPython run). A native x86_64 kernel runs in QEMU microvm
+   (`--arch x86_64`). Next: its SMP, grix-vmm on x86 KVM, and x86 hosts'
+   releases.
 
 ## Repository layout
 
@@ -696,8 +702,8 @@ subshells.
 crates/abi/        shared host<->guest definitions: boot image, policy, wire protocol (no_std)
 crates/grix/       host library + `grix` CLI (builds images, runs the VMM, decodes output)
 crates/vmm/        grix-vmm: the VMM (Hypervisor.framework, KVM), PL011 + virtio console
-kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat)
-  src/arch/        per architecture (aarch64/): boot, traps, page-table entries, GIC, signal frame
+kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat and x86_64-unknown-none)
+  src/arch/        per architecture (aarch64/, x86_64/): boot, traps, page tables, interrupts, signal frame, ABI layouts
   src/mm/          frame allocator, page tables, address spaces / VMAs
   src/sched.rs     threads: round-robin scheduler, blocking, timer interrupts
   src/signal.rs    signal queues, rt_sigframe delivery, rt_sigreturn, EINTR/restart

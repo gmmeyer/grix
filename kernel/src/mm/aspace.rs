@@ -14,8 +14,8 @@ use crate::errno::*;
 use crate::fs::{Content, Ino};
 
 /// User addresses are below 2^48.
-pub const USER_TOP: u64 = 1 << 48;
-pub const STACK_TOP: u64 = 0x0000_ffff_fffe_0000;
+pub const USER_TOP: u64 = crate::arch::USER_TOP;
+pub const STACK_TOP: u64 = USER_TOP - 0x2_0000;
 /// RLIMIT_STACK's default, as on Linux.
 pub const STACK_SIZE: u64 = 8 << 20;
 /// The biggest stack exec makes (for an unlimited RLIMIT_STACK too). It's

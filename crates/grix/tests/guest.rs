@@ -9,8 +9,24 @@ use grix::{
     SandboxBuilder, Stream,
 };
 
+fn x86_64_guest() -> bool {
+    grix::Arch::from_env() == grix::Arch::X86_64
+}
+
+/// A fixture built for the guest's architecture (`GRIX_ARCH`): x86_64's
+/// programs are in `amd64/`, its Alpine in `alpine-x86_64/`. (The x86_64
+/// translator's own fixtures are for arm64 guests.)
 fn fixture(name: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").join(name);
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build");
+    let p = match grix::Arch::from_env() {
+        grix::Arch::X86_64 => match name.split_once('/') {
+            Some(("alpine", rest)) => base.join("alpine-x86_64").join(rest),
+            Some(_) => base.join(name),
+            None if name == "hello-x86_64" => base.join(name),
+            None => base.join("amd64").join(name),
+        },
+        grix::Arch::Aarch64 => base.join(name),
+    };
     assert!(p.exists(), "missing fixture {} — run `make fixtures`", p.display());
     p
 }
@@ -386,7 +402,9 @@ fn memory_management() {
 
 #[test]
 fn faults_become_signals() {
-    for (arg, sig) in [("segv", 11), ("abort", 6), ("ill", 5)] {
+    // __builtin_trap: brk on arm64 (SIGTRAP), ud2 on x86_64 (SIGILL).
+    let trap = if x86_64_guest() { 4 } else { 5 };
+    for (arg, sig) in [("segv", 11), ("abort", 6), ("ill", trap)] {
         let out = run(with("fault"), &["/bin/fault", arg]);
         assert_eq!(out.status, ExitStatus::Signaled(sig), "{arg}");
         assert!(matches!(out.events.last(), Some(GuestEvent::Fault { signal, .. }) if *signal == sig as u32));
@@ -445,6 +463,10 @@ fn timeout() {
 
 #[test]
 fn images_built_from_oci_images() {
+    // The OCI fixtures are arm64 images.
+    if x86_64_guest() {
+        return;
+    }
     // From Docker Hub's alpine (pulled into an OCI layout by `make
     // fixtures`), with files, settings and build steps, through a file, to
     // a run.
@@ -1127,7 +1149,7 @@ fn alpine_static_busybox_applets() {
         "chars 21\n"
     );
     assert_eq!(busybox(&sb, &["sh", "-c", "x=6; echo $((x*7))"]).stdout_str(), "42\n");
-    assert_eq!(busybox(&sb, &["uname", "-sm"]).stdout_str(), "Linux aarch64\n");
+    assert_eq!(busybox(&sb, &["uname", "-sm"]).stdout_str(), format!("Linux {}\n", grix::Arch::from_env().name()));
 }
 
 #[test]
@@ -1489,6 +1511,10 @@ fn vdso() {
 
 #[test]
 fn processes_in_parallel() {
+    // One CPU on x86_64 (yet).
+    if x86_64_guest() {
+        return;
+    }
     // With four CPUs, three busy processes run at once (their CPU time is
     // nearly three times the wall time); with one, they take turns.
     let ratio = |cpus: u32| {
@@ -1803,6 +1829,9 @@ fn proc_for_every_process() {
 /// A stand-in kernel, hand-assembled: it writes `serial` to the PL011 and
 /// powers off, which is what the real one does when it panics.
 fn fake_kernel(serial: &[u8]) -> Vec<u8> {
+    if x86_64_guest() {
+        return fake_kernel_x86_64(serial);
+    }
     const BASE: u64 = 0x4020_0000;
     assert!(serial.len() < 1 << 16);
     let code: [u32; 13] = [
@@ -1838,6 +1867,64 @@ fn fake_kernel(serial: &[u8]) -> Vec<u8> {
     elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
     elf.extend_from_slice(&7u32.to_le_bytes()); // rwx
     for v in [0x1000, BASE, BASE, segment.len() as u64, segment.len() as u64, 0x1000] {
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.resize(0x1000, 0);
+    elf.extend_from_slice(&segment);
+    elf
+}
+
+/// An x86_64 kernel that writes `serial` to COM1 and ends (a triple fault),
+/// entered by PVH (32-bit protected mode) as the real one is.
+fn fake_kernel_x86_64(serial: &[u8]) -> Vec<u8> {
+    const BASE: u32 = 0x20_0000;
+    // The code, then the 6-byte empty IDT descriptor, the PVH note, the bytes.
+    let code_len = 29u32;
+    let idtr = BASE + code_len;
+    let note = idtr + 8;
+    let bytes = note + 20;
+    let mut code = vec![0x66, 0xba, 0xf8, 0x03]; // mov $0x3f8, %dx
+    code.push(0xbe); // mov $bytes, %esi
+    code.extend_from_slice(&bytes.to_le_bytes());
+    code.push(0xb9); // mov $len, %ecx
+    code.extend_from_slice(&(serial.len() as u32).to_le_bytes());
+    code.extend_from_slice(&[0xac, 0xee, 0xe2, 0xfc]); // lodsb; out %al, %dx; loop
+    code.extend_from_slice(&[0x0f, 0x01, 0x1d]); // lidt (idtr)
+    code.extend_from_slice(&idtr.to_le_bytes());
+    code.extend_from_slice(&[0xcc, 0xf4, 0xeb, 0xfd]); // int3; hlt; jmp .
+    assert_eq!(code.len() as u32, code_len);
+    let mut segment = code;
+    segment.extend_from_slice(&[0; 8]);
+    // XEN_ELFNOTE_PHYS32_ENTRY: "Xen", the entry.
+    for v in [4u32, 4, 18] {
+        segment.extend_from_slice(&v.to_le_bytes());
+    }
+    segment.extend_from_slice(b"Xen\0");
+    segment.extend_from_slice(&BASE.to_le_bytes());
+    segment.extend_from_slice(serial);
+    segment.extend_from_slice(&grix_abi::abi_marker());
+    let mut elf = Vec::new();
+    elf.extend_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
+    elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf.extend_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&(BASE as u64).to_le_bytes()); // entry
+    elf.extend_from_slice(&64u64.to_le_bytes()); // program headers
+    elf.extend_from_slice(&0u64.to_le_bytes()); // no section headers
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    for v in [64u16, 56, 2, 64, 0, 0] {
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    let len = segment.len() as u64;
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&7u32.to_le_bytes()); // rwx
+    for v in [0x1000, BASE as u64, BASE as u64, len, len, 0x1000] {
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.extend_from_slice(&4u32.to_le_bytes()); // PT_NOTE
+    elf.extend_from_slice(&4u32.to_le_bytes());
+    let at = (note - BASE) as u64;
+    for v in [0x1000 + at, note as u64, note as u64, 20, 20, 4] {
         elf.extend_from_slice(&v.to_le_bytes());
     }
     elf.resize(0x1000, 0);
@@ -1882,8 +1969,10 @@ fn the_default_vmm() {
         .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next()?.trim().parse::<u32>().ok())
         .is_some_and(|v| v >= 15);
-    let native =
-        cfg!(target_arch = "aarch64") && (cfg!(target_os = "macos") && macos_15 || cfg!(target_os = "linux") && kvm);
+    // grix-vmm runs arm64 guests (on arm64 hosts).
+    let native = cfg!(target_arch = "aarch64")
+        && !x86_64_guest()
+        && (cfg!(target_os = "macos") && macos_15 || cfg!(target_os = "linux") && kvm);
     if native && !qemu_asked {
         let vmm = Sandbox::builder().vmm_path().map(Path::to_path_buf);
         assert!(vmm.as_ref().is_some_and(|p| p.is_file()), "grix-vmm not found: run `make vmm`");
@@ -2098,10 +2187,25 @@ fn snapshots_with_more_cpus() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// What user code may set in its own registers stays out of the kernel
+/// (x86_64: RFLAGS.NT across a system call, a thread pointer that isn't a
+/// user address).
+#[test]
+fn user_registers_stay_out_of_the_kernel() {
+    let out = run(with("regs").allow(Capability::Process), &["/bin/regs"]);
+    assert_eq!(out.stdout_str(), "regs ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// More CPUs: programs see them, threads run in parallel on them, and
 /// execve and exit work while other threads spin on other CPUs.
 #[test]
 fn threads_run_in_parallel_on_more_cpus() {
+    // One CPU on x86_64 (yet).
+    if x86_64_guest() {
+        return;
+    }
     let b = || with("smp").allow(Capability::Threads).allow(Capability::Process);
     for cpus in [1, 4] {
         let out = run(b().cpus(cpus), &["/bin/smp"]);
@@ -2138,6 +2242,10 @@ fn threads_run_in_parallel_on_more_cpus() {
 /// qemu-x86_64, user mode), the way binfmt_misc runs them on Linux.
 #[test]
 fn x86_64_programs_run_through_a_translator() {
+    // An x86_64 kernel runs them itself.
+    if x86_64_guest() {
+        return;
+    }
     let qemu = fixture("qemu-x86_64/usr/bin/qemu-x86_64");
     let b = || with("hello-x86_64").env("GREETING", "from x86_64").allow(Capability::Threads);
     let out = run(b().x86_64(&qemu).unwrap(), &["/bin/hello-x86_64", "world"]);

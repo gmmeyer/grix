@@ -198,7 +198,7 @@ pub fn log(args: fmt::Arguments) {
 pub fn start(stdin_from_host: bool) {
     let mut guard = CONSOLE.lock();
     let c = guard.as_mut().expect("console not initialised");
-    crate::arch::irq::enable_spi(c.dev.irq);
+    crate::arch::irq::enable_device_irq(c.dev.irq);
     if stdin_from_host {
         c.stdin.eof = false;
     }

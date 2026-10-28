@@ -141,6 +141,23 @@ pub fn setitimer(p: &mut Process, which: u64, new: u64, old: u64) -> SysResult {
     Ok(0)
 }
 
+/// alarm (x86_64's): ITIMER_REAL in `secs` seconds (0 disarms it); the
+/// seconds the last one had left, rounded as Linux does (and 1 for any
+/// less than half a second).
+#[cfg(target_arch = "x86_64")]
+pub fn alarm(p: &mut Process, secs: u64) -> SysResult {
+    let left = p.timers.real.remaining(time::monotonic_ns());
+    let old = match (left / 1_000_000_000, left % 1_000_000_000) {
+        (s, ns) if ns >= 500_000_000 => s + 1,
+        (0, ns) if ns > 0 => 1,
+        (s, _) => s,
+    };
+    let timing = arm(p, 1, None, 0, 0, secs.saturating_mul(1_000_000_000));
+    p.timers.real = timing;
+    p.timer_dirty = true;
+    Ok(old)
+}
+
 // ---------------------------------------------------------------- POSIX timers
 
 pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResult {

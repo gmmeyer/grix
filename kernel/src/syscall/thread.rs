@@ -68,6 +68,10 @@ pub fn clone3(p: &mut Process, tf: &TrapFrame, uargs: u64, size: u64) -> SysResu
 fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResult {
     let (name, _) = super::table::info(n);
     let flags = args.flags;
+    // As arch_prctl(ARCH_SET_FS) would refuse it (Linux's copy_thread).
+    if flags & CLONE_SETTLS != 0 && !arch::valid_tls(args.tls) {
+        return Err(EPERM);
+    }
     if flags & CLONE_NAMESPACES != 0 {
         return p.deny(n, name, "privileged", "new namespaces");
     }

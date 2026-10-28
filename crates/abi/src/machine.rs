@@ -1,7 +1,8 @@
 //! The machine the kernel runs on: where its devices are, for the VMM that
-//! makes it (QEMU `virt` or `grix-vmm`) and the kernel that drives it.
+//! makes it (QEMU or `grix-vmm`) and the kernel that drives it. The items
+//! at the top are arm64's; x86_64's are in [`x86_64`].
 //!
-//! It's QEMU `virt`'s layout, which `grix-vmm` follows too, except for the
+//! On arm64 it's QEMU `virt`'s layout, which `grix-vmm` follows too, except for the
 //! GIC redistributors: the boot image's header says where they are
 //! ([`image::Header::gicr`](crate::image::Header)). Everything is below
 //! [`RAM_BASE`](crate::image::RAM_BASE), which the kernel maps as device
@@ -50,3 +51,25 @@ pub const CONSOLE_PORT: u32 = 1;
 pub const CONSOLE_RX: u32 = 2 * CONSOLE_PORT + 2;
 pub const CONSOLE_TX: u32 = 2 * CONSOLE_PORT + 3;
 pub const CONSOLE_CONTROL_TX: u32 = 3;
+
+/// The x86_64 machine: QEMU `microvm`'s layout (with `ioapic2=off`), which
+/// `grix-vmm` on x86 KVM follows too. RAM starts at 0 (up to
+/// [`image::MAX_RAM`](crate::image::MAX_RAM), below the devices); the
+/// kernel is loaded at 2 MiB and the boot image at [`x86_64::IMAGE_BASE`].
+pub mod x86_64 {
+    pub const RAM_BASE: u64 = 0;
+    pub const IMAGE_BASE: u64 = 0x0800_0000;
+
+    /// The 16550 UART's I/O ports (COM1).
+    pub const UART_PORT: u16 = 0x3f8;
+
+    /// virtio-mmio transports, as on `microvm`: transport `i` at
+    /// `VIRTIO + i * VIRTIO_STRIDE`, on IOAPIC pin (GSI) `VIRTIO_GSI + i`.
+    pub const VIRTIO: u64 = 0xfeb0_0000;
+    pub const VIRTIO_STRIDE: u64 = 0x200;
+    pub const VIRTIO_SLOTS: u64 = 8;
+    pub const VIRTIO_GSI: u32 = 5;
+
+    pub const IOAPIC: u64 = 0xfec0_0000;
+    pub const LAPIC: u64 = 0xfee0_0000;
+}
