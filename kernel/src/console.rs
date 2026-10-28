@@ -375,8 +375,19 @@ pub fn take_all_input() -> bool {
     quiet
 }
 
-/// Take stdin bytes into `out`.
+/// The program waits for input from the host (for a snapshot's moment).
+pub fn mark_stdin_waited() {
+    STDIN_WAITED.store(true, Ordering::Relaxed);
+}
+
+/// Take stdin bytes into `out`: the program reading it.
 pub fn stdin_read(out: &mut [u8]) -> StdinRead {
+    stdin_take(out, true)
+}
+
+/// Take stdin bytes into `out`; finding none counts as the program
+/// waiting for input if `program` (TTY mode's pump isn't the program).
+pub fn stdin_take(out: &mut [u8], program: bool) -> StdinRead {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return StdinRead::Eof };
     // Pick up anything that arrived since the last interrupt.
@@ -386,7 +397,9 @@ pub fn stdin_read(out: &mut [u8]) -> StdinRead {
         if s.eof {
             StdinRead::Eof
         } else {
-            STDIN_WAITED.store(true, Ordering::Relaxed);
+            if program {
+                STDIN_WAITED.store(true, Ordering::Relaxed);
+            }
             StdinRead::Empty
         }
     } else {

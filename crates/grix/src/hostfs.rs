@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};
 use grix_abi::wire::{self, Input};
 
@@ -42,6 +42,8 @@ const ESTALE: u16 = 116;
 
 /// Ids the host keeps track of (everything listed or created).
 const MAX_IDS: usize = 1_000_000;
+/// `Server::save`'s format.
+const STATE_VERSION: u32 = 1;
 /// Directory entries of lazy imports kept as first listed.
 const MAX_FROZEN: usize = 4_000_000;
 /// Files kept open between requests.
@@ -276,6 +278,119 @@ impl Server {
             listing: None,
             assembler: Assembler::default(),
         })
+    }
+
+    /// What a snapshot keeps of the server, for runs restored from it:
+    /// the ids it gave out (each a name in its parent), and what the guest
+    /// first saw of lazy imports. Not open files: they're opened again.
+    pub fn save(&self) -> Vec<u8> {
+        use grix_abi::codec::Writer;
+        let mut w = Writer::default();
+        w.u32(STATE_VERSION);
+        w.u32(self.roots.len() as u32);
+        w.u64(self.next_id);
+        let mut nodes: Vec<(&u64, &Node)> = self.nodes.iter().collect();
+        nodes.sort_by_key(|(id, _)| **id);
+        w.u32(nodes.len() as u32);
+        for (id, n) in nodes {
+            w.u64(*id);
+            w.u64(n.parent);
+            w.str(&n.name);
+        }
+        // In order of id, so the same state saves the same.
+        let mut attrs: Vec<(&u64, &Attr)> = self.attrs.iter().collect();
+        attrs.sort_by_key(|(id, _)| **id);
+        w.u32(attrs.len() as u32);
+        for (id, a) in attrs {
+            w.u64(*id);
+            a.put(&mut w);
+        }
+        let mut frozen: Vec<_> = self.frozen.iter().collect();
+        frozen.sort_by_key(|(id, _)| **id);
+        w.u32(frozen.len() as u32);
+        for (dir, entries) in frozen {
+            w.u64(*dir);
+            w.u32(entries.len() as u32);
+            for (name, attr, target) in entries {
+                w.str(name);
+                attr.put(&mut w);
+                w.str(target);
+            }
+        }
+        w.buf
+    }
+
+    /// A server for `mounts` that goes on from `state` (`save`'s). It may
+    /// come from anyone's snapshot file: every name is one plain component,
+    /// every id's parent came before it, and nothing exceeds the limits, or
+    /// it's refused.
+    pub fn restore(mounts: &[LiveMount], state: &[u8]) -> Result<Server> {
+        use grix_abi::codec::Reader;
+        let mut s = Server::new(mounts)?;
+        let bad = |what: &str| anyhow::anyhow!("the snapshot's mount state is bad ({what})");
+        let mut r = Reader::new(state);
+        let d = |_| bad("cut off");
+        if r.u32().map_err(d)? != STATE_VERSION {
+            return Err(bad("version"));
+        }
+        if r.u32().map_err(d)? as usize != s.roots.len() {
+            bail!("the snapshot had another number of live mounts");
+        }
+        let roots = s.roots.len() as u64;
+        let next_id = r.u64().map_err(d)?;
+        let n = r.u32().map_err(d)? as usize;
+        if n > MAX_IDS || next_id > roots + 1 + MAX_IDS as u64 * 4 {
+            return Err(bad("too many ids"));
+        }
+        let mut last = roots;
+        for _ in 0..n {
+            let (id, parent) = (r.u64().map_err(d)?, r.u64().map_err(d)?);
+            let name = r.str().map_err(d)?;
+            cname(name).map_err(|_| bad("a name"))?;
+            // Sorted, and each after the one it's in.
+            if id <= last || id >= next_id || parent >= id || (parent > roots && !s.nodes.contains_key(&parent)) {
+                return Err(bad("an id"));
+            }
+            if parent == 0 || s.by_name.insert((parent, name.to_string()), id).is_some() {
+                return Err(bad("a parent"));
+            }
+            s.nodes.insert(id, Node { parent, name: name.to_string() });
+            last = id;
+        }
+        s.next_id = next_id.max(roots + 1);
+        let known = |s: &Server, id: u64| (1..=roots).contains(&id) || s.nodes.contains_key(&id);
+        let n = r.u32().map_err(d)? as usize;
+        if n > MAX_IDS {
+            return Err(bad("too many attributes"));
+        }
+        for _ in 0..n {
+            let id = r.u64().map_err(d)?;
+            let a = Attr::get(&mut r).map_err(d)?;
+            if !known(&s, id) || !s.is_lazy(id) {
+                return Err(bad("an attribute"));
+            }
+            s.attrs.insert(id, a);
+        }
+        let n = r.u32().map_err(d)? as usize;
+        for _ in 0..n {
+            let dir = r.u64().map_err(d)?;
+            let count = r.u32().map_err(d)? as usize;
+            if !known(&s, dir) || !s.is_lazy(dir) || s.frozen_entries + count > MAX_FROZEN {
+                return Err(bad("a listing"));
+            }
+            let mut entries = Vec::with_capacity(count.min(4096));
+            for _ in 0..count {
+                let name = r.str().map_err(d)?;
+                cname(name).map_err(|_| bad("a listed name"))?;
+                let attr = Attr::get(&mut r).map_err(d)?;
+                let target = r.str().map_err(d)?;
+                entries.push((name.to_string(), attr, target.to_string()));
+            }
+            s.frozen_entries += count;
+            s.frozen.insert(dir, entries);
+        }
+        r.done().map_err(d)?;
+        Ok(s)
     }
 
     /// A `Channel::Fs` frame from the guest. Returns the frames of the
@@ -892,6 +1007,44 @@ mod tests {
         assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(attr) if attr.size == 5));
         let r = req(&mut s, Request::Read { id: a, off: 0, len: 100 });
         assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EIO));
+        // Saved in a snapshot and restored: the same ids, and the same view.
+        let m = || LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: false, lazy: true };
+        let state = s.save();
+        let mut back = Server::restore(&[m()], &state).unwrap();
+        assert_eq!(names(&mut back), first);
+        let r = req(&mut back, Request::Read { id: a, off: 0, len: 100 });
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EIO));
+        assert_eq!(back.save(), state);
+        // A file from anyone: names that would leave the mount, ids out of
+        // order or unknown, too many mounts, or garbage are refused.
+        use grix_abi::codec::Writer;
+        let crafted = |nodes: &[(u64, u64, &str)], roots: u32| {
+            let mut w = Writer::default();
+            w.u32(STATE_VERSION);
+            w.u32(roots);
+            w.u64(100);
+            w.u32(nodes.len() as u32);
+            for (id, parent, name) in nodes {
+                w.u64(*id);
+                w.u64(*parent);
+                w.str(name);
+            }
+            w.u32(0);
+            w.u32(0);
+            w.buf
+        };
+        assert!(Server::restore(&[m()], &crafted(&[(2, 1, "ok"), (3, 2, "fine")], 1)).is_ok());
+        for bad in [
+            crafted(&[(2, 1, "..")], 1),
+            crafted(&[(2, 1, "a/b")], 1),
+            crafted(&[(3, 1, "a"), (2, 3, "b")], 1),
+            crafted(&[(2, 7, "a")], 1),
+            crafted(&[(2, 1, "a"), (3, 1, "a")], 1),
+            crafted(&[(2, 1, "a")], 2),
+            vec![1, 2, 3],
+        ] {
+            assert!(Server::restore(&[m()], &bad).is_err());
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

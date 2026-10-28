@@ -1896,6 +1896,89 @@ fn the_default_vmm() {
 /// A machine saved when its program first waits for input, and runs from
 /// there: each its own (stdin, randomness), at the right time of day.
 #[test]
+fn snapshots_in_tty_mode() {
+    // An interactive shell, saved at its prompt: each run types into its
+    // terminal, whose size is the runner's.
+    let b = Sandbox::builder()
+        .cpus(1)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .env("PS1", "$ ")
+        .timeout(Duration::from_secs(30))
+        .tty(24, 80);
+    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let dir = temp_dir("ttysnap");
+    let snap = b.build().unwrap().snapshot(&["/bin/busybox", "sh", "-i"], dir.join("sh.snap")).unwrap();
+    assert!(snap.tty());
+    for (rows, cols) in [(33, 111), (40, 120)] {
+        let control = RunControl::new();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let c = control.clone();
+        std::thread::spawn(move || {
+            // Once it runs: the size, then the typing.
+            while !c.resize(rows, cols) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = tx.send(b"/bin/busybox stty size; echo $((6*7)); exit\n".to_vec());
+        });
+        let out = snap.clone().control(&control).run_streaming(Typed(rx, Vec::new()), |_, _| {}).unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+        let stdout = out.stdout_str();
+        assert!(stdout.contains(&format!("\r\n{rows} {cols}\r\n42\r\n")), "{stdout:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshots_with_live_mounts() {
+    // A live mount and a lazy import, used before the snapshot and after:
+    // each run gives their host directories again (read-only if it likes).
+    let dir = temp_dir("mountsnap");
+    let (work, lazy) = (dir.join("work"), dir.join("lazy"));
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&lazy).unwrap();
+    std::fs::write(work.join("a.txt"), "A\n").unwrap();
+    std::fs::write(lazy.join("b.txt"), "B\n").unwrap();
+    let b = Sandbox::builder()
+        .cpus(1)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .mount(&work, "/work")
+        .unwrap()
+        .import_lazy(&lazy, "/lazy")
+        .unwrap()
+        .timeout(Duration::from_secs(30));
+    if b.vmm_path().is_none() || !cfg!(target_os = "macos") {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let script = "/bin/busybox cat /work/a.txt; /bin/busybox ls /lazy; read line; \
+                  /bin/busybox cat /work/a.txt /lazy/b.txt; echo \"$line\" > /work/out.txt; echo done";
+    let snap = b.build().unwrap().snapshot(&["/bin/busybox", "sh", "-c", script], dir.join("s.snap")).unwrap();
+    assert_eq!(snap.live_mounts_needed(), [("/work", true), ("/lazy", false)]);
+    // Without its mounts, a run is refused.
+    let err = snap.run("x\n").unwrap_err();
+    assert!(err.to_string().contains("give it a host directory"), "{err}");
+    std::fs::write(work.join("a.txt"), "A2\n").unwrap();
+    let out = snap.clone().mount(&work, "/work").unwrap().mount(&lazy, "/lazy").unwrap().run("one\n").unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.stdout_str(), "A2\nB\ndone\n");
+    assert_eq!(std::fs::read_to_string(work.join("out.txt")).unwrap(), "one\n");
+    // Read-only this time: the write fails.
+    let out =
+        snap.clone().mount_read_only(&work, "/work").unwrap().mount(&lazy, "/lazy").unwrap().run("two\n").unwrap();
+    assert_eq!(out.stdout_str(), "A2\nB\ndone\n");
+    assert!(out.stderr_str().contains("Read-only"), "{}", out.stderr_str());
+    assert_eq!(std::fs::read_to_string(work.join("out.txt")).unwrap(), "one\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn snapshots_resume_where_the_program_waited() {
     // Snapshots are of one CPU (whatever GRIX_CPUS says).
     let b = Sandbox::builder()

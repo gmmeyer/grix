@@ -836,6 +836,19 @@ static HOST_EOF: AtomicBool = AtomicBool::new(false);
 /// and a new size in. When the host's stdin ends, a canonical-mode reader
 /// gets end-of-file, as util-linux's script gives it (VEOF, twice if a
 /// line was being typed); in raw mode nothing more comes.
+/// Is `tty` the console's terminal (TTY mode's /dev/pts/0)?
+pub fn is_console(tty: &TtyRef) -> bool {
+    CONSOLE_TTY.lock().as_ref().is_some_and(|c| Arc::ptr_eq(c, tty))
+}
+
+/// The program found its terminal with nothing to read: in TTY mode,
+/// that's waiting for the host's input (a snapshot's moment).
+pub fn waiting_on(tty: &TtyRef) {
+    if is_console(tty) {
+        crate::console::mark_stdin_waited();
+    }
+}
+
 fn pump(cur: &mut Process, procs: &mut Procs) {
     let Some(tty) = CONSOLE_TTY.lock().clone() else { return };
     if let Some((rows, cols)) = crate::console::take_resize() {
@@ -850,7 +863,7 @@ fn pump(cur: &mut Process, procs: &mut Procs) {
         if room == 0 || tty.lock().hung_up() {
             break;
         }
-        match crate::console::stdin_read(&mut buf[..room]) {
+        match crate::console::stdin_take(&mut buf[..room], false) {
             crate::console::StdinRead::Data(n) => {
                 let (_, sigs) = tty.lock().receive(&buf[..n]);
                 for (pgrp, sig) in sigs {

@@ -57,6 +57,7 @@ pub fn take_if_wanted() {
             }
             crate::rng::reseed(&entropy);
             crate::time::resumed_after(x5);
+            crate::fs::lock().forget_live();
             klog!("restored from a snapshot\n");
         }
         // Input arrived as it was being taken: next time.

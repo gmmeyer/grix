@@ -102,6 +102,11 @@ pub fn lookup(dir: u64, name: &str) -> Result<Entry, Errno> {
     })
 }
 
+/// What was read ahead goes (a restored snapshot: it may be old).
+pub fn forget_kept() {
+    KEPT.lock().clear();
+}
+
 /// Bytes of file `id` at `off` into `out`; fewer at the end of the file.
 pub fn read(id: u64, off: u64, out: &mut [u8]) -> Result<usize, Errno> {
     let now = crate::time::monotonic_ns();

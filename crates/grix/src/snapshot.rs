@@ -10,9 +10,12 @@
 //!
 //! What the program set up for itself before the snapshot is shared by
 //! every run: a random seed it drew then, say. And what the host holds for
-//! a run isn't saved, so the snapshot waits until the program has no
+//! a run isn't all saved, so the snapshot waits until the program has no
 //! connections or DNS lookups open through the host, and sandboxes with
-//! mounts can't take one.
+//! on-exit mounts can't take one. Live mounts are kept (what the host
+//! knows of them: the names it gave ids, and what the guest first saw of
+//! lazy imports); each run gives them their host directories again
+//! ([`Snapshot::mount`]).
 //!
 //! Snapshots need grix's own VMM on macOS (Hypervisor.framework).
 //!
@@ -33,7 +36,9 @@ use crate::sandbox::RunOutput;
 pub(crate) const FOOTER: &[u8; 8] = b"GRIXSNPH";
 /// The VMM's part starts with this once it's complete.
 pub(crate) const VMM_MAGIC: &[u8; 8] = b"GRIXSNP1";
-const MAX_SETTINGS: u64 = 1 << 20;
+/// The settings, live mounts' state included (lazy imports remember what
+/// the guest saw of them).
+const MAX_SETTINGS: u64 = 256 << 20;
 
 /// What the host side of a restored run needs to be the same as the run
 /// that took the snapshot.
@@ -52,6 +57,23 @@ pub(crate) struct Settings {
     pub timeout_ms: u64,
     pub grace_ms: u64,
     pub memory_mb: u64,
+    /// Taken in TTY mode: the program's stdio is a terminal.
+    #[serde(default)]
+    pub tty: bool,
+    /// Live mounts, in the order the guest numbers them, and the host
+    /// side's state for them (`hostfs::Server::save`, base64).
+    #[serde(default)]
+    pub live: Vec<SavedMount>,
+    #[serde(default)]
+    pub fs_state: String,
+}
+
+/// A live mount a snapshot has, which each run gives a host directory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SavedMount {
+    pub guest: String,
+    pub writable: bool,
+    pub lazy: bool,
 }
 
 /// A saved machine to run from (see the module docs).
@@ -64,6 +86,8 @@ pub struct Snapshot {
     pub(crate) control: Option<crate::RunControl>,
     /// Guest RAM, as the VMM's header says (what a restored run maps).
     ram_size: u64,
+    /// Host directories for its live mounts: (host, guest, read-only).
+    mounts: Vec<(PathBuf, String, bool)>,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -112,7 +136,15 @@ impl Snapshot {
             );
         }
         let timeout = Duration::from_millis(settings.timeout_ms);
-        Ok(Snapshot { path, settings, timeout, vmm: crate::sandbox::default_vmm(), control: None, ram_size })
+        Ok(Snapshot {
+            path,
+            settings,
+            timeout,
+            vmm: crate::sandbox::default_vmm(),
+            control: None,
+            ram_size,
+            mounts: Vec::new(),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -153,6 +185,77 @@ impl Snapshot {
         s.max_export = s.max_export.min(max_export);
         s.grace_ms = s.grace_ms.min(grace.as_millis() as u64);
         self
+    }
+
+    /// The live mounts each run needs a host directory for (`mount`): guest
+    /// path, and whether it's writable.
+    pub fn live_mounts_needed(&self) -> Vec<(&str, bool)> {
+        self.settings.live.iter().map(|m| (m.guest.as_str(), m.writable)).collect()
+    }
+
+    /// Give live mount `guest` its host directory `host` for runs from
+    /// here (each needs one): writable if it was.
+    pub fn mount(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, false)
+    }
+
+    /// Like [`mount`](Snapshot::mount), but read-only whatever it was
+    /// (the program's writes there fail with EROFS).
+    pub fn mount_read_only(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        self.mount_with(host, guest, true)
+    }
+
+    fn mount_with(mut self, host: impl AsRef<Path>, guest: &str, read_only: bool) -> Result<Self> {
+        let host = host.as_ref();
+        if !self.settings.live.iter().any(|m| m.guest == guest) {
+            let have: Vec<&str> = self.settings.live.iter().map(|m| m.guest.as_str()).collect();
+            bail!("the snapshot has no live mount at {guest} (it has {have:?})");
+        }
+        let real = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
+        if !real.is_dir() {
+            bail!("{} isn't a directory", host.display());
+        }
+        self.mounts.retain(|m| m.1 != guest);
+        self.mounts.push((real, guest.to_string(), read_only));
+        Ok(self)
+    }
+
+    /// The live mounts for a run, in the guest's order, and the host side's
+    /// state for them.
+    pub(crate) fn live_mounts(&self) -> Result<(Vec<crate::hostfs::LiveMount>, Option<Vec<u8>>)> {
+        if self.settings.live.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let mut live = Vec::new();
+        for m in &self.settings.live {
+            let Some((host, _, read_only)) = self.mounts.iter().find(|x| x.1 == m.guest) else {
+                bail!(
+                    "the snapshot has a live mount at {}: give it a host directory (Snapshot::mount, --mount HOST:{})",
+                    m.guest,
+                    m.guest
+                );
+            };
+            live.push(crate::hostfs::LiveMount {
+                host: host.clone(),
+                guest: m.guest.clone(),
+                writable: m.writable && !read_only,
+                lazy: m.lazy,
+            });
+        }
+        let state = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(&self.settings.fs_state)
+                .context("the snapshot's mount state is bad")?
+        };
+        Ok((live, Some(state)))
+    }
+
+    /// Taken in TTY mode: the program's stdio is a terminal (its size comes
+    /// from [`RunControl::resize`](crate::RunControl::resize)), and stdin
+    /// is what's typed into it.
+    pub fn tty(&self) -> bool {
+        self.settings.tty
     }
 
     /// The directories a run from here sends back when the program ends
@@ -236,8 +339,19 @@ mod tests {
             timeout_ms: 1000,
             grace_ms: u64::MAX,
             memory_mb: 512,
+            tty: false,
+            live: vec![],
+            fs_state: String::new(),
         };
-        Snapshot { path: "x".into(), settings, timeout: Duration::ZERO, vmm: None, control: None, ram_size: 0 }
+        Snapshot {
+            path: "x".into(),
+            settings,
+            timeout: Duration::ZERO,
+            vmm: None,
+            control: None,
+            ram_size: 0,
+            mounts: vec![],
+        }
     }
 
     /// Whatever the file says, a caller's network policy and limits win.

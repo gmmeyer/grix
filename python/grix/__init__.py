@@ -254,7 +254,8 @@ class Sandbox:
         """Start ``command`` (or the image's) and save the whole machine to
         ``path`` when it first waits for input; each :meth:`Snapshot.run`
         then starts from there, in milliseconds. Needs grix's own VMM
-        (macOS 15+); the sandbox can't have mounts."""
+        (macOS 15+); the sandbox can't have on-exit mounts, and its live
+        mounts need their host directories again (``Snapshot.mounts``)."""
         if native(self.grix):
             try:
                 _native.snapshot(self._config(), os.fspath(path), list(command or []))
@@ -274,11 +275,14 @@ class Sandbox:
 @dataclass
 class Snapshot:
     """A machine :meth:`Sandbox.snapshot` saved: each :meth:`run` goes on
-    from where the program waited for input, with its own stdin."""
+    from where the program waited for input, with its own stdin. Its live
+    mounts need their host directories again: ``mounts`` lists ``(host,
+    guest)`` or ``(host, guest, "ro")``."""
 
     path: PathLike
     timeout: Optional[float] = None
     grix: Optional[PathLike] = None
+    mounts: Sequence[tuple] = ()
 
     def run(
         self,
@@ -290,12 +294,16 @@ class Snapshot:
         if native(self.grix):
             data = stdin.encode() if isinstance(stdin, str) else stdin
             inner = control._inner if control is not None else None
+            mounts = [(os.fspath(m[0]), m[1], m[2] if len(m) > 2 else "rw") for m in self.mounts]
             return _native_result(
-                _native.snapshot_run, os.fspath(self.path), _install_dir(), data, self.timeout, on_output, inner
+                _native.snapshot_run, os.fspath(self.path), _install_dir(), data, self.timeout, on_output, inner, mounts
             )
         if control is not None:
             raise GrixError("Control needs grix's native module (make python)")
         argv = [find_grix(self.grix), "run", "--json", "--quiet", "--snapshot", os.fspath(self.path)]
+        for m in self.mounts:
+            host, guest, *mode = m
+            argv += ["--mount", f"{os.fspath(host)}:{guest}" + (f":{mode[0]}" if mode else "")]
         if self.timeout is not None:
             argv += ["--timeout", str(max(1, int(round(self.timeout))))]
         if stdin is None:

@@ -426,8 +426,9 @@ fn tools(config: &McpConfig) -> Value {
     run_schema["properties"]["stdin"] = json!({"type": "string"});
     run_schema["properties"]["snapshot"] = json!({"type": "string",
         "description": "Run from this snapshot (from the `snapshot` tool) instead: the program goes on from where it \
-                        waited, with `stdin`. Then only stdin and timeout_secs apply; what comes back is what the \
-                        snapshot's sandbox exported."});
+                        waited, with `stdin`. Then only stdin, timeout_secs and mounts apply (each of the snapshot's \
+                        live mounts needs its host directory again); what comes back is what the snapshot's sandbox \
+                        exported."});
     json!([
         {
             "name": "run",
@@ -443,7 +444,7 @@ fn tools(config: &McpConfig) -> Value {
         },
         {
             "name": "snapshot",
-            "description": "Start a program in a sandbox (the same options as `run`, but no mounts) and save the whole \
+            "description": "Start a program in a sandbox (the same options as `run`, but no on_exit mounts) and save the whole \
                             machine when it first waits for input, so each `run` with `snapshot` starts from there in \
                             milliseconds: start an interpreter that reads code from stdin, say, once its libraries are \
                             loaded. Needs a writable server.",
@@ -536,9 +537,19 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
         Some(path) => {
             // Whoever wrote the file, runs from it get only the network
             // this server allows.
-            let snap = crate::Snapshot::open(config.host_path(path)?)?
+            let mut snap = crate::Snapshot::open(config.host_path(path)?)?
                 .restrict_net(config.capabilities.contains(&Capability::Net), &config.allow_hosts)?
                 .limits(OUTPUT_MAX * 4, EXPORT_LIMIT, Duration::from_secs(5));
+            // Its live mounts' host directories, under the roots; writable
+            // only if this server lets agents change host files.
+            for m in args["mounts"].as_array().into_iter().flatten() {
+                let host = config.host_path(m["host"].as_str().context("mount without host")?)?;
+                let guest = m["guest"].as_str().context("mount without guest")?;
+                let writable = m["mode"].as_str().unwrap_or("rw") == "rw"
+                    && config.writable
+                    && config.capabilities.contains(&Capability::FsWrite);
+                snap = if writable { snap.mount(host, guest)? } else { snap.mount_read_only(host, guest)? };
+            }
             // It sends back what it was made to export.
             for e in strings(&args["exports"]) {
                 if !snap.exports().contains(&e) {
@@ -571,8 +582,8 @@ fn snapshot(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(S
     if !config.writable {
         bail!("this server doesn't write host files (it isn't --writable), so it can't save snapshots");
     }
-    if args["mounts"].as_array().is_some_and(|m| !m.is_empty()) {
-        bail!("a snapshot can't have mounts");
+    if args["mounts"].as_array().into_iter().flatten().any(|m| m["mode"] == "on_exit") {
+        bail!("a snapshot can't have on_exit mounts");
     }
     let out = output_path(config, args)?;
     let (sandbox, command) = sandbox(config, args, control)?;

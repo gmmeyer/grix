@@ -40,6 +40,8 @@ pub(crate) struct VmConfig {
     pub cpus: u32,
     /// Take a snapshot into this file, or run the one in it.
     pub snapshot: Option<SnapshotFile>,
+    /// A restored run's live mounts go on from this (`hostfs::Server::save`).
+    pub fs_state: Option<Vec<u8>>,
 }
 
 /// A snapshot file for the VMM (as its fd 3).
@@ -185,6 +187,8 @@ pub(crate) struct VmRun {
     /// The time ran out (the program may have ended on the SIGTERM sent
     /// then).
     pub timed_out: bool,
+    /// For a run that takes a snapshot: its live mounts' state.
+    pub fs_state: Option<Vec<u8>>,
 }
 
 /// How often a run with a `RunControl` looks for `stop`.
@@ -222,7 +226,10 @@ pub(crate) fn run(
     // before QEMU starts, so a busy one fails the run at once.
     let to_guest = Outbox::new();
     let proxy = Proxy::start(cfg.net.clone(), to_guest.clone())?;
-    let fs = crate::hostfs::Server::new(&cfg.live)?;
+    let fs = match &cfg.fs_state {
+        Some(state) => crate::hostfs::Server::restore(&cfg.live, state)?,
+        None => crate::hostfs::Server::new(&cfg.live)?,
+    };
     let uart_path = temp_path("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;
@@ -410,7 +417,7 @@ fn run_vm(
                 None => VmEnd::Timeout,
             };
             timed_out |= matches!(end, VmEnd::Timeout);
-            return Ok(VmRun { end, events: proxy.stop(), timed_out });
+            return Ok(VmRun { end, events: proxy.stop(), timed_out, fs_state: None });
         }
         let left = deadline.saturating_duration_since(Instant::now());
         let wait = if live.is_some() { left.min(STOP_POLL) } else { left };
@@ -445,5 +452,6 @@ fn run_vm(
         Some((kind, code)) => VmEnd::Exited { kind, code },
         None => VmEnd::Lost { vmm_status: status.code(), vmm_stderr },
     };
-    Ok(VmRun { end, events, timed_out })
+    let fs_state = matches!(cfg.snapshot, Some(SnapshotFile::Take(_))).then(|| fs.save());
+    Ok(VmRun { end, events, timed_out, fs_state })
 }

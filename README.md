@@ -170,7 +170,8 @@ size (the foreground group gets SIGWINCH), and the CLI follows its own
 terminal's. When the host's stdin ends, a program reading a line gets
 end-of-file, as with util-linux's `script`. In the CLI, a program that
 stops itself (Ctrl-Z with nothing to catch it, or vim's suspend) stops
-grix too, until `fg`. Snapshots don't take TTY mode yet.
+grix too, until `fg`. A snapshot can be taken in TTY mode (`grix snapshot
+-t`): an interactive shell or REPL at its prompt.
 
 Programs can make their own terminals too: `/dev/ptmx` and `/dev/pts/N`
 (`posix_openpt`, `openpty`, Python's `pty`), with Linux's line discipline
@@ -405,10 +406,15 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   that was waiting still has its 5 seconds). What the program drew for
   itself before the snapshot (a random seed, say) is the same in every
   run.
-- The snapshot is taken once the program has found stdin empty and waits.
-  What the host holds for a run isn't saved, so it waits until the
-  program has no connections or DNS lookups open through the host, and
-  sandboxes with mounts can't take one.
+- The snapshot is taken once the program has found stdin empty and waits
+  (or, in TTY mode, its terminal: `grix snapshot -t`, then `grix run
+  --snapshot FILE -t`, which sends the terminal's size). It waits until the
+  program has no connections or DNS lookups open through the host, whose
+  part isn't saved. Live mounts are (the names the host gave ids, and what
+  the guest first saw of lazy imports): each run gives them host
+  directories again (`--mount HOST:GUEST[:ro]`, `Snapshot::mount`), and
+  what the guest knew of them is fetched again. Sandboxes with on-exit
+  mounts can't take one.
 - The file holds the program's memory, so it's created readable only by
   you, and written fully before it replaces the old one.
 - Snapshots need grix-vmm on macOS (Hypervisor.framework). Runs from a

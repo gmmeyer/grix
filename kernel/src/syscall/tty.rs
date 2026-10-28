@@ -70,6 +70,7 @@ pub fn read(p: &mut Process, end: &PtyEnd, buf: u64, count: u64, nonblock: bool)
                 Some(line) => line,
                 None => {
                     drop(t);
+                    tty::waiting_on(&end.tty);
                     return would_block(p, nonblock);
                 }
             }
@@ -82,6 +83,7 @@ pub fn read(p: &mut Process, end: &PtyEnd, buf: u64, count: u64, nonblock: bool)
             let enough = if min == 0 || time > 0 { have > 0 } else { have >= min.min(max) };
             if !enough && !(nonblock && have > 0) {
                 drop(t);
+                tty::waiting_on(&end.tty);
                 if min == 0 && time == 0 {
                     return Ok(0);
                 }

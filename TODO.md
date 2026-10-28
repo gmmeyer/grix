@@ -45,7 +45,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     host too). Left: packet mode (`TIOCPKT`), `VMIN`+`VTIME`'s interbyte
     timer (any byte returns), orphaned process groups (SIGTSTP from a
     terminal isn't dropped, no SIGHUP when one with stopped members is
-    orphaned), snapshots in TTY mode, TTY mode over MCP and Python.
+    orphaned), TTY mode over MCP and Python.
 11. [x] **Shared file mappings and locks**: `MAP_SHARED` file mappings are
     the file's pages (writes go both ways, across fork; SIGBUS past the
     end, also after a truncate); `flock`, POSIX record locks (`F_GETLK`,
@@ -88,7 +88,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     of any process; three busy processes on four CPUs use 2.5 CPUs'
     worth, one at a time before). Left: finer locking than one kernel
     lock.
-18. **Snapshots**: on KVM, with more CPUs, with live mounts.
+18. [~] **Snapshots**: in TTY mode and with live mounts (each run gives
+    their host directories again). Left: on KVM, with more CPUs.
 19. **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
 20. **An outside security review** (after the above).
 

@@ -148,9 +148,10 @@ struct BuildArgs {
 struct RunArgs {
     /// Run from a snapshot (`grix snapshot`): the program goes on from where
     /// it waited for input, with this run's stdin. Of the other options,
-    /// only --timeout, --json, -v, -q, --no-stdin and --export apply (to say
-    /// where the snapshot's exports go).
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["image", "manifest", "imports", "mounts", "command"])]
+    /// only --timeout, --json, -v, -q, -t, --no-stdin, --export (to say
+    /// where the snapshot's exports go) and --mount (the host directories
+    /// for its live mounts; `:ro` makes one read-only) apply.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["image", "manifest", "imports", "command"])]
     snapshot: Option<PathBuf>,
     /// Run a grix image (`grix build`): its files, settings, command and kernel.
     #[arg(long, value_name = "IMAGE")]
@@ -223,7 +224,7 @@ struct RunArgs {
     /// and takes what you type, Ctrl-C and Ctrl-Z included: they reach the
     /// program through its terminal. If the program itself stops (Ctrl-Z
     /// with nothing to catch it), grix stops too, until `fg`.
-    #[arg(short = 't', long, conflicts_with_all = ["snapshot", "json"])]
+    #[arg(short = 't', long, conflicts_with_all = ["json"])]
     tty: bool,
     /// Kill the program (SIGSYS) instead of returning EPERM when it uses a capability it lacks.
     #[arg(long)]
@@ -328,7 +329,17 @@ fn run(args: RunArgs) -> Result<i32> {
         if let Some(s) = args.timeout {
             snap = snap.timeout(Duration::from_secs(s));
         }
-        forward_signals(control, args.quiet);
+        for spec in &args.mounts {
+            let (rest, read_only) = match spec.rsplit_once(':') {
+                Some((rest, "ro")) => (rest, true),
+                Some((rest, "rw" | "lazy")) => (rest, false),
+                _ => (spec.as_str(), false),
+            };
+            let (host, guest) =
+                rest.rsplit_once(':').with_context(|| format!("--mount {spec:?} must be HOST:GUEST[:ro]"))?;
+            snap = if read_only { snap.mount_read_only(host, guest)? } else { snap.mount(host, guest)? };
+        }
+        forward_signals(control.clone(), args.quiet);
         let exports: Vec<(String, PathBuf)> = args
             .exports
             .iter()
@@ -343,11 +354,18 @@ fn run(args: RunArgs) -> Result<i32> {
             }
         }
         let exports = grix::results::check_destinations(&exports, &[])?;
-        let stdin = !args.no_stdin && !std::io::stdin().is_terminal();
+        // A snapshot taken in TTY mode is a terminal's (`-t` is then ours).
+        let tty = snap.tty();
+        if args.tty && !tty {
+            bail!("the snapshot wasn't taken in TTY mode (grix snapshot -t)");
+        }
+        let stdin = !args.no_stdin && (tty || !std::io::stdin().is_terminal());
+        let raw = terminal(args.tty && stdin, &control, true);
         let input: Box<dyn std::io::Read + Send> =
             if stdin { Box::new(std::io::stdin()) } else { Box::new(std::io::empty()) };
         let out =
             if args.json { snap.run_streaming(input, |_, _| {})? } else { snap.run_streaming(input, write_stream)? };
+        drop(raw);
         return report(&args, out, &exports);
     }
     let p = prepare(&args)?;
@@ -355,25 +373,7 @@ fn run(args: RunArgs) -> Result<i32> {
     // Piped or redirected input goes to the program; a terminal only in
     // TTY mode (otherwise the program sees end-of-file).
     let stdin = !args.no_stdin && (args.tty || !std::io::stdin().is_terminal());
-    // TTY mode with our terminal: raw, so every key goes to the program's.
-    let raw = if args.tty && stdin && std::io::stdin().is_terminal() { RawTerminal::enter() } else { None };
-    if let Some(saved) = raw.as_ref().map(|r| r.0) {
-        follow_size(p.control.clone());
-        let c = p.control.clone();
-        p.control.on_event(move |e| {
-            if let GuestEvent::Stopped { .. } = e {
-                // As a shell does for a stopped job: our terminal back as
-                // it was, and grix stopped until `fg`; then the program
-                // goes on.
-                let _ = std::io::stdout().flush();
-                RawTerminal::set(&saved, false);
-                // SAFETY: raising a signal; its default action stops us.
-                unsafe { libc::raise(libc::SIGTSTP) };
-                RawTerminal::set(&saved, true);
-                c.signal(18);
-            }
-        });
-    }
+    let raw = terminal(args.tty && stdin, &p.control, false);
     let (sandbox, command) = (&p.sandbox, &p.command);
     let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
         if stdin {
@@ -385,6 +385,36 @@ fn run(args: RunArgs) -> Result<i32> {
     let out = if args.json { run(&mut |_, _| {})? } else { run(&mut write_stream)? };
     drop(raw);
     report(&args, out, &p.exports)
+}
+
+/// TTY mode with our terminal: raw, so every key goes to the program's,
+/// its size followed (`now`: sent at once too, for a restored snapshot,
+/// whose terminal was another's), and a stopped program stops us.
+fn terminal(wanted: bool, control: &RunControl, now: bool) -> Option<RawTerminal> {
+    if !wanted || !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let raw = RawTerminal::enter()?;
+    let saved = raw.0;
+    if now {
+        RESIZED.store(true, Ordering::SeqCst);
+    }
+    follow_size(control.clone());
+    let c = control.clone();
+    control.on_event(move |e| {
+        if let GuestEvent::Stopped { .. } = e {
+            // As a shell does for a stopped job: our terminal back as
+            // it was, and grix stopped until `fg`; then the program
+            // goes on.
+            let _ = std::io::stdout().flush();
+            RawTerminal::set(&saved, false);
+            // SAFETY: raising a signal; its default action stops us.
+            unsafe { libc::raise(libc::SIGTSTP) };
+            RawTerminal::set(&saved, true);
+            c.signal(18);
+        }
+    });
+    Some(raw)
 }
 
 /// Our terminal in raw mode (TTY mode), put back as it was when dropped.
@@ -445,9 +475,12 @@ fn follow_size(control: RunControl) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(50));
-            if RESIZED.swap(false, Ordering::SeqCst) {
+            // Until the run has started, a size waits.
+            if RESIZED.load(Ordering::SeqCst) {
                 let (rows, cols) = terminal_size();
-                control.resize(rows, cols);
+                if control.resize(rows, cols) {
+                    RESIZED.store(false, Ordering::SeqCst);
+                }
             }
         }
     });

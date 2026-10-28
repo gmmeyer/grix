@@ -865,7 +865,7 @@ impl Sandbox {
         stdin: Option<Box<dyn Read + Send>>,
         take: Option<std::fs::File>,
         on_output: impl FnMut(Stream, &[u8]),
-    ) -> Result<(RunOutput, bool)> {
+    ) -> Result<(RunOutput, Option<Vec<u8>>)> {
         let cfg = &self.cfg;
         let argv: Vec<&str> = argv.iter().map(|s| s.as_ref()).collect();
         let exe = *argv.first().context("empty command")?;
@@ -945,6 +945,7 @@ impl Sandbox {
             vmm: cfg.vmm.clone(),
             cpus: cfg.cpus,
             snapshot: take.map(SnapshotFile::Take),
+            fs_state: None,
         };
         // A snapshot is taken while the program waits for stdin, which
         // must neither come nor end. A terminal with nothing to type gets
@@ -964,19 +965,19 @@ impl Sandbox {
     /// Run `argv` until it first waits for input, and save the whole machine
     /// to `path` there: each [`Snapshot::run`](crate::Snapshot::run) then
     /// starts from that moment (see [`crate::snapshot`]). Needs grix-vmm
-    /// on macOS; the sandbox can't have mounts, or listeners from
-    /// [`forward_listener`](SandboxBuilder::forward_listener).
+    /// on macOS; the sandbox can't have mounts applied when it ends
+    /// ([`mount_on_exit`](SandboxBuilder::mount_on_exit)), or listeners
+    /// from [`forward_listener`](SandboxBuilder::forward_listener). Live
+    /// mounts are kept: each run gives them their host directories again
+    /// ([`Snapshot::mount`](crate::Snapshot::mount)).
     pub fn snapshot<S: AsRef<str>>(&self, argv: &[S], path: impl AsRef<Path>) -> Result<crate::Snapshot> {
         let cfg = &self.cfg;
         let path = path.as_ref();
         if cfg.vmm.is_none() || !cfg!(target_os = "macos") {
             bail!("snapshots need grix's own VMM on macOS 15+ (Hypervisor.framework), not QEMU or KVM");
         }
-        if !cfg.mounts.is_empty() || !cfg.live.is_empty() {
-            bail!("a sandbox with mounts can't be snapshotted: what the host holds for them isn't saved");
-        }
-        if cfg.tty.is_some() {
-            bail!("a sandbox in TTY mode can't be snapshotted (yet)");
+        if !cfg.mounts.is_empty() {
+            bail!("a sandbox with on-exit mounts can't be snapshotted: what the host holds for them isn't saved");
         }
         if cfg.cpus != 1 {
             bail!("a sandbox with more than one CPU can't be snapshotted yet");
@@ -999,6 +1000,13 @@ impl Sandbox {
             timeout_ms: cfg.timeout.as_millis() as u64,
             grace_ms: cfg.grace.as_millis() as u64,
             memory_mb: cfg.memory_mb,
+            tty: cfg.tty.is_some(),
+            live: cfg
+                .live
+                .iter()
+                .map(|m| crate::snapshot::SavedMount { guest: m.guest.clone(), writable: m.writable, lazy: m.lazy })
+                .collect(),
+            fs_state: String::new(),
         };
         // Written to a new file of our own (it holds the program's memory:
         // only we may read it), then renamed into place: never through a
@@ -1017,7 +1025,7 @@ impl Sandbox {
         // The VMM ends the run once it has written the machine out; the
         // program ending, the time running out (or anything else) means
         // there's no snapshot.
-        if !taken {
+        let Some(fs_state) = taken else {
             let events: Vec<String> = out.events.iter().map(|e| e.to_string()).collect();
             bail!(
                 "no snapshot: the program didn't wait for input ({:?})\n{}{}",
@@ -1025,7 +1033,12 @@ impl Sandbox {
                 events.join("\n"),
                 out.stderr_str()
             );
-        }
+        };
+        let mut settings = settings;
+        settings.fs_state = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(fs_state)
+        };
         crate::snapshot::finish(&mut keep, &settings)?;
         std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))?;
         std::mem::forget(cleanup);
@@ -1053,7 +1066,7 @@ fn execute(
     mut exports: Collector,
     max_output: usize,
     mut on_output: impl FnMut(Stream, &[u8]),
-) -> Result<(RunOutput, Vec<crate::export::Changes>, bool)> {
+) -> Result<(RunOutput, Vec<crate::export::Changes>, Option<Vec<u8>>)> {
     let mut out = RunOutput {
         status: ExitStatus::Timeout,
         stdout: Vec::new(),
@@ -1103,7 +1116,9 @@ fn execute(
     let (exported, changes) = exports.finish();
     out.exports = exported;
     out.duration = started.elapsed();
-    let taken = vm.snapshot.is_some() && !run_timed_out && matches!(run.end, VmEnd::Lost { vmm_status: Some(0), .. });
+    // Taken: with what the host must keep of its live mounts.
+    let taken = (vm.snapshot.is_some() && !run_timed_out && matches!(run.end, VmEnd::Lost { vmm_status: Some(0), .. }))
+        .then(|| run.fs_state.clone().unwrap_or_default());
     out.status = match run.end {
         // Out of time, even if the program then ended on the SIGTERM;
         // a kernel panic or a lost VM still says so.
@@ -1148,11 +1163,12 @@ pub(crate) fn run_snapshot(
         let a = addr.parse().with_context(|| format!("forward address {addr:?} in the snapshot"))?;
         net.forwards.push((ForwardFrom::Addr(a), *port));
     }
+    let (live, fs_state) = snap.live_mounts()?;
     let vm = VmConfig {
         net,
         control: snap.control.clone(),
         grace: Duration::from_millis(s.grace_ms),
-        live: Vec::new(),
+        live,
         qemu: PathBuf::new(),
         kernel: PathBuf::new(),
         memory_mb: s.memory_mb,
@@ -1160,6 +1176,7 @@ pub(crate) fn run_snapshot(
         vmm: Some(snap.vmm.clone().context("snapshots need grix's own VMM (grix-vmm, on macOS 15+)")?),
         cpus: 1,
         snapshot: Some(SnapshotFile::Restore(file)),
+        fs_state,
     };
     let exports = Collector::new(&s.exports, &[], s.max_export as u64);
     Ok(execute(&vm, &[], snap.timeout, Some(stdin), exports, s.max_output, on_output)?.0)

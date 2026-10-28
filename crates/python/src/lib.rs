@@ -268,7 +268,8 @@ fn snapshot(py: Python<'_>, config: Config, path: PathBuf, command: Option<Vec<S
 
 /// Run from a snapshot, with this stdin.
 #[pyfunction]
-#[pyo3(signature = (path, install_dir, stdin=None, timeout=None, on_output=None, control=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (path, install_dir, stdin=None, timeout=None, on_output=None, control=None, mounts=Vec::new()))]
 fn snapshot_run(
     py: Python<'_>,
     path: PathBuf,
@@ -277,9 +278,14 @@ fn snapshot_run(
     timeout: Option<f64>,
     on_output: Option<Py<PyAny>>,
     control: Option<PyRef<'_, Control>>,
+    mounts: Vec<(PathBuf, String, String)>,
 ) -> PyResult<String> {
     let control = control.map(|c| c.inner.clone()).unwrap_or_default();
     let mut snap = grix::Snapshot::open(path).map_err(err)?.install_dir(install_dir).control(&control);
+    // Its live mounts' host directories (mode "ro" makes one read-only).
+    for (host, guest, mode) in mounts {
+        snap = if mode == "ro" { snap.mount_read_only(host, &guest) } else { snap.mount(host, &guest) }.map_err(err)?;
+    }
     if let Some(s) = timeout {
         snap = snap.timeout(seconds("timeout", s).map_err(err)?);
     }

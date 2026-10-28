@@ -521,6 +521,17 @@ Next, in TODO.md order:
   that broke was a fixture whose parent and child printed at once, as on
   Linux: lines are now written whole.
 
+- **Snapshots in TTY mode and with live mounts** (round 2, item 18): the
+  moment in TTY mode is the program reading or polling its terminal with
+  nothing typed (`tty::waiting_on`; the pump moving host stdin in doesn't
+  count), and a restored run gets the runner's terminal size. A live
+  mount's host side (`hostfs::Server`: the ids it gave out, each a name in
+  its parent, and lazy imports' first views) is saved in the snapshot's
+  settings and restored after validation; each run gives the mounts host
+  directories again, read-only if it likes, and the kernel forgets how
+  fresh its view of them was (`Fs::forget_live`: monotonic time didn't
+  count the time the snapshot sat there).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

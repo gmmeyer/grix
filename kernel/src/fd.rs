@@ -108,7 +108,13 @@ impl FileKind {
             FileKind::SignalFd(_) | FileKind::PidFd(_) => (0, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
-            FileKind::Pty(end) => end.tty.lock().poll(end.master),
+            FileKind::Pty(end) => {
+                let (mask, version) = end.tty.lock().poll(end.master);
+                if !end.master && mask & EPOLLIN == 0 {
+                    crate::tty::waiting_on(&end.tty);
+                }
+                (mask, version)
+            }
             FileKind::Unix(s) => s.lock().poll(),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).

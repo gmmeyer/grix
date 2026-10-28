@@ -59,7 +59,7 @@ pub struct Attr {
 }
 
 impl Attr {
-    fn put(&self, w: &mut Writer) {
+    pub fn put(&self, w: &mut Writer) {
         w.u8(self.ty as u8);
         w.u32(self.mode);
         w.u64(self.size);
@@ -68,7 +68,7 @@ impl Attr {
         w.u64(self.ctime_ns);
     }
 
-    fn get(r: &mut Reader) -> Result<Attr, DecodeError> {
+    pub fn get(r: &mut Reader) -> Result<Attr, DecodeError> {
         Ok(Attr {
             ty: FileType::get(r)?,
             mode: r.u32()?,

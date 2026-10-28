@@ -1858,15 +1858,38 @@ impl Fs {
 
 // ---------------------------------------------------------------- live mounts
 
+/// Was a live mount's node fetched (at monotonic `at`; 0: never, or
+/// forgotten) recently enough to go on as it was?
+fn recent(at: u64) -> bool {
+    at != 0 && crate::time::monotonic_ns().saturating_sub(at) < hostfs::FRESH_NS
+}
+
 impl Fs {
+    /// Restored from a snapshot: what live mounts' nodes were like before
+    /// may have changed on the host while it sat there (monotonic time
+    /// doesn't count that), so it's fetched again. Lazy imports stay as
+    /// first seen: the host remembers that too.
+    pub fn forget_live(&mut self) {
+        let lazy = self.lazy.clone();
+        for n in self.nodes.iter_mut() {
+            if let Some(r) = n.remote.as_deref_mut()
+                && !lazy[r.mount]
+            {
+                r.fetched = 0;
+                r.listed_at = 0;
+            }
+        }
+        self.page = None;
+        hostfs::forget_kept();
+    }
+
     /// Before using directory `dir`'s entries: for a live mount's, have
     /// them from the host, and recently.
     fn ensure(&mut self, dir: Ino) -> Result<(), Errno> {
         let n = &self.nodes[dir];
         let Some(r) = n.remote.as_deref() else { return Ok(()) };
         // A lazy import's directory, once listed, stays as it was.
-        let fresh = r.listed
-            && (self.lazy[r.mount] || crate::time::monotonic_ns().saturating_sub(r.listed_at) < hostfs::FRESH_NS);
+        let fresh = r.listed && (self.lazy[r.mount] || recent(r.listed_at));
         if fresh || r.large || n.nlink == 0 || !matches!(n.kind, Kind::Dir(_)) {
             return Ok(());
         }
@@ -1881,10 +1904,7 @@ impl Fs {
             return self.ensure(ino);
         }
         let frozen = self.lazy[r.mount] && r.fetched != 0;
-        if frozen
-            || crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS
-            || self.nodes[ino].nlink == 0
-        {
+        if frozen || recent(r.fetched) || self.nodes[ino].nlink == 0 {
             return Ok(());
         }
         let id = r.id;
@@ -2270,10 +2290,9 @@ impl Fs {
         let child = self.child(dir, name);
         let Some(r) = self.nodes[dir].remote.as_deref().filter(|r| r.large) else { return Ok(child) };
         let (id, mount, writable) = (r.id, r.mount, r.writable);
-        let now = crate::time::monotonic_ns();
         let lazy = self.lazy[mount];
         if let Some(c) = child
-            && self.nodes[c].remote.as_ref().is_some_and(|r| lazy || now.saturating_sub(r.fetched) < hostfs::FRESH_NS)
+            && self.nodes[c].remote.as_ref().is_some_and(|r| lazy || recent(r.fetched))
         {
             return Ok(Some(c));
         }

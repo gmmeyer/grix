@@ -247,9 +247,14 @@ after a suspend), and returns `SNAPSHOT_RESTORED`, fresh entropy
 on (`time::resumed_after`). The host writes the file privately and renames
 it into place, and appends its settings for restored runs (network
 policy, exports, limits) as JSON: a file may come from anyone, so MCP
-replaces the network policy and caps the limits. Nothing the host held is
-saved, and the host refuses mounts. Anything new that lives on the host
-side of a run needs the same treatment.
+replaces the network policy and caps the limits. Of what the host held,
+only live mounts' state is saved (`hostfs::Server::save`, validated by
+`restore`: names, ids, limits); each run gives them host directories
+again (`Snapshot::mount`), and the kernel fetches what it knew of them
+again (`Fs::forget_live`). On-exit mounts are refused. In TTY mode the
+moment is the program waiting at its terminal (`tty::waiting_on`).
+Anything new that lives on the host side of a run needs the same
+treatment.
 
 Shared file mappings and locks: a MAP_SHARED mapping of a file in the
 sandbox maps the file's own frames (`Backing::SharedFile`; the file and
