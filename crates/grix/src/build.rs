@@ -140,6 +140,9 @@ pub struct BuildOptions<'a> {
     pub kernel: Option<PathBuf>,
     /// Each build step's output, as it comes.
     pub on_output: &'a mut dyn FnMut(Stream, &[u8]),
+    /// Signals and stops reach build steps through this; a cancelled
+    /// build ends before its next step ([`RunControl::cancel`]).
+    pub control: Option<crate::RunControl>,
     /// What a build may do (the default: anything a user's own build may).
     pub policy: BuildPolicy,
 }
@@ -292,7 +295,10 @@ impl Grixfile {
         crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", kernel_path.display()))?;
         let mut image = Image::new(files, config, kernel);
         for step in &self.run {
-            image = run_step(image, step, &opts.policy, opts.on_output)?;
+            if opts.control.as_ref().is_some_and(|c| c.is_cancelled()) {
+                bail!("the build was cancelled");
+            }
+            image = run_step(image, step, &opts.policy, opts.on_output, opts.control.as_ref())?;
         }
         // Steps run as the base image's user (root, for most): they're
         // what installs software and adds users. The program runs as this.
@@ -333,6 +339,7 @@ fn run_step(
     step: &Step,
     policy: &BuildPolicy,
     on_output: &mut dyn FnMut(Stream, &[u8]),
+    control: Option<&crate::RunControl>,
 ) -> Result<Image> {
     let argv = step.argv();
     if argv.is_empty() {
@@ -363,6 +370,9 @@ fn run_step(
         for rule in &policy.allow_hosts {
             b = b.allow_host(rule)?;
         }
+    }
+    if let Some(c) = control {
+        b = b.control(c);
     }
     for e in &image.config.env {
         if let Some((k, v)) = e.split_once('=') {

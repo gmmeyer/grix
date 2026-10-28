@@ -30,6 +30,8 @@ pub struct RunControl(Arc<Inner>);
 struct Inner {
     runs: Mutex<Vec<Weak<Live>>>,
     on_event: Mutex<Option<EventHook>>,
+    /// `cancel`ed: runs that start from now on stop at once too.
+    cancelled: AtomicBool,
 }
 
 type EventHook = Arc<dyn Fn(&crate::GuestEvent) + Send + Sync>;
@@ -100,6 +102,22 @@ impl RunControl {
         !runs.is_empty()
     }
 
+    /// Stop the runs in progress and any that start later: for giving up
+    /// on work that may not have started its run yet (an agent's request,
+    /// a build between steps). There's no undoing it.
+    pub fn cancel(&self) {
+        let runs = self.0.runs.lock().unwrap();
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        for run in runs.iter().filter_map(Weak::upgrade) {
+            run.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Has [`cancel`](Self::cancel) been called?
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
     /// Call `f` with each event as the guest reports it during a run (they
     /// are in [`RunOutput::events`](crate::RunOutput::events) too), on the
     /// thread that reads the VM's output: it should return soon.
@@ -118,6 +136,10 @@ impl RunControl {
     pub(crate) fn attach(&self, outbox: Arc<Outbox>) -> Arc<Live> {
         let live = Arc::new(Live { outbox, stop: AtomicBool::new(false) });
         let mut runs = self.0.runs.lock().unwrap();
+        // Under the lock `cancel` takes, so a run can't slip past it.
+        if self.0.cancelled.load(Ordering::SeqCst) {
+            live.stop.store(true, Ordering::Relaxed);
+        }
         runs.retain(|w| w.strong_count() > 0);
         runs.push(Arc::downgrade(&live));
         live

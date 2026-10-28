@@ -4,6 +4,6 @@ members = ["crates/abi", "crates/grix", "crates/vmm"]
 exclude = ["kernel"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"

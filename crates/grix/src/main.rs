@@ -90,6 +90,9 @@ struct McpArgs {
     /// Docker's, Podman's). Without it, agents' pulls are anonymous.
     #[arg(long)]
     registry_credentials: bool,
+    /// How many tool calls run at once (default 2); more wait their turn.
+    #[arg(long, value_name = "N")]
+    max_parallel: Option<usize>,
 }
 
 /// The flags add to the Grixfile, or make the whole image without one:
@@ -829,7 +832,8 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
     steps.sort_by_key(|(i, _)| *i);
     g.run.extend(steps.into_iter().map(|(_, s)| s));
     let policy = grix::build::BuildPolicy { cache: !args.no_cache, ..Default::default() };
-    let opts = grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output, policy };
+    let opts =
+        grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output, policy, control: None };
     let image = g.build(&base, opts)?;
     image.write_to(&args.output)?;
     let (n, bytes) = image.size();
@@ -861,6 +865,9 @@ fn mcp(args: McpArgs) -> Result<i32> {
     }
     config.allow_hosts = args.allow_hosts.clone();
     config.registry_credentials = args.registry_credentials;
+    if let Some(n) = args.max_parallel {
+        config.max_parallel = n.max(1);
+    }
     if let Some(s) = args.max_timeout {
         config.max_timeout = Duration::from_secs(s);
     }
@@ -871,6 +878,6 @@ fn mcp(args: McpArgs) -> Result<i32> {
         config.max_cpus = n;
     }
     config.writable = args.writable;
-    grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout().lock())?;
+    grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout())?;
     Ok(0)
 }

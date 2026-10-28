@@ -5,6 +5,7 @@
 #   tools/bump-version.sh          # the next patch version
 #   tools/bump-version.sh 0.1.0    # this one
 set -eu
+PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
 old=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
 if [ $# -gt 0 ]; then

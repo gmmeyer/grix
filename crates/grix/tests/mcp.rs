@@ -31,7 +31,15 @@ impl Server {
     }
 
     fn call(&mut self, msg: Value) -> Value {
+        self.send(msg);
+        self.read()
+    }
+
+    fn send(&mut self, msg: Value) {
         writeln!(self.to.as_mut().unwrap(), "{msg}").unwrap();
+    }
+
+    fn read(&mut self) -> Value {
         let mut line = String::new();
         self.from.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
@@ -202,4 +210,52 @@ fn a_writable_server_builds_images_and_writes_mounts() {
     assert!(text(&r).contains("threads capability, which this server doesn't allow"), "{}", text(&r));
     server.end();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn progress_and_cancellation() {
+    // Two calls at once: one streams its output as progress, the other is
+    // withdrawn mid-run and never answered.
+    let fixtures = fixtures();
+    let busybox = fixtures.join("alpine/bin/busybox.static");
+    let mut server = Server::start(&["--max-parallel", "2"], &[&fixtures]);
+    let started = std::time::Instant::now();
+    let call = |id: u64, token: Value, script: &str| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+        "name": "run",
+        "_meta": {"progressToken": token},
+        "arguments": {
+            "imports": [{"host": busybox, "guest": "/bin/busybox"}],
+            "command": ["/bin/busybox", "sh", "-c", script],
+            "capabilities": ["process"],
+            "timeout_secs": 120,
+        }}})
+    };
+    server.send(call(10, json!("long"), "/bin/busybox sleep 100"));
+    server.send(call(11, json!(7), "echo one; /bin/busybox sleep 1; echo two >&2; echo three"));
+    let (mut messages, mut last) = (String::new(), 0);
+    let reply = loop {
+        let v = server.read();
+        assert_ne!(v["id"], 10, "{v}");
+        if v["method"] == "notifications/progress" {
+            assert_eq!(v["params"]["progressToken"], 7, "{v}");
+            let n = v["params"]["progress"].as_u64().unwrap();
+            assert!(n > last, "progress goes up");
+            last = n;
+            messages.push_str(v["params"]["message"].as_str().unwrap());
+        } else {
+            break v;
+        }
+    };
+    assert_eq!(reply["id"], 11, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"]["stdout"], "one\nthree\n");
+    assert!(messages.contains("one\n") && messages.contains("[stderr] two\n"), "{messages:?}");
+    // Withdrawn: it stops, and only the ping is answered.
+    server.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 10, "reason": "test"}}),
+    );
+    let pong = server.call(json!({"jsonrpc": "2.0", "id": 12, "method": "ping"}));
+    assert_eq!(pong["id"], 12, "{pong}");
+    server.end();
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "the sleep was stopped");
 }

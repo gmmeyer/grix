@@ -8,19 +8,29 @@
 //! host paths under its roots, capabilities from its list (no `net` unless
 //! enabled, and then under its `allow_host` rules), and a time and memory
 //! cap.
+//!
+//! Tool calls run on their own threads (at most `max_parallel` at once),
+//! so the server keeps reading: `notifications/cancelled` stops a call's
+//! sandbox (or its build) and its answer isn't sent. When input ends, the
+//! calls in progress finish and are answered. A call that comes with a
+//! `progressToken` gets the program's output as it comes, in
+//! `notifications/progress`.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::policy::Capability;
 use serde_json::{Value, json};
 
+use crate::RunControl;
 use crate::build::{BuildOptions, BuildPolicy, Grixfile};
 use crate::export::ExportContent;
 use crate::mount::MountState;
-use crate::sandbox::{ExitStatus, MountMode, Sandbox};
+use crate::sandbox::{ExitStatus, MountMode, Sandbox, Stream};
 
 /// What agents may do.
 #[derive(Clone, Debug)]
@@ -43,6 +53,9 @@ pub struct McpConfig {
     /// `build_image` may pull images with the user's registry logins. Off
     /// by default: what an agent builds is anonymous.
     pub registry_credentials: bool,
+    /// How many tool calls run at once (each boots a VM, with up to
+    /// `max_memory_mb`); more wait their turn.
+    pub max_parallel: usize,
 }
 
 impl McpConfig {
@@ -61,6 +74,7 @@ impl McpConfig {
             max_cpus: 4,
             writable: false,
             registry_credentials: false,
+            max_parallel: 2,
         })
     }
 
@@ -99,44 +113,233 @@ const EXPORT_MAX: usize = 1 << 20;
 const EXPORT_LIMIT: usize = 256 << 20;
 /// The longest message read (inline files and stdin come in them).
 const MESSAGE_MAX: usize = 64 << 20;
+/// The most of a call's output streamed as progress, and how often.
+const STREAM_MAX: usize = OUTPUT_MAX * 4;
+const STREAM_EVERY: Duration = Duration::from_millis(250);
+const STREAM_CHUNK: usize = 8192;
 
 /// Serve requests from `input` until it ends.
-pub fn serve(config: &McpConfig, input: impl BufRead, output: impl Write) -> Result<()> {
+pub fn serve(config: &McpConfig, input: impl BufRead, output: impl Write + Send) -> Result<()> {
     serve_with_limit(config, input, output, MESSAGE_MAX)
 }
 
-fn serve_with_limit(config: &McpConfig, mut input: impl BufRead, mut output: impl Write, max: usize) -> Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        // At most `max` bytes and the newline.
-        if (&mut input).take(max as u64 + 1).read_until(b'\n', &mut line)? == 0 {
-            break;
-        }
-        let reply = if line.len() > max && line.last() != Some(&b'\n') {
-            input.skip_until(b'\n')?;
-            Some(error(Value::Null, -32700, &format!("message over {max} bytes")))
-        } else if line.trim_ascii().is_empty() {
-            continue;
-        } else {
-            match serde_json::from_slice::<Value>(&line) {
-                Ok(msg) => handle(config, &msg),
-                Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
+/// Writes whole messages, one per line, from any thread.
+type Sender<'a> = &'a (dyn Fn(&Value) + Sync);
+
+fn serve_with_limit(config: &McpConfig, mut input: impl BufRead, output: impl Write + Send, max: usize) -> Result<()> {
+    let output = Mutex::new(output);
+    // A client that has gone has no use for answers: write errors are dropped.
+    let send = |v: &Value| {
+        let mut o = output.lock().unwrap();
+        let _ = writeln!(o, "{v}").and_then(|()| o.flush());
+    };
+    let send: Sender = &send;
+    // Calls in progress, by id (as JSON, so 1 and "1" differ), and whether
+    // the client withdrew them (then they aren't answered).
+    let calls: Mutex<HashMap<String, (RunControl, bool)>> = Mutex::new(HashMap::new());
+    let slots = Slots { free: Mutex::new(config.max_parallel.max(1)), freed: Condvar::new() };
+    std::thread::scope(|scope| -> Result<()> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // At most `max` bytes and the newline.
+            if (&mut input).take(max as u64 + 1).read_until(b'\n', &mut line)? == 0 {
+                break;
             }
-        };
-        if let Some(reply) = reply {
-            writeln!(output, "{reply}")?;
-            output.flush()?;
+            if line.len() > max && line.last() != Some(&b'\n') {
+                input.skip_until(b'\n')?;
+                send(&error(Value::Null, -32700, &format!("message over {max} bytes")));
+                continue;
+            }
+            if line.trim_ascii().is_empty() {
+                continue;
+            }
+            let msg = match serde_json::from_slice::<Value>(&line) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    send(&error(Value::Null, -32700, &format!("parse error: {e}")));
+                    continue;
+                }
+            };
+            match (msg["method"].as_str(), msg.get("id")) {
+                (Some("notifications/cancelled"), _) => {
+                    let id = msg["params"]["requestId"].to_string();
+                    if let Some((c, withdrawn)) = calls.lock().unwrap().get_mut(&id) {
+                        *withdrawn = true;
+                        c.cancel();
+                    }
+                }
+                (Some("tools/call"), Some(id)) => {
+                    let (id, key, control) = (id.clone(), id.to_string(), RunControl::new());
+                    {
+                        let mut calls = calls.lock().unwrap();
+                        if calls.contains_key(&key) {
+                            send(&error(id, -32600, "a request with this id is still in progress"));
+                            continue;
+                        }
+                        calls.insert(key.clone(), (control.clone(), false));
+                    }
+                    let (calls, slots) = (&calls, &slots);
+                    scope.spawn(move || {
+                        let token = msg["params"]["_meta"]["progressToken"].clone();
+                        let mut progress = Progress::new(send, token);
+                        let reply = match slots.take(&control, &mut progress) {
+                            Some(_slot) => call_tool(config, &msg, id, &control, &mut progress),
+                            None => Some(error(id, -32800, "cancelled")),
+                        };
+                        let withdrawn = calls.lock().unwrap().remove(&key).is_some_and(|(_, w)| w);
+                        // A call the client cancelled isn't answered (as the
+                        // protocol has it).
+                        if let Some(reply) = reply.filter(|_| !withdrawn) {
+                            progress.flush();
+                            send(&reply);
+                        }
+                    });
+                }
+                _ => {
+                    if let Some(reply) = handle(config, &msg) {
+                        send(&reply);
+                    }
+                }
+            }
+        }
+        // The client has closed its end: the calls it made still finish and
+        // are answered (the scope waits for them), as before calls ran in
+        // parallel. A client that's leaving cancels them, or ends the server.
+        Ok(())
+    })
+}
+
+/// Turns for tool calls: at most `max_parallel` at once.
+struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl Slots {
+    /// Wait for a turn, unless the call is cancelled meanwhile.
+    fn take(&self, control: &RunControl, progress: &mut Progress) -> Option<Slot<'_>> {
+        let mut free = self.free.lock().unwrap();
+        let mut said = false;
+        loop {
+            if control.is_cancelled() {
+                return None;
+            }
+            if *free > 0 {
+                *free -= 1;
+                return Some(Slot(self));
+            }
+            if !said {
+                said = true;
+                progress.note("waiting for another call to finish (the server runs a few at a time)");
+            }
+            free = self.freed.wait_timeout(free, Duration::from_millis(100)).unwrap().0;
         }
     }
-    Ok(())
+}
+
+/// A call's progress notifications: its output as it comes, a few times a
+/// second, up to `STREAM_MAX` (the answer has the output too).
+struct Progress<'a> {
+    send: Sender<'a>,
+    token: Value,
+    count: u64,
+    streamed: usize,
+    pending: [Vec<u8>; 2],
+    last: Instant,
+}
+
+impl<'a> Progress<'a> {
+    fn new(send: Sender<'a>, token: Value) -> Progress<'a> {
+        Progress { send, token, count: 0, streamed: 0, pending: [Vec::new(), Vec::new()], last: Instant::now() }
+    }
+
+    fn wanted(&self) -> bool {
+        self.token.is_string() || self.token.is_number()
+    }
+
+    fn notify(&mut self, message: &str) {
+        self.count += 1;
+        (self.send)(&json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+            "progressToken": self.token, "progress": self.count, "message": message}}));
+    }
+
+    /// Something the server has to say.
+    fn note(&mut self, message: &str) {
+        if self.wanted() {
+            self.flush();
+            self.notify(message);
+        }
+    }
+
+    fn output(&mut self, stream: Stream, data: &[u8]) {
+        if !self.wanted() || self.streamed >= STREAM_MAX {
+            return;
+        }
+        let take = data.len().min(STREAM_MAX - self.streamed);
+        self.streamed += take;
+        self.pending[(stream == Stream::Stderr) as usize].extend_from_slice(&data[..take]);
+        let waiting = self.pending.iter().map(Vec::len).sum::<usize>();
+        if waiting >= STREAM_CHUNK || self.last.elapsed() >= STREAM_EVERY {
+            self.flush();
+        }
+        if self.streamed >= STREAM_MAX {
+            self.note(&format!("[output past {} KiB isn't streamed; the answer has what fits]", STREAM_MAX >> 10));
+        }
+    }
+
+    fn flush(&mut self) {
+        self.last = Instant::now();
+        for (i, prefix) in [(0, ""), (1, "[stderr] ")] {
+            if !self.pending[i].is_empty() {
+                let text = format!("{prefix}{}", String::from_utf8_lossy(&std::mem::take(&mut self.pending[i])));
+                self.notify(&text);
+            }
+        }
+    }
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-/// The answer to one message (none for notifications).
+/// A tool call's answer.
+fn call_tool(
+    config: &McpConfig,
+    msg: &Value,
+    id: Value,
+    control: &RunControl,
+    progress: &mut Progress,
+) -> Option<Value> {
+    let name = msg["params"]["name"].as_str().unwrap_or("");
+    let args = &msg["params"]["arguments"];
+    let outcome = match name {
+        "run" => run(config, args, control, progress),
+        "snapshot" => snapshot(config, args, control),
+        "build_image" => build_image(config, args, control, progress),
+        _ => return Some(error(id, -32602, &format!("unknown tool {name:?}"))),
+    };
+    let result = match outcome {
+        Ok((text, structured, failed)) => json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": structured,
+            "isError": failed,
+        }),
+        Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}], "isError": true}),
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+/// The answer to a message that isn't a tool call (none for notifications).
 fn handle(config: &McpConfig, msg: &Value) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg["method"].as_str().unwrap_or("");
@@ -150,24 +353,6 @@ fn handle(config: &McpConfig, msg: &Value) -> Option<Value> {
         }),
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools(config)}),
-        "tools/call" => {
-            let name = msg["params"]["name"].as_str().unwrap_or("");
-            let args = &msg["params"]["arguments"];
-            let outcome = match name {
-                "run" => run(config, args),
-                "snapshot" => snapshot(config, args),
-                "build_image" => build_image(config, args),
-                _ => return Some(error(id, -32602, &format!("unknown tool {name:?}"))),
-            };
-            match outcome {
-                Ok((text, structured, failed)) => json!({
-                    "content": [{"type": "text", "text": text}],
-                    "structuredContent": structured,
-                    "isError": failed,
-                }),
-                Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}], "isError": true}),
-            }
-        }
         _ => return Some(error(id, -32601, &format!("method {method:?} not found"))),
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
@@ -287,7 +472,12 @@ fn timeout(config: &McpConfig, args: &Value, default: Duration) -> Result<Durati
     Ok(t.min(config.max_timeout))
 }
 
-fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
+fn run(
+    config: &McpConfig,
+    args: &Value,
+    control: &RunControl,
+    progress: &mut Progress,
+) -> Result<(String, Value, bool)> {
     let stdin = args["stdin"].as_str().unwrap_or("").as_bytes().to_vec();
     let out = match args["snapshot"].as_str() {
         Some(path) => {
@@ -310,20 +500,21 @@ fn run(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
                 );
             }
             let t = timeout(config, args, snap.default_timeout())?;
-            snap.timeout(t).run(stdin)?
+            snap.timeout(t).control(control).run_streaming(std::io::Cursor::new(stdin), |s, d| progress.output(s, d))?
         }
         None => {
-            let (sandbox, command) = sandbox(config, args)?;
+            let (sandbox, command) = sandbox(config, args, control)?;
             match args["stdin"].as_str() {
-                Some(_) => sandbox.run_with_stdin(&command, stdin)?,
-                None => sandbox.run(&command)?,
+                Some(_) => sandbox
+                    .run_streaming_with_stdin(&command, std::io::Cursor::new(stdin), |s, d| progress.output(s, d))?,
+                None => sandbox.run_streaming(&command, |s, d| progress.output(s, d))?,
             }
         }
     };
     Ok(describe(&out))
 }
 
-fn snapshot(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
+fn snapshot(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(String, Value, bool)> {
     if !config.writable {
         bail!("this server doesn't write host files (it isn't --writable), so it can't save snapshots");
     }
@@ -331,7 +522,7 @@ fn snapshot(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
         bail!("a snapshot can't have mounts");
     }
     let out = output_path(config, args)?;
-    let (sandbox, command) = sandbox(config, args)?;
+    let (sandbox, command) = sandbox(config, args, control)?;
     let started = std::time::Instant::now();
     let snap = sandbox.snapshot(&command, &out)?;
     let size = std::fs::metadata(&out).map_or(0, |m| m.len());
@@ -354,7 +545,7 @@ fn output_path(config: &McpConfig, args: &Value) -> Result<PathBuf> {
 }
 
 /// The sandbox `args` describe, within the server's policy, and its command.
-fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
+fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sandbox, Vec<String>)> {
     let cpus = match &args["cpus"] {
         Value::Null => 1,
         v => v.as_u64().filter(|n| *n >= 1).context("cpus must be a whole number of CPUs")?,
@@ -438,7 +629,7 @@ fn sandbox(config: &McpConfig, args: &Value) -> Result<(Sandbox, Vec<String>)> {
     if memory_mb > config.max_memory_mb {
         bail!("this needs {memory_mb} MiB of memory; the server allows at most {} MiB", config.max_memory_mb);
     }
-    b = b.memory_mb(memory_mb);
+    b = b.memory_mb(memory_mb).control(control);
     let sandbox = b.build()?;
     let mut command = strings(&args["command"]);
     if command.is_empty() {
@@ -527,7 +718,12 @@ fn describe(out: &crate::RunOutput) -> (String, Value, bool) {
     (text, structured, lost)
 }
 
-fn build_image(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)> {
+fn build_image(
+    config: &McpConfig,
+    args: &Value,
+    control: &RunControl,
+    progress: &mut Progress,
+) -> Result<(String, Value, bool)> {
     if !config.writable {
         bail!("this server doesn't write host files (it isn't --writable), so it can't build images");
     }
@@ -538,12 +734,14 @@ fn build_image(config: &McpConfig, args: &Value) -> Result<(String, Value, bool)
         &grixfile,
         BuildOptions {
             kernel: None,
-            on_output: &mut |_, d| {
+            on_output: &mut |s, d| {
+                progress.output(s, d);
                 if log.len() < OUTPUT_MAX * 4 {
                     log.extend_from_slice(d)
                 }
             },
             policy: config.build_policy(),
+            control: Some(control.clone()),
         },
     )?;
     image.write_to(&out)?;
@@ -578,8 +776,12 @@ mod tests {
         .join("\n");
         let mut out = Vec::new();
         serve_with_limit(&config, input.as_bytes(), &mut out, 150).unwrap();
-        let replies: Vec<Value> =
+        let mut replies: Vec<Value> =
             String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        // Tool calls answer when they're done: in order of id (the two
+        // errors without one came in order too).
+        let key = |v: &Value| v["id"].as_u64().unwrap_or(5);
+        replies.sort_by_key(key);
         assert_eq!(replies.len(), 8, "no answer to the notification");
         assert_eq!(replies[0]["result"]["serverInfo"]["name"], "grix");
         let names: Vec<&str> =

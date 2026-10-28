@@ -711,7 +711,12 @@ fn glibc_programs_from_debian() {
     let image = g
         .build(
             std::path::Path::new("."),
-            grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
+            grix::build::BuildOptions {
+                kernel: None,
+                on_output: &mut |_, _| {},
+                policy: Default::default(),
+                control: None,
+            },
         )
         .unwrap();
     let b = Sandbox::builder()

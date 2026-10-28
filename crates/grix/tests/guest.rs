@@ -476,7 +476,12 @@ content = "a note"
     // outside, so here it's let out, as a path on the command line would be.
     let err = grix::build::Grixfile::build_file(
         &dir.join("Grixfile"),
-        grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
+        grix::build::BuildOptions {
+            kernel: None,
+            on_output: &mut |_, _| {},
+            policy: Default::default(),
+            control: None,
+        },
     );
     assert!(err.err().unwrap().to_string().contains("outside the build context"));
     let mut g = grix::build::Grixfile::parse(&grixfile).unwrap();
@@ -486,6 +491,7 @@ content = "a note"
         kernel: None,
         on_output: &mut |_, d: &[u8]| log.extend_from_slice(d),
         policy: Default::default(),
+        control: None,
     };
     let image = g.build(&dir, opts).unwrap();
     image.write_to(dir.join("hello.grix")).unwrap();
@@ -529,7 +535,12 @@ fn images_with_no_other_os() {
     let image = g
         .build(
             Path::new("."),
-            grix::build::BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() },
+            grix::build::BuildOptions {
+                kernel: None,
+                on_output: &mut |_, _| {},
+                policy: Default::default(),
+                control: None,
+            },
         )
         .unwrap();
     let (n, _) = image.size();
@@ -564,7 +575,10 @@ fn images_built_on_images_and_cached_steps() {
         let mut log = Vec::new();
         let policy = BuildPolicy { cache, ..Default::default() };
         let image = g
-            .build(&dir, BuildOptions { kernel: None, on_output: &mut |_, d| log.extend_from_slice(d), policy })
+            .build(
+                &dir,
+                BuildOptions { kernel: None, on_output: &mut |_, d| log.extend_from_slice(d), policy, control: None },
+            )
             .unwrap();
         (image, String::from_utf8_lossy(&log).into_owned())
     };
@@ -601,7 +615,7 @@ run = [["/bin/busybox", "cp", "/stamp", "/copy"]]
     // A base outside the build context is refused, as any path is.
     let outside = Grixfile::parse(&format!("from = \"image:{}\"", dir.join("base.grix").display())).unwrap();
     let elsewhere = temp_dir("elsewhere");
-    let opts = BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() };
+    let opts = BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default(), control: None };
     let err = outside.build(&elsewhere, opts).err().unwrap();
     assert!(err.to_string().contains("outside the build context"), "{err:#}");
     std::fs::remove_dir_all(&dir).unwrap();

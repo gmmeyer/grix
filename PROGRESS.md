@@ -475,6 +475,17 @@ Next, in TODO.md order:
   flate2 now uses zlib-rs: building from python:3.12-alpine went from
   9.4 s to 3.8 s (7.8 s of it was gzip).
 
+- **Releases**: every commit to main is one (0.0.1 on), built and
+  published by `.github/workflows/release.yml` (see AGENTS.md).
+
+- **MCP** (round 2, item 16): tool calls run on their own threads (a
+  scope; at most `max_parallel`), so the server keeps reading.
+  `notifications/cancelled` cancels the call's `RunControl` (`cancel` is
+  sticky: a run that starts later stops at once too; builds stop between
+  steps) and suppresses its answer; at EOF the calls in progress finish
+  and are answered (as when calls ran one at a time). A `progressToken` gets `notifications/progress`
+  with the output, coalesced (every 250 ms or 8 KiB), up to 1 MiB.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

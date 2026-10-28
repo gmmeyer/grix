@@ -19,7 +19,7 @@ jobs:
   kernel:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
         run: |
           command -v rustup || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
@@ -28,7 +28,7 @@ jobs:
           "$HOME/.cargo/bin/rustup" target add aarch64-unknown-none-softfloat
       - name: Build the kernel
         run: cd kernel && cargo build --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kernel
           path: kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
@@ -38,8 +38,8 @@ jobs:
     needs: kernel
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: kernel
           path: kernel-out
@@ -79,7 +79,7 @@ jobs:
           mkdir "$d"
           cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel README.md "$d/"
           tar czf "$d.tar.gz" "$d"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-arm64
           path: grix-*-linux-arm64.tar.gz
@@ -89,8 +89,8 @@ jobs:
     needs: kernel
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: kernel
           path: kernel-out
@@ -112,7 +112,7 @@ jobs:
           cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel README.md "$d/"
           ./target/release/grix --version
           tar czf "$d.tar.gz" "$d"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-arm64
           path: grix-*-macos-arm64.tar.gz
@@ -124,10 +124,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true

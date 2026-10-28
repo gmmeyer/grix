@@ -326,8 +326,15 @@ grix mcp -a fs_write -a process          # capabilities agents may grant (defaul
 grix mcp -a net --allow-host pypi.org    # net only if allowed, and only where the rules say
 grix mcp --writable                      # rw/on_exit mounts and build_image (default: agents only read the host)
 grix mcp --registry-credentials          # build_image may pull with your registry logins (default: anonymously)
+grix mcp --max-parallel 4                # tool calls at once (default 2; more wait their turn)
 grix mcp --max-timeout 120 --max-mem 1024
 ```
+
+Tool calls run in parallel (up to `--max-parallel`). A call sent with a
+`progressToken` gets the program's output (and a build's) as it comes, in
+`notifications/progress`; `notifications/cancelled` stops its sandbox,
+and it isn't answered. When stdin closes, calls in progress finish and
+are answered before the server exits.
 
 Images an agent runs get the server's kernel, and may ask only for
 capabilities the server allows. Builds follow the same policy: their steps

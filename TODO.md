@@ -96,8 +96,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 - [x] Python bindings (`python/`), over `grix run --json`.
 - [x] Snapshots: the `snapshot` tool and `run`'s `snapshot` (with the
       server's network policy, whoever wrote the file).
-- [ ] Streaming output and signals over MCP (progress notifications,
-      cancellation into `RunControl`).
+- [x] Streaming output and signals over MCP: progress notifications with
+      the output as it comes, cancellation into `RunControl::cancel`, tool
+      calls in parallel (`--max-parallel`).
 - [ ] Native Python bindings (PyO3) instead of driving the CLI.
 
 ## Images
