@@ -319,6 +319,7 @@ grix mcp --root ~/projects/demo          # host paths only under the roots (defa
 grix mcp -a fs_write -a process          # capabilities agents may grant (default: fs_write, threads, process)
 grix mcp -a net --allow-host pypi.org    # net only if allowed, and only where the rules say
 grix mcp --writable                      # rw/on_exit mounts and build_image (default: agents only read the host)
+grix mcp --registry-credentials          # build_image may pull with your registry logins (default: anonymously)
 grix mcp --max-timeout 120 --max-mem 1024
 ```
 
@@ -417,13 +418,25 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
 
 - `from` takes a registry reference (`alpine:3.21`,
   `ghcr.io/owner/repo:tag`; the linux/arm64 image), `oci:DIR` (an OCI image
-  layout), `docker-archive:FILE` (`docker save` output), `docker:NAME` or
-  `dir:DIR`. Layers are applied with their whiteouts, every blob is checked
-  against its digest, and the image's entrypoint, command, environment and
-  working directory become the grix image's, and so does its user (root
-  unless it names one, as in Docker). A command that's a bare name is
-  looked up on the image's `PATH`. `grix pull REF --oci DIR` saves an
-  image for offline builds.
+  layout), `docker-archive:FILE` (`docker save` output), `docker:NAME`,
+  `dir:DIR`, or `image:FILE` (another grix image: its files and settings,
+  to build on). Layers (tar, gzip or zstd) are applied with their
+  whiteouts, every blob is checked against its digest, and the image's
+  entrypoint, command, environment and working directory become the grix
+  image's, and so does its user (root unless it names one, as in Docker).
+  A command that's a bare name is looked up on the image's `PATH`. `grix
+  pull REF --oci DIR` saves an image for offline builds.
+- Private images: `grix login ghcr.io -u NAME --password-stdin` (Docker
+  Hub is `docker.io`, the default) saves a login in
+  `~/.config/grix/auth.json`; Docker's and Podman's logins (and credential
+  helpers) work too. A login goes only to the registry that asks for it,
+  and its token service, over TLS (or to a registry on this machine).
+- Builds are cached in `~/.cache/grix/trees` (at most 10 GiB, or
+  `GRIX_TREE_CACHE_MB`): what an image's layers add up to, and what each
+  build step left, by everything that went into it (the files before it,
+  the step, its environment, user and working directory, the kernel and
+  the network rules). A step whose inputs haven't changed doesn't run
+  again; `grix build --no-cache` runs them all.
 - Build steps (`run`) run in grix itself, with `fs_write`, `process`,
   `threads` and `net`. A string runs with `/bin/sh -c`; a list such as
   `["/bin/setup", "--fast"]` runs as it is, without a shell. The file tree

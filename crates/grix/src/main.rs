@@ -38,6 +38,23 @@ enum Cmd {
     },
     /// Show a grix image's settings and size.
     Inspect { image: PathBuf },
+    /// Save a login for a registry (for pulling private images), in
+    /// ~/.config/grix/auth.json. Docker's and Podman's logins work too.
+    Login {
+        /// The registry: docker.io (the default), ghcr.io, localhost:5000, ...
+        #[arg(default_value = "docker.io")]
+        registry: String,
+        #[arg(short, long)]
+        username: String,
+        /// Read the password (or token) from stdin, as it must be.
+        #[arg(long, required = true)]
+        password_stdin: bool,
+    },
+    /// Forget grix's login for a registry.
+    Logout {
+        #[arg(default_value = "docker.io")]
+        registry: String,
+    },
     /// Serve AI agents over MCP (stdio): a `run` tool for sandboxed programs, and `build_image`.
     Mcp(McpArgs),
     /// List the capabilities a sandbox can be granted.
@@ -69,6 +86,10 @@ struct McpArgs {
     /// on_exit) and build_image's output. Without it they only read.
     #[arg(long)]
     writable: bool,
+    /// Let build_image pull with your registry logins (`grix login`,
+    /// Docker's, Podman's). Without it, agents' pulls are anonymous.
+    #[arg(long)]
+    registry_credentials: bool,
 }
 
 /// The flags add to the Grixfile, or make the whole image without one:
@@ -117,6 +138,10 @@ struct BuildArgs {
     /// Don't show build steps' output.
     #[arg(short, long)]
     quiet: bool,
+    /// Run every build step, even those whose inputs haven't changed since
+    /// they last ran.
+    #[arg(long)]
+    no_cache: bool,
 }
 
 #[derive(Parser)]
@@ -243,6 +268,16 @@ fn main() -> ExitCode {
         Cmd::Pull { reference, oci } => grix::pull(&reference, &oci).map(|digest| {
             eprintln!("grix: pulled {reference} ({digest}) into {}", oci.display());
             0
+        }),
+        Cmd::Login { registry, username, password_stdin: _ } => login(&registry, &username),
+        Cmd::Logout { registry } => grix::auth::logout(&registry).map(|had| {
+            if had {
+                eprintln!("grix: logged out of {registry}");
+                0
+            } else {
+                eprintln!("grix: there was no login for {registry} (Docker's and Podman's are theirs to remove)");
+                1
+            }
         }),
         Cmd::Inspect { image } => grix::Image::open(&image).map(|img| {
             let (n, bytes) = img.size();
@@ -755,7 +790,7 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
         None => (Grixfile::default(), PathBuf::from(".")),
     };
     if let Some(from) = &args.from {
-        let from = ["dir:", "oci:", "docker-archive:"]
+        let from = ["dir:", "oci:", "docker-archive:", "image:"]
             .iter()
             .find_map(|p| from.strip_prefix(p).map(|rest| format!("{p}{}", here(rest).display())))
             .unwrap_or_else(|| from.clone());
@@ -793,15 +828,24 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
     );
     steps.sort_by_key(|(i, _)| *i);
     g.run.extend(steps.into_iter().map(|(_, s)| s));
-    let opts = grix::build::BuildOptions {
-        kernel: args.kernel.clone(),
-        on_output: &mut on_output,
-        policy: Default::default(),
-    };
+    let policy = grix::build::BuildPolicy { cache: !args.no_cache, ..Default::default() };
+    let opts = grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output, policy };
     let image = g.build(&base, opts)?;
     image.write_to(&args.output)?;
     let (n, bytes) = image.size();
     eprintln!("grix: built {} ({n} entries, {} MiB)", args.output.display(), bytes >> 20);
+    Ok(0)
+}
+
+fn login(registry: &str, username: &str) -> Result<i32> {
+    let mut password = String::new();
+    std::io::stdin().read_line(&mut password).context("reading the password from stdin")?;
+    let password = password.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        anyhow::bail!("no password on stdin");
+    }
+    let path = grix::auth::login(registry, username, password)?;
+    eprintln!("grix: saved the login for {registry} in {}", path.display());
     Ok(0)
 }
 
@@ -816,6 +860,7 @@ fn mcp(args: McpArgs) -> Result<i32> {
             .collect::<Result<_>>()?;
     }
     config.allow_hosts = args.allow_hosts.clone();
+    config.registry_credentials = args.registry_credentials;
     if let Some(s) = args.max_timeout {
         config.max_timeout = Duration::from_secs(s);
     }

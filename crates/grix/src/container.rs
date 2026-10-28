@@ -169,32 +169,9 @@ impl Image {
                     }
                     // An image may come from anywhere: plain names only.
                     let path = image::guest_path(&format!("/{rel}")).with_context(|| format!("bad path {name:?}"))?;
-                    total_files += 1;
-                    if total_files > MAX_FILES {
-                        bail!("the image has more than {MAX_FILES} entries");
+                    if let Some(node) = read_node(&mut entry, &mut total_bytes, &mut total_files)? {
+                        files.insert(path, node);
                     }
-                    let h = entry.header();
-                    let mode = h.mode().unwrap_or(0o644) & 0o7777;
-                    let mtime_ns = h.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
-                    let node = match h.entry_type() {
-                        tar::EntryType::Directory => Node::Dir { mode, mtime_ns },
-                        tar::EntryType::Symlink => {
-                            let target = entry.link_name()?.context("link without a target")?;
-                            Node::Symlink { target: target.to_string_lossy().into_owned(), mtime_ns }
-                        }
-                        tar::EntryType::Regular => {
-                            let size = h.size()?;
-                            total_bytes = total_bytes.saturating_add(size);
-                            if total_bytes > MAX_BYTES {
-                                bail!("the image is bigger than grix can run");
-                            }
-                            let mut data = Vec::with_capacity(size.min(1 << 20) as usize);
-                            (&mut entry).take(size).read_to_end(&mut data)?;
-                            Node::File { data, mode, mtime_ns }
-                        }
-                        _ => continue,
-                    };
-                    files.insert(path, node);
                 }
             }
         }
@@ -234,30 +211,7 @@ impl Image {
         };
         b.append_data(&mut file(meta.len(), 0o644, 0), "grix-image.json", &meta[..])?;
         b.append_data(&mut file(self.kernel.len(), 0o644, 0), "kernel", &self.kernel[..])?;
-        for (p, node) in &self.files {
-            let name = format!("rootfs{p}");
-            match node {
-                Node::File { data, mode, mtime_ns } => {
-                    b.append_data(&mut file(data.len(), *mode, *mtime_ns), &name, &data[..])?
-                }
-                Node::Dir { mode, mtime_ns } => {
-                    let mut h = tar::Header::new_gnu();
-                    h.set_entry_type(tar::EntryType::Directory);
-                    h.set_size(0);
-                    h.set_mode(*mode);
-                    h.set_mtime(mtime_ns / 1_000_000_000);
-                    b.append_data(&mut h, &name, &[][..])?;
-                }
-                Node::Symlink { target, mtime_ns } => {
-                    let mut h = tar::Header::new_gnu();
-                    h.set_entry_type(tar::EntryType::Symlink);
-                    h.set_size(0);
-                    h.set_mode(0o777);
-                    h.set_mtime(mtime_ns / 1_000_000_000);
-                    b.append_link(&mut h, &name, target)?;
-                }
-            }
-        }
+        append_files(&mut b, "rootfs", &self.files)?;
         b.into_inner()?.finish()?.flush()?;
         Ok(())
     }
@@ -289,6 +243,76 @@ impl Image {
         }
         Ok(path)
     }
+}
+
+/// Write `files` to a tar, under `prefix`.
+pub(crate) fn append_files<W: Write>(
+    b: &mut tar::Builder<W>,
+    prefix: &str,
+    files: &BTreeMap<String, Node>,
+) -> Result<()> {
+    for (p, node) in files {
+        let name = format!("{prefix}{p}");
+        let mut h = tar::Header::new_gnu();
+        match node {
+            Node::File { data, mode, mtime_ns } => {
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_size(data.len() as u64);
+                h.set_mode(*mode);
+                h.set_mtime(mtime_ns / 1_000_000_000);
+                b.append_data(&mut h, &name, &data[..])?
+            }
+            Node::Dir { mode, mtime_ns } => {
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(*mode);
+                h.set_mtime(mtime_ns / 1_000_000_000);
+                b.append_data(&mut h, &name, &[][..])?;
+            }
+            Node::Symlink { target, mtime_ns } => {
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_size(0);
+                h.set_mode(0o777);
+                h.set_mtime(mtime_ns / 1_000_000_000);
+                b.append_link(&mut h, &name, target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The node a tar entry (of `append_files`) holds, counting it against the
+/// limits on what an image may hold. None: a kind images don't have.
+pub(crate) fn read_node<R: Read>(
+    entry: &mut tar::Entry<R>,
+    total_bytes: &mut u64,
+    total_files: &mut usize,
+) -> Result<Option<Node>> {
+    *total_files += 1;
+    if *total_files > MAX_FILES {
+        bail!("the image has more than {MAX_FILES} entries");
+    }
+    let h = entry.header();
+    let mode = h.mode().unwrap_or(0o644) & 0o7777;
+    let mtime_ns = h.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
+    Ok(Some(match h.entry_type() {
+        tar::EntryType::Directory => Node::Dir { mode, mtime_ns },
+        tar::EntryType::Symlink => {
+            let target = entry.link_name()?.context("link without a target")?;
+            Node::Symlink { target: target.to_string_lossy().into_owned(), mtime_ns }
+        }
+        tar::EntryType::Regular => {
+            let size = h.size()?;
+            *total_bytes = total_bytes.saturating_add(size);
+            if *total_bytes > MAX_BYTES {
+                bail!("the image is bigger than grix can run");
+            }
+            let mut data = Vec::with_capacity(size.min(1 << 20) as usize);
+            (&mut *entry).take(size).read_to_end(&mut data)?;
+            Node::File { data, mode, mtime_ns }
+        }
+        _ => return Ok(None),
+    }))
 }
 
 pub(crate) fn cache_dir() -> Result<PathBuf> {

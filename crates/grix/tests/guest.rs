@@ -542,6 +542,72 @@ fn images_with_no_other_os() {
     assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
+#[test]
+fn images_built_on_images_and_cached_steps() {
+    // A base image whose build step leaves something new every time it
+    // runs; the step cache gives the same result while nothing changed.
+    use grix::build::{BuildOptions, BuildPolicy, Copy, Grixfile, Step};
+    let dir = temp_dir("layered");
+    let stamp = "/bin/busybox od -An -tx1 -N16 /dev/urandom > /stamp";
+    let base = Grixfile {
+        command: Some(vec!["/bin/busybox".into(), "cat".into(), "/stamp".into()]),
+        capabilities: vec!["process".into()],
+        copies: vec![Copy {
+            host: fixture("alpine/bin/busybox.static"),
+            guest: "/bin/busybox".into(),
+            outside_context: true,
+        }],
+        run: vec![Step::Exec(vec!["/bin/busybox".into(), "sh".into(), "-c".into(), stamp.into()])],
+        ..Default::default()
+    };
+    let build = |g: &Grixfile, cache: bool| {
+        let mut log = Vec::new();
+        let policy = BuildPolicy { cache, ..Default::default() };
+        let image = g
+            .build(&dir, BuildOptions { kernel: None, on_output: &mut |_, d| log.extend_from_slice(d), policy })
+            .unwrap();
+        (image, String::from_utf8_lossy(&log).into_owned())
+    };
+    let stamp_of = |image: &grix::Image| {
+        let sb = Sandbox::builder().image(image).unwrap().build().unwrap();
+        let out = sb.run(sb.command()).unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
+        out.stdout_str()
+    };
+    let (first, _) = build(&base, true);
+    let first_stamp = stamp_of(&first);
+    let (again, log) = build(&base, true);
+    assert!(log.contains("cached"), "{log}");
+    assert_eq!(stamp_of(&again), first_stamp);
+    let (fresh, log) = build(&base, false);
+    assert!(!log.contains("cached"), "{log}");
+    assert_ne!(stamp_of(&fresh), first_stamp);
+    // Another image built on it: its files and settings, and more.
+    first.write_to(dir.join("base.grix")).unwrap();
+    let app = Grixfile::parse(
+        r#"
+from = "image:base.grix"
+capabilities = ["threads"]
+run = [["/bin/busybox", "cp", "/stamp", "/copy"]]
+"#,
+    )
+    .unwrap();
+    let (image, _) = build(&app, true);
+    assert_eq!(image.config.command, ["/bin/busybox", "cat", "/stamp"]);
+    assert_eq!(image.config.capabilities, ["process", "threads"]);
+    let sb = Sandbox::builder().image(&image).unwrap().build().unwrap();
+    let out = sb.run(&["/bin/busybox", "cat", "/copy"]).unwrap();
+    assert_eq!(out.stdout_str(), first_stamp);
+    // A base outside the build context is refused, as any path is.
+    let outside = Grixfile::parse(&format!("from = \"image:{}\"", dir.join("base.grix").display())).unwrap();
+    let elsewhere = temp_dir("elsewhere");
+    let opts = BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default() };
+    let err = outside.build(&elsewhere, opts).err().unwrap();
+    assert!(err.to_string().contains("outside the build context"), "{err:#}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&elsewhere).unwrap();
+}
+
 // ---------------------------------------------------------------- signals from the host
 
 fn hostsig() -> SandboxBuilder {

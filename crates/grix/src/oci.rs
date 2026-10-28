@@ -2,10 +2,12 @@
 //! from a registry (Docker Hub, GHCR, ...), read from an OCI image layout
 //! directory, or read from a `docker save` archive.
 //!
-//! The image for linux/arm64 is picked and its layers are applied in order,
-//! whiteouts included. Its config gives the command, environment and working
-//! directory. Every blob is checked against its digest, and blobs from a
-//! registry are cached by digest (`~/.cache/grix/blobs`).
+//! The image for linux/arm64 is picked and its layers (tar, gzip or zstd)
+//! are applied in order, whiteouts included. Its config gives the command,
+//! environment and working directory. Every blob is checked against its
+//! digest, and blobs from a registry are cached by digest
+//! (`~/.cache/grix/oci`), and so is what an image's layers add up to
+//! (`treecache`). Registries that want a login get one from `auth`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -17,7 +19,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::auth::{Credential, Store};
 use crate::image::{self, Node};
+use crate::treecache;
 
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
@@ -63,7 +67,12 @@ pub(crate) struct Pulled {
 /// in the local Docker daemon, through `docker save`), or a registry
 /// reference such as `alpine:3.21`, `python:3.12-alpine` or
 /// `ghcr.io/owner/repo@sha256:...`. Relative paths are taken from `base`.
-pub(crate) fn load(source: &str, base: &Path) -> Result<Pulled> {
+/// With `credentials`, a registry that asks for a login gets the user's.
+pub(crate) fn load(source: &str, base: &Path, credentials: bool) -> Result<Pulled> {
+    load_with(source, base, if credentials { Store::user() } else { Store::none() })
+}
+
+fn load_with(source: &str, base: &Path, store: Store) -> Result<Pulled> {
     let resolve = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
     if let Some(dir) = source.strip_prefix("oci:") {
         return Layout::open(&resolve(dir))?.load();
@@ -86,7 +95,7 @@ pub(crate) fn load(source: &str, base: &Path) -> Result<Pulled> {
         return load_archive(&tar);
     }
     let reference = Reference::parse(source)?;
-    let mut registry = Registry::new(&reference)?;
+    let mut registry = Registry::new(&reference, store)?;
     let manifest_digest = registry.resolve(&reference.tag_or_digest)?;
     let layout = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&manifest_digest, &layout)?;
@@ -98,7 +107,7 @@ pub(crate) fn load(source: &str, base: &Path) -> Result<Pulled> {
 /// Returns the manifest's digest.
 pub fn pull_to_layout(source: &str, dir: &Path) -> Result<String> {
     let reference = Reference::parse(source)?;
-    let mut registry = Registry::new(&reference)?;
+    let mut registry = Registry::new(&reference, Store::user())?;
     let digest = registry.resolve(&reference.tag_or_digest)?;
     let cache = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&digest, &cache)?;
@@ -249,13 +258,14 @@ impl Layout {
         let config_digest = manifest["config"]["digest"].as_str().context("manifest without a config")?;
         fetch(config_digest, manifest["config"]["size"].as_u64())?;
         let config = parse_config(&self.json(config_digest)?)?;
+        // The layers, applied before: nothing to fetch or unpack.
+        let key = treecache::key("applied-layers-v1", &[digest.as_bytes()]);
+        if let Some(files) = treecache::get(&key) {
+            return Ok(Pulled { files, config, digest });
+        }
         let (mut files, mut totals) = (BTreeMap::new(), Totals::default());
         for layer in manifest["layers"].as_array().context("manifest without layers")? {
             let d = layer["digest"].as_str().context("layer without a digest")?;
-            let media = layer["mediaType"].as_str().unwrap_or("");
-            if media.contains("zstd") {
-                bail!("layer {d} is zstd-compressed, which grix can't read yet");
-            }
             fetch(d, layer["size"].as_u64())?;
             // Checked as it's read: what's applied is what was checked.
             let mut blob = Hashing::new(File::open(self.blob_path(d)?)?);
@@ -264,6 +274,8 @@ impl Layout {
                 bail!("layer {d} doesn't match its digest");
             }
         }
+        // Only a chance to save time later.
+        let _ = treecache::put(&key, &files);
         Ok(Pulled { files, config, digest })
     }
 }
@@ -358,10 +370,10 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
     let (mut files, mut totals) = (BTreeMap::new(), Totals::default());
     for (i, layer) in m["Layers"].as_array().context("manifest.json without layers")?.iter().enumerate() {
         let mut blob = Hashing::new(File::open(plain(layer)?)?);
-        let gzipped = apply_layer(&mut files, &mut blob, &mut totals)?;
+        let compressed = apply_layer(&mut files, &mut blob, &mut totals)?;
         let hash = blob.finish()?;
         if let Some(d) = diff_ids.get(i)
-            && !gzipped
+            && !compressed
             && hash != check_digest(d)?
         {
             bail!("layer {} doesn't match its digest", i + 1);
@@ -372,9 +384,9 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
 
 // ---------------------------------------------------------------- layers
 
-/// Apply one layer (a tar, gzipped or not) to `files`: OCI whiteouts
-/// (`.wh.NAME`, `.wh..wh..opq`) remove what lower layers had. Returns
-/// whether it was gzipped.
+/// Apply one layer (a tar: plain, gzipped or zstd-compressed) to `files`:
+/// OCI whiteouts (`.wh.NAME`, `.wh..wh..opq`) remove what lower layers
+/// had. Returns whether it was compressed.
 pub(crate) fn apply_layer(
     files: &mut BTreeMap<String, Node>,
     data: &mut dyn Read,
@@ -382,11 +394,11 @@ pub(crate) fn apply_layer(
 ) -> Result<bool> {
     let mut r = BufReader::new(data);
     let head = r.fill_buf()?;
-    let gzipped = head.starts_with(&[0x1f, 0x8b]);
+    let (gzipped, zstd) = (head.starts_with(&[0x1f, 0x8b]), head.starts_with(&ZSTD_MAGIC));
     let reader: Box<dyn Read> = if gzipped {
-        Box::new(flate2::read::GzDecoder::new(r))
-    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        bail!("zstd-compressed layers aren't supported yet");
+        Box::new(flate2::read::MultiGzDecoder::new(r))
+    } else if zstd {
+        Box::new(Zstd { source: r, decoder: ruzstd::decoding::FrameDecoder::new(), in_frame: false })
     } else {
         Box::new(r)
     };
@@ -472,7 +484,60 @@ pub(crate) fn apply_layer(
         added.insert(path.clone());
         files.insert(path, node);
     }
-    Ok(gzipped)
+    Ok(gzipped || zstd)
+}
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// zstd, frame after frame (as parallel compressors write it), skipping
+/// skippable frames. A frame's window is capped at ruzstd's default (128
+/// MiB, zstd's own default limit), so a layer can't make it allocate more.
+struct Zstd<R: BufRead> {
+    source: R,
+    decoder: ruzstd::decoding::FrameDecoder,
+    in_frame: bool,
+}
+
+impl<R: BufRead> Read for Zstd<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use ruzstd::decoding::BlockDecodingStrategy;
+        use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if !self.in_frame {
+                if self.source.fill_buf()?.is_empty() {
+                    return Ok(0);
+                }
+                match self.decoder.init(&mut self.source) {
+                    Ok(()) => self.in_frame = true,
+                    Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                        length, ..
+                    })) => {
+                        let want = u64::from(length);
+                        let skipped = std::io::copy(&mut (&mut self.source).take(want), &mut std::io::sink())?;
+                        if skipped < want {
+                            return Err(std::io::ErrorKind::UnexpectedEof.into());
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e)),
+                }
+            }
+            let d = &mut self.decoder;
+            while d.can_collect() == 0 && !d.is_finished() {
+                d.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1))
+                    .map_err(std::io::Error::other)?;
+            }
+            let n = d.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            // That frame is done; another may follow.
+            self.in_frame = false;
+        }
+    }
 }
 
 /// A reader that hashes what goes through it.
@@ -517,37 +582,99 @@ struct Registry {
     agent: ureq::Agent,
     host: String,
     repo: String,
-    token: Option<String>,
+    /// `https`, or `http` for a registry on this machine that doesn't
+    /// speak TLS (as Docker allows for one).
+    scheme: &'static str,
+    /// What goes in Authorization: a token, or a login (Basic).
+    auth: Option<String>,
+    store: Store,
+    /// The login for this registry, once looked up.
+    credential: Option<Option<Credential>>,
+}
+
+/// Is `host` (`name[:port]`, `[v6]:port`) this machine?
+fn loopback(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    matches!(name, "localhost" | "127.0.0.1" | "::1")
 }
 
 impl Registry {
-    fn new(r: &Reference) -> Result<Registry> {
+    fn new(r: &Reference, store: Store) -> Result<Registry> {
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(Duration::from_secs(30))
             .timeout_read(Duration::from_secs(120))
             .build();
-        Ok(Registry { agent, host: r.host.clone(), repo: r.repo.clone(), token: None })
+        Ok(Registry {
+            agent,
+            host: r.host.clone(),
+            repo: r.repo.clone(),
+            scheme: "https",
+            auth: None,
+            store,
+            credential: None,
+        })
     }
 
-    /// GET `/v2/<repo>/<path>`, getting a token if the registry asks for
-    /// one, and following redirects (without the token: they go to
-    /// storage elsewhere).
+    /// May this registry send us to `url` (a redirect, a token service)?
+    /// Over TLS only: what comes back is checked by digest, but a
+    /// plain-HTTP hop could still be steered at local services (and would
+    /// carry a login in the clear). A registry on this machine without
+    /// TLS may send us elsewhere on it.
+    fn may_reach(&self, url: &str) -> bool {
+        url.starts_with("https://")
+            || (self.scheme == "http"
+                && url.strip_prefix("http://").is_some_and(|rest| loopback(rest.split('/').next().unwrap_or(""))))
+    }
+
+    /// The user's login for this registry, looked up once.
+    fn credential(&mut self) -> Result<Option<Credential>> {
+        if self.credential.is_none() {
+            self.credential = Some(self.store.lookup(&self.host)?);
+        }
+        Ok(self.credential.clone().flatten())
+    }
+
+    /// The registry as `grix login` takes it.
+    fn login_name(&self) -> &str {
+        if self.host == "registry-1.docker.io" { "docker.io" } else { &self.host }
+    }
+
+    /// GET `/v2/<repo>/<path>`, logging in if the registry asks, and
+    /// following redirects (without the token or login: they go to storage
+    /// elsewhere).
     fn get(&mut self, path: &str, accept: &str) -> Result<ureq::Response> {
-        let url = format!("https://{}/v2/{}/{path}", self.host, self.repo);
-        for attempt in 0..2 {
+        let (mut authenticated, mut tried_http) = (false, false);
+        loop {
+            let url = format!("{}://{}/v2/{}/{path}", self.scheme, self.host, self.repo);
             let mut req = self.agent.get(&url).set("Accept", accept);
-            if let Some(t) = &self.token {
-                req = req.set("Authorization", &format!("Bearer {t}"));
+            if let Some(a) = &self.auth {
+                req = req.set("Authorization", a);
             }
             let resp = match req.call() {
                 Ok(r) => r,
-                Err(ureq::Error::Status(401, r)) if attempt == 0 => {
+                Err(ureq::Error::Status(401, r)) if !authenticated => {
+                    authenticated = true;
                     let challenge = r.header("www-authenticate").context("401 without a challenge")?.to_string();
-                    self.token = Some(self.authenticate(&challenge)?);
+                    self.auth = Some(self.authenticate(&challenge)?);
                     continue;
                 }
+                Err(ureq::Error::Status(401, _)) => {
+                    let name = self.login_name().to_string();
+                    if self.credential()?.is_some() {
+                        bail!("{url}: not authorized, with the login for {name}");
+                    }
+                    bail!("{url}: not authorized (if the image is private, log in first: `grix login {name}`)");
+                }
                 Err(ureq::Error::Status(code, _)) => bail!("{url}: HTTP {code}"),
+                Err(ureq::Error::Transport(_)) if self.scheme == "https" && loopback(&self.host) && !tried_http => {
+                    tried_http = true;
+                    self.scheme = "http";
+                    continue;
+                }
                 Err(e) => return Err(anyhow::Error::new(e).context(url)),
             };
             let mut resp = resp;
@@ -556,10 +683,8 @@ impl Registry {
                     return Ok(resp);
                 }
                 let to = resp.header("location").context("redirect without a location")?.to_string();
-                let to = if to.starts_with('/') { format!("https://{}{to}", self.host) } else { to };
-                // Elsewhere, over TLS only (what comes back is checked by digest,
-                // but a plain-HTTP hop could still be steered at local services).
-                if !to.starts_with("https://") {
+                let to = if to.starts_with('/') { format!("{}://{}{to}", self.scheme, self.host) } else { to };
+                if !self.may_reach(&to) {
                     bail!("{url}: redirected to {to}, which isn't https");
                 }
                 resp = match self.agent.get(&to).call() {
@@ -570,30 +695,71 @@ impl Registry {
             }
             bail!("{url}: too many redirects");
         }
-        bail!("{url}: not authorized")
     }
 
-    /// An anonymous pull token, as the registry's challenge says to get one.
-    fn authenticate(&self, challenge: &str) -> Result<String> {
-        let params = challenge.strip_prefix("Bearer ").context("unsupported registry authentication")?;
+    /// What to send as Authorization, as the registry's challenge asks: a
+    /// token from its token service (anonymous, or with the user's login),
+    /// or the login itself.
+    fn authenticate(&mut self, challenge: &str) -> Result<String> {
+        let credential = self.credential()?;
+        let (scheme, params) = challenge.trim().split_once(' ').unwrap_or((challenge.trim(), ""));
+        if scheme.eq_ignore_ascii_case("basic") {
+            return match credential.as_ref().and_then(Credential::basic_header) {
+                Some(h) => Ok(h),
+                None => bail!("{} wants a login: `grix login {}`", self.host, self.login_name()),
+            };
+        }
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            bail!("unsupported registry authentication {scheme:?}");
+        }
         let mut fields = BTreeMap::new();
         for part in params.split(',') {
             if let Some((k, v)) = part.trim().split_once('=') {
                 fields.insert(k.to_string(), v.trim_matches('"').to_string());
             }
         }
-        let realm = fields.get("realm").context("challenge without a realm")?;
-        if !realm.starts_with("https://") {
+        let realm = fields.get("realm").context("challenge without a realm")?.clone();
+        if !self.may_reach(&realm) {
             bail!("the registry's token service {realm} isn't https");
         }
-        let mut req = self.agent.get(realm);
-        if let Some(s) = fields.get("service") {
-            req = req.query("service", s);
-        }
         let scope = fields.get("scope").cloned().unwrap_or_else(|| format!("repository:{}:pull", self.repo));
-        req = req.query("scope", &scope);
-        let body: Value = serde_json::from_slice(&read_limited(req.call()?.into_reader(), MAX_JSON)?)?;
-        Ok(body["token"].as_str().or(body["access_token"].as_str()).context("no token in the answer")?.to_string())
+        let service = fields.get("service").cloned();
+        let answer = match &credential {
+            // OAuth2, as Docker does with an identity token.
+            Some(Credential::IdentityToken(token)) => {
+                let mut form = vec![
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", token.as_str()),
+                    ("client_id", "grix"),
+                    ("scope", scope.as_str()),
+                ];
+                if let Some(s) = &service {
+                    form.push(("service", s.as_str()));
+                }
+                self.agent.post(&realm).send_form(&form)
+            }
+            _ => {
+                let mut req = self.agent.get(&realm).query("scope", &scope);
+                if let Some(s) = &service {
+                    req = req.query("service", s);
+                }
+                if let Some(h) = credential.as_ref().and_then(Credential::basic_header) {
+                    req = req.set("Authorization", &h);
+                }
+                req.call()
+            }
+        };
+        let resp = match answer {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) if credential.is_some() => {
+                bail!("{realm}: HTTP {code} for the login for {}", self.login_name())
+            }
+            Err(ureq::Error::Status(code, _)) => bail!("{realm}: HTTP {code}"),
+            Err(e) => return Err(anyhow::Error::new(e).context(realm)),
+        };
+        let body: Value = serde_json::from_slice(&read_limited(resp.into_reader(), MAX_JSON)?)?;
+        let token = body["token"].as_str().or(body["access_token"].as_str()).context("no token in the answer")?;
+        Ok(format!("Bearer {token}"))
     }
 
     /// The digest of the linux/arm64 manifest that `tag` names.
@@ -714,6 +880,7 @@ fn tempdir(what: &str) -> Result<TempDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::random_suffix;
 
     fn layer(entries: &[(&str, Option<&str>)]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
@@ -804,6 +971,163 @@ mod tests {
         assert!(matches!(p.files.get("/w/f"), Some(Node::File { data, .. }) if data == b"hi"));
         // Not for arm64: refused.
         assert!(parse_config(br#"{"architecture":"amd64"}"#).is_err());
+    }
+
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn zstd_layers() {
+        let tar = layer(&[("etc/", None), ("etc/a", Some(&"a".repeat(100_000))), ("etc/b", Some("b"))]);
+        // One frame; then the same in two frames with a skippable frame
+        // between them, as parallel compressors write it.
+        let mut split = zstd(&tar[..5000]);
+        split.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3]);
+        split.extend_from_slice(&zstd(&tar[5000..]));
+        for packed in [zstd(&tar), split] {
+            let mut files = BTreeMap::new();
+            let compressed = apply_layer(&mut files, &mut &packed[..], &mut Totals::default()).unwrap();
+            assert!(compressed);
+            assert!(matches!(files.get("/etc/a"), Some(Node::File { data, .. }) if data.len() == 100_000));
+            assert!(matches!(files.get("/etc/b"), Some(Node::File { data, .. }) if data == b"b"));
+        }
+        // Garbage after the magic is an error, not a panic.
+        let mut bad = zstd(&tar);
+        let n = bad.len();
+        bad.truncate(n / 2);
+        assert!(apply_layer(&mut BTreeMap::new(), &mut &bad[..], &mut Totals::default()).is_err());
+    }
+
+    /// A registry on this machine, over plain HTTP, that wants a login:
+    /// `bearer` sends clients to its token service (which gives anonymous
+    /// tokens that can't pull), otherwise it takes the login itself.
+    struct FakeRegistry {
+        port: u16,
+    }
+
+    impl FakeRegistry {
+        fn start(bearer: bool, blobs: BTreeMap<String, Vec<u8>>, manifest: Vec<u8>) -> FakeRegistry {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let login = format!("Basic {}", {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode("user:pass")
+            });
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { continue };
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                        match conn.read(&mut byte) {
+                            // Not HTTP (a TLS handshake): hang up.
+                            Ok(1) if head.is_empty() && !byte[0].is_ascii_uppercase() => break,
+                            Ok(1) => head.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let Some(path) = head.lines().next().and_then(|l| l.split(' ').nth(1)) else { continue };
+                    let auth = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Authorization: ").or(l.strip_prefix("authorization: ")))
+                        .unwrap_or("")
+                        .to_string();
+                    let allowed = if bearer { auth == "Bearer good" } else { auth == login };
+                    let (status, body, extra) = if path.starts_with("/token") {
+                        let token = if auth == login { "good" } else { "anonymous" };
+                        ("200 OK", format!("{{\"token\":\"{token}\"}}").into_bytes(), String::new())
+                    } else if !allowed {
+                        let challenge = if bearer {
+                            format!("Bearer realm=\"http://127.0.0.1:{port}/token\",service=\"fake\"")
+                        } else {
+                            "Basic realm=\"fake\"".to_string()
+                        };
+                        ("401 Unauthorized", Vec::new(), format!("WWW-Authenticate: {challenge}\r\n"))
+                    } else if path.contains("/manifests/") {
+                        ("200 OK", manifest.clone(), format!("Content-Type: {OCI_MANIFEST}\r\n"))
+                    } else if let Some(b) = path.rsplit_once("/blobs/").and_then(|(_, d)| blobs.get(d)) {
+                        ("200 OK", b.clone(), String::new())
+                    } else {
+                        ("404 Not Found", Vec::new(), String::new())
+                    };
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",
+                        body.len()
+                    );
+                    let _ = conn.write_all(&body);
+                }
+            });
+            FakeRegistry { port }
+        }
+    }
+
+    #[test]
+    fn registries_that_want_a_login() {
+        // A private image with a zstd layer.
+        let config = br#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/hello"]}}"#.to_vec();
+        let layer_data = zstd(&layer(&[("hello", Some(&random_suffix()))]));
+        let digest = |d: &[u8]| format!("sha256:{}", sha256(d));
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest(&config), "size": config.len()},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+zstd", "digest": digest(&layer_data), "size": layer_data.len()}],
+        })
+        .to_string()
+        .into_bytes();
+        let blobs: BTreeMap<String, Vec<u8>> =
+            [(digest(&config), config.clone()), (digest(&layer_data), layer_data.clone())].into_iter().collect();
+        let dir = tempdir("logins").unwrap();
+        let creds = dir.path.join("config.json");
+        let auth = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode("user:pass")
+        };
+        for bearer in [true, false] {
+            let reg = FakeRegistry::start(bearer, blobs.clone(), manifest.clone());
+            let source = format!("localhost:{}/team/private:1", reg.port);
+            // Without a login: refused, saying how to log in.
+            let err = load_with(&source, &dir.path, Store::none()).err().unwrap();
+            assert!(format!("{err:#}").contains(&format!("grix login localhost:{}", reg.port)), "{err:#}");
+            // With one (as Docker keeps it): pulled.
+            std::fs::write(
+                &creds,
+                serde_json::json!({"auths": {format!("localhost:{}", reg.port): {"auth": auth}}}).to_string(),
+            )
+            .unwrap();
+            let pulled = load_with(&source, &dir.path, Store::file(&creds)).unwrap();
+            assert_eq!(pulled.config.cmd, ["/hello"]);
+            assert!(pulled.files.contains_key("/hello"));
+            // A wrong one is refused.
+            std::fs::write(
+                &creds,
+                serde_json::json!({"auths": {format!("localhost:{}", reg.port): {"username": "user", "password": "nope"}}})
+                    .to_string(),
+            )
+            .unwrap();
+            let err = load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds));
+            assert!(err.is_err());
+        }
+    }
+
+    #[test]
+    fn where_registries_may_send_us() {
+        let r = Reference::parse("ghcr.io/o/r:1").unwrap();
+        let reg = Registry::new(&r, Store::none()).unwrap();
+        assert!(reg.may_reach("https://elsewhere.example/token"));
+        assert!(!reg.may_reach("http://127.0.0.1:8080/token"));
+        let r = Reference::parse("localhost:5000/o/r:1").unwrap();
+        let mut reg = Registry::new(&r, Store::none()).unwrap();
+        assert!(!reg.may_reach("http://127.0.0.1:8080/token"));
+        reg.scheme = "http";
+        assert!(reg.may_reach("http://127.0.0.1:8080/token"));
+        assert!(reg.may_reach("http://[::1]:8080/x") && !reg.may_reach("http://example.com/x"));
+        assert!(loopback("localhost:5000") && loopback("[::1]:5000") && !loopback("localhost.example.com"));
     }
 
     #[test]

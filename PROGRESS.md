@@ -459,6 +459,22 @@ Next, in TODO.md order:
     computes nanoseconds the same way (`(ticks * mult) >> 32`), so the
     vDSO and the system calls agree to the nanosecond.
 
+- **Images** (round 2, item 15): zstd layers (ruzstd, pure Rust, frame
+  after frame, windows capped at 128 MiB) and multi-member gzip; private
+  registries (`auth.rs`: `grix login`, Docker's and Podman's files and
+  credential helpers; Bearer with a login or an identity token, and Basic;
+  a login only goes over TLS, to the registry or the token service it
+  names, or to a registry on this machine, which may speak plain HTTP);
+  agents' builds pull anonymously unless the MCP server says
+  `--registry-credentials`. `treecache.rs` keeps file trees as hashed,
+  uncompressed tars: an image's applied layers by manifest digest, and
+  each build step's result by everything that went into it (files before
+  it by contents and modes, not times; the step, environment, user,
+  working directory, kernel and network rules), least recently used out
+  past 10 GiB. `from = "image:FILE"` builds on another grix image.
+  flate2 now uses zlib-rs: building from python:3.12-alpine went from
+  9.4 s to 3.8 s (7.8 s of it was gzip).
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use

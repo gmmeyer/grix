@@ -75,8 +75,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     (`clock_gettime` and `gettimeofday` without a system call). Left:
     `MAP_GROWSDOWN`; another process's CPU clock as a timer's clock;
     `/proc/<pid>` of zombies; `PIDFD_THREAD`.
-15. **Images**: zstd layers, registries that need a login, a cache of
-    applied base layers.
+15. [x] **Images**: zstd layers, registries that need a login (`grix
+    login`, Docker's and Podman's logins and credential helpers), a cache
+    of applied base layers and of build steps, and images built on grix
+    images (`from = "image:FILE"`). Left: pushing images; an image's root
+    served lazily.
 16. **Agents**: MCP progress/streaming and cancellation; native Python
     bindings (PyO3).
 17. **SMP**: several processes in parallel; finer locking than one kernel
@@ -103,10 +106,14 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       OCI layout, `docker save`, the Docker daemon) or nothing, copies, files,
       build steps (shell or argv), settings, and the kernel, in a `.grix` file.
       `grix run --image`, `SandboxBuilder::image`, `grix inspect`, `grix pull`.
-- [ ] zstd-compressed layers.
-- [ ] Registries that need credentials (only anonymous pulls today).
-- [ ] Multi-image layering without re-reading the base (a cache of applied
-      bases); building is a full re-import every time.
+- [x] zstd-compressed layers (and multi-member gzip).
+- [x] Registries that need credentials: `grix login`, Docker's and Podman's
+      logins and credential helpers, Bearer (with a login or an identity
+      token) and Basic. Agents' builds pull anonymously unless the MCP
+      server allows otherwise (`--registry-credentials`).
+- [x] Multi-image layering without re-reading the base: images built on
+      grix images (`from = "image:FILE"`), and a cache of applied bases and
+      of build steps (`--no-cache`).
 - [x] A Docker image of grix itself (`Dockerfile`): static `grix` and
       `grix-vmm`, FROM scratch, run with `--device /dev/kvm`.
 

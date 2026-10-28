@@ -79,7 +79,12 @@ file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),
 `kernel` and `rootfs/`. `grix build` assembles one from a Grixfile: a
 Docker/OCI image (`oci.rs` pulls from registries and reads OCI layouts and
 `docker save` archives, applying layers with whiteouts and checking
-digests), copies, files, and build steps. Steps run in grix itself and
+digests; zstd too), copies, files, and build steps, or another grix
+image (`image:FILE`). Registry logins come from `auth.rs` (only when a
+registry asks; agents' builds only with `--registry-credentials`).
+`treecache.rs` keeps applied layers and build steps' results, keyed by
+what went into them: anything new that changes a step's result belongs
+in `build::step_key`. Steps run in grix itself and
 export `/`; nodes the kernel made at boot (`Node::generated`) stay out
 unless the step changed them. They run as the image's user
 (`ImageConfig::user`, an OCI image's `User`, root by default as in

@@ -40,6 +40,9 @@ pub struct McpConfig {
     /// Agents may change host files: writable mounts (`rw`, `on_exit`) and
     /// `build_image`'s output. Off by default.
     pub writable: bool,
+    /// `build_image` may pull images with the user's registry logins. Off
+    /// by default: what an agent builds is anonymous.
+    pub registry_credentials: bool,
 }
 
 impl McpConfig {
@@ -57,6 +60,7 @@ impl McpConfig {
             max_memory_mb: 2048,
             max_cpus: 4,
             writable: false,
+            registry_credentials: false,
         })
     }
 
@@ -78,6 +82,8 @@ impl McpConfig {
             allow_hosts: self.allow_hosts.clone(),
             registries: net,
             docker: false,
+            credentials: self.registry_credentials,
+            cache: true,
             step_timeout: self.max_timeout,
             step_memory_mb: self.max_memory_mb,
         }

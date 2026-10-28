@@ -19,6 +19,7 @@
 //! capabilities you grant ([`Capability`]). Anything it tries beyond that is
 //! denied and reported in [`RunOutput::events`].
 
+pub mod auth;
 pub mod build;
 mod container;
 mod control;
@@ -34,6 +35,7 @@ mod net;
 mod oci;
 mod sandbox;
 pub mod snapshot;
+mod treecache;
 mod vmm;
 
 pub use container::{Image, ImageConfig};

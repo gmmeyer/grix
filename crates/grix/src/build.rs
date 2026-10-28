@@ -24,12 +24,20 @@
 //! `from` takes a registry reference (`alpine:3.21`,
 //! `ghcr.io/owner/repo:tag`), `oci:DIR` (an OCI image layout),
 //! `docker-archive:FILE` (`docker save` output), `docker:NAME` (from the
-//! local Docker daemon) or `dir:DIR` (a root file system). Without `from`,
-//! the image has nothing but the grix kernel and what the Grixfile puts in:
-//! a static program needs no other OS. Build steps run in grix itself, with
-//! `fs_write`, `process`, `threads` and `net`, and the file tree they leave
-//! is the image's. A step that's a string runs with `/bin/sh -c`; one that's
-//! a list is a program and its arguments, which needs no shell.
+//! local Docker daemon), `dir:DIR` (a root file system) or `image:FILE`
+//! (another grix image: its files and settings, to build on). Without
+//! `from`, the image has nothing but the grix kernel and what the Grixfile
+//! puts in: a static program needs no other OS. Build steps run in grix
+//! itself, with `fs_write`, `process`, `threads` and `net`, and the file
+//! tree they leave is the image's. A step that's a string runs with
+//! `/bin/sh -c`; one that's a list is a program and its arguments, which
+//! needs no shell.
+//!
+//! What a step leaves is cached (`treecache`), by everything that went
+//! into it: the files before it (contents and modes), the step, the
+//! environment, the user, the working directory, the kernel and what the
+//! network allowed. A step whose inputs haven't changed isn't run again,
+//! as with Docker's build cache; `grix build --no-cache` runs them all.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -147,6 +155,11 @@ pub struct BuildPolicy {
     pub registries: bool,
     /// `from` may be `docker:NAME` (the host's Docker daemon).
     pub docker: bool,
+    /// A registry that wants a login gets the user's (`auth`).
+    pub credentials: bool,
+    /// Steps whose inputs are unchanged may be taken from the cache
+    /// instead of running (what they leave is cached either way).
+    pub cache: bool,
     /// Each step's time limit and the most memory it may have.
     pub step_timeout: Duration,
     pub step_memory_mb: u64,
@@ -159,6 +172,8 @@ impl Default for BuildPolicy {
             allow_hosts: Vec::new(),
             registries: true,
             docker: true,
+            credentials: true,
+            cache: true,
             step_timeout: Duration::from_secs(1800),
             step_memory_mb: 3000,
         }
@@ -188,6 +203,13 @@ impl Grixfile {
                 let dir = in_context(base, Path::new(&dir[4..]), self.from_outside_context)?;
                 image::import(&mut files, &dir, "/")?;
             }
+            // Another grix image: its files and how it runs, built on.
+            Some(path) if path.starts_with("image:") => {
+                let path = in_context(base, Path::new(&path[6..]), self.from_outside_context)?;
+                let base_image = Image::open(&path)?;
+                files = base_image.files;
+                config = base_image.config;
+            }
             Some(source) => {
                 let local = ["oci:", "docker-archive:", "docker:"].iter().any(|p| source.starts_with(p));
                 if source.starts_with("docker:") && !opts.policy.docker {
@@ -202,7 +224,8 @@ impl Grixfile {
                         in_context(base, Path::new(p), self.from_outside_context)?;
                     }
                 }
-                let pulled = crate::oci::load(source, base).with_context(|| format!("from {source}"))?;
+                let pulled = crate::oci::load(source, base, opts.policy.credentials)
+                    .with_context(|| format!("from {source}"))?;
                 files = pulled.files;
                 let c = pulled.config;
                 config.command = c.entrypoint.into_iter().chain(c.cmd).collect();
@@ -230,8 +253,15 @@ impl Grixfile {
         for name in &self.capabilities {
             Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?;
         }
-        config.capabilities = self.capabilities.clone();
-        config.memory_mb = self.memory_mb;
+        // What a base image's program needs, this one may well need too.
+        for name in &self.capabilities {
+            if !config.capabilities.contains(name) {
+                config.capabilities.push(name.clone());
+            }
+        }
+        if self.memory_mb.is_some() {
+            config.memory_mb = self.memory_mb;
+        }
         for c in &self.copies {
             let host = in_context(base, &c.host, c.outside_context)?;
             image::import(&mut files, &host, &c.guest)?;
@@ -270,7 +300,30 @@ impl Grixfile {
     }
 }
 
-/// Run one build step in `image` and take the file tree it leaves.
+/// What a step's result depends on: the files before it, the step, and
+/// how it runs.
+fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
+    use sha2::{Digest, Sha256};
+    let tree = crate::treecache::tree_hash(&image.files);
+    let kernel: String = Sha256::digest(image.kernel_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let c = &image.config;
+    let net = if policy.net { policy.allow_hosts.join("\0") } else { "\0no net".into() };
+    let parts = [
+        tree.as_bytes(),
+        argv.join("\0").as_bytes(),
+        c.env.join("\0").as_bytes(),
+        c.user.as_deref().unwrap_or("").as_bytes(),
+        c.cwd.as_deref().unwrap_or("").as_bytes(),
+        kernel.as_bytes(),
+        net.as_bytes(),
+    ]
+    .map(|p| p.to_vec());
+    let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    crate::treecache::key("build-step-v1", &parts)
+}
+
+/// Run one build step in `image` and take the file tree it leaves (or
+/// what it left before, from the cache).
 fn run_step(
     image: Image,
     step: &Step,
@@ -280,6 +333,14 @@ fn run_step(
     let argv = step.argv();
     if argv.is_empty() {
         bail!("an empty build step");
+    }
+    let key = step_key(&image, &argv, policy);
+    if policy.cache
+        && let Some(files) = crate::treecache::get(&key)
+    {
+        on_output(Stream::Stderr, format!("grix: {step:?}: cached\n").as_bytes());
+        let kernel = image.kernel_bytes().to_vec();
+        return Ok(Image::new(files, image.config, kernel));
     }
     let (_, bytes) = image.size();
     // Room for the tree, what the step adds, and the export of it all.
@@ -322,6 +383,8 @@ fn run_step(
         };
         files.insert(format!("/{}", e.path), node);
     }
+    // Only a chance to save time later.
+    let _ = crate::treecache::put(&key, &files);
     let kernel = image.kernel_bytes().to_vec();
     Ok(Image::new(files, image.config, kernel))
 }

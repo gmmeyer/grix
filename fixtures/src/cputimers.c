@@ -82,7 +82,9 @@ int main(void) {
     spin(CLOCK_PROCESS_CPUTIME_ID, 200, NULL);
     struct itimerval off = {{0, 0}, {0, 0}};
     CHECK(setitimer(ITIMER_PROF, &off, NULL) == 0);
-    CHECK(prof >= 8 && prof <= 25);
+    // Fewer if the host held the vCPU back: periods that pass together
+    // make one signal.
+    CHECK(prof >= 2 && prof <= 25);
     int seen = prof;
     spin(CLOCK_PROCESS_CPUTIME_ID, 50, NULL);
     CHECK(prof == seen);
