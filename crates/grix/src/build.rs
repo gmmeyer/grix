@@ -231,7 +231,18 @@ impl Grixfile {
                         in_context(base, Path::new(p), self.from_outside_context)?;
                     }
                 }
-                let pulled = crate::oci::load(source, base, opts.policy.credentials, opts.policy.local_registries)
+                // Where the steps may connect, so may the pull.
+                let allow = opts
+                    .policy
+                    .allow_hosts
+                    .iter()
+                    .map(|r| crate::net::HostRule::parse(r))
+                    .collect::<Result<Vec<_>>>()?;
+                let reach = crate::oci::Reach {
+                    allow: (!allow.is_empty()).then_some(allow),
+                    local: opts.policy.local_registries,
+                };
+                let pulled = crate::oci::load(source, base, opts.policy.credentials, reach)
                     .with_context(|| format!("from {source}"))?;
                 files = pulled.files;
                 let c = pulled.config;

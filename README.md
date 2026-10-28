@@ -346,8 +346,11 @@ Images an agent runs get the server's kernel, and may ask only for
 capabilities the server allows. Builds follow the same policy: their steps
 get `net` (under the same host rules) and `from` may pull from a registry
 only if the server allows `net`, anonymously unless it says
-`--registry-credentials`; `docker:` sources and registries on the host
-itself are refused.
+`--registry-credentials`, and only from hosts its rules allow (the
+registry, its token service and where it sends downloads, such as
+`registry-1.docker.io`, `auth.docker.io` and
+`production.cloudflare.docker.com` for Docker Hub); `docker:` sources and
+registries on the host itself are refused.
 
 For example, in a Claude Code or other MCP client config:
 
@@ -474,8 +477,14 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   Hub is `docker.io`, the default) saves a login in
   `~/.config/grix/auth.json`; Docker's and Podman's logins (and credential
   helpers) work too. A login goes only to the registry that asks for it,
-  and its token service, over TLS (or to a registry on this machine,
-  which may speak plain HTTP). The caches are private (0700).
+  and its token service if that's on the registry's own site (its host,
+  a parent domain, or a host beside it: `auth.docker.io` for
+  `registry-1.docker.io`), over TLS (or to a registry on this machine,
+  which may speak plain HTTP); another token service is asked without it.
+  A pull connects as the build's steps may (`--allow-host`), never to
+  special addresses (this machine, cloud metadata) unless a rule names
+  them, whatever names resolve to them; a registry on this machine is the
+  exception, where builds allow one. The caches are private (0700).
 - Builds are cached in `~/.cache/grix/trees` (at most 10 GiB, or
   `GRIX_TREE_CACHE_MB`): what an image's layers add up to, and what each
   build step left, by everything that went into it (the files before it,

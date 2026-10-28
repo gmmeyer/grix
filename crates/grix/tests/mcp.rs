@@ -228,6 +228,34 @@ fn a_writable_server_builds_images_and_writes_mounts() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// With `net` and an allow-list, a build's registry pulls connect only
+/// where the list allows, as its steps do: not this machine under another
+/// name for it, and not anywhere the list doesn't name.
+#[test]
+fn registry_pulls_keep_to_the_network_policy() {
+    let dir = std::env::temp_dir().join(format!("grix-mcp-pull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let mut server = Server::start(&["--writable", "--allow", "net", "--allow-host", "allowed.invalid:443"], &[&dir]);
+    for (from, why) in [
+        (format!("127.0.0.2:{port}/review/probe:1"), "on this machine"),
+        (format!("[::ffff:127.0.0.1]:{port}/review/probe:1"), "on this machine"),
+        ("example.com/review/probe:1".to_string(), "isn't in the allow-list"),
+    ] {
+        std::fs::write(dir.join("Grixfile"), format!("from = {from:?}\n")).unwrap();
+        let r = server.tool("build_image", json!({"grixfile": dir.join("Grixfile"), "output": dir.join("x.grix")}));
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(text(&r).contains(why), "{from}: {}", text(&r));
+    }
+    server.end();
+    assert!(listener.accept().is_err(), "a pull connected to this machine");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn progress_and_cancellation() {
     // Two calls at once: one streams its output as progress, the other is

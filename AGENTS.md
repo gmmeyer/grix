@@ -131,7 +131,11 @@ Docker/OCI image (`oci.rs` pulls from registries and reads OCI layouts and
 `docker save` archives, applying layers with whiteouts and checking
 digests; zstd too), copies, files, and build steps, or another grix
 image (`image:FILE`). Registry logins come from `auth.rs` (only when a
-registry asks; agents' builds only with `--registry-credentials`).
+registry asks, to its own site's token service; agents' builds only
+with `--registry-credentials`). Every connection a pull makes goes
+through `oci::Resolver`, which checks the addresses names resolve to
+against the build's network policy (`net::reachable`), as the proxy
+checks a program's.
 `treecache.rs` keeps applied layers and build steps' results, keyed by
 what went into them: anything new that changes a step's result belongs
 in `build::step_key`. Steps run in grix itself and

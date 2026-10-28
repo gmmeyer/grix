@@ -68,12 +68,12 @@ pub(crate) struct Pulled {
 /// reference such as `alpine:3.21`, `python:3.12-alpine` or
 /// `ghcr.io/owner/repo@sha256:...`. Relative paths are taken from `base`.
 /// With `credentials`, a registry that asks for a login gets the user's;
-/// without `local`, registries on this machine are refused.
-pub(crate) fn load(source: &str, base: &Path, credentials: bool, local: bool) -> Result<Pulled> {
-    load_with(source, base, if credentials { Store::user() } else { Store::none() }, local)
+/// a pull connects only where `reach` allows.
+pub(crate) fn load(source: &str, base: &Path, credentials: bool, reach: Reach) -> Result<Pulled> {
+    load_with(source, base, if credentials { Store::user() } else { Store::none() }, reach)
 }
 
-fn load_with(source: &str, base: &Path, store: Store, local: bool) -> Result<Pulled> {
+fn load_with(source: &str, base: &Path, store: Store, reach: Reach) -> Result<Pulled> {
     let resolve = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
     if let Some(dir) = source.strip_prefix("oci:") {
         return Layout::open(&resolve(dir))?.load();
@@ -96,10 +96,10 @@ fn load_with(source: &str, base: &Path, store: Store, local: bool) -> Result<Pul
         return load_archive(&tar);
     }
     let reference = Reference::parse(source)?;
-    if loopback(&reference.host) && !local {
+    if loopback(&reference.host) && !reach.local {
         bail!("this build may not pull from registries on this machine ({})", reference.host);
     }
-    let mut registry = Registry::new(&reference, store)?;
+    let mut registry = Registry::new(&reference, store, reach)?;
     let manifest_digest = registry.resolve(&reference.tag_or_digest)?;
     let layout = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&manifest_digest, &layout)?;
@@ -111,7 +111,7 @@ fn load_with(source: &str, base: &Path, store: Store, local: bool) -> Result<Pul
 /// Returns the manifest's digest.
 pub fn pull_to_layout(source: &str, dir: &Path) -> Result<String> {
     let reference = Reference::parse(source)?;
-    let mut registry = Registry::new(&reference, Store::user())?;
+    let mut registry = Registry::new(&reference, Store::user(), Reach { allow: None, local: true })?;
     let digest = registry.resolve(&reference.tag_or_digest)?;
     let cache = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&digest, &cache)?;
@@ -633,13 +633,72 @@ struct Registry {
     credential: Option<Option<Credential>>,
 }
 
+/// Where a pull may connect: the build's network policy.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Reach {
+    /// `allow_host` rules (None: anywhere but the special addresses).
+    pub allow: Option<Vec<crate::net::HostRule>>,
+    /// Registries on this machine: the reference's own host may be one.
+    pub local: bool,
+}
+
+/// Every connection a pull makes (to the registry, its token service,
+/// where it redirects) goes only where its `Reach` allows, checked as the
+/// proxy checks a program's: on the addresses the name resolves to, so a
+/// name for a special address (loopback, cloud metadata) gets no further
+/// than the address itself. A registry on this machine, if allowed, may
+/// be reached by its name and send us elsewhere on it (as `may_reach`);
+/// no other may send us here.
+struct Resolver {
+    reach: Reach,
+    /// The registry's host.
+    registry: String,
+}
+
+impl ureq::Resolver for Resolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        let host = host_of(netloc);
+        let own_local =
+            self.reach.local && (loopback(&self.registry) || host.eq_ignore_ascii_case(host_of(&self.registry)));
+        let denied = |why: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("this build may not connect to {netloc}: {why}"),
+            )
+        };
+        if host.parse::<std::net::IpAddr>().is_err() && !crate::net::may_resolve(self.reach.allow.as_deref(), host) {
+            return Err(denied(format!("{host} isn't in the allow-list")));
+        }
+        let (mut ok, mut refused) = (Vec::new(), None);
+        for addr in std::net::ToSocketAddrs::to_socket_addrs(netloc)? {
+            if own_local && addr.ip().to_canonical().is_loopback() {
+                ok.push(addr);
+                continue;
+            }
+            match crate::net::reachable(self.reach.allow.as_deref(), addr.ip(), addr.port(), Some(host)) {
+                Ok(()) => ok.push(addr),
+                Err(why) => refused = Some(why),
+            }
+        }
+        match refused {
+            Some(why) if ok.is_empty() => Err(denied(why)),
+            _ => Ok(ok),
+        }
+    }
+}
+
+/// The name in `name[:port]` or `[v6][:port]`.
+fn host_of(netloc: &str) -> &str {
+    match netloc.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => netloc.split(':').next().unwrap_or(""),
+    }
+}
+
 /// Is `host` (a reference's: `name[:port]`, `[v6]:port`) this machine?
 fn loopback(host: &str) -> bool {
-    let name = match host.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(""),
-        None => host.split(':').next().unwrap_or(""),
-    };
-    matches!(name, "localhost" | "127.0.0.1" | "::1")
+    let name = host_of(host);
+    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// Is `url` a plain-HTTP URL of this machine (and nothing else: no user
@@ -658,8 +717,9 @@ fn loopback_http(url: &str) -> bool {
 }
 
 impl Registry {
-    fn new(r: &Reference, store: Store) -> Result<Registry> {
+    fn new(r: &Reference, store: Store, reach: Reach) -> Result<Registry> {
         let agent = ureq::AgentBuilder::new()
+            .resolver(Resolver { reach, registry: r.host.clone() })
             .redirects(0)
             .timeout_connect(Duration::from_secs(30))
             .timeout_read(Duration::from_secs(120))
@@ -684,6 +744,26 @@ impl Registry {
         let Ok(u) = url::Url::parse(url) else { return false };
         let plain = u.username().is_empty() && u.password().is_none() && u.host().is_some();
         (u.scheme() == "https" && plain) || (self.scheme == "http" && loopback_http(url))
+    }
+
+    /// May the login for this registry go to its token service at `realm`?
+    /// Only on the registry's own site: its host, a parent domain of it, or
+    /// another host under its parent (Docker Hub's token service is
+    /// auth.docker.io, for registry-1.docker.io; GitLab's is gitlab.com, for
+    /// registry.gitlab.com). Anywhere else is asked without it, so a
+    /// registry can't send the login on to someone else.
+    fn login_may_go_to(&self, realm: &str) -> bool {
+        let Some(to) = url::Url::parse(realm).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) else {
+            return false;
+        };
+        let to = to.trim_start_matches('[').trim_end_matches(']');
+        let own = host_of(&self.host).to_ascii_lowercase();
+        let parent = |h: &str| h.split_once('.').map(|(_, p)| p.to_string()).filter(|p| p.contains('.'));
+        to == own
+            || (loopback(&own) && loopback(to))
+            || parent(&own).as_deref() == Some(to)
+            || parent(to).as_deref() == Some(own.as_str())
+            || parent(to).is_some_and(|p| parent(&own).as_deref() == Some(p.as_str()))
     }
 
     /// The user's login for this registry, looked up once. One that can't
@@ -784,6 +864,16 @@ impl Registry {
         if !self.may_reach(&realm) {
             bail!("the registry's token service {realm} isn't https");
         }
+        let credential = match credential {
+            Some(_) if !self.login_may_go_to(&realm) => {
+                eprintln!(
+                    "grix: not sending the login for {} to {realm}, which is another site; asking without it",
+                    self.login_name()
+                );
+                None
+            }
+            c => c,
+        };
         let scope = fields.get("scope").cloned().unwrap_or_else(|| format!("repository:{}:pull", self.repo));
         let service = fields.get("service").cloned();
         let answer = match &credential {
@@ -1157,7 +1247,7 @@ mod tests {
             let reg = FakeRegistry::start(bearer, blobs.clone(), manifest.clone());
             let source = format!("localhost:{}/team/private:1", reg.port);
             // Without a login: refused, saying how to log in.
-            let err = load_with(&source, &dir.path, Store::none(), true).err().unwrap();
+            let err = load_with(&source, &dir.path, Store::none(), local()).err().unwrap();
             assert!(format!("{err:#}").contains(&format!("grix login localhost:{}", reg.port)), "{err:#}");
             // With one (as Docker keeps it): pulled.
             std::fs::write(
@@ -1165,9 +1255,9 @@ mod tests {
                 serde_json::json!({"auths": {format!("localhost:{}", reg.port): {"auth": auth}}}).to_string(),
             )
             .unwrap();
-            let pulled = load_with(&source, &dir.path, Store::file(&creds), true).unwrap();
+            let pulled = load_with(&source, &dir.path, Store::file(&creds), local()).unwrap();
             // Unless registries on this machine are off limits.
-            let err = load_with(&source, &dir.path, Store::file(&creds), false).err().unwrap();
+            let err = load_with(&source, &dir.path, Store::file(&creds), Reach::default()).err().unwrap();
             assert!(err.to_string().contains("on this machine"), "{err:#}");
             assert_eq!(pulled.config.cmd, ["/hello"]);
             assert!(pulled.files.contains_key("/hello"));
@@ -1178,24 +1268,82 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            let err = load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds), true);
+            let err =
+                load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds), local());
             assert!(err.is_err());
+        }
+    }
+
+    fn local() -> Reach {
+        Reach { allow: None, local: true }
+    }
+
+    /// A pull connects only where the build's network policy allows, by
+    /// the addresses names resolve to.
+    #[test]
+    fn pulls_connect_where_the_policy_allows() {
+        use ureq::Resolver as _;
+        let resolver = |reach: Reach, registry: &str| Resolver { reach, registry: registry.into() };
+        let only = |rule: &str| Reach { allow: Some(vec![crate::net::HostRule::parse(rule).unwrap()]), local: false };
+        // This machine: only a local registry's own host, when allowed.
+        assert!(resolver(local(), "localhost:5000").resolve("localhost:5000").is_ok());
+        assert!(resolver(local(), "localhost:5000").resolve("127.0.0.1:5001").is_ok());
+        assert!(resolver(local(), "ghcr.io").resolve("localhost:5000").is_err());
+        assert!(resolver(Reach::default(), "localhost:5000").resolve("localhost:5000").is_err());
+        for special in ["127.0.0.2:443", "169.254.169.254:443", "[::1]:443", "[::ffff:127.0.0.1]:443"] {
+            assert!(resolver(local(), "ghcr.io").resolve(special).is_err(), "{special}");
+        }
+        // Anywhere else, with no rules; with rules, what they name.
+        assert!(resolver(Reach::default(), "ghcr.io").resolve("8.8.8.8:443").is_ok());
+        assert!(resolver(only("ghcr.io"), "ghcr.io").resolve("8.8.8.8:443").is_err());
+        // Nor is a name looked up that the rules don't cover.
+        let err = resolver(only("ghcr.io"), "ghcr.io").resolve("data.exfil.example:443").unwrap_err();
+        assert!(err.to_string().contains("isn't in the allow-list"), "{err}");
+        assert!(resolver(only("8.8.8.0/24"), "ghcr.io").resolve("8.8.8.8:443").is_ok());
+        assert!(resolver(only("169.254.169.254"), "ghcr.io").resolve("169.254.169.254:443").is_ok());
+    }
+
+    /// A registry's login goes to its own site's token service only.
+    #[test]
+    fn logins_stay_on_the_registrys_site() {
+        let reg = |host: &str| {
+            Registry::new(&Reference::parse(&format!("{host}/o/r:1")).unwrap(), Store::none(), Reach::default())
+                .unwrap()
+        };
+        for (registry, realm) in [
+            ("registry-1.docker.io", "https://auth.docker.io/token"),
+            ("registry.gitlab.com", "https://gitlab.com/jwt/auth"),
+            ("ghcr.io", "https://ghcr.io/token"),
+            ("example.com", "https://auth.example.com/token"),
+            ("localhost:5000", "http://127.0.0.1:5001/token"),
+        ] {
+            assert!(reg(registry).login_may_go_to(realm), "{registry} -> {realm}");
+        }
+        for (registry, realm) in [
+            ("ghcr.io", "https://evil.example/token"),
+            ("registry-1.docker.io", "https://docker.io.evil.example/token"),
+            ("example.com", "https://evil.com/token"),
+            ("localhost:5000", "https://evil.example/token"),
+            ("ghcr.io", "not a url"),
+        ] {
+            assert!(!reg(registry).login_may_go_to(realm), "{registry} -> {realm}");
         }
     }
 
     #[test]
     fn where_registries_may_send_us() {
         let r = Reference::parse("ghcr.io/o/r:1").unwrap();
-        let reg = Registry::new(&r, Store::none()).unwrap();
+        let reg = Registry::new(&r, Store::none(), Reach::default()).unwrap();
         assert!(reg.may_reach("https://elsewhere.example/token"));
         assert!(!reg.may_reach("http://127.0.0.1:8080/token"));
         let r = Reference::parse("localhost:5000/o/r:1").unwrap();
-        let mut reg = Registry::new(&r, Store::none()).unwrap();
+        let mut reg = Registry::new(&r, Store::none(), Reach::default()).unwrap();
         assert!(!reg.may_reach("http://127.0.0.1:8080/token"));
         reg.scheme = "http";
         assert!(reg.may_reach("http://127.0.0.1:8080/token"));
         assert!(reg.may_reach("http://[::1]:8080/x") && !reg.may_reach("http://example.com/x"));
         assert!(loopback("localhost:5000") && loopback("[::1]:5000") && !loopback("localhost.example.com"));
+        assert!(loopback("127.0.0.2:5000") && loopback("[::ffff:127.0.0.1]:5000"));
         // What's before an @ is a user name, not the host.
         for sneaky in
             ["http://localhost:1@evil.example/token", "http://127.0.0.1:x@10.0.0.5/", "http://[::1]@evil.example/"]

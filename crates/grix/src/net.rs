@@ -244,7 +244,6 @@ impl NetPolicy {
     /// `name` is what DNS answered `ip` for, if it did.
     fn check(&self, ip: IpAddr, port: u16, name: Option<&str>) -> Result<SocketAddr, String> {
         let rules = self.allow.as_deref().unwrap_or(&[]);
-        let named = |r: &HostRule| r.port_ok(port) && (r.matches_ip(ip) || name.is_some_and(|n| r.matches_name(n)));
         // The host's own services: only for a rule naming exactly that.
         if ip == host_v4() {
             let explicit = rules
@@ -263,34 +262,48 @@ impl NetPolicy {
         if ip == IpAddr::V4(Ipv4Addr::from(link::GUEST_V4)) {
             return Err(format!("{ip}:{port} is the guest's own address"));
         }
-        if let Some(min) = special(ip)
-            && !rules.iter().any(|r| r.port_ok(port) && r.matches_ip(ip) && r.prefix() >= min)
-        {
-            return Err(format!("{ip}:{port} is a special address; allow it with allow_host(\"{ip}\")"));
-        }
-        match &self.allow {
-            None => Ok(SocketAddr::new(ip, port)),
-            Some(rules) if rules.iter().any(named) => Ok(SocketAddr::new(ip, port)),
-            Some(_) => Err(match name {
-                Some(n) => format!("{ip}:{port} ({n}) isn't in the allow-list"),
-                None => format!("{ip}:{port} isn't in the allow-list"),
-            }),
-        }
+        reachable(self.allow.as_deref(), ip, port, name).map(|()| SocketAddr::new(ip, port))
     }
 
-    /// May the guest look up `name`? With an allow-list, only names it
-    /// covers (so lookups can't carry data out either).
+    /// May the guest look up `name`?
     fn may_resolve(&self, name: &str) -> bool {
-        match &self.allow {
-            None => true,
-            Some(rules) => rules.iter().any(|r| r.matches_name(name)),
-        }
+        may_resolve(self.allow.as_deref(), name)
     }
 
     /// Do connections need the names DNS gave their addresses?
     fn has_name_rules(&self) -> bool {
         self.allow.iter().flatten().any(|r| matches!(r.host, Pattern::Name(_)))
     }
+}
+
+/// May a connection go to `ip:port` (an address DNS gave for `name`, if it
+/// did) under `allow` (None: anywhere)? Special addresses only with a rule
+/// for them. What the proxy checks of the program's connections, past the
+/// guest's own addresses, and the host of those it makes for a build
+/// (`oci`'s registry pulls).
+pub(crate) fn reachable(allow: Option<&[HostRule]>, ip: IpAddr, port: u16, name: Option<&str>) -> Result<(), String> {
+    let ip = ip.to_canonical();
+    let rules = allow.unwrap_or(&[]);
+    if let Some(min) = special(ip)
+        && !rules.iter().any(|r| r.port_ok(port) && r.matches_ip(ip) && r.prefix() >= min)
+    {
+        return Err(format!("{ip}:{port} is a special address; allow it with allow_host(\"{ip}\")"));
+    }
+    let named = |r: &HostRule| r.port_ok(port) && (r.matches_ip(ip) || name.is_some_and(|n| r.matches_name(n)));
+    match allow {
+        None => Ok(()),
+        Some(rules) if rules.iter().any(named) => Ok(()),
+        Some(_) => Err(match name {
+            Some(n) => format!("{ip}:{port} ({n}) isn't in the allow-list"),
+            None => format!("{ip}:{port} isn't in the allow-list"),
+        }),
+    }
+}
+
+/// May `name` be looked up under `allow`? With an allow-list, only names
+/// it covers (so lookups can't carry data out either).
+pub(crate) fn may_resolve(allow: Option<&[HostRule]>, name: &str) -> bool {
+    allow.is_none_or(|rules| rules.iter().any(|r| r.matches_name(&name.to_ascii_lowercase())))
 }
 
 /// A frame for the guest.
