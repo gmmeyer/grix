@@ -19,6 +19,7 @@
 //! capabilities you grant ([`Capability`]). Anything it tries beyond that is
 //! denied and reported in [`RunOutput::events`].
 
+mod at;
 pub mod auth;
 pub mod build;
 mod container;

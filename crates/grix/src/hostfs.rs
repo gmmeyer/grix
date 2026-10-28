@@ -9,12 +9,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};
 use grix_abi::wire::{self, Input};
+
+use crate::at::{check, openat, read_dir, readlink_at, rename, stat_at, stat_fd};
 
 /// A directory mounted live.
 #[derive(Clone, Debug)]
@@ -90,10 +92,6 @@ fn err(e: io::Error) -> u16 {
     linux_errno(&e)
 }
 
-fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
-    if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
-}
-
 /// A name the guest may use: one plain component.
 fn cname(name: &str) -> Result<CString, u16> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') {
@@ -103,26 +101,6 @@ fn cname(name: &str) -> Result<CString, u16> {
         return Err(ENAMETOOLONG);
     }
     CString::new(name).map_err(|_| EINVAL)
-}
-
-fn openat(dir: RawFd, name: &CStr, flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
-    // SAFETY: `name` is NUL-terminated; the result is a new descriptor we own.
-    let fd = check(unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) })?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn stat_fd(fd: RawFd) -> io::Result<libc::stat> {
-    // SAFETY: fstat fills `st`, a plain C struct.
-    let mut st = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::fstat(fd, &mut st) })?;
-    Ok(st)
-}
-
-fn stat_at(dir: RawFd, name: &CStr) -> io::Result<libc::stat> {
-    // SAFETY: as for stat_fd; AT_SYMLINK_NOFOLLOW never follows a link.
-    let mut st = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
-    Ok(st)
 }
 
 fn ns(sec: i64, nsec: i64) -> u64 {
@@ -151,47 +129,6 @@ fn attr_of(st: &libc::stat) -> Option<Attr> {
         mtime_ns: ns(st.st_mtime as i64, st.st_mtime_nsec as i64),
         ctime_ns: ns(st.st_ctime as i64, st.st_ctime_nsec as i64),
     })
-}
-
-fn readlink_at(dir: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; 4096];
-    // SAFETY: readlinkat writes at most buf.len() bytes.
-    let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    buf.truncate(n as usize);
-    Ok(buf)
-}
-
-/// The names in directory `dir` (not `.` or `..`).
-fn read_dir(dir: RawFd) -> io::Result<Vec<CString>> {
-    // fdopendir takes the descriptor over, so give it a copy.
-    // SAFETY: dup of a descriptor we hold; fdopendir owns the copy, and
-    // closedir closes it.
-    let copy = check(unsafe { libc::dup(dir) })?;
-    let d = unsafe { libc::fdopendir(copy) };
-    if d.is_null() {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(copy) };
-        return Err(e);
-    }
-    // From the start, whatever the shared offset was.
-    unsafe { libc::rewinddir(d) };
-    let mut names = Vec::new();
-    loop {
-        // SAFETY: readdir's entry is valid until the next call on `d`.
-        let e = unsafe { libc::readdir(d) };
-        if e.is_null() {
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
-        }
-    }
-    unsafe { libc::closedir(d) };
-    Ok(names)
 }
 
 /// A directory's entries the guest can see, sorted: (name, attributes,
@@ -259,9 +196,9 @@ impl Server {
     pub fn new(mounts: &[LiveMount]) -> Result<Server> {
         let mut roots = Vec::new();
         for m in mounts {
-            let path = CString::new(m.host.as_os_str().as_encoded_bytes())?;
-            let fd = openat(libc::AT_FDCWD, &path, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-                .with_context(|| format!("mounting {}", m.host.display()))?;
+            // Walked down to like everything in it: a link swapped in on
+            // the way since it was made canonical can't move the mount.
+            let fd = crate::at::open_dir(&m.host).with_context(|| format!("mounting {}", m.host.display()))?;
             roots.push((fd, m.writable && !m.lazy));
         }
         Ok(Server {
@@ -862,31 +799,6 @@ impl Server {
     }
 }
 
-/// rename, or with `noreplace` fail if `to` exists.
-fn rename(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, noreplace: bool) -> io::Result<()> {
-    // SAFETY: renameat and its variants on descriptors we hold and checked
-    // names; none follows a link in the last component.
-    let r = if !noreplace {
-        unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) }
-    } else {
-        // The system call itself: musl has no wrapper for it.
-        #[cfg(target_os = "linux")]
-        let r = unsafe {
-            libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_NOREPLACE)
-                as libc::c_int
-        };
-        #[cfg(target_os = "macos")]
-        let r = unsafe { libc::renameatx_np(from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_EXCL) };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let r = {
-            let _ = (from_dir, from, to_dir, to);
-            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
-        };
-        r
-    };
-    check(r).map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +818,22 @@ mod tests {
             }
         }
         out.expect("a reply")
+    }
+
+    #[test]
+    fn mounts_the_directory_named_only() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/m")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let m = |host: PathBuf| LiveMount { host, guest: "/m".into(), writable: true, lazy: false };
+        assert!(Server::new(&[m(root.join("real/m"))]).is_ok());
+        // A link on the way there (swapped in since the path was made
+        // canonical) isn't followed.
+        assert!(Server::new(&[m(root.join("link/m"))]).is_err());
+        assert!(Server::new(&[m(root.join("link"))]).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

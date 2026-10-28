@@ -6,14 +6,19 @@
 //!
 //! The changes come from the guest, so applying them trusts nothing in
 //! them. Every path stays inside the directory and is reached through real
-//! directories only, never through a link. Files and links are replaced by
+//! directories only, never through a link: each is opened from the one
+//! above it (`crate::at`), so a directory something else swaps for a link
+//! meanwhile can't send a change elsewhere. Files and links are replaced by
 //! renaming a new one into place. Anything that changed on the host during
 //! the run is left as the host has it and reported as a conflict.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::ffi::{CStr, CString, OsStr};
+use std::fs;
+use std::io::{self, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::wire::MAX_EXPORT_PATH;
 use serde::Serialize;
 
+use crate::at::{self, Kind};
 use crate::export::{Changes, ExportContent, ExportEntry, ExportState};
 use crate::image::{self, Node};
 
@@ -49,35 +55,28 @@ enum Snap {
     Other,
 }
 
-fn snap_of(meta: &fs::Metadata, path: &Path) -> Snap {
-    let ft = meta.file_type();
-    if ft.is_dir() {
-        Snap::Dir
-    } else if ft.is_file() {
-        Snap::File {
-            len: meta.len(),
-            mtime_ns: image::mtime_of(meta),
-            mode: meta.permissions().mode() & 0o7777,
-            ino: meta.ino(),
-            ctime_ns: ctime_ns(meta),
+/// What `name` in `dir` is now, if anything.
+#[allow(clippy::unnecessary_cast)]
+fn current(dir: RawFd, name: &CStr) -> io::Result<Option<Snap>> {
+    let st = match at::stat_at(dir, name) {
+        Ok(st) => st,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(match at::kind(&st) {
+        Kind::Dir => Snap::Dir,
+        Kind::File => Snap::File {
+            len: st.st_size as u64,
+            mtime_ns: at::mtime_ns(&st),
+            mode: at::mode(&st),
+            ino: st.st_ino as u64,
+            ctime_ns: at::ctime_ns(&st),
+        },
+        Kind::Symlink => {
+            Snap::Symlink(PathBuf::from(OsStr::from_bytes(&at::readlink_at(dir, name).unwrap_or_default())))
         }
-    } else if ft.is_symlink() {
-        Snap::Symlink(fs::read_link(path).unwrap_or_default())
-    } else {
-        Snap::Other
-    }
-}
-
-fn ctime_ns(meta: &fs::Metadata) -> i128 {
-    meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128
-}
-
-fn current(path: &Path) -> io::Result<Option<Snap>> {
-    match fs::symlink_metadata(path) {
-        Ok(m) => Ok(Some(snap_of(&m, path))),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+        Kind::Other => Snap::Other,
+    }))
 }
 
 /// A mount as imported for one run.
@@ -85,18 +84,25 @@ pub(crate) struct Imported {
     pub files: BTreeMap<String, Node>,
     /// Relative path -> what it was on the host.
     snaps: HashMap<String, Snap>,
+    /// Which directory it was.
+    root: (u64, u64),
 }
 
 impl Mount {
+    #[allow(clippy::unnecessary_cast)]
     pub fn import(&self) -> Result<Imported> {
-        if !fs::symlink_metadata(&self.host).is_ok_and(|m| m.is_dir()) {
-            bail!("mounting {}: not a directory any more", self.host.display());
-        }
         let mut files = BTreeMap::new();
         let mut stamps = HashMap::new();
-        image::import_with(&mut files, &self.host, &self.guest, &mut |path, meta| {
-            stamps.insert(path.to_string(), (meta.ino(), ctime_ns(meta)));
+        let mut root = None;
+        image::import_with(&mut files, &self.host, &self.guest, &mut |path, st| {
+            if path == self.guest {
+                root = Some(at::identity(st));
+            }
+            stamps.insert(path.to_string(), (st.st_ino as u64, at::ctime_ns(st)));
         })?;
+        let Some(root) = root.filter(|_| matches!(files.get(&self.guest), Some(Node::Dir { .. }))) else {
+            bail!("mounting {}: not a directory any more", self.host.display());
+        };
         let prefix = format!("{}/", self.guest);
         let mut snaps = HashMap::new();
         for (p, n) in &files {
@@ -116,7 +122,7 @@ impl Mount {
             };
             snaps.insert(rel.to_string(), snap);
         }
-        Ok(Imported { files, snaps })
+        Ok(Imported { files, snaps, root })
     }
 }
 
@@ -171,14 +177,16 @@ impl Imported {
             out.state = MountState::Failed(format!("{e:#}"));
             return out;
         }
-        // Still the directory it was (nothing below checks above it).
-        if !fs::symlink_metadata(&m.host).is_ok_and(|md| md.is_dir())
-            || m.host.canonicalize().ok().as_deref() != Some(m.host.as_path())
-        {
+        // Still the directory it was, and reached by the same real
+        // directories (nothing below looks above it).
+        let root = at::open_dir(&m.host)
+            .ok()
+            .filter(|fd| at::stat_fd(fd.as_raw_fd()).is_ok_and(|st| at::identity(&st) == self.root));
+        let Some(root) = root else {
             out.state = MountState::Failed(format!("{} isn't the mounted directory any more", m.host.display()));
             return out;
-        }
-        let mut a = Apply { root: &m.host, snaps: &self.snaps, out: &mut out, dir_modes: Vec::new() };
+        };
+        let mut a = Apply { root, host: &m.host, snaps: &self.snaps, out: &mut out, dir_modes: Vec::new() };
         if let Err(e) = a.run(&changes) {
             out.state = MountState::Failed(format!("{e:#}"));
         }
@@ -212,12 +220,32 @@ fn check(c: &Changes) -> Result<()> {
 }
 
 struct Apply<'a> {
-    root: &'a Path,
+    /// The mount's directory, `host`.
+    root: OwnedFd,
+    host: &'a Path,
     snaps: &'a HashMap<String, Snap>,
     out: &'a mut MountChanges,
     /// Directories' modes, set last: a read-only one would stop anything
     /// being created in it.
     dir_modes: Vec<(String, u32)>,
+}
+
+/// A directory of the mount and a name in it.
+struct At {
+    dir: OwnedFd,
+    name: CString,
+}
+
+impl At {
+    fn fd(&self) -> RawFd {
+        self.dir.as_raw_fd()
+    }
+}
+
+/// Every path in the changes has plain names only (`export::valid_path`),
+/// which may still hold a NUL.
+fn cname(name: &str) -> io::Result<CString> {
+    at::cname(OsStr::new(name))
 }
 
 impl Apply<'_> {
@@ -231,37 +259,32 @@ impl Apply<'_> {
             self.write(e).with_context(|| format!("writing {}", e.path))?;
         }
         for (rel, mode) in std::mem::take(&mut self.dir_modes).into_iter().rev() {
-            // set_permissions follows links: check again that this is the
-            // real directory it was.
-            let Some(path) = self.resolve(&rel)? else { continue };
-            if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                continue;
-            }
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o755))
-                .with_context(|| format!("setting the mode of {}", path.display()))?;
+            // The directory itself, opened: never what a link points at.
+            let Some(at) = self.resolve(&rel)? else { continue };
+            let Ok(d) = at::open_dir_at(at.fd(), &at.name) else { continue };
+            fs::File::from(d)
+                .set_permissions(fs::Permissions::from_mode(mode & 0o755))
+                .with_context(|| format!("setting the mode of {}", self.host.join(&rel).display()))?;
         }
         Ok(())
     }
 
-    /// The host path for `rel`, if every directory on the way there is a
-    /// real directory (not a link to one).
-    fn resolve(&self, rel: &str) -> io::Result<Option<PathBuf>> {
-        let mut path = self.root.to_path_buf();
+    /// The directory `rel` is in, if every directory on the way there is a
+    /// real directory (not a link to one), opened by walking down to it.
+    fn resolve(&self, rel: &str) -> io::Result<Option<At>> {
         let (dirs, name) = match rel.rsplit_once('/') {
             Some((dirs, name)) => (Some(dirs), name),
             None => (None, rel),
         };
+        let mut dir = at::openat(self.root.as_raw_fd(), c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         for c in dirs.into_iter().flat_map(|d| d.split('/')) {
-            path.push(c);
-            match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => {}
-                Ok(_) => return Ok(None),
-                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            dir = match at::open_dir_at(dir.as_raw_fd(), &cname(c)?) {
+                Ok(d) => d,
+                Err(e) if at::not_a_dir(&e) => return Ok(None),
                 Err(e) => return Err(e),
-            }
+            };
         }
-        path.push(name);
-        Ok(Some(path))
+        Ok(Some(At { dir, name: cname(name)? }))
     }
 
     fn conflict(&mut self, rel: &str) {
@@ -270,41 +293,49 @@ impl Apply<'_> {
 
     fn remove(&mut self, rel: &str) -> io::Result<()> {
         // Gone already, with the directory it was in or by itself.
-        let Some(path) = self.resolve(rel)? else { return Ok(()) };
-        if current(&path)?.is_none() {
+        let Some(at) = self.resolve(rel)? else { return Ok(()) };
+        if current(at.fd(), &at.name)?.is_none() {
             return Ok(());
         }
-        if self.remove_matching(rel, &path)? {
+        if self.remove_matching(rel, at.fd(), &at.name)? {
             self.out.removed.push(rel.to_string());
         }
         Ok(())
     }
 
-    /// Remove `path` and, for a directory, what's in it, as far as it's
-    /// what was imported. Returns whether it's all gone.
-    fn remove_matching(&mut self, rel: &str, path: &Path) -> io::Result<bool> {
-        let now = current(path)?;
+    /// Remove `name` in `dir` and, for a directory, what's in it, as far as
+    /// it's what was imported (`rel`). Returns whether it's all gone.
+    fn remove_matching(&mut self, rel: &str, dir: RawFd, name: &CStr) -> io::Result<bool> {
+        let now = current(dir, name)?;
         let was = self.snaps.get(rel);
         match (&now, was) {
             (None, _) => Ok(true),
             (Some(Snap::Dir), Some(Snap::Dir)) => {
+                let sub = match at::open_dir_at(dir, name) {
+                    Ok(d) => d,
+                    // Not a directory any more: changed meanwhile.
+                    Err(e) if at::not_a_dir(&e) => {
+                        self.conflict(rel);
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let mut all = true;
-                for entry in fs::read_dir(path)? {
-                    let name = entry?.file_name();
-                    let Some(name) = name.to_str() else {
-                        self.conflict(&format!("{rel}/{}", name.to_string_lossy()));
+                for entry in at::read_dir(sub.as_raw_fd())? {
+                    let Ok(n) = entry.to_str() else {
+                        self.conflict(&format!("{rel}/{}", entry.to_string_lossy()));
                         all = false;
                         continue;
                     };
-                    all &= self.remove_matching(&format!("{rel}/{name}"), &path.join(name))?;
+                    all &= self.remove_matching(&format!("{rel}/{n}"), sub.as_raw_fd(), &entry)?;
                 }
                 if all {
-                    fs::remove_dir(path)?;
+                    at::remove_at(dir, name, true)?;
                 }
                 Ok(all)
             }
             (Some(n), Some(w)) if n == w => {
-                fs::remove_file(path)?;
+                at::remove_at(dir, name, false)?;
                 Ok(true)
             }
             _ => {
@@ -316,22 +347,23 @@ impl Apply<'_> {
 
     fn write(&mut self, e: &ExportEntry) -> Result<()> {
         let rel = e.path.as_str();
-        let Some(path) = self.resolve(rel)? else {
+        let path = self.host.join(rel);
+        let Some(at) = self.resolve(rel)? else {
             // Its directory changed on the host, or wasn't made here.
             self.conflict(rel);
             return Ok(());
         };
-        let now = current(&path)?;
+        let now = current(at.fd(), &at.name)?;
         let was = self.snaps.get(rel);
         if let ExportContent::Dir = e.content {
             match &now {
                 // There already, or made on the host too: the same thing.
                 Some(Snap::Dir) => {}
                 n if n.as_ref() == was => {
-                    if n.is_some() && !self.remove_matching(rel, &path)? {
+                    if n.is_some() && !self.remove_matching(rel, at.fd(), &at.name)? {
                         return Ok(());
                     }
-                    fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+                    at::mkdir_at(at.fd(), &at.name, 0o777).with_context(|| format!("creating {}", path.display()))?;
                 }
                 _ => {
                     self.conflict(rel);
@@ -346,14 +378,14 @@ impl Apply<'_> {
             self.conflict(rel);
             return Ok(());
         }
-        if matches!(now, Some(Snap::Dir)) && !self.remove_matching(rel, &path)? {
+        if matches!(now, Some(Snap::Dir)) && !self.remove_matching(rel, at.fd(), &at.name)? {
             return Ok(());
         }
         // A new file or link next to it, renamed over it: never written
         // through a link, and never half-written.
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_file_name(format!(".grix-{}-{n}.tmp", std::process::id()));
+        let tmp = cname(&format!(".grix-{}-{n}.tmp", std::process::id()))?;
         let made = match &e.content {
             ExportContent::File(data) => {
                 // Group and other write only if the file had them.
@@ -361,14 +393,14 @@ impl Apply<'_> {
                     Some(Snap::File { mode, .. }) => mode & 0o022,
                     _ => 0,
                 };
-                write_file(&tmp, data, e, (e.mode & 0o755) | (e.mode & keep))
+                write_file(at.fd(), &tmp, data, e, (e.mode & 0o755) | (e.mode & keep))
             }
-            ExportContent::Symlink(target) => std::os::unix::fs::symlink(target, &tmp),
+            ExportContent::Symlink(target) => cname(target).and_then(|target| at::symlink_at(&target, at.fd(), &tmp)),
             ExportContent::Dir => unreachable!(),
         };
-        let made = made.and_then(|()| fs::rename(&tmp, &path));
+        let made = made.and_then(|()| at::rename(at.fd(), &tmp, at.fd(), &at.name, false));
         if let Err(err) = made {
-            let _ = fs::remove_file(&tmp);
+            let _ = at::remove_at(at.fd(), &tmp, false);
             return Err(err).with_context(|| format!("replacing {}", path.display()));
         }
         self.out.written.push(rel.to_string());
@@ -376,8 +408,9 @@ impl Apply<'_> {
     }
 }
 
-fn write_file(path: &Path, data: &[u8], e: &ExportEntry, mode: u32) -> io::Result<()> {
-    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+fn write_file(dir: RawFd, name: &CStr, data: &[u8], e: &ExportEntry, mode: u32) -> io::Result<()> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+    let mut f = fs::File::from(at::openat(dir, name, flags, 0o600)?);
     f.write_all(data)?;
     f.set_modified(e.mtime)?;
     f.set_permissions(fs::Permissions::from_mode(mode))
@@ -485,6 +518,67 @@ mod tests {
         assert!(!root.join("a").exists());
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_link_meanwhile_leads_nowhere() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let root = tempdir();
+        let outside = tempdir();
+        fs::create_dir(root.join("d")).unwrap();
+        let m = Mount { host: root.clone(), guest: "/work".into() };
+        let imported = m.import().unwrap();
+        // Something else with the directory (another run's live mount)
+        // keeps swapping d for a link outside and back.
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (root, outside, stop) = (root.clone(), outside.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::rename(root.join("d"), root.join("real"));
+                    let _ = std::os::unix::fs::symlink(&outside, root.join("d"));
+                    let _ = fs::remove_file(root.join("d"));
+                    let _ = fs::rename(root.join("real"), root.join("d"));
+                }
+            })
+        };
+        let mut written = Vec::new();
+        for i in 0..500 {
+            let out = imported.apply(&m, changes(vec![file(&format!("d/f{i}"), "x")], &[]));
+            written.extend(out.written);
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        let escaped: Vec<_> = fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(escaped.is_empty(), "written outside the mount: {escaped:?}");
+        for w in &written {
+            assert!(root.join(w).exists(), "{w} was written, but isn't there");
+        }
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn applies_to_the_directory_imported_only() {
+        let base = tempdir();
+        let root = base.join("m");
+        fs::create_dir(&root).unwrap();
+        let m = Mount { host: root.clone(), guest: "/work".into() };
+        let imported = m.import().unwrap();
+        // Another directory by that name now,
+        fs::rename(&root, base.join("old")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let out = imported.apply(&m, changes(vec![file("a", "1")], &[]));
+        assert!(matches!(out.state, MountState::Failed(_)), "{out:?}");
+        // or a link to the one it was.
+        fs::remove_dir(&root).unwrap();
+        std::os::unix::fs::symlink(base.join("old"), &root).unwrap();
+        let out = imported.apply(&m, changes(vec![file("a", "1")], &[]));
+        assert!(matches!(out.state, MountState::Failed(_)), "{out:?}");
+        assert!(!root.join("a").exists() && !base.join("old/a").exists());
+        assert!(m.import().is_err());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -548,7 +548,7 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
                 let writable = m["mode"].as_str().unwrap_or("rw") == "rw"
                     && config.writable
                     && config.capabilities.contains(&Capability::FsWrite);
-                snap = if writable { snap.mount(host, guest)? } else { snap.mount_read_only(host, guest)? };
+                snap = snap.mount_real(host, guest, !writable)?;
             }
             // It sends back what it was made to export.
             for e in strings(&args["exports"]) {
@@ -638,7 +638,7 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
     }
     for imp in args["imports"].as_array().into_iter().flatten() {
         let host = imp["host"].as_str().context("import without host")?;
-        b = b.import(config.host_path(host)?, imp["guest"].as_str().context("import without guest")?)?;
+        b = b.import_real(&config.host_path(host)?, imp["guest"].as_str().context("import without guest")?)?;
     }
     for f in args["files"].as_array().into_iter().flatten() {
         let mode = if f["executable"].as_bool() == Some(true) { 0o755 } else { 0o644 };
@@ -659,7 +659,7 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
         {
             bail!("this server doesn't allow writable mounts (only \"ro\")");
         }
-        b = b.mount_with(host, m["guest"].as_str().context("mount without guest")?, mode)?;
+        b = b.mount_real(host, m["guest"].as_str().context("mount without guest")?, mode)?;
     }
     if let Some(env) = args["env"].as_object() {
         for (k, v) in env {

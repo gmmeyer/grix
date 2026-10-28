@@ -427,8 +427,16 @@ impl Default for SandboxBuilder {
 
 impl SandboxBuilder {
     /// Make a host file or directory (recursively) visible at `guest`.
-    pub fn import(mut self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
-        image::import(&mut self.files, host.as_ref(), guest)?;
+    pub fn import(self, host: impl AsRef<Path>, guest: &str) -> Result<Self> {
+        let host = image::real_dirs(host.as_ref())?;
+        self.import_real(&host, guest)
+    }
+
+    /// [`import`](Self::import) of a path whose directories are real ones
+    /// already, which nothing resolves again: a path checked to be in an
+    /// allowed directory stays there, whatever is swapped in since.
+    pub(crate) fn import_real(mut self, host: &Path, guest: &str) -> Result<Self> {
+        image::import(&mut self.files, host, guest)?;
         Ok(self)
     }
 
@@ -619,12 +627,19 @@ impl SandboxBuilder {
     }
 
     /// Mount `host` at `guest` in `mode`.
-    pub fn mount_with(mut self, host: impl AsRef<Path>, guest: &str, mode: MountMode) -> Result<Self> {
+    pub fn mount_with(self, host: impl AsRef<Path>, guest: &str, mode: MountMode) -> Result<Self> {
         let host = host.as_ref();
         let canonical = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
-        if !canonical.is_dir() {
-            bail!("mounting {}: not a directory", host.display());
-        }
+        self.mount_real(canonical, guest, mode)
+    }
+
+    /// [`mount_with`](Self::mount_with) of a canonical path, which nothing
+    /// resolves again: a directory checked to be an allowed one stays the
+    /// one mounted, whatever is swapped in since (a link on the way fails
+    /// the run instead).
+    pub(crate) fn mount_real(mut self, canonical: PathBuf, guest: &str, mode: MountMode) -> Result<Self> {
+        let host = canonical.as_path();
+        crate::at::open_dir(host).with_context(|| format!("mounting {}: not a directory", host.display()))?;
         let guest = image::guest_path(guest)?;
         if guest == "/" {
             bail!("mount {} at a directory other than /", host.display());

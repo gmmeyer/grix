@@ -1,13 +1,17 @@
 //! Collecting imports and encoding the boot image.
 
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::io::Read;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::image::{Entry, EntryKind};
+
+use crate::at::{self, Kind};
 
 /// An imported file, directory or link. `mtime_ns` is its modification
 /// time in ns since the Unix epoch, as the host has it.
@@ -25,11 +29,6 @@ pub(crate) fn ns(t: SystemTime) -> u64 {
 
 pub(crate) fn now_ns() -> u64 {
     ns(SystemTime::now())
-}
-
-/// A file's modification time in ns (0 if the host can't say).
-pub(crate) fn mtime_of(meta: &fs::Metadata) -> u64 {
-    meta.modified().map_or(0, ns)
 }
 
 /// Paths the guest kernel provides itself.
@@ -51,53 +50,89 @@ pub(crate) fn guest_path(p: &str) -> Result<String> {
     Ok(norm)
 }
 
+/// `host` with its directories resolved (the last name may still be a
+/// link, which imports as one): the path [`import`] wants, for a path
+/// given by whoever runs grix, links and all.
+pub(crate) fn real_dirs(host: &Path) -> Result<PathBuf> {
+    let missing = || format!("{} does not exist", host.display());
+    match (host.parent(), host.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+            Ok(parent.canonicalize().with_context(missing)?.join(name))
+        }
+        _ => host.canonicalize().with_context(missing),
+    }
+}
+
 /// Import a host file, directory (recursively) or symlink at `guest`.
+/// `host`'s directories must be real ones ([`real_dirs`]): nothing
+/// resolves it again, and nothing on the way to it or in it is followed
+/// if it's a link, so whatever is swapped in while it's read (or since it
+/// was checked) can't lead anywhere else.
 pub(crate) fn import(files: &mut BTreeMap<String, Node>, host: &Path, guest: &str) -> Result<()> {
     import_with(files, host, guest, &mut |_, _| {})
 }
 
-/// Like [`import`], also passing each guest path's host metadata to `seen`.
 pub(crate) fn import_with(
     files: &mut BTreeMap<String, Node>,
     host: &Path,
     guest: &str,
-    seen: &mut dyn FnMut(&str, &fs::Metadata),
+    seen: &mut dyn FnMut(&str, &libc::stat),
 ) -> Result<()> {
     let guest = guest_path(guest)?;
-    import_at(files, host, &guest, seen).with_context(|| format!("importing {}", host.display()))
+    let (dir, name) = at::open_parent(host).with_context(|| format!("{} does not exist", host.display()))?;
+    import_at(files, dir.as_raw_fd(), &name, host, &guest, seen)
+        .with_context(|| format!("importing {}", host.display()))
 }
 
+/// Import `name` in `dir` (which is `host`).
 fn import_at(
     files: &mut BTreeMap<String, Node>,
+    dir: RawFd,
+    name: &CStr,
     host: &Path,
     guest: &str,
-    seen: &mut dyn FnMut(&str, &fs::Metadata),
+    seen: &mut dyn FnMut(&str, &libc::stat),
 ) -> Result<()> {
-    let meta = fs::symlink_metadata(host).with_context(|| format!("{} does not exist", host.display()))?;
-    seen(guest, &meta);
-    let mode = meta.permissions().mode() & 0o7777;
-    let mtime_ns = mtime_of(&meta);
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        let target = fs::read_link(host)?;
-        let target = target.to_str().with_context(|| format!("non UTF-8 symlink {}", host.display()))?;
-        files.insert(guest.into(), Node::Symlink { target: target.into(), mtime_ns });
-    } else if ft.is_dir() {
-        if guest != "/" {
-            files.insert(guest.into(), Node::Dir { mode, mtime_ns });
+    let st = at::stat_at(dir, name).with_context(|| format!("{} does not exist", host.display()))?;
+    match at::kind(&st) {
+        Kind::Symlink => {
+            let target = String::from_utf8(at::readlink_at(dir, name)?)
+                .ok()
+                .with_context(|| format!("non UTF-8 symlink {}", host.display()))?;
+            seen(guest, &st);
+            files.insert(guest.into(), Node::Symlink { target, mtime_ns: at::mtime_ns(&st) });
         }
-        for entry in fs::read_dir(host)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_str().with_context(|| format!("non UTF-8 file name in {}", host.display()))?;
-            let child = if guest == "/" { format!("/{name}") } else { format!("{guest}/{name}") };
-            import_at(files, &entry.path(), &child, seen)?;
+        Kind::Dir => {
+            // What's opened is what's described and listed, whatever has
+            // the name by now.
+            let d = at::open_dir_at(dir, name)?;
+            let st = at::stat_fd(d.as_raw_fd())?;
+            seen(guest, &st);
+            if guest != "/" {
+                files.insert(guest.into(), Node::Dir { mode: at::mode(&st), mtime_ns: at::mtime_ns(&st) });
+            }
+            for child in at::read_dir(d.as_raw_fd())? {
+                let n = child.to_str().with_context(|| format!("non UTF-8 file name in {}", host.display()))?;
+                let g = if guest == "/" { format!("/{n}") } else { format!("{guest}/{n}") };
+                import_at(files, d.as_raw_fd(), &child, &host.join(n), &g, seen)?;
+            }
         }
-    } else if ft.is_file() {
-        let data = fs::read(host)?;
-        files.insert(guest.into(), Node::File { data, mode, mtime_ns });
+        Kind::File => {
+            // O_NONBLOCK: by now it may be a FIFO, whose open would wait.
+            let mut f = fs::File::from(at::openat(dir, name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0)?);
+            let st = at::stat_fd(f.as_raw_fd())?;
+            if at::kind(&st) != Kind::File {
+                return Ok(());
+            }
+            seen(guest, &st);
+            let mut data = Vec::new();
+            f.read_to_end(&mut data)?;
+            files.insert(guest.into(), Node::File { data, mode: at::mode(&st), mtime_ns: at::mtime_ns(&st) });
+        }
+        // Sockets, FIFOs and device nodes are skipped.
+        Kind::Other => {}
     }
-    // Sockets, FIFOs and device nodes are skipped.
     Ok(())
 }
 
@@ -131,6 +166,61 @@ pub(crate) fn imported_bytes(files: &BTreeMap<String, Node>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "grix-image-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn imports_never_follow_what_is_swapped_in() {
+        let root = tempdir();
+        let outside = tempdir();
+        fs::write(outside.join("secret"), "OUTSIDE").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/f"), "inside").unwrap();
+        fs::write(root.join("g"), "inside").unwrap();
+        let mut files = BTreeMap::new();
+        // Each, once it's been looked at, becomes a link out: the file
+        // before it's read, the directory before it's listed.
+        import_with(&mut files, &root, "/m", &mut |path, _| match path {
+            "/m/g" => {
+                fs::remove_file(root.join("g")).unwrap();
+                symlink(outside.join("secret"), root.join("g")).unwrap();
+            }
+            "/m/sub" => {
+                fs::rename(root.join("sub"), root.join("moved")).unwrap();
+                symlink(&outside, root.join("sub")).unwrap();
+            }
+            _ => {}
+        })
+        .unwrap();
+        let data = |files: &BTreeMap<String, Node>, p: &str| match files.get(p) {
+            Some(Node::File { data, .. }) => Some(String::from_utf8_lossy(data).into_owned()),
+            _ => None,
+        };
+        assert_eq!(data(&files, "/m/g").as_deref(), Some("inside"));
+        assert_eq!(data(&files, "/m/sub/f").as_deref(), Some("inside"));
+        assert!(!files.contains_key("/m/sub/secret"), "{:?}", files.keys());
+        // A link on the way to the import fails it, unless resolved first;
+        // a link as the last name is imported as one.
+        symlink(root.join("moved"), root.join("dirlink")).unwrap();
+        assert!(import(&mut files, &root.join("dirlink/f"), "/x").is_err());
+        import(&mut files, &real_dirs(&root.join("dirlink/f")).unwrap(), "/x").unwrap();
+        assert_eq!(data(&files, "/x").as_deref(), Some("inside"));
+        import(&mut files, &real_dirs(&root.join("dirlink")).unwrap(), "/y").unwrap();
+        assert!(matches!(files.get("/y"), Some(Node::Symlink { .. })));
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
 
     #[test]
     fn guest_paths_are_normalized_and_checked() {

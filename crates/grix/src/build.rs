@@ -83,7 +83,7 @@ pub struct Grixfile {
 fn in_context(base: &Path, path: &Path, anywhere: bool) -> Result<PathBuf> {
     let full = if path.is_absolute() { path.to_path_buf() } else { base.join(path) };
     if anywhere {
-        return Ok(full);
+        return image::real_dirs(&full);
     }
     let context = base.canonicalize().with_context(|| format!("the build context {}", base.display()))?;
     let real = full.canonicalize().with_context(|| format!("{} does not exist", full.display()))?;

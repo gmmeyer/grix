@@ -223,16 +223,20 @@ impl Snapshot {
         self.mount_with(host, guest, true)
     }
 
-    fn mount_with(mut self, host: impl AsRef<Path>, guest: &str, read_only: bool) -> Result<Self> {
+    fn mount_with(self, host: impl AsRef<Path>, guest: &str, read_only: bool) -> Result<Self> {
         let host = host.as_ref();
+        let real = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
+        self.mount_real(real, guest, read_only)
+    }
+
+    /// Mount a canonical path, which nothing resolves again (see
+    /// `SandboxBuilder::mount_real`).
+    pub(crate) fn mount_real(mut self, real: PathBuf, guest: &str, read_only: bool) -> Result<Self> {
         if !self.settings.live.iter().any(|m| m.guest == guest) {
             let have: Vec<&str> = self.settings.live.iter().map(|m| m.guest.as_str()).collect();
             bail!("the snapshot has no live mount at {guest} (it has {have:?})");
         }
-        let real = host.canonicalize().with_context(|| format!("mounting {}", host.display()))?;
-        if !real.is_dir() {
-            bail!("{} isn't a directory", host.display());
-        }
+        crate::at::open_dir(&real).with_context(|| format!("{} isn't a directory", real.display()))?;
         self.mounts.retain(|m| m.1 != guest);
         self.mounts.push((real, guest.to_string(), read_only));
         Ok(self)
