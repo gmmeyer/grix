@@ -49,20 +49,26 @@ pub enum ProcFile {
     CgroupMemoryMax,
 }
 
-/// The files to create, by path. `/proc/self` is a symlink to `/proc/1`.
+/// Each process's directory, /proc/<pid> (made at fork, gone when it
+/// ends; `/proc/self` is the caller's): these files, `fd/`, and the `exe`,
+/// `cwd` and `root` links.
+pub const PID_FILES: &[(&str, ProcFile)] = &[
+    ("maps", ProcFile::Maps),
+    ("status", ProcFile::Status),
+    ("stat", ProcFile::Stat),
+    ("statm", ProcFile::Statm),
+    ("cmdline", ProcFile::Cmdline),
+    ("environ", ProcFile::Environ),
+    ("comm", ProcFile::Comm),
+    ("limits", ProcFile::Limits),
+    ("mountinfo", ProcFile::Mountinfo),
+    ("mounts", ProcFile::Mounts),
+    ("cgroup", ProcFile::Text("0::/\n")),
+    ("oom_score_adj", ProcFile::Text("0\n")),
+];
+
+/// The other files to create, by path.
 pub const FILES: &[(&str, ProcFile)] = &[
-    ("/proc/1/maps", ProcFile::Maps),
-    ("/proc/1/status", ProcFile::Status),
-    ("/proc/1/stat", ProcFile::Stat),
-    ("/proc/1/statm", ProcFile::Statm),
-    ("/proc/1/cmdline", ProcFile::Cmdline),
-    ("/proc/1/environ", ProcFile::Environ),
-    ("/proc/1/comm", ProcFile::Comm),
-    ("/proc/1/limits", ProcFile::Limits),
-    ("/proc/1/mountinfo", ProcFile::Mountinfo),
-    ("/proc/1/mounts", ProcFile::Mounts),
-    ("/proc/1/cgroup", ProcFile::Text("0::/\n")),
-    ("/proc/1/oom_score_adj", ProcFile::Text("0\n")),
     ("/proc/cpuinfo", ProcFile::Cpuinfo),
     ("/proc/stat", ProcFile::ProcStat),
     ("/proc/meminfo", ProcFile::Meminfo),
@@ -227,9 +233,7 @@ fn maps(p: &Process, s: &mut String) {
         let (offset, inode, name) = match v.backing {
             Backing::File { offset, ino, .. }
             | Backing::Data { offset, ino, .. }
-            | Backing::SharedFile { offset, ino, .. } => {
-                (offset, fs.ino_number(ino), fs.path_of(ino))
-            }
+            | Backing::SharedFile { offset, ino, .. } => (offset, fs.ino_number(ino), fs.path_of(ino)),
             Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
             Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
             // What Linux calls the page holding the signal-return code on arm32.
@@ -253,7 +257,7 @@ fn status(p: &Process, s: &mut String) {
     let (pid, ppid) = (p.pid, p.ppid);
     let _ = write!(
         s,
-        "Name:\t{}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
+        "Name:\t{}\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
          TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n\
          VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/0\n\
          SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
@@ -262,6 +266,7 @@ fn status(p: &Process, s: &mut String) {
          NoNewPrivs:\t1\nSeccomp:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
         comm(p),
         p.umask,
+        state(p),
         p.fds.len(),
         size * 4,
         size * 4,
@@ -271,6 +276,17 @@ fn status(p: &Process, s: &mut String) {
     );
 }
 
+/// Stopped, running (the caller), or waiting for its turn or for something.
+fn state(p: &Process) -> &'static str {
+    if p.stopped {
+        "T (stopped)"
+    } else if p.pid == crate::process::current_pid() {
+        "R (running)"
+    } else {
+        "S (sleeping)"
+    }
+}
+
 fn stat(p: &Process, s: &mut String) {
     let (size, rss) = mem_pages(p);
     // utime, in clock ticks (all CPU time counts as user time).
@@ -278,9 +294,10 @@ fn stat(p: &Process, s: &mut String) {
     let (pid, ppid, pgrp, sid) = (p.pid, p.ppid, p.pgid, p.sid);
     let _ = writeln!(
         s,
-        "{pid} ({}) R {ppid} {pgrp} {sid} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
+        "{pid} ({}) {} {ppid} {pgrp} {sid} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
         comm(p),
+        &state(p)[..1],
         p.threads.len(),
         size * 4096,
     );
@@ -376,9 +393,18 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
     }
 }
 
+/// Another process's descriptor, `/proc/<pid>/fd/N`.
+pub fn other_fd_path(path: &str) -> Option<(u32, u64)> {
+    let (pid, fd) = path.strip_prefix("/proc/")?.split_once("/fd/")?;
+    let pid: u32 = pid.parse().ok()?;
+    let fd = fd.trim_end_matches('/').parse().ok()?;
+    (pid != crate::process::current_pid()).then_some((pid, fd))
+}
+
 /// Which descriptor a path names, if it is `/proc/self/fd/N` or an alias of it.
 pub fn fd_path(path: &str) -> Option<u64> {
-    let rest = ["/proc/self/fd/", "/proc/1/fd/", "/proc/thread-self/fd/", "/dev/fd/"]
+    let mine = alloc::format!("/proc/{}/fd/", crate::process::current_pid());
+    let rest = ["/proc/self/fd/", mine.as_str(), "/proc/thread-self/fd/", "/dev/fd/"]
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .or(match path {

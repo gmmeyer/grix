@@ -713,8 +713,14 @@ pub struct Fs {
     orphans: Vec<Ino>,
     /// Reclaimed slots ready for new nodes.
     free: Vec<Ino>,
-    /// `/proc/1/fd`, whose entries are the live descriptors.
-    pub fd_dir: Ino,
+    /// /proc, its `self` and `thread-self` links (whose targets are the
+    /// running process's pid), each process's directory, and the `fd`
+    /// directories (their entries are that process's descriptors).
+    proc_dir: Ino,
+    self_links: [Ino; 2],
+    pid_dirs: BTreeMap<u32, Ino>,
+    dir_pids: BTreeMap<Ino, u32>,
+    fd_dirs: BTreeMap<Ino, u32>,
     /// `/dev/pts`, and the nodes of the pseudo-terminals ever made: each
     /// index keeps its node, linked there while its master is open.
     pts_dir: Ino,
@@ -730,6 +736,22 @@ pub struct Fs {
 }
 
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
+
+/// Processes that ended while the filesystem was busy: their /proc
+/// directories go at the next chance.
+static PROC_GONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Process `pid` ended: its /proc/<pid> goes (now, or once the filesystem
+/// is free).
+pub fn proc_gone(pid: u32) {
+    let mut gone = PROC_GONE.lock();
+    gone.push(pid);
+    if let Some(mut fs) = try_lock() {
+        for pid in core::mem::take(&mut *gone) {
+            fs.proc_remove(pid);
+        }
+    }
+}
 
 /// Make `fs` the filesystem. Done once, after exec resolved the program.
 pub fn install(fs: Fs) {
@@ -813,7 +835,11 @@ impl Fs {
             nodes: vec![Box::new(root)],
             orphans: Vec::new(),
             free: Vec::new(),
-            fd_dir: ROOT,
+            proc_dir: ROOT,
+            self_links: [ROOT; 2],
+            pid_dirs: BTreeMap::new(),
+            dir_pids: BTreeMap::new(),
+            fd_dirs: BTreeMap::new(),
             pts_dir: ROOT,
             pts_nodes: BTreeMap::new(),
             page: None,
@@ -859,20 +885,16 @@ impl Fs {
             fs.insert(dev, name, Kind::Symlink(alloc::format!("/proc/self/fd/{i}")), 0o777);
         }
 
-        let pid_dir = fs.mkdir_p("/proc/1");
-        fs.fd_dir = fs.insert(pid_dir, "fd", Kind::Dir(BTreeMap::new()), 0o500);
         let proc = fs.mkdir_p("/proc");
-        fs.insert(proc, "self", Kind::Symlink("1".into()), 0o777);
-        fs.insert(proc, "thread-self", Kind::Symlink("1".into()), 0o777);
+        fs.proc_dir = proc;
+        fs.self_links[0] = fs.insert(proc, "self", Kind::Symlink("1".into()), 0o777);
+        fs.self_links[1] = fs.insert(proc, "thread-self", Kind::Symlink("1".into()), 0o777);
         fs.insert(proc, "mounts", Kind::Symlink("self/mounts".into()), 0o777);
         for &(path, file) in procfs::FILES {
             let (dir, name) = path.rsplit_once('/').unwrap();
             let parent = fs.mkdir_p(dir);
             fs.insert(parent, name, Kind::Proc(file), 0o444);
         }
-        // /proc/<pid> belongs to the process's user (ps reads its owner from there).
-        fs.nodes[pid_dir].perm = 0o555;
-        fs.walk_tree(pid_dir, &mut |n| (n.uid, n.gid) = (uid, gid));
         for top in ["/dev", "/proc", "/sys"] {
             if let Ok(ino) = fs.lookup(ROOT, top, false) {
                 fs.walk_tree(ino, &mut |n| n.system = true);
@@ -958,15 +980,112 @@ impl Fs {
         }
     }
 
-    /// `/proc/self/exe` points at the program actually running (the
-    /// interpreter, for `#!` scripts).
-    pub fn set_exe(&mut self, path: &str) {
-        let pid_dir = self.mkdir_p("/proc/1");
-        let exe = self.insert(pid_dir, "exe", Kind::Symlink(path.into()), 0o777);
-        let owner = &self.nodes[pid_dir];
-        let (uid, gid) = (owner.uid, owner.gid);
-        let n = &mut self.nodes[exe];
-        (n.uid, n.gid, n.system) = (uid, gid, true);
+    /// A new process's /proc/<pid>, owned by its user (ps reads the owner
+    /// from there): its files, `fd/`, and `exe` (the program actually
+    /// running: the interpreter, for `#!` scripts), `cwd` and `root`.
+    /// Without room for it (the metadata budget), there's none.
+    pub fn proc_add(&mut self, pid: u32, owner: (u32, u32), exe: &str, cwd: &str) {
+        for gone in core::mem::take(&mut *PROC_GONE.lock()) {
+            self.proc_remove(gone);
+        }
+        self.proc_remove(pid);
+        let made = (|| -> Result<(), Errno> {
+            let dir =
+                self.add_node(self.proc_dir, &alloc::format!("{pid}"), Kind::Dir(BTreeMap::new()), 0o555, owner)?;
+            self.pid_dirs.insert(pid, dir);
+            self.dir_pids.insert(dir, pid);
+            for &(name, file) in procfs::PID_FILES {
+                self.add_node(dir, name, Kind::Proc(file), 0o444, owner)?;
+            }
+            let fd = self.add_node(dir, "fd", Kind::Dir(BTreeMap::new()), 0o500, owner)?;
+            self.fd_dirs.insert(fd, pid);
+            for (name, target) in [("exe", exe), ("cwd", cwd), ("root", "/")] {
+                self.add_node(dir, name, Kind::Symlink(target.into()), 0o777, owner)?;
+            }
+            Ok(())
+        })();
+        if made.is_err() {
+            self.proc_remove(pid);
+        }
+    }
+
+    /// A node of the kernel's own (in /proc), counted against the metadata
+    /// budget, in a slot that's reused once it's gone.
+    fn add_node(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, owner: (u32, u32)) -> Result<Ino, Errno> {
+        let mut node = Node::new(kind, perm, owner, dir, name, crate::time::realtime_ns());
+        node.system = true;
+        self.reclaim();
+        charge(node.cost() + entry_cost(name))?;
+        let ino = self.alloc_node(node);
+        if let Kind::Dir(children) = &mut self.nodes[dir].kind {
+            children.insert(name.into(), ino);
+        }
+        Ok(ino)
+    }
+
+    /// /proc/<pid>/`name` (exe, cwd) now leads to `target`.
+    pub fn proc_set(&mut self, pid: u32, name: &str, target: &str) {
+        let Some(&dir) = self.pid_dirs.get(&pid) else { return };
+        let Some(link) = self.child(dir, name) else { return };
+        if let Kind::Symlink(t) = &mut self.nodes[link].kind {
+            if charge(target.len() as u64).is_err() {
+                return;
+            }
+            release(t.len() as u64);
+            *t = target.into();
+        }
+    }
+
+    /// /proc/<pid> belongs to the process's effective user, as on Linux.
+    pub fn proc_owner(&mut self, pid: u32, owner: (u32, u32)) {
+        if let Some(&dir) = self.pid_dirs.get(&pid) {
+            self.walk_tree(dir, &mut |n| (n.uid, n.gid) = owner);
+        }
+    }
+
+    /// Process `pid` is gone: so is /proc/<pid>.
+    pub fn proc_remove(&mut self, pid: u32) {
+        let Some(dir) = self.pid_dirs.remove(&pid) else { return };
+        self.dir_pids.remove(&dir);
+        self.remove_tree(dir);
+        if let Kind::Dir(children) = &mut self.nodes[self.proc_dir].kind {
+            children.remove(&alloc::format!("{pid}"));
+        }
+        release(entry_cost(&alloc::format!("{pid}")));
+        self.drop_name(dir);
+    }
+
+    /// Unlink everything below `dir` (open descriptors keep their nodes).
+    fn remove_tree(&mut self, dir: Ino) {
+        let Kind::Dir(children) = &mut self.nodes[dir].kind else { return };
+        for (name, child) in core::mem::take(children) {
+            self.fd_dirs.remove(&child);
+            self.remove_tree(child);
+            release(entry_cost(&name));
+            self.drop_name(child);
+        }
+    }
+
+    /// The process a /proc/<pid> file describes (None: the caller).
+    pub fn proc_pid(&self, ino: Ino) -> Option<u32> {
+        self.dir_pids.get(&self.nodes[ino].parent).copied()
+    }
+
+    /// The process whose descriptors a /proc/<pid>/fd directory lists.
+    pub fn fd_dir_pid(&self, ino: Ino) -> Option<u32> {
+        self.fd_dirs.get(&ino).copied()
+    }
+
+    /// A symlink's target: `/proc/self` and `thread-self` lead to the
+    /// running process's directory.
+    pub fn link_target(&self, ino: Ino) -> Option<String> {
+        if self.self_links.contains(&ino) {
+            return Some(alloc::format!("{}", crate::process::current_pid()));
+        }
+        match &self.nodes[ino].kind {
+            Kind::Symlink(t) => Some(t.clone()),
+            _ => None,
+        }
     }
 
     /// Make the directory at `path` a mount point.
@@ -1127,14 +1246,12 @@ impl Fs {
                 name => {
                     let child =
                         self.find_child(cur, name)?.ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
-                    if let Kind::Symlink(target) = &self.nodes[child].kind
-                        && (!last || follow_last || must_be_dir)
-                    {
+                    if matches!(self.nodes[child].kind, Kind::Symlink(_)) && (!last || follow_last || must_be_dir) {
                         *links += 1;
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        let target = target.clone();
+                        let target = self.link_target(child).unwrap();
                         cur = self.walk(cur, &target, true, links)?;
                         continue;
                     }
@@ -1337,17 +1454,27 @@ impl Fs {
     /// before creating it).
     pub fn missing_is_import_gap(&mut self, base: Ino, path: &str) -> bool {
         // A live mount has whatever the host has: nothing there is missing;
-        // nor in /dev/pts, whose entries come and go with pseudo-terminals.
+        // nor in /dev/pts or /proc/<pid>, whose entries come and go.
         let gap = |fs: &Fs, ino: Ino| {
             let n = &fs.nodes[ino];
-            !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none() && n.host_ino == 0 && ino != fs.pts_dir
+            !n.changed
+                && n.perm & S_ISVTX == 0
+                && n.remote.is_none()
+                && n.host_ino == 0
+                && ino != fs.pts_dir
+                && !fs.dir_pids.contains_key(&ino)
+                && !fs.fd_dirs.contains_key(&ino)
         };
         let mut p = path.trim_end_matches('/');
         loop {
             match p.rsplit_once('/') {
-                Some((dir, _)) => {
+                Some((dir, name)) => {
                     let dir = if dir.is_empty() { "/" } else { dir };
                     if let Ok(ino) = self.lookup(base, dir, true) {
+                        // A process that has ended (or never was).
+                        if ino == self.proc_dir && name.parse::<u32>().is_ok() {
+                            return false;
+                        }
                         return gap(self, ino);
                     }
                     p = dir.trim_end_matches('/');
@@ -1754,7 +1881,9 @@ impl Fs {
             return self.ensure(ino);
         }
         let frozen = self.lazy[r.mount] && r.fetched != 0;
-        if frozen || crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS || self.nodes[ino].nlink == 0
+        if frozen
+            || crate::time::monotonic_ns().saturating_sub(r.fetched) < hostfs::FRESH_NS
+            || self.nodes[ino].nlink == 0
         {
             return Ok(());
         }

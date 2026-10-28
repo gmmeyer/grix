@@ -15,8 +15,8 @@ use crate::fd::{
     new_file,
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
-use crate::procfs;
 use crate::locks;
+use crate::procfs;
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
@@ -100,6 +100,17 @@ pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     }
 }
 
+/// `f` of another process, if the caller may look at its descriptors (as
+/// ptrace's PTRACE_MODE_READ on Linux: root, or the same user throughout).
+fn with_other<T>(p: &Process, pid: u32, f: impl FnOnce(&Process) -> Result<T, Errno>) -> Result<T, Errno> {
+    let procs = crate::procs::PROCS.lock();
+    let q = procs.others.get(&pid).ok_or(ENOENT)?;
+    if p.uid != 0 && (p.uid, p.uid, p.uid) != (q.uid, q.ids.ruid, q.ids.suid) {
+        return Err(EACCES);
+    }
+    f(q)
+}
+
 /// The node a path names, for calls that take (dirfd, path, AT_* flags).
 fn at_node(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Ino, Errno> {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
@@ -138,9 +149,11 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
         FileKind::Pty(end) => fs::lock().stat(end.ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
-        FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_) => {
-            anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0)
-        }
+        FileKind::Socket(_)
+        | FileKind::Netlink(_)
+        | FileKind::UnixUnbound(_)
+        | FileKind::Inet(_)
+        | FileKind::Unix(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_)
@@ -161,6 +174,9 @@ fn path_stat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Stat
     }
     if let Some(fd) = procfs::fd_path(&path) {
         return fd_stat(p, fd);
+    }
+    if let Some((pid, fd)) = procfs::other_fd_path(&path) {
+        return with_other(p, pid, |q| fd_stat(q, fd).map_err(|_| ENOENT));
     }
     let ino = resolve(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
     Ok(fs::lock().stat(ino))
@@ -241,8 +257,9 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     let writes = acc != O_RDONLY || flags & O_TRUNC != 0;
-    let (content, proc) = {
+    let (content, proc, proc_pid) = {
         let mut fs = fs::lock();
+        let proc_pid = fs.proc_pid(ino).filter(|&pid| pid != p.pid);
         fs.revalidate(ino);
         if writes && fs.read_only(ino) && !fs.is_dir(ino) {
             return Err(EROFS);
@@ -271,17 +288,26 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
                     return Err(EACCES);
                 }
                 fs.list_now(ino)?;
-                (None, None)
+                (None, None, None)
             }
             Kind::File(_) | Kind::Unlinked { .. } if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
-            Kind::File(c) => (Some(c.clone()), None),
+            Kind::File(c) => (Some(c.clone()), None, None),
             Kind::Unlinked { .. } => return Err(ENOENT),
             Kind::Proc(_) if writes => return Err(EACCES),
-            Kind::Proc(f) => (None, Some(*f)),
+            Kind::Proc(f) => (None, Some(*f), proc_pid),
         }
     };
     if let Some(f) = proc {
-        let data = procfs::generate(p, f);
+        // Another process's /proc/<pid>: generated from it (kernel state
+        // only, never its memory).
+        let data = match proc_pid {
+            Some(pid) => {
+                let procs = crate::procs::PROCS.lock();
+                let q = procs.others.get(&pid).ok_or(ESRCH)?;
+                procfs::generate(q, f)
+            }
+            None => procfs::generate(p, f),
+        };
         let held = crate::kmem::Charge::new(data.capacity() as u64)?;
         let file = new_file(FileKind::Generated(data), flags & !(O_CLOEXEC | O_CREAT | O_EXCL));
         file.lock().held = Some(held);
@@ -328,9 +354,8 @@ fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32) ->
     let (dir, name) = parent_in(p, base, path)?;
     let mut fs = fs::lock();
     if let Ok(link) = fs.lookup(dir, &name, false)
-        && let Kind::Symlink(target) = &fs.node(link).kind
+        && let Some(target) = fs.link_target(link)
     {
-        let target = target.clone();
         drop(fs);
         return if depth >= 8 { Err(ELOOP) } else { create_file(p, dir, &target, perm, depth + 1) };
     }
@@ -1081,16 +1106,18 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
         return Err(EINVAL);
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
-    let target = match procfs::fd_path(&path) {
-        Some(fd) if path.contains("/fd/") => {
+    let target = match (procfs::fd_path(&path), procfs::other_fd_path(&path)) {
+        (Some(fd), _) if path.contains("/fd/") => {
             let file = p.fds.get(fd).map_err(|_| ENOENT)?;
             procfs::fd_link(&file.lock().kind, fd)
         }
+        (_, Some((pid, fd))) => with_other(p, pid, |q| {
+            let file = q.fds.get(fd).map_err(|_| ENOENT)?;
+            Ok(procfs::fd_link(&file.lock().kind, fd))
+        })?,
         _ => {
             let ino = resolve(p, dirfd, &path, false)?;
-            let fs = fs::lock();
-            let Kind::Symlink(target) = &fs.node(ino).kind else { return Err(EINVAL) };
-            target.clone()
+            fs::lock().link_target(ino).ok_or(EINVAL)?
         }
     };
     let n = (target.len() as u64).min(size) as usize;
@@ -1108,11 +1135,16 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     let mut out: Vec<u8> = Vec::new();
     let mut pos = f.offset;
     let mut cursor = f.dir_pos.clone();
-    // /proc/self/fd lists the live descriptors as symlinks.
-    let fd_names: Vec<String> = if dir == fs.fd_dir {
-        (0..p.fds.len() as u64).filter(|&fd| p.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
-    } else {
-        Vec::new()
+    // /proc/<pid>/fd lists the process's descriptors as symlinks.
+    let fd_pid = fs.fd_dir_pid(dir);
+    let fd_names: Vec<String> = match fd_pid {
+        Some(pid) if pid == p.pid => {
+            (0..p.fds.len() as u64).filter(|&fd| p.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
+        }
+        Some(pid) => crate::procs::PROCS.lock().others.get(&pid).map_or_else(Vec::new, |q| {
+            (0..q.fds.len() as u64).filter(|&fd| q.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
+        }),
+        None => Vec::new(),
     };
     loop {
         let entry = match pos {
@@ -1121,7 +1153,7 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
                 let parent = fs.node(dir).parent;
                 Some((String::from(".."), fs.ino_number(parent), 4))
             }
-            n if dir == fs.fd_dir => fd_names.get(n as usize - 2).map(|name| (name.clone(), fs.ino_number(dir), 10)),
+            n if fd_pid.is_some() => fd_names.get(n as usize - 2).map(|name| (name.clone(), fs.ino_number(dir), 10)),
             // Resume after the last name returned: entries may have come and
             // gone since (rm -rf unlinks while it reads).
             _ => match fs.dir_next(dir, cursor.as_deref()) {
@@ -1187,11 +1219,13 @@ pub fn fchdir(p: &mut Process, fd: u64) -> SysResult {
 }
 
 fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
-    let fs = fs::lock();
+    let mut fs = fs::lock();
     if !fs.is_dir(ino) {
         return Err(ENOTDIR);
     }
     (p.cwd, p.cwd_pin) = (ino, Some(fs.pin(ino)));
+    let path = fs.path_of(ino);
+    fs.proc_set(p.pid, "cwd", &path);
     Ok(0)
 }
 

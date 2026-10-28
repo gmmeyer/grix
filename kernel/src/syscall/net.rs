@@ -1141,7 +1141,13 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
     if to.is_local() || to.is_unspecified() {
         let addr = match to {
             _ if to.is_loopback() => to.addr,
-            _ if to.is_unspecified() => if s.v6 { Addr::V6(inet::LOOPBACK_V6) } else { Addr::V4([127, 0, 0, 1]) },
+            _ if to.is_unspecified() => {
+                if s.v6 {
+                    Addr::V6(inet::LOOPBACK_V6)
+                } else {
+                    Addr::V4([127, 0, 0, 1])
+                }
+            }
             _ => Addr::V4(link::GUEST_V4),
         };
         let from = SockAddr { addr, port: local.port };

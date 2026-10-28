@@ -86,9 +86,15 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if vfork {
         c.vfork_parent = Some((p.pid, p.current));
     }
+    let owner = (c.uid, c.gid);
     procs.others.insert(pid, c);
     p.timer_dirty = true;
     drop(procs);
+    {
+        let mut fs = crate::fs::lock();
+        let cwd = fs.path_of(p.cwd);
+        fs.proc_add(pid, owner, &p.exe, &cwd);
+    }
     if vfork { p.block(WaitOn::Vfork, None, Ok(pid as u64)) } else { Ok(pid as u64) }
 }
 
@@ -169,6 +175,7 @@ pub fn execve(
     let (entry, sp) = program.install(p);
     // As on Linux, the saved ids become the effective ones.
     (p.ids.suid, p.ids.sgid) = (p.uid, p.gid);
+    crate::fs::lock().proc_set(p.pid, "exe", &p.exe);
     // The other threads end (Linux's de_thread); this one takes the pid.
     let mut t = p.threads.remove(&p.current).unwrap();
     for (_, other) in core::mem::take(&mut p.threads) {
@@ -243,7 +250,8 @@ impl Which {
 fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<Option<(u32, i32, u64)>, Errno> {
     let mut procs = PROCS.lock();
     let me = p.pid;
-    let zombie = procs.zombies.iter().find(|(pid, z)| z.ppid == me && which.matches(**pid, z.pgid)).map(|(pid, _)| *pid);
+    let zombie =
+        procs.zombies.iter().find(|(pid, z)| z.ppid == me && which.matches(**pid, z.pgid)).map(|(pid, _)| *pid);
     if let Some(pid) = zombie.filter(|_| options & WEXITED != 0) {
         let z = &procs.zombies[&pid];
         let r = (pid, z.status, z.cpu_ns);

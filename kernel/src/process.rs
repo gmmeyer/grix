@@ -266,6 +266,17 @@ pub enum JobReport {
 
 pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 
+/// The pid of the process in `PROCESS` (what /proc/self is).
+static CURRENT_PID: AtomicU32 = AtomicU32::new(INIT);
+
+pub fn current_pid() -> u32 {
+    CURRENT_PID.load(Ordering::Relaxed)
+}
+
+pub fn set_current_pid(pid: u32) {
+    CURRENT_PID.store(pid, Ordering::Relaxed);
+}
+
 /// What has been reported to the host already, for every process: each
 /// denial, gap and missing path once.
 static REPORTED: Mutex<BTreeSet<(u8, u32, String)>> = Mutex::new(BTreeSet::new());
@@ -667,7 +678,11 @@ pub fn start(img: Image<'static>) -> ! {
         Ok(program) => program,
         Err(e) => fail(if e.errno == ENOENT { 127 } else { 126 }, &e.reason),
     };
-    fs::lock().set_exe(&program.exe);
+    {
+        let mut fs = fs::lock();
+        let cwd_path = fs.path_of(cwd);
+        fs.proc_add(INIT, (img.uid, img.gid), &program.exe, &cwd_path);
+    }
     let (entry, sp) = program.install(&mut p);
     p.slice_start = crate::time::monotonic_ns();
     // The kernel is ours while the other CPUs start (they wait for it).
@@ -758,21 +773,21 @@ pub fn load_program(
     aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
 
     let auxv = [
-        (3, loaded.phdr),  // AT_PHDR
-        (4, 56),           // AT_PHENT
-        (5, loaded.phnum), // AT_PHNUM
-        (6, 4096),         // AT_PAGESZ
-        (7, interp_base),  // AT_BASE
-        (8, 0),            // AT_FLAGS
-        (9, loaded.entry), // AT_ENTRY
+        (3, loaded.phdr),        // AT_PHDR
+        (4, 56),                 // AT_PHENT
+        (5, loaded.phnum),       // AT_PHNUM
+        (6, 4096),               // AT_PAGESZ
+        (7, interp_base),        // AT_BASE
+        (8, 0),                  // AT_FLAGS
+        (9, loaded.entry),       // AT_ENTRY
         (11, p.ids.ruid as u64), // AT_UID
         (12, p.uid as u64),      // AT_EUID
         (13, p.ids.rgid as u64), // AT_GID
         (14, p.gid as u64),      // AT_EGID
-        (16, arch::hwcap()), // AT_HWCAP
-        (17, 100),           // AT_CLKTCK
-        (23, 0),             // AT_SECURE
-        (26, 0),             // AT_HWCAP2
+        (16, arch::hwcap()),     // AT_HWCAP
+        (17, 100),               // AT_CLKTCK
+        (23, 0),                 // AT_SECURE
+        (26, 0),                 // AT_HWCAP2
     ];
     // The stack is written through the new address space's own mapping.
     aspace.activate();

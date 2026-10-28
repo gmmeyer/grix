@@ -41,8 +41,8 @@ mod syscall;
 mod time;
 mod timer;
 mod tty;
-mod unix;
 mod uaccess;
+mod unix;
 mod virtio;
 
 use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, Image};

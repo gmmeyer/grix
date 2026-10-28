@@ -668,7 +668,8 @@ impl Drop for Udp {
 pub fn deliver_local(from: SockAddr, to: SockAddr, data: &[u8]) -> bool {
     let Some(u) = UDP_PORTS.lock().get(&to.port).and_then(Weak::upgrade) else { return false };
     let mut u = u.lock();
-    let takes = u.local.is_some_and(|l| l.is_unspecified() || l.addr == to.addr || (l.is_loopback() && to.is_loopback()));
+    let takes =
+        u.local.is_some_and(|l| l.is_unspecified() || l.addr == to.addr || (l.is_loopback() && to.is_loopback()));
     if takes {
         u.push(from, data);
     }
@@ -897,4 +898,3 @@ impl Inet {
         }
     }
 }
-

@@ -48,11 +48,8 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         nr::getgid => Ok(p.ids.rgid as u64),
         nr::getegid => Ok(p.gid as u64),
         nr::getresuid | nr::getresgid => {
-            let ids = if n == nr::getresuid {
-                [p.ids.ruid, p.uid, p.ids.suid]
-            } else {
-                [p.ids.rgid, p.gid, p.ids.sgid]
-            };
+            let ids =
+                if n == nr::getresuid { [p.ids.ruid, p.uid, p.ids.suid] } else { [p.ids.rgid, p.gid, p.ids.sgid] };
             for (ptr, id) in a[..3].iter().zip(ids) {
                 write_u32(&mut p.aspace, *ptr, id)?;
             }
@@ -261,6 +258,7 @@ fn set_ids(p: &mut Process, n: u32, _name: &str, a: [u64; 6]) -> SysResult {
     } else {
         (p.ids.rgid, p.gid, p.ids.sgid) = (nr_, ne, ns);
     }
+    crate::fs::lock().proc_owner(p.pid, (p.uid, p.gid));
     Ok(0)
 }
 

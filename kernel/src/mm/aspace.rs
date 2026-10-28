@@ -111,13 +111,9 @@ impl Vma {
             Backing::Shared { ref pages, index } => {
                 Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
             }
-            Backing::SharedFile { ref data, offset, ino, may_write, ref token } => Backing::SharedFile {
-                data: data.clone(),
-                offset: offset + skip,
-                ino,
-                may_write,
-                token: token.clone(),
-            },
+            Backing::SharedFile { ref data, offset, ino, may_write, ref token } => {
+                Backing::SharedFile { data: data.clone(), offset: offset + skip, ino, may_write, token: token.clone() }
+            }
             Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
                 data,
                 offset: offset + skip,

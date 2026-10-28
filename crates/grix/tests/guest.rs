@@ -1600,6 +1600,52 @@ fn busybox_sees_user_and_system_info() {
     assert_eq!(busybox(&sb, &["ls", "/proc/self/fd"]).stdout_str(), "0\n1\n2\n3\n");
 }
 
+/// Every process has a /proc/<pid> (gone when it ends), and /proc/self is
+/// the caller's.
+#[test]
+fn proc_for_every_process() {
+    let sb = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .build()
+        .unwrap();
+    let script = r#"
+        cd /tmp
+        /bin/busybox sleep 30 &
+        kid=$!
+        /bin/busybox sleep 0.2
+        echo "kid $(/bin/busybox cat /proc/$kid/cmdline | /bin/busybox tr '\0' ' ')"
+        echo "exe $(/bin/busybox readlink /proc/$kid/exe)"
+        echo "cwd $(/bin/busybox readlink /proc/$kid/cwd)"
+        echo "ppid $(/bin/busybox awk '/^PPid/ {print $2}' /proc/$kid/status)"
+        echo "fds $(/bin/busybox ls /proc/$kid/fd | /bin/busybox wc -l)"
+        /bin/busybox sh -c 'echo "self $$ $(exec /bin/busybox readlink /proc/self)"'
+        /bin/busybox ps -o pid,args | /bin/busybox grep "^ *$kid " | /bin/busybox sed 's/^ *[0-9]* //'
+        kill $kid
+        wait $kid
+        [ -d /proc/$kid ] || echo gone
+        cd -P /proc/self && echo "init $(pwd)"
+    "#;
+    let out = sb.run(&["/bin/busybox", "sh", "-c", script]).unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let text = out.stdout_str();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "kid /bin/busybox sleep 30 ", "{text}");
+    assert_eq!(lines[1], "exe /bin/busybox", "{text}");
+    assert_eq!(lines[2], "cwd /tmp", "{text}");
+    assert_eq!(lines[3], "ppid 1", "{text}");
+    assert!(lines[4].starts_with("fds ") && lines[4] != "fds 0", "{text}");
+    // readlink, a process of its own, sees itself as /proc/self.
+    let self_line: Vec<&str> = lines[5].split(' ').collect();
+    assert_eq!(self_line[0], "self", "{text}");
+    assert_ne!(self_line[2], "1", "{text}");
+    assert_eq!(lines[6], "/bin/busybox sleep 30", "{text}");
+    assert_eq!(lines[7], "gone", "{text}");
+    assert_eq!(lines[8], "init /proc/1", "{text}");
+}
+
 /// A stand-in kernel, hand-assembled: it writes `serial` to the PL011 and
 /// powers off, which is what the real one does when it panics.
 fn fake_kernel(serial: &[u8]) -> Vec<u8> {

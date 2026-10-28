@@ -80,6 +80,7 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     if next != p.pid {
         let mut body = procs.others.remove(&next).unwrap();
         core::mem::swap(p, &mut body);
+        crate::process::set_current_pid(p.pid);
         p.aspace.activate();
         smp::activated(p.aspace.pt.root);
         // `body` is the process that was running: back with the others,

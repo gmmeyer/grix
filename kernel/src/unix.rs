@@ -185,7 +185,10 @@ pub enum State {
     /// Bound, neither listening nor connected (a stream or seqpacket
     /// socket).
     Idle,
-    Listening { backlog: usize, queue: VecDeque<(Incoming, Slot)> },
+    Listening {
+        backlog: usize,
+        queue: VecDeque<(Incoming, Slot)>,
+    },
     /// Datagram, or a seqpacket connection's end: messages for it, and
     /// where they go without an address (the peer, if connected).
     Messages {
@@ -306,7 +309,9 @@ impl Sock {
     pub fn has_room(&self, len: usize) -> bool {
         let cost = len + MSG_OVERHEAD;
         match &self.state {
-            State::Messages { queue, bytes, .. } => queue.len() < QUEUE_MSGS && (*bytes == 0 || bytes + cost <= QUEUE_BYTES),
+            State::Messages { queue, bytes, .. } => {
+                queue.len() < QUEUE_MSGS && (*bytes == 0 || bytes + cost <= QUEUE_BYTES)
+            }
             _ => false,
         }
     }
@@ -423,11 +428,7 @@ pub fn message_pair(ty: u64, a: Cred, b: Cred) -> (SockRef, SockRef) {
 
 /// connect() of a stream socket to `listener`: a socket pair, one end
 /// queued for accept. EAGAIN if the queue is full.
-pub fn connect_stream(
-    listener: &SockRef,
-    me: Option<Name>,
-    cred: Cred,
-) -> Result<(SocketEnd, StreamInfo), Errno> {
+pub fn connect_stream(listener: &SockRef, me: Option<Name>, cred: Cred) -> Result<(SocketEnd, StreamInfo), Errno> {
     let mut l = listener.lock();
     let (target, lcred) = (l.name.clone(), l.cred);
     let State::Listening { backlog, queue } = &mut l.state else { return Err(ECONNREFUSED) };

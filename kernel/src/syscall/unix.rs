@@ -227,7 +227,15 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
 }
 
 /// accept4 on a listening AF_UNIX socket.
-pub fn accept(p: &mut Process, sock: &SockRef, nonblock: bool, addr: u64, addrlen: u64, flags: u32, cloexec: bool) -> SysResult {
+pub fn accept(
+    p: &mut Process,
+    sock: &SockRef,
+    nonblock: bool,
+    addr: u64,
+    addrlen: u64,
+    flags: u32,
+    cloexec: bool,
+) -> SysResult {
     if !p.fds.has_room() {
         return Err(EMFILE);
     }
@@ -475,7 +483,13 @@ pub fn send_msg(
 }
 
 /// Receive from a message socket.
-pub fn recv_msg(p: &mut Process, sock: &SockRef, bufs: &[(u64, u64)], flags: u64, nonblock: bool) -> Result<Received, Errno> {
+pub fn recv_msg(
+    p: &mut Process,
+    sock: &SockRef,
+    bufs: &[(u64, u64)],
+    flags: u64,
+    nonblock: bool,
+) -> Result<Received, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let mut s = sock.lock();
     let msg = if flags & MSG_PEEK != 0 {

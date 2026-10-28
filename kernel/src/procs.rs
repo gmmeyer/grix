@@ -84,6 +84,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.cwd_pin = None;
     dead.dead = true;
     let (pid, ppid) = (dead.pid, dead.ppid);
+    crate::fs::proc_gone(pid);
     // A session leader's end hangs up its terminal's foreground group.
     if let Some(tty) = dead.ctty.take()
         && dead.sid == pid

@@ -377,8 +377,9 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
         }
         // Not terminals Linux's ptys answer for either: consoles, virtual
         // terminals, serial lines and modem lines.
-        0x4b00..=0x4bff | 0x5600..=0x56ff | 0x5415..=0x5418 | 0x541c | 0x541e | 0x541f | 0x542e | 0x5459
-        | 0x545d => Err(ENOTTY),
+        0x4b00..=0x4bff | 0x5600..=0x56ff | 0x5415..=0x5418 | 0x541c | 0x541e | 0x541f | 0x542e | 0x5459 | 0x545d => {
+            Err(ENOTTY)
+        }
         _ => p.unimplemented(nr::ioctl, "ioctl", &alloc::format!("terminal ioctl {req:#x}"), ENOTTY),
     }
 }

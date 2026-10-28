@@ -17,11 +17,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::errno::*;
+use crate::fd::FileKind;
 use crate::fs::Ino;
 use crate::ipc::{EPOLLHUP, EPOLLIN, EPOLLOUT};
 use crate::process::Process;
 use crate::procs::Procs;
-use crate::fd::FileKind;
 use crate::signal::{self, SIGCONT, SIGTSTP, SigInfo, Target};
 
 pub const SIGHUP: u32 = 1;

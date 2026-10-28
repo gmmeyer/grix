@@ -120,7 +120,14 @@ pub fn conflict(key: Key, owner: Owner, write: bool, start: u64, end: u64) -> Op
 /// F_SETLK and friends: lock [start, end) (`write`), or unlock it
 /// (`None`). Whatever `owner` had over the range is replaced, splitting
 /// its locks at the edges.
-pub fn set_range(key: Key, owner: Owner, pid: u32, write: Option<bool>, start: u64, end: u64) -> Result<Outcome, Errno> {
+pub fn set_range(
+    key: Key,
+    owner: Owner,
+    pid: u32,
+    write: Option<bool>,
+    start: u64,
+    end: u64,
+) -> Result<Outcome, Errno> {
     let mut t = LOCKS.lock();
     let old: &[Lock] = t.ranges.get(&key).map_or(&[], Vec::as_slice);
     if let Some(write) = write
