@@ -460,12 +460,16 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
     sanitize(tf);
 }
 
-/// iretq to a non-canonical rip faults in the kernel: user code that asked
-/// for one (a bad entry point, handler or return address) faults at 0
-/// instead, in user mode.
+/// iretq to a non-canonical rip or rsp faults in the kernel: user code
+/// that asked for one (a bad entry point, handler or return address, or a
+/// stack pointer it set to a kernel-half or non-canonical value) faults
+/// at 0 instead, in user mode.
 fn sanitize(tf: &mut TrapFrame) {
     if tf.rip >= sigframe::USER_END {
         tf.rip = 0;
+    }
+    if tf.rsp >= sigframe::USER_END {
+        tf.rsp = 0;
     }
 }
 

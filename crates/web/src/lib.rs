@@ -325,7 +325,10 @@ impl Session {
     pub fn input(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         while !self.stdin.is_empty() && self.credit > 0 {
-            let n = self.stdin.len().min(wire::MAX_FRAME).min(self.credit as usize);
+            // credit's low 32 bits are all that fit in wasm32's usize: cap
+            // it, so a full counter never truncates to zero here (the
+            // loop above would spin forever on a frame of nothing).
+            let n = self.stdin.len().min(wire::MAX_FRAME).min(self.credit.min(u32::MAX as u64) as usize);
             out.extend_from_slice(&wire::input_header(Input::Stdin, n));
             out.extend(self.stdin.drain(..n));
             self.credit -= n as u64;
