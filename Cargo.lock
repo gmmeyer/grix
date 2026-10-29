@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "grix"
-version = "0.0.12"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "base64",
@@ -291,11 +291,11 @@ dependencies = [
 
 [[package]]
 name = "grix-abi"
-version = "0.0.12"
+version = "0.0.14"
 
 [[package]]
 name = "grix-python"
-version = "0.0.12"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "grix",
@@ -306,10 +306,19 @@ dependencies = [
 
 [[package]]
 name = "grix-vmm"
-version = "0.0.12"
+version = "0.0.14"
 dependencies = [
  "grix-abi",
  "libc",
+]
+
+[[package]]
+name = "grix-web"
+version = "0.0.14"
+dependencies = [
+ "grix-abi",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
