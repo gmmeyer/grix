@@ -77,7 +77,9 @@
 
 <p>I decided not to statically link the program to the kernel, instead it compiles to a more limited kernel and allows you to run your program on top of that. It gives it more freedom (you don't need to write rust, you can run anything on it.)</p>
 
-<p>One reason that unikernels lost, is that they strip out most of the observability from the operating system. They didn't have commands like lsof or ps. I made sure these and /proc existed in the unikernal. I know that this makes it a little bigger, but by making my kernel a little bigger it gets around one of the biggest issues we had. In addition, you can observe these from the host. If you run it as a process, the host will tell you what's happening. If you run this as a container, it will report properly back to the host or to Kubernetes. These small changes makes this fairly usable as an operating system.</p>
+<p>One reason that unikernels lost, is that they strip out most of the observability from the operating system. They didn't have /proc, you usually couldn't use lsof or ps. I made sure /proc existed, so you could use these and other tools. I know that this makes it a little bigger, but it gets around one of the biggest issues unikernels had.</p>
+
+<p>In addition, you can observe grix from the host as a normal process. If you choose to run it in a container, it will also report any process (or container) metrics that you would normally expect. These small changes makes this fairly usable as a sandbox operating system.</p>
 
 <h2>Limited Sandbox</h2>
 
