@@ -571,6 +571,9 @@ grix run --image alpine-x86_64.grix -a process -- uname -m    # x86_64
   honours), every blob is checked against its digest, and the image's
   entrypoint, command, environment and working directory become the grix
   image's, and so does its user (root unless it names one, as in Docker).
+  Its `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are left out,
+  as Docker's runtime puts its own over them: the kernel makes them, and
+  its `/etc/hosts` names the sandbox (`grix`, at 10.0.2.15).
   A command that's a bare name is looked up on the image's `PATH`. `grix
   pull REF --oci DIR [--arch ARCH]` saves an image (the host's
   architecture's by default) for offline builds. `docker:NAME` asks

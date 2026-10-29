@@ -614,6 +614,10 @@ content = "a note"
     assert_eq!(out.stdout_str(), "built\na note");
     let out = sb.run(&["ls", "/etc/motd"]).unwrap();
     assert_eq!(out.status, ExitStatus::Exited(1));
+    // The image's /etc/hosts gives way to the sandbox's, as Docker's
+    // runtime does it, and that names the sandbox.
+    let out = sb.run(&["hostname", "-i"]).unwrap();
+    assert_eq!(out.stdout_str().trim(), "10.0.2.15");
     // The image's user is root (as in Docker): /proc/<pid>/environ and
     // auxv are each process's owner's, and only those who may inspect it
     // (ptrace's rule) read another's.
@@ -1789,6 +1793,12 @@ fn cache_maintenance_on_read_only_pages() {
 fn udp_reconnect_chooses_the_source_again() {
     // glibc 2.31's getaddrinfo sorts its answers with one UDP socket.
     popular(with("popular").allow(Capability::Net), &["udproute"]);
+}
+
+#[test]
+fn the_sandbox_has_a_name() {
+    // Java's InetAddress.getLocalHost (Elasticsearch) looks it up.
+    popular(with("popular"), &["hostname"]);
 }
 
 #[test]

@@ -1039,6 +1039,13 @@ impl Fs {
             let ino = fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
             fs.nodes[ino].generated = true;
         }
+        // And its name, which Docker images carry as an empty file too.
+        if !mounted("/etc/hostname") && fs.placeholder("/etc/hostname") {
+            let etc = fs.mkdir_p("/etc");
+            let text = alloc::format!("{}\n", procfs::HOSTNAME);
+            let ino = fs.insert(etc, "hostname", Kind::File(FileData::new(leak(text))), 0o644);
+            fs.nodes[ino].generated = true;
+        }
         if !mounted("/etc/mtab") && fs.lookup(ROOT, "/etc/mtab", false).is_err() {
             let etc = fs.mkdir_p("/etc");
             fs.insert(etc, "mtab", Kind::Symlink("/proc/self/mounts".into()), 0o777);

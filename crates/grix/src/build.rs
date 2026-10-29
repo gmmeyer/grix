@@ -57,6 +57,9 @@ use crate::export::ExportContent;
 use crate::image::{self, Node};
 use crate::sandbox::{Arch, ExitStatus, Sandbox, Stream};
 
+/// What a container runtime gives each container, not the image's.
+const RUNTIME_FILES: &[&str] = &["/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grixfile {
@@ -263,6 +266,14 @@ impl Grixfile {
                 let pulled = crate::oci::load(source, base, opts.policy.credentials, reach, arch)
                     .with_context(|| format!("from {source}"))?;
                 files = pulled.files;
+                // A container's runtime provides these (Docker mounts its
+                // own over the image's), and so does grix's kernel: its
+                // /etc/hosts names the sandbox, which the image's can't.
+                for path in RUNTIME_FILES {
+                    if files.get(*path).is_some_and(|n| !matches!(n, Node::Dir { .. })) {
+                        files.remove(*path);
+                    }
+                }
                 let c = pulled.config;
                 config.command = c.entrypoint.into_iter().chain(c.cmd).collect();
                 config.env = c.env;

@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,6 +180,20 @@ static int udproute(void) {
     return 0;
 }
 
+// Elasticsearch (Java's InetAddress.getLocalHost) and Apache look up the
+// machine's own name; Docker's /etc/hosts has it.
+static int hostname(void) {
+    char name[64];
+    CHECK(gethostname(name, sizeof name) == 0 && strcmp(name, "grix") == 0);
+    struct addrinfo hints = {.ai_family = AF_INET}, *res;
+    CHECK(getaddrinfo(name, NULL, &hints, &res) == 0);
+    struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+    CHECK(a->sin_addr.s_addr == inet_addr("10.0.2.15"));
+    freeaddrinfo(res);
+    CHECK(slurp("/etc/hostname") > 0 && strcmp(buf, "grix\n") == 0);
+    return 0;
+}
+
 // Erlang's JIT writes code through one mapping of a memfd and runs it
 // through another, read-only one, cleaning the data cache there to the
 // point of unification (`dc cvau`, in __clear_cache) before the pages
@@ -257,6 +272,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "anyaddr") == 0) r = anyaddr();
         if (strcmp(argv[i], "cacheflush") == 0) r = cacheflush();
         if (strcmp(argv[i], "udproute") == 0) r = udproute();
+        if (strcmp(argv[i], "hostname") == 0) r = hostname();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
