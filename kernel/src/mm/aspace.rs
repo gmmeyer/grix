@@ -73,7 +73,9 @@ pub enum Backing {
     /// MAP_SHARED anonymous memory: page `index + o / PAGE_SIZE` of
     /// `pages`, which every mapping of it sees, in every process that
     /// shares it since a fork. Never copy-on-write.
-    Shared { pages: Arc<SharedPages>, index: u64 },
+    /// `may_write`: mprotect may add PROT_WRITE (not for a System V
+    /// segment attached SHM_RDONLY); `sysv`: the segment it is.
+    Shared { pages: Arc<SharedPages>, index: u64, may_write: bool, sysv: Option<Sysv> },
     /// MAP_SHARED of a file in the sandbox: the file's own pages (byte
     /// `offset + o`), so writes through the mapping are the file's and the
     /// file's writes show in it. Never copy-on-write. `may_write`: the fd
@@ -107,6 +109,15 @@ impl Usage {
         self.private_dirty += o.private_dirty;
         self.anonymous += o.anonymous;
     }
+}
+
+/// A System V shared memory segment, as its mappings know it: its key and
+/// id (for /proc/<pid>/maps) and its size in pages.
+#[derive(Clone, Copy, Debug)]
+pub struct Sysv {
+    pub key: i32,
+    pub id: u32,
+    pub pages: u64,
 }
 
 /// The pages of a MAP_SHARED anonymous mapping, made as they're first
@@ -150,8 +161,8 @@ impl Vma {
             },
             Backing::Sigpage => Backing::Sigpage,
             Backing::KernelPage(pa) => Backing::KernelPage(pa),
-            Backing::Shared { ref pages, index } => {
-                Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
+            Backing::Shared { ref pages, index, may_write, sysv } => {
+                Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE, may_write, sysv }
             }
             Backing::SharedFile { ref data, offset, ino, may_write, ref token } => Backing::SharedFile {
                 data: data.clone(),
@@ -494,8 +505,14 @@ impl AddressSpace {
     /// wasn't open for writing, or a page of the kernel's (mprotect can't
     /// make those writable)?
     pub fn has_read_only_shared_file(&self, start: u64, end: u64) -> bool {
-        self.overlapping(start, end)
-            .any(|v| matches!(v.backing, Backing::SharedFile { may_write: false, .. } | Backing::KernelPage(_)))
+        self.overlapping(start, end).any(|v| {
+            matches!(
+                v.backing,
+                Backing::SharedFile { may_write: false, .. }
+                    | Backing::Shared { may_write: false, .. }
+                    | Backing::KernelPage(_)
+            )
+        })
     }
 
     /// Pages that got a frame since this address space's shared mappings
@@ -680,8 +697,13 @@ impl AddressSpace {
             }
             return Ok(());
         }
-        if let Backing::Shared { ref pages, index } = vma.backing {
+        if let Backing::Shared { ref pages, index, sysv, .. } = vma.backing {
             let idx = index + (page - vma.start) / PAGE_SIZE;
+            // Past a System V segment's end (mremap made the mapping
+            // longer): SIGBUS, as on Linux.
+            if sysv.is_some_and(|s| idx >= s.pages) {
+                return Err(FaultError::PastEnd);
+            }
             let mut pages = pages.0.lock();
             let pa = match pages.get(&idx) {
                 Some(&pa) => pa,

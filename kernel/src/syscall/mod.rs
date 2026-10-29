@@ -6,6 +6,7 @@ mod misc;
 mod net;
 mod proc;
 pub use proc::shields_init;
+mod shm;
 mod signal;
 pub mod table;
 mod thread;
@@ -220,6 +221,10 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::brk => mem::brk(p, a[0]),
         nr::mmap => mem::mmap(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::munmap => mem::munmap(p, a[0], a[1]),
+        nr::shmget => shm::shmget(p, a[0], a[1], a[2]),
+        nr::shmat => shm::shmat(p, a[0], a[1], a[2]),
+        nr::shmdt => shm::shmdt(p, a[0]),
+        nr::shmctl => shm::shmctl(p, a[0], a[1], a[2]),
         nr::mprotect => mem::mprotect(p, a[0], a[1], a[2]),
         nr::mremap => mem::mremap(p, a[0], a[1], a[2], a[3], a[4]),
         nr::madvise => mem::madvise(p, a[0], a[1], a[2]),

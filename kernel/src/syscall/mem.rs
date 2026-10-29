@@ -10,7 +10,7 @@ use crate::syscall::table::nr;
 
 const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
-const MAP_FIXED: u64 = 0x10;
+pub(super) const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 /// Nothing is mapped below this (`/proc/sys/vm/mmap_min_addr`): a NULL
@@ -57,7 +57,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         _ => return Err(EINVAL),
     };
     let prot = Prot::from_linux(prot);
-    let shared_anon = || Backing::Shared { pages: Default::default(), index: 0 };
+    let shared_anon = || Backing::Shared { pages: Default::default(), index: 0, may_write: true, sysv: None };
     let backing = if flags & MAP_ANONYMOUS != 0 {
         if shared { shared_anon() } else { Backing::Anon }
     } else {
@@ -128,7 +128,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
 /// Place a new mapping: at `addr` with MAP_FIXED, there if it's free and
 /// asked for (and not below MMAP_MIN_ADDR, as for MAP_FIXED), or wherever
 /// there's room.
-fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing: Backing) -> SysResult {
+pub(super) fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Prot, backing: Backing) -> SysResult {
     let a = &mut p.aspace;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     let start = if fixed {

@@ -499,6 +499,7 @@ fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String
         Backing::KernelPage(_) if v.start == VVAR => (0, 0, "[vvar]".into()),
         Backing::KernelPage(_) => (0, 0, "[vdso]".into()),
         Backing::Anon => (0, 0, String::new()),
+        Backing::Shared { sysv: Some(s), .. } => (0, s.id as u64, format!("/SYSV{:08x} (deleted)", s.key as u32)),
         Backing::Shared { index, .. } => (index * 4096, 0, "/dev/zero (deleted)".into()),
     };
     let dev = if inode == 0 { "00:00" } else { "00:01" };

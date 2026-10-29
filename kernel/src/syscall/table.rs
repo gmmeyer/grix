@@ -195,6 +195,10 @@ syscalls! {
     177 getegid Core;
     178 gettid Core;
     179 sysinfo Core;
+    194 shmget Core;
+    195 shmctl Core;
+    196 shmat Core;
+    197 shmdt Core;
     198 socket Core; // gated by family: netlink route sockets only know `lo`; see net.rs
     199 socketpair Core; // AF_UNIX pairs are local IPC; others need `net`
     200 bind Core; // acts on existing sockets (netlink port ids); see net.rs
@@ -301,6 +305,9 @@ syscalls! {
     26 msync Core;
     27 mincore Core;
     28 madvise Core;
+    29 shmget Core;
+    30 shmat Core;
+    31 shmctl Core;
     32 dup Core;
     33 dup2 Core;
     34 pause Core;
@@ -333,6 +340,7 @@ syscalls! {
     61 wait4 Cap(Process);
     62 kill Core;
     63 uname Core;
+    67 shmdt Core;
     72 fcntl Core;
     73 flock Core;
     74 fsync Core;

@@ -27,6 +27,7 @@ pub const EMFILE: Errno = Errno(24);
 pub const ENOTTY: Errno = Errno(25);
 pub const EFBIG: Errno = Errno(27);
 pub const ENOSPC: Errno = Errno(28);
+pub const EIDRM: Errno = Errno(43);
 pub const ESPIPE: Errno = Errno(29);
 pub const EROFS: Errno = Errno(30);
 pub const EPIPE: Errno = Errno(32);

@@ -1826,6 +1826,12 @@ fn preadv2_and_pwritev2() {
 }
 
 #[test]
+fn system_v_shared_memory() {
+    // PostgreSQL's postmaster interlock.
+    popular(with("popular").allow(Capability::Process), &["sysvshm"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

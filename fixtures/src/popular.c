@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <setjmp.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -15,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -381,6 +383,96 @@ static int rwv2(void) {
     return 0;
 }
 
+static sigjmp_buf fault_jump;
+
+static void on_fault(int sig) {
+    siglongjmp(fault_jump, sig);
+}
+
+/// Which signal reading `p` raises (SIGSEGV or SIGBUS), or 0.
+static int touch_faults(volatile char *p) {
+    struct sigaction sa = {.sa_handler = on_fault}, old_segv, old_bus;
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    int sig = sigsetjmp(fault_jump, 1);
+    if (sig == 0) {
+        (void)*p;
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    return sig;
+}
+
+#ifndef SHM_DEST
+#define SHM_DEST 01000
+#endif
+
+// PostgreSQL's postmaster keeps a small System V segment as an interlock:
+// shm_nattch says whether an old server (or its backends) still runs.
+static int sysvshm(void) {
+    key_t key = 5432001;
+    int id = shmget(key, 56, IPC_CREAT | IPC_EXCL | 0600);
+    CHECK(id >= 0);
+    CHECK(shmget(key, 56, IPC_CREAT | IPC_EXCL | 0600) == -1 && errno == EEXIST);
+    CHECK(shmget(key, 0, 0) == id);
+    CHECK(shmget(key, 100, 0) == -1 && errno == EINVAL);
+    CHECK(shmget(key + 1, 56, 0) == -1 && errno == ENOENT);
+    char *a = shmat(id, NULL, 0);
+    CHECK(a != (void *)-1);
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1 && ds.shm_segsz == 56);
+    CHECK(ds.shm_perm.__ipc_perm_key == key && (ds.shm_perm.mode & 0777) == 0600 && ds.shm_cpid == getpid());
+    strcpy(a, "hello");
+    // Another attachment is the same memory.
+    char *b = shmat(id, NULL, SHM_RDONLY);
+    CHECK(b != (void *)-1 && b != a && strcmp(b, "hello") == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2);
+    CHECK(shmdt(b) == 0 && shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+    CHECK(shmdt(b) == -1 && errno == EINVAL);
+    // A forked child's attachment counts, and its writes show.
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct shmid_ds d;
+        int ok = shmctl(id, IPC_STAT, &d) == 0 && d.shm_nattch == 2;
+        strcpy(a, "child");
+        _exit(ok ? 0 : 1);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && status == 0 && strcmp(a, "child") == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+    // Removed: its key is free at once, its memory stays while attached.
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    CHECK(shmget(key, 56, 0) == -1 && errno == ENOENT);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && (ds.shm_perm.mode & SHM_DEST));
+    CHECK(strcmp(a, "child") == 0 && shmdt(a) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
+    // IPC_PRIVATE is always a new one.
+    int p1 = shmget(IPC_PRIVATE, 4096, 0600), p2 = shmget(IPC_PRIVATE, 4096, 0600);
+    CHECK(p1 >= 0 && p2 >= 0 && p1 != p2);
+    CHECK(shmctl(p1, IPC_RMID, NULL) == 0 && shmctl(p2, IPC_RMID, NULL) == 0);
+    // A read-only attach stays read-only, as Linux attaches it without
+    // VM_MAYWRITE; and the mode's bits count (this isn't root).
+    CHECK(getuid() != 0);
+    int ro = shmget(IPC_PRIVATE, 4096, 0400);
+    CHECK(ro >= 0);
+    CHECK(shmat(ro, NULL, 0) == (void *)-1 && errno == EACCES);
+    CHECK(shmat(ro, NULL, SHM_RDONLY | SHM_EXEC) == (void *)-1 && errno == EACCES);
+    char *r = shmat(ro, NULL, SHM_RDONLY);
+    CHECK(r != (void *)-1);
+    CHECK(mprotect(r, 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
+    // /proc/<pid>/maps names it as Linux does.
+    char name[32];
+    snprintf(name, sizeof name, "/SYSV%08x (deleted)", (unsigned)IPC_PRIVATE);
+    CHECK(slurp("/proc/self/maps") > 0 && strstr(buf, name));
+    // Past its end (mremap made the mapping longer): SIGBUS.
+    char *grown = mremap(r, 4096, 8192, MREMAP_MAYMOVE);
+    CHECK(grown != MAP_FAILED);
+    CHECK(touch_faults(grown + 4096) == SIGBUS && touch_faults(grown) == 0);
+    CHECK(shmdt(grown) == 0 && shmctl(ro, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -441,6 +533,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "sigioinit") == 0) r = sigioinit();
         if (strcmp(argv[i], "sendfile") == 0) r = sendfile_out();
         if (strcmp(argv[i], "rwv2") == 0) r = rwv2();
+        if (strcmp(argv[i], "sysvshm") == 0) r = sysvshm();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
