@@ -40,8 +40,9 @@ impl Uart {
     fn write(&mut self, off: u64, v: u32) {
         if off == 0
             && let Some(s) = &mut self.out
-            && s.write_all(&[v as u8]).is_err()
+            && let Err(e) = s.write_all(&[v as u8])
         {
+            eprintln!("grix-vmm: the serial port's socket: {e}");
             self.out = None;
         }
     }

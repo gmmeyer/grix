@@ -38,8 +38,9 @@ impl Uart {
         match off {
             0 if self.lcr & 0x80 == 0 => {
                 if let Some(s) = &mut self.out
-                    && s.write_all(&[v]).is_err()
+                    && let Err(e) = s.write_all(&[v])
                 {
+                    eprintln!("grix-vmm: the serial port's socket: {e}");
                     self.out = None;
                 }
             }
