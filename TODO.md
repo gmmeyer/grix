@@ -108,6 +108,49 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     images built on x86_64 Linux run there natively.
 20. **An outside security review** (after the above).
 
+### Round 3 (2026-10-29): popular software (COMPAT.md)
+
+Forty-odd programs from their official images. Done: `smaps`,
+descriptors reached through symlinks, `IPV6_V6ONLY`, cache maintenance
+faults on arm64, UDP `connect(AF_UNSPEC)`, the sandbox's hostname in
+every image, `O_ASYNC`/SIGIO, `sendfile` to pipes and sockets,
+`preadv2`/`pwritev2`, System V shared memory, `mkdir` EEXIST without
+`fs_write`, the stack's strings in Linux's order, build steps' memory,
+and shared memory charged to kmem (`/proc/<pid>/auxv`, TCP to 0.0.0.0,
+named pipes and images per architecture came with 0.0.31 and 0.0.32).
+Left, in order of impact:
+
+21. [x] **Named pipes**: done in the Datadog series (`mkfifo`, `mknod`,
+    Linux's open semantics); Elasticsearch's ML controller runs.
+22. [x] **x86_64 images from registries**: done with images per
+    architecture (`grix build --arch x86_64` pulls linux/amd64); nginx
+    and Redis from Docker Hub run on the x86_64 kernel.
+23. [ ] **`openat2`** (unsupported; rsync falls back to `openat`): `struct
+    open_how`, and `RESOLVE_NO_SYMLINKS`, `NO_MAGICLINKS`, `BENEATH`,
+    `IN_ROOT`, `NO_XDEV` in `Fs::walk` (ELOOP on a symlink, EXDEV leaving
+    the start or crossing a live mount, the dirfd as `/`).
+    `RESOLVE_CACHED` may always be EAGAIN.
+24. [ ] **More than 1024 descriptors** (`RLIMIT_NOFILE` is 1024/1024):
+    Redis lowers `maxclients` to 992. A higher hard limit needs a
+    descriptor table that grows with use, with the global open-file cap
+    still the bound (ENFILE).
+25. [ ] **xattrs** (`cp -a`, `tar --xattrs`): unsupported `setxattr`.
+26. [ ] **Linux AIO** (`io_setup`, ...) and **io_uring**: MariaDB and
+    nginx fall back to synchronous I/O. io_uring is a large surface
+    (its own submission paths for every operation, each needing its
+    gate); AIO on in-memory files could complete at submission.
+27. [ ] **seccomp filters** (Elasticsearch warns it can't install its
+    own): a classic-BPF interpreter over the syscall number and
+    arguments, checked before the gate. It can only take away, so it
+    can't weaken the policy.
+28. [ ] **ID registers from EL0** (`mrs` of `ID_AA64*`, Linux's
+    `HWCAP_CPUID` emulation): Go reads `/proc/self/auxv` now, but other
+    code may read them directly. The trap (EC 0x18 with FEAT_IDST, or
+    an undefined instruction) can be emulated with sanitized values.
+29. [ ] `/proc/sys/vm/overcommit_memory` says 0, so Redis warns that a
+    background save may fail; what grix actually does (memory is only
+    taken as it's touched) is closer to 1.
+
 ## Agent integrations
 
 - [x] MCP server (`grix mcp`): `run` and `build_image` tools, confined to
