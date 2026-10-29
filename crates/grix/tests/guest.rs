@@ -2988,6 +2988,12 @@ fn threads_run_in_parallel_on_more_cpus() {
     let out = run(b().cpus(4).timeout(Duration::from_secs(20)), &["/bin/smp", "fork"]);
     assert_eq!(out.stdout_str(), "fork ok\n", "{:?}", out.status);
     assert_eq!(out.status, ExitStatus::Exited(0));
+    // Copy-on-write while other threads write: each child sees memory as
+    // it was at its fork, and the parent never sees a page as it was
+    // before a copy (a TLB flush missed).
+    let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "cow"]);
+    assert_eq!(out.stdout_str(), "cow ok\n", "{:?}", out.status);
+    assert_eq!(out.status, ExitStatus::Exited(0));
     // The CPU count is checked.
     assert!(Sandbox::builder().cpus(0).build().is_err());
     assert!(Sandbox::builder().cpus(9).build().is_err());

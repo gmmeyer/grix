@@ -6,6 +6,9 @@
 //   smp exec     a spinning thread, then execve from another thread
 //   smp exit     spinning threads, then exit(3) from main
 //   smp fork     a spinning thread, then fork and wait for the child
+//   smp cow      threads write while main forks again and again: each
+//                child sees a consistent snapshot, the parent's reader
+//                never sees a page as it was (prints "cow ok")
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -15,6 +18,7 @@
 #include <string.h>
 #include <time.h>
 #include <linux/membarrier.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -82,6 +86,87 @@ static void start_spinners(int n) {
     while (atomic_load(&spinning) < n) sched_yield();
 }
 
+// `cow`: each writer fills its page with round numbers, then publishes
+// the round in its flag; every store is a release, so any prefix of them
+// is what anyone can see.
+#define WORDS 512
+static _Atomic unsigned long (*pages)[WORDS];
+static _Atomic unsigned long *flags;
+static _Atomic int done;
+
+static void *cow_writer(void *arg) {
+    long w = (long)arg;
+    for (unsigned long round = 1; !atomic_load(&done); round++) {
+        for (int i = 0; i < WORDS; i++) atomic_store_explicit(&pages[w][i], round, memory_order_release);
+        atomic_store_explicit(&flags[w * 8], round, memory_order_release);
+    }
+    return 0;
+}
+
+// The parent's view: once a round is published, its page has it (a CPU
+// still reading the page as it was before a copy would see less).
+static void *cow_reader(void *arg) {
+    long writers = (long)arg;
+    while (!atomic_load(&done)) {
+        for (long w = 0; w < writers; w++) {
+            unsigned long f = atomic_load_explicit(&flags[w * 8], memory_order_acquire);
+            for (int i = 0; i < WORDS; i += 64) {
+                unsigned long v = atomic_load_explicit(&pages[w][i], memory_order_relaxed);
+                if (v < f) {
+                    printf("FAILED: parent read %lu in page %ld word %d after round %lu\n", v, w, i, f);
+                    exit(1);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// The child's view, from fork's moment: each page is round f+1 up to
+// some word and round f after it, f being its flag, and stays that way.
+static int cow_check(long writers) {
+    for (long w = 0; w < writers; w++) {
+        unsigned long f = atomic_load(&flags[w * 8]);
+        unsigned long last = f + 1;
+        for (int i = 0; i < WORDS; i++) {
+            unsigned long v = atomic_load(&pages[w][i]);
+            if (v > last || v < f) {
+                printf("FAILED: child read %lu in page %ld word %d, round %lu\n", v, w, i, f);
+                return 1;
+            }
+            last = v;
+        }
+        if (atomic_load(&flags[w * 8]) != f || atomic_load(&pages[w][0]) < atomic_load(&pages[w][WORDS - 1])) {
+            printf("FAILED: page %ld changed in the child\n", w);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cow(long cpus) {
+    long writers = cpus > 3 ? cpus - 2 : 1;
+    pages = mmap(0, writers * WORDS * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    flags = mmap(0, writers * 64, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pages != MAP_FAILED && flags != MAP_FAILED);
+    pthread_t t[8];
+    for (long w = 0; w < writers; w++) CHECK(pthread_create(&t[w], 0, cow_writer, (void *)w) == 0);
+    CHECK(pthread_create(&t[writers], 0, cow_reader, (void *)writers) == 0);
+    int forks = 200;
+    for (int i = 0; i < forks; i++) {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) _exit(cow_check(writers));
+        int status;
+        CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+        if (WEXITSTATUS(status) != 0) exit(1);
+    }
+    atomic_store(&done, 1);
+    for (long i = 0; i <= writers; i++) pthread_join(t[i], 0);
+    printf("cow ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "exec-done") == 0) {
         printf("exec ok\n");
@@ -99,6 +184,7 @@ int main(int argc, char **argv) {
         start_spinners(cpus);
         exit(3);
     }
+    if (argc > 1 && strcmp(argv[1], "cow") == 0) return cow(cpus);
     if (argc > 1 && strcmp(argv[1], "fork") == 0) {
         // The child is another process: the spinning thread's CPU has to
         // give way for it to run at all.

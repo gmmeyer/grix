@@ -324,7 +324,10 @@ TLB flushes and instruction-cache invalidation are broadcast (on
 x86_64, which has no broadcast invalidation, `flush_tlb` IPIs the other
 CPUs and waits for each, except one in the kernel: IF is clear there and
 it may be waiting for the lock, so it catches up when it gets it,
-`tlb_sync`, before it touches user memory); free pages
+`tlb_sync`, before it touches user memory); flush only when an entry
+that was there changed (no TLB holds an empty slot), but do flush one
+made writable: a CPU still holding it read-only would fault on the
+kernel's own write there; free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
 (`publish_barrier`). User memory other threads use at the same time is

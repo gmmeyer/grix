@@ -326,6 +326,9 @@ impl AddressSpace {
         child.brk = self.brk;
         child.set_stack(self.stack_size);
         let mut out_of_memory = false;
+        // Entries made read-only: until the flush, other CPUs running the
+        // parent's threads may still write through their old ones.
+        let mut downgraded = false;
         for v in self.vmas.values() {
             let cow = v.prot.write && !v.shared_pages();
             self.pt.for_each_mapped(v.start, v.end, |va, pte| unsafe {
@@ -333,6 +336,7 @@ impl AddressSpace {
                     return;
                 }
                 let shared = if cow { paging::read_only(*pte) } else { *pte };
+                downgraded |= shared != *pte;
                 let pa = shared & ADDR_MASK;
                 if !frame::share(pa) {
                     out_of_memory = true;
@@ -345,7 +349,9 @@ impl AddressSpace {
                 *pte = shared;
             });
         }
-        arch::flush_tlb();
+        if downgraded {
+            arch::flush_tlb();
+        }
         // The child is dropped, which releases what it got; the parent's
         // pages are just read-only now, and fault back in writable.
         if out_of_memory { Err(ENOMEM) } else { Ok(child) }
@@ -369,13 +375,19 @@ impl AddressSpace {
             arch::sync_icache(p2v(pa), PAGE_SIZE);
         }
         // Break before make: the old entry is gone from every CPU's TLB
-        // before the new one, to another page, appears.
+        // before the new one, to another page, appears (in an invalid
+        // slot, which no TLB holds: nothing more to flush). The same page
+        // made writable is flushed too: a CPU still holding it read-only
+        // would fault on the kernel's own writes there (`ensure` sees the
+        // new entry, the TLB has the old).
         if pa != old {
             self.pt.for_each_mapped(page, page + PAGE_SIZE, |_, pte| unsafe { *pte = 0 });
             arch::flush_tlb();
         }
         self.pt.map(page, pa, prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
-        arch::flush_tlb();
+        if pa == old {
+            arch::flush_tlb();
+        }
         Ok(())
     }
 
@@ -603,6 +615,10 @@ impl AddressSpace {
             return Err(ENOMEM);
         }
         let flags = prot.pte_flags();
+        // Only entries that were there and changed can be in a TLB as they
+        // were (thread stacks, mapped PROT_NONE and then opened up, have
+        // none yet).
+        let mut changed = false;
         for mut piece in self.carve(start, end) {
             piece.prot = prot;
             // A page shared with a forked process stays read-only until
@@ -610,7 +626,9 @@ impl AddressSpace {
             let cow = prot.write && !piece.shared_pages();
             self.pt.for_each_mapped(piece.start, piece.end, |_, pte| unsafe {
                 let pa = *pte & ADDR_MASK;
-                *pte = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
+                let new = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
+                changed |= new != *pte;
+                *pte = new;
                 if prot.exec {
                     arch::sync_icache(p2v(pa), PAGE_SIZE);
                 }
@@ -618,7 +636,9 @@ impl AddressSpace {
             self.vmas.insert(piece.start, piece);
         }
         self.recount();
-        arch::flush_tlb();
+        if changed {
+            arch::flush_tlb();
+        }
         Ok(())
     }
 
@@ -676,11 +696,20 @@ impl AddressSpace {
         moved.end = new + new_len;
         self.vmas.insert(new, moved);
         self.recount();
+        // The new slots were unmapped (no TLB holds them); the old entries
+        // must go from every TLB, whatever happens to the new ones.
+        let moved = !pages.is_empty();
+        let mut result = Ok(new);
         for (off, pte) in pages {
-            self.pt.map(new + off, pte & ADDR_MASK, pte & !ADDR_MASK).ok_or(ENOMEM)?;
+            if self.pt.map(new + off, pte & ADDR_MASK, pte & !ADDR_MASK).is_none() {
+                result = Err(ENOMEM);
+                break;
+            }
         }
-        arch::flush_tlb();
-        Ok(new)
+        if moved {
+            arch::flush_tlb();
+        }
+        result
     }
 
     /// Resolve a fault: an unmapped page, or a write to one shared
@@ -705,10 +734,19 @@ impl AddressSpace {
                     if old != pa && !frame::share(pa) {
                         return Err(FaultError::OutOfMemory);
                     }
-                    self.pt.map(page, pa, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
-                    arch::flush_tlb();
+                    // Break before make, as in `unshare`.
                     if old != pa {
+                        self.pt.for_each_mapped(page, page + PAGE_SIZE, |_, pte| unsafe { *pte = 0 });
+                        arch::flush_tlb();
                         frame::free(old);
+                    }
+                    let mapped = self.pt.map(page, pa, vma.prot.pte_flags());
+                    if mapped.is_none() && old != pa {
+                        frame::free(pa);
+                    }
+                    mapped.ok_or(FaultError::OutOfMemory)?;
+                    if old == pa {
+                        arch::flush_tlb();
                     }
                     Ok(())
                 }
