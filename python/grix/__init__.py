@@ -388,14 +388,19 @@ def build(
     capabilities: Iterable[str] = (),
     run: Iterable[str] = (),
     cache: bool = True,
+    arch: Optional[str] = None,
     grix: Optional[PathLike] = None,
 ) -> None:
     """Build a grix image at ``output`` (``grix build``): from a Grixfile,
     these settings, or both. ``run`` steps are shell commands. With
-    ``cache=False``, every step runs even if its inputs haven't changed."""
+    ``cache=False``, every step runs even if its inputs haven't changed.
+    ``arch`` (``"aarch64"`` or ``"x86_64"``) is the architecture to build
+    for, the host's by default: an image runs on its own."""
     argv = [find_grix(grix), "build", "--quiet", "-o", os.fspath(output)]
     if not cache:
         argv.append("--no-cache")
+    if arch is not None:
+        argv += ["--arch", arch]
     if grixfile is not None:
         argv += ["-f", os.fspath(grixfile)]
     if from_:

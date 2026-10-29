@@ -39,11 +39,14 @@ fixtures:
 	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/alpine-x86_64 busybox-static busybox
 	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/python-x86_64 python3 ca-certificates-bundle
 	python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/node-x86_64 nodejs
-	# A Docker Hub image, as an OCI layout, for the image tests.
+	# A Docker Hub image, as an OCI layout, for the image tests: arm64's
+	# and amd64's (GRIX_ARCH=x86_64).
 	cargo build --release -p grix
-	./target/release/grix pull alpine:3.21 --oci fixtures/build/oci/alpine
+	./target/release/grix pull --arch aarch64 alpine:3.21 --oci fixtures/build/oci/alpine
+	./target/release/grix pull --arch x86_64 alpine:3.21 --oci fixtures/build/oci-x86_64/alpine
 	# glibc programs: Debian.
-	./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci/debian
+	./target/release/grix pull --arch aarch64 debian:bookworm-slim --oci fixtures/build/oci/debian
+	./target/release/grix pull --arch x86_64 debian:bookworm-slim --oci fixtures/build/oci-x86_64/debian
 
 test: kernel vmm python fixtures
 	cargo test --workspace

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::image::{self, Node};
+use crate::sandbox::Arch;
 
 /// A grix image.
 #[derive(Clone)]
@@ -112,6 +113,70 @@ pub(crate) fn check_kernel(kernel: &[u8]) -> Result<()> {
         Some(v) => bail!("it speaks grix ABI {v}, and this grix speaks {ABI_VERSION}: rebuild it"),
         None => bail!("it isn't a grix kernel (no ABI marker)"),
     }
+}
+
+/// Where a command name is looked for: Docker's default PATH.
+const PATH: [&str; 6] = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+
+/// Check that the programs an image runs first (its command's, and
+/// /bin/sh, which build steps and most images' scripts use) are `arch`'s,
+/// as its kernel is: the kernel runs nothing else. x86_64 programs pass
+/// in an arm64 image, which may run them with a translator
+/// (`SandboxBuilder::x86_64`). Programs that aren't there, scripts and
+/// ELF files for neither architecture are the kernel's to refuse.
+pub(crate) fn check_programs(files: &BTreeMap<String, Node>, command: &[String], arch: Arch) -> Result<()> {
+    let mut paths: Vec<String> = Vec::new();
+    match command.first() {
+        Some(p) if p.starts_with('/') => paths.push(p.clone()),
+        Some(name) if !name.contains('/') => paths.extend(
+            PATH.iter().map(|d| format!("{d}/{name}")).find(|p| matches!(follow(files, p), Some(Node::File { .. }))),
+        ),
+        _ => {}
+    }
+    paths.push("/bin/sh".into());
+    for path in paths {
+        let Some(Node::File { data, .. }) = follow(files, &path) else { continue };
+        let Some(program) = Arch::of_elf(data) else { continue };
+        if program != arch && !(arch == Arch::Aarch64 && program == Arch::X86_64) {
+            bail!(
+                "{path} is an {program} program, and the image's kernel is {arch}'s: an image's programs and \
+                 kernel must be for the same architecture (build it for {program}: `grix build --arch {program}`)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The node `path` leads to in `files`, through symbolic links.
+fn follow<'a>(files: &'a BTreeMap<String, Node>, path: &str) -> Option<&'a Node> {
+    let mut path = path.to_string();
+    // As Linux's limit on links followed.
+    for _ in 0..40 {
+        match files.get(&path)? {
+            Node::Symlink { target, .. } => {
+                let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+                let joined = if target.starts_with('/') { target.clone() } else { format!("{dir}/{target}") };
+                path = normalize(&joined)?;
+            }
+            node => return Some(node),
+        }
+    }
+    None
+}
+
+/// `path` with `.`, `..` and repeated slashes resolved (not links).
+fn normalize(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 /// Eight random bytes in hex, for names nobody can guess or collide with.
@@ -218,6 +283,12 @@ impl Image {
 
     pub(crate) fn kernel_bytes(&self) -> &[u8] {
         &self.kernel
+    }
+
+    /// What the image is for: its kernel's architecture (the ELF file's
+    /// machine), which its programs share.
+    pub fn arch(&self) -> Result<Arch> {
+        Arch::of_elf(&self.kernel).context("the image's kernel isn't an arm64 or x86_64 ELF file")
     }
 
     /// Files, directories and links in the image, and the bytes of their

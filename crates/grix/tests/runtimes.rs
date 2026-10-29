@@ -717,16 +717,13 @@ fn x86_64_python_through_a_translator() {
 /// another (as apt does to fetch packages).
 #[test]
 fn glibc_programs_from_debian() {
-    // The Debian fixture is an arm64 image.
-    if grix::Arch::from_env() == grix::Arch::X86_64 {
-        return;
-    }
     let mut g = grix::build::Grixfile::parse(&format!("from = \"oci:{}\"", runtime("oci/debian").display())).unwrap();
     g.from_outside_context = true;
     let image = g
         .build(
             std::path::Path::new("."),
             grix::build::BuildOptions {
+                arch: None,
                 kernel: None,
                 on_output: &mut |_, _| {},
                 policy: Default::default(),

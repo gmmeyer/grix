@@ -25,13 +25,17 @@ enum Cmd {
     Snapshot(Box<SnapshotArgs>),
     /// Build a grix image (the files, settings and kernel to run) from a Grixfile.
     Build(Box<BuildArgs>),
-    /// Pull a Docker/OCI image (linux/arm64) into an OCI image layout directory.
+    /// Pull a Docker/OCI image (linux/arm64 or linux/amd64) into an OCI image layout directory.
     Pull {
         /// e.g. alpine:3.21, python:3.12-alpine, ghcr.io/owner/repo:tag
         reference: String,
         /// The layout directory to write.
         #[arg(long, value_name = "DIR")]
         oci: PathBuf,
+        /// The image's architecture: aarch64 (linux/arm64) or x86_64
+        /// (linux/amd64). Default: the host's, or GRIX_ARCH.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
     },
     /// Show a grix image's settings and size.
     Inspect { image: PathBuf },
@@ -136,7 +140,13 @@ struct BuildArgs {
     /// The image to write.
     #[arg(short, long, default_value = "image.grix")]
     output: PathBuf,
-    /// The grix kernel to put in the image (default: the one grix runs).
+    /// The architecture to build for: aarch64 or x86_64 (default: the
+    /// host's, or GRIX_ARCH). A Docker/OCI image's linux/arm64 or
+    /// linux/amd64 variant is pulled, and the kernel is that one's.
+    #[arg(long, value_name = "ARCH")]
+    arch: Option<String>,
+    /// The grix kernel to put in the image (default: grix's, for the
+    /// architecture).
     #[arg(long)]
     kernel: Option<PathBuf>,
     /// Don't show build steps' output.
@@ -203,9 +213,9 @@ struct RunArgs {
     /// CPUs for the program's threads (default 1).
     #[arg(long)]
     cpus: Option<u32>,
-    /// The guest's architecture: aarch64 or x86_64 (default: the host's,
-    /// or GRIX_ARCH). Programs must be built for it; another than the
-    /// host's is emulated.
+    /// The guest's architecture: aarch64 or x86_64 (default: an image's
+    /// own, otherwise the host's or GRIX_ARCH). Programs must be built for
+    /// it; another than the host's is emulated.
     #[arg(long, value_name = "ARCH")]
     arch: Option<String>,
     /// Run x86_64 programs with this translator (an arm64 Linux program:
@@ -250,7 +260,7 @@ struct RunArgs {
     /// Print a JSON result instead of streaming output.
     #[arg(long)]
     json: bool,
-    /// Also print the guest kernel log.
+    /// Also print the machine it runs in, and the guest kernel log.
     #[arg(short, long)]
     verbose: bool,
     /// Don't report denied/missing operations.
@@ -284,10 +294,15 @@ fn main() -> ExitCode {
         Cmd::Snapshot(args) => snapshot(*args),
         Cmd::Build(args) => build(*args, matches.subcommand_matches("build")),
         Cmd::Mcp(args) => mcp(args),
-        Cmd::Pull { reference, oci } => grix::pull(&reference, &oci).map(|digest| {
-            eprintln!("grix: pulled {reference} ({digest}) into {}", oci.display());
-            0
-        }),
+        Cmd::Pull { reference, oci, arch } => parse_arch(arch.as_deref())
+            .and_then(|arch| {
+                let arch = arch.unwrap_or_else(grix::Arch::from_env);
+                grix::pull(&reference, &oci, arch).map(|digest| (arch, digest))
+            })
+            .map(|(arch, digest)| {
+                eprintln!("grix: pulled {reference} for {arch} ({digest}) into {}", oci.display());
+                0
+            }),
         Cmd::Login { registry, username, password_stdin: _ } => login(&registry, &username),
         Cmd::Logout { registry } => grix::auth::logout(&registry).map(|had| {
             if had {
@@ -300,7 +315,8 @@ fn main() -> ExitCode {
         }),
         Cmd::Inspect { image } => grix::Image::open(&image).map(|img| {
             let (n, bytes) = img.size();
-            let info = serde_json::json!({ "config": img.config, "entries": n, "bytes": bytes });
+            let arch = img.arch().ok().map(grix::Arch::name);
+            let info = serde_json::json!({ "arch": arch, "config": img.config, "entries": n, "bytes": bytes });
             println!("{}", serde_json::to_string_pretty(&info).unwrap());
             0
         }),
@@ -601,6 +617,12 @@ fn write_stream(stream: Stream, data: &[u8]) {
     };
 }
 
+/// `--arch`'s architecture, if given.
+fn parse_arch(name: Option<&str>) -> Result<Option<grix::Arch>> {
+    name.map(|a| grix::Arch::parse(a).with_context(|| format!("--arch {a}: aarch64 (arm64) or x86_64 (amd64)")))
+        .transpose()
+}
+
 /// The sandbox `args` describe: counted in `metrics`, and with `streamed`,
 /// keeping none of the output (it's shown as it comes).
 fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<Prepared> {
@@ -609,12 +631,8 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         None => Manifest::default(),
     };
     let mut b = Sandbox::builder();
-    if let Some(a) = &args.arch {
-        b = b.arch(match a.as_str() {
-            "aarch64" | "arm64" => grix::Arch::Aarch64,
-            "x86_64" | "amd64" => grix::Arch::X86_64,
-            _ => bail!("--arch {a}: aarch64 or x86_64"),
-        });
+    if let Some(arch) = parse_arch(args.arch.as_deref())? {
+        b = b.arch(arch);
     }
     if let Some(path) = args.image.as_ref().or(manifest.image.as_ref()) {
         let image = grix::Image::open(path)?;
@@ -718,6 +736,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         b = b.max_export(mb << 20);
     }
 
+    if args.verbose {
+        eprintln!("grix: {}", b.machine());
+    }
     let control = RunControl::new();
     let sandbox = b.control(&control).build()?;
     let command = [&args.command, &manifest.command, &sandbox.command().to_vec()]
@@ -907,12 +928,18 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
     steps.sort_by_key(|(i, _)| *i);
     g.run.extend(steps.into_iter().map(|(_, s)| s));
     let policy = grix::build::BuildPolicy { cache: !args.no_cache, ..Default::default() };
-    let opts =
-        grix::build::BuildOptions { kernel: args.kernel.clone(), on_output: &mut on_output, policy, control: None };
+    let opts = grix::build::BuildOptions {
+        arch: parse_arch(args.arch.as_deref())?,
+        kernel: args.kernel.clone(),
+        on_output: &mut on_output,
+        policy,
+        control: None,
+    };
     let image = g.build(&base, opts)?;
     image.write_to(&args.output)?;
     let (n, bytes) = image.size();
-    eprintln!("grix: built {} ({n} entries, {} MiB)", args.output.display(), bytes >> 20);
+    let arch = image.arch()?;
+    eprintln!("grix: built {} for {arch} ({n} entries, {} MiB)", args.output.display(), bytes >> 20);
     Ok(0)
 }
 

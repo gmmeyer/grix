@@ -21,6 +21,7 @@ fn fixture(name: &str) -> PathBuf {
     let p = match grix::Arch::from_env() {
         grix::Arch::X86_64 => match name.split_once('/') {
             Some(("alpine", rest)) => base.join("alpine-x86_64").join(rest),
+            Some(("oci", rest)) => base.join("oci-x86_64").join(rest),
             Some(_) => base.join(name),
             None if name == "hello-x86_64" => base.join(name),
             None => base.join("amd64").join(name),
@@ -488,12 +489,19 @@ fn timeout() {
 
 // ---------------------------------------------------------------- images
 
+/// Docker Hub's alpine for `arch`, as an OCI layout (`make fixtures`).
+fn oci_alpine(arch: grix::Arch) -> PathBuf {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build");
+    let p = match arch {
+        grix::Arch::Aarch64 => base.join("oci/alpine"),
+        grix::Arch::X86_64 => base.join("oci-x86_64/alpine"),
+    };
+    assert!(p.exists(), "missing fixture {} — run `make fixtures`", p.display());
+    p
+}
+
 #[test]
 fn images_built_from_oci_images() {
-    // The OCI fixtures are arm64 images.
-    if x86_64_guest() {
-        return;
-    }
     // From Docker Hub's alpine (pulled into an OCI layout by `make
     // fixtures`), with files, settings and build steps, through a file, to
     // a run.
@@ -526,6 +534,7 @@ content = "a note"
     let err = grix::build::Grixfile::build_file(
         &dir.join("Grixfile"),
         grix::build::BuildOptions {
+            arch: None,
             kernel: None,
             on_output: &mut |_, _| {},
             policy: Default::default(),
@@ -537,6 +546,7 @@ content = "a note"
     g.from_outside_context = true;
     let mut log = Vec::new();
     let opts = grix::build::BuildOptions {
+        arch: None,
         kernel: None,
         on_output: &mut |_, d: &[u8]| log.extend_from_slice(d),
         policy: Default::default(),
@@ -560,6 +570,80 @@ content = "a note"
     assert_eq!(out.stdout_str(), "built\na note");
     let out = sb.run(&["ls", "/etc/motd"]).unwrap();
     assert_eq!(out.status, ExitStatus::Exited(1));
+    let out = sb.run(&["uname", "-m"]).unwrap();
+    assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
+    assert_eq!(image.arch().unwrap(), grix::Arch::from_env());
+
+    // An image is one architecture's: a build for another refuses this
+    // one's layout (it has nothing else) and this image as its base.
+    let other = match grix::Arch::from_env() {
+        grix::Arch::Aarch64 => grix::Arch::X86_64,
+        grix::Arch::X86_64 => grix::Arch::Aarch64,
+    };
+    let build_for = |from: String, arch| {
+        let g = grix::build::Grixfile { from: Some(from), from_outside_context: true, ..Default::default() };
+        let opts = grix::build::BuildOptions {
+            arch: Some(arch),
+            kernel: None,
+            on_output: &mut |_, _| {},
+            policy: Default::default(),
+            control: None,
+        };
+        g.build(&dir, opts).err().map(|e| format!("{e:#}"))
+    };
+    let err = build_for(format!("oci:{}", fixture("oci/alpine").display()), other).unwrap();
+    assert!(err.contains(&format!("no linux/{} image", other.oci_name())), "{err}");
+    let err = build_for(format!("image:{}", dir.join("hello.grix").display()), other).unwrap();
+    assert!(
+        err.contains(&format!("is an image for {}, and this build is for {other}", grix::Arch::from_env())),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An image runs on its own architecture, wherever it is and whatever
+/// grix would run otherwise: one built for the other architecture than
+/// the host's runs, emulated in QEMU, with no architecture given.
+#[test]
+fn images_for_the_other_architecture_run_anywhere() {
+    use std::process::Command;
+    let host = if cfg!(target_arch = "x86_64") { grix::Arch::X86_64 } else { grix::Arch::Aarch64 };
+    let other = match host {
+        grix::Arch::Aarch64 => grix::Arch::X86_64,
+        grix::Arch::X86_64 => grix::Arch::Aarch64,
+    };
+    let dir = temp_dir("other-arch");
+    let image = dir.join("other.grix");
+    let grix = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+            .args(args)
+            .env_remove("GRIX_ARCH")
+            .env_remove("GRIX_KERNEL")
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let from = format!("oci:{}", oci_alpine(other).display());
+    let (code, _, err) =
+        grix(&["build", "--quiet", "--arch", other.name(), "--from", &from, "-o", image.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(err.contains(&format!("for {other}")), "{err}");
+    let (code, out, err) = grix(&["inspect", image.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains(&format!("\"arch\": \"{other}\"")), "{out}");
+    // No architecture given: the image's, its kernel in QEMU.
+    let run = ["run", "--image", image.to_str().unwrap(), "--timeout", "120", "-a", "process", "--", "/bin/sh", "-c"];
+    let (code, out, err) = grix(&[&run[..], &["uname -m; cat /etc/alpine-release"]].concat());
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.starts_with(&format!("{other}\n3.21.")), "{out:?} {err}");
+    // Asking for the host's architecture for it is an error, saying why.
+    let (code, _, err) = grix(&[&run[..3], &["--arch", host.name(), "--", "/bin/true"]].concat());
+    assert_ne!(code, Some(0));
+    assert!(err.contains(&format!("the image is for {other}")) && err.contains("--arch"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -585,6 +669,7 @@ fn images_with_no_other_os() {
         .build(
             Path::new("."),
             grix::build::BuildOptions {
+                arch: None,
                 kernel: None,
                 on_output: &mut |_, _| {},
                 policy: Default::default(),
@@ -626,7 +711,13 @@ fn images_built_on_images_and_cached_steps() {
         let image = g
             .build(
                 &dir,
-                BuildOptions { kernel: None, on_output: &mut |_, d| log.extend_from_slice(d), policy, control: None },
+                BuildOptions {
+                    arch: None,
+                    kernel: None,
+                    on_output: &mut |_, d| log.extend_from_slice(d),
+                    policy,
+                    control: None,
+                },
             )
             .unwrap();
         (image, String::from_utf8_lossy(&log).into_owned())
@@ -664,7 +755,8 @@ run = [["/bin/busybox", "cp", "/stamp", "/copy"]]
     // A base outside the build context is refused, as any path is.
     let outside = Grixfile::parse(&format!("from = \"image:{}\"", dir.join("base.grix").display())).unwrap();
     let elsewhere = temp_dir("elsewhere");
-    let opts = BuildOptions { kernel: None, on_output: &mut |_, _| {}, policy: Default::default(), control: None };
+    let opts =
+        BuildOptions { arch: None, kernel: None, on_output: &mut |_, _| {}, policy: Default::default(), control: None };
     let err = outside.build(&elsewhere, opts).err().unwrap();
     assert!(err.to_string().contains("outside the build context"), "{err:#}");
     std::fs::remove_dir_all(&dir).unwrap();

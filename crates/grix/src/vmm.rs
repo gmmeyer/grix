@@ -176,6 +176,17 @@ impl Drop for RunDir {
 /// (on top of what's left of the timeout).
 const EXPORT_GRACE: Duration = Duration::from_secs(30);
 
+/// A kernel for `arch`'s machine: another's would fail to load, or hang.
+pub(crate) fn check_machine(kernel: &[u8], arch: crate::sandbox::Arch) -> Result<()> {
+    match crate::sandbox::Arch::of_elf(kernel) {
+        Some(a) if a == arch => Ok(()),
+        Some(a) => anyhow::bail!(
+            "it's for {a}, and the machine about to boot it is {arch}'s (GRIX_KERNEL, GRIX_ARCH and --arch must agree)"
+        ),
+        None => anyhow::bail!("it isn't an arm64 or x86_64 ELF file"),
+    }
+}
+
 /// The most of the serial port's output we keep: the kernel only writes
 /// there before the virtio console is up and when it panics.
 const MAX_UART: usize = 1 << 20;
@@ -293,6 +304,7 @@ pub(crate) fn run(
         // A kernel that speaks another ABI would only garble the conversation.
         let kernel = std::fs::read(&cfg.kernel).with_context(|| format!("reading {}", cfg.kernel.display()))?;
         crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
+        check_machine(&kernel, cfg.arch).with_context(|| format!("the kernel {}", cfg.kernel.display()))?;
         Some(dir.write("image", image)?)
     };
     // Everything for the guest's console input (stdin, networking) goes

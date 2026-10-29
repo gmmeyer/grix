@@ -2,8 +2,8 @@
 //! from a registry (Docker Hub, GHCR, ...), read from an OCI image layout
 //! directory, or read from a `docker save` archive.
 //!
-//! The image for linux/arm64 is picked and its layers (tar, gzip or zstd)
-//! are applied in order, whiteouts included. Its config gives the command,
+//! The image for the build's architecture (linux/arm64 or linux/amd64) is
+//! picked and its layers (tar, gzip or zstd) are applied in order, whiteouts included. Its config gives the command,
 //! environment and working directory. Every blob is checked against its
 //! digest, and blobs from a registry are cached by digest
 //! (`~/.cache/grix/oci`), and so is what an image's layers add up to
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::{Credential, Store};
 use crate::image::{self, Node};
+use crate::sandbox::Arch;
 use crate::treecache;
 
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -78,25 +79,26 @@ pub(crate) struct Pulled {
 /// in the local Docker daemon, through `docker save`), or a registry
 /// reference such as `alpine:3.21`, `python:3.12-alpine` or
 /// `ghcr.io/owner/repo@sha256:...`. Relative paths are taken from `base`.
-/// With `credentials`, a registry that asks for a login gets the user's;
-/// a pull connects only where `reach` allows.
-pub(crate) fn load(source: &str, base: &Path, credentials: bool, reach: Reach) -> Result<Pulled> {
-    load_with(source, base, if credentials { Store::user() } else { Store::none() }, reach)
+/// The image is `arch`'s (linux/arm64 or linux/amd64): an image for
+/// another is refused. With `credentials`, a registry that asks for a
+/// login gets the user's; a pull connects only where `reach` allows.
+pub(crate) fn load(source: &str, base: &Path, credentials: bool, reach: Reach, arch: Arch) -> Result<Pulled> {
+    load_with(source, base, if credentials { Store::user() } else { Store::none() }, reach, arch)
 }
 
-fn load_with(source: &str, base: &Path, store: Store, reach: Reach) -> Result<Pulled> {
+fn load_with(source: &str, base: &Path, store: Store, reach: Reach, arch: Arch) -> Result<Pulled> {
     let resolve = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
     if let Some(dir) = source.strip_prefix("oci:") {
-        return Layout::open(&resolve(dir))?.load();
+        return Layout::open(&resolve(dir))?.load(arch);
     }
     if let Some(file) = source.strip_prefix("docker-archive:") {
-        return load_archive(&resolve(file));
+        return load_archive(&resolve(file), arch);
     }
     if let Some(name) = source.strip_prefix("docker:") {
         let tmp = tempdir("docker-save")?;
         let tar = tmp.path.join("image.tar");
         let status = std::process::Command::new("docker")
-            .args(["save", "--platform", "linux/arm64", "-o"])
+            .args(["save", "--platform", &format!("linux/{}", arch.oci_name()), "-o"])
             .arg(&tar)
             .arg(name)
             .status()
@@ -104,28 +106,32 @@ fn load_with(source: &str, base: &Path, store: Store, reach: Reach) -> Result<Pu
         if !status.success() {
             bail!("docker save {name} failed");
         }
-        return load_archive(&tar);
+        return load_archive(&tar, arch);
     }
     let reference = Reference::parse(source)?;
     if loopback(&reference.host) && !reach.local {
         bail!("this build may not pull from registries on this machine ({})", reference.host);
     }
     let mut registry = Registry::new(&reference, store, reach)?;
-    let manifest_digest = registry.resolve(&reference.tag_or_digest)?;
+    let manifest_digest = registry.resolve(&reference.tag_or_digest, arch)?;
     let layout = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&manifest_digest, &layout)?;
-    layout.load_manifest(&manifest, digest, &mut |d, size| registry.fetch_blob(d, size, &layout))
+    layout.load_manifest(&manifest, digest, arch, &mut |d, size| registry.fetch_blob(d, size, &layout))
 }
 
 /// Pull `reference` (a registry reference such as `alpine:3.21`; its
-/// linux/arm64 image) into an OCI image layout at `dir`, for offline use.
-/// Returns the manifest's digest.
-pub fn pull_to_layout(source: &str, dir: &Path) -> Result<String> {
+/// image for `arch`, linux/arm64 or linux/amd64) into an OCI image layout
+/// at `dir`, for offline use. Returns the manifest's digest.
+pub fn pull_to_layout(source: &str, dir: &Path, arch: Arch) -> Result<String> {
     let reference = Reference::parse(source)?;
     let mut registry = Registry::new(&reference, Store::user(), Reach { allow: None, local: true })?;
-    let digest = registry.resolve(&reference.tag_or_digest)?;
+    let digest = registry.resolve(&reference.tag_or_digest, arch)?;
     let cache = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&digest, &cache)?;
+    // A digest given names one image, whatever it's for.
+    let config = manifest["config"]["digest"].as_str().context("manifest without a config")?;
+    registry.fetch_blob(config, manifest["config"]["size"].as_u64(), &cache)?;
+    parse_config(&cache.json(config)?, arch)?;
     let out = Layout { dir: dir.to_path_buf() };
     fs::create_dir_all(dir.join("blobs/sha256"))?;
     fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#)?;
@@ -148,7 +154,7 @@ pub fn pull_to_layout(source: &str, dir: &Path) -> Result<String> {
             "mediaType": manifest_type(&manifest),
             "digest": digest,
             "size": size,
-            "platform": {"architecture": "arm64", "os": "linux"},
+            "platform": {"architecture": arch.oci_name(), "os": "linux"},
             "annotations": {"org.opencontainers.image.ref.name": source},
         }],
     });
@@ -283,17 +289,17 @@ impl Layout {
         Ok(data)
     }
 
-    /// The image for linux/arm64 in this layout.
-    fn load(&self) -> Result<Pulled> {
+    /// The image for `arch` in this layout.
+    fn load(&self, arch: Arch) -> Result<Pulled> {
         let index: Value = serde_json::from_slice(&read_limited(File::open(self.dir.join("index.json"))?, MAX_JSON)?)?;
-        let mut digest = pick_platform(&index)?;
+        let mut digest = pick_platform(&index, arch)?;
         let mut manifest: Value = serde_json::from_slice(&self.json(&digest)?)?;
         // An index may point at another index.
         if manifest.get("manifests").is_some() {
-            digest = pick_platform(&manifest)?;
+            digest = pick_platform(&manifest, arch)?;
             manifest = serde_json::from_slice(&self.json(&digest)?)?;
         }
-        self.load_manifest(&manifest, digest, &mut |d, _| {
+        self.load_manifest(&manifest, digest, arch, &mut |d, _| {
             self.blob_path(d)?;
             Ok(())
         })
@@ -305,13 +311,16 @@ impl Layout {
         &self,
         manifest: &Value,
         digest: String,
+        arch: Arch,
         fetch: &mut dyn FnMut(&str, Option<u64>) -> Result<()>,
     ) -> Result<Pulled> {
         let config_digest = manifest["config"]["digest"].as_str().context("manifest without a config")?;
         fetch(config_digest, manifest["config"]["size"].as_u64())?;
-        let config = parse_config(&self.json(config_digest)?)?;
-        // The layers, applied before: nothing to fetch or unpack.
-        let key = treecache::key("applied-layers-v2", &[digest.as_bytes()]);
+        let config = parse_config(&self.json(config_digest)?, arch)?;
+        // The layers, applied before: nothing to fetch or unpack. (A
+        // manifest is one platform's, but the key says which too: one
+        // architecture's tree is never another's.)
+        let key = applied_layers_key(&digest, arch);
         if let Some(files) = treecache::get(&key) {
             return Ok(Pulled { files, config, digest });
         }
@@ -332,16 +341,29 @@ impl Layout {
     }
 }
 
-/// The linux/arm64 manifest in an index.
-fn pick_platform(index: &Value) -> Result<String> {
+/// The treecache key for what `digest`'s layers add up to, for `arch`.
+fn applied_layers_key(digest: &str, arch: Arch) -> String {
+    treecache::key("applied-layers-v3", &[arch.oci_name().as_bytes(), digest.as_bytes()])
+}
+
+/// `arch`'s manifest in an index (linux/arm64 or linux/amd64, as Docker
+/// picks: arm64's v8 variant or none, amd64's v1 or none).
+fn pick_platform(index: &Value, arch: Arch) -> Result<String> {
     let manifests = index["manifests"].as_array().context("index without manifests")?;
-    let arm64 = |m: &&Value| {
-        let p = &m["platform"];
-        // Without a platform, an index of one is taken as it is.
-        (p.is_null() && manifests.len() == 1)
-            || (p["architecture"] == "arm64" && p["os"] == "linux" && p["variant"].as_str().is_none_or(|v| v == "v8"))
+    let variant = match arch {
+        Arch::Aarch64 => "v8",
+        Arch::X86_64 => "v1",
     };
-    match manifests.iter().find(arm64) {
+    let wanted = |m: &&Value| {
+        let p = &m["platform"];
+        // Without a platform, an index of one is taken as it is (its
+        // config says what it's for).
+        (p.is_null() && manifests.len() == 1)
+            || (p["architecture"] == arch.oci_name()
+                && p["os"] == "linux"
+                && p["variant"].as_str().is_none_or(|v| v == variant))
+    };
+    match manifests.iter().find(wanted) {
         Some(m) => Ok(m["digest"].as_str().context("manifest without a digest")?.to_string()),
         None => {
             let have: Vec<String> = manifests
@@ -354,17 +376,21 @@ fn pick_platform(index: &Value) -> Result<String> {
                     )
                 })
                 .collect();
-            bail!("no linux/arm64 image (there's {})", have.join(", "))
+            bail!("no linux/{} image (there's {})", arch.oci_name(), have.join(", "))
         }
     }
 }
 
-fn parse_config(data: &[u8]) -> Result<OciConfig> {
+fn parse_config(data: &[u8], arch: Arch) -> Result<OciConfig> {
     let v: Value = serde_json::from_slice(data).context("image config")?;
-    if let Some(arch) = v["architecture"].as_str()
-        && arch != "arm64"
+    if let Some(theirs) = v["architecture"].as_str()
+        && theirs != arch.oci_name()
     {
-        bail!("the image is for {arch}; grix runs arm64 programs");
+        let hint = match Arch::parse(theirs) {
+            Some(a) => format!(" (build for {a} with `--arch {a}`)"),
+            None => String::new(),
+        };
+        bail!("the image is for {theirs}, and this build is for {}{hint}", arch.oci_name());
     }
     let c = &v["config"];
     let strings = |v: &Value| -> Vec<String> {
@@ -386,7 +412,7 @@ fn parse_config(data: &[u8]) -> Result<OciConfig> {
 /// says how big it is, whatever the archive holds).
 const MAX_ARCHIVE: u64 = 2 * MAX_BYTES;
 
-fn load_archive(tar_path: &Path) -> Result<Pulled> {
+fn load_archive(tar_path: &Path, arch: Arch) -> Result<Pulled> {
     let tmp = tempdir("archive")?;
     let mut ar = tar::Archive::new(File::open(tar_path).with_context(|| format!("opening {}", tar_path.display()))?);
     // Plain names only: it's extracted to read it, not trusted.
@@ -409,7 +435,7 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
     }
     // Newer Docker saves an OCI layout.
     if tmp.path.join("index.json").is_file() {
-        return Layout::open(&tmp.path)?.load();
+        return Layout::open(&tmp.path)?.load(arch);
     }
     // The classic format: manifest.json names a config file and layer tars.
     let manifest: Value =
@@ -423,7 +449,7 @@ fn load_archive(tar_path: &Path) -> Result<Pulled> {
         Ok(tmp.path.join(p))
     };
     let config_bytes = read_limited(File::open(plain(&m["Config"])?)?, MAX_JSON)?;
-    let config = parse_config(&config_bytes)?;
+    let config = parse_config(&config_bytes, arch)?;
     // The config lists each layer's digest, uncompressed: check them.
     let diff_ids: Vec<String> = serde_json::from_slice::<Value>(&config_bytes)?["rootfs"]["diff_ids"]
         .as_array()
@@ -941,8 +967,8 @@ impl Registry {
         Ok(format!("Bearer {token}"))
     }
 
-    /// The digest of the linux/arm64 manifest that `tag` names.
-    fn resolve(&mut self, tag: &str) -> Result<String> {
+    /// The digest of `arch`'s manifest that `tag` names.
+    fn resolve(&mut self, tag: &str, arch: Arch) -> Result<String> {
         let accept = [OCI_INDEX, DOCKER_LIST, OCI_MANIFEST, DOCKER_MANIFEST].join(", ");
         let resp = self.get(&format!("manifests/{tag}"), &accept)?;
         let body = read_limited(resp.into_reader(), MAX_JSON)?;
@@ -950,7 +976,7 @@ impl Registry {
             bail!("manifest {tag} doesn't match its digest");
         }
         let v: Value = serde_json::from_slice(&body)?;
-        if v.get("manifests").is_some() { pick_platform(&v) } else { Ok(format!("sha256:{}", sha256(&body))) }
+        if v.get("manifests").is_some() { pick_platform(&v, arch) } else { Ok(format!("sha256:{}", sha256(&body))) }
     }
 
     /// Manifest `digest`, kept in `cache`.
@@ -1155,7 +1181,7 @@ mod tests {
             }
             let path = dir.path.join("image.tar");
             fs::write(&path, b.into_inner().unwrap()).unwrap();
-            load_archive(&path)
+            load_archive(&path, Arch::Aarch64)
         };
         let good = format!("\"sha256:{}\"", sha256(&tar));
         for packed in [&tar, &gzipped] {
@@ -1170,8 +1196,76 @@ mod tests {
             assert!(err.to_string().contains("doesn't match its digest"), "{err:#}");
             assert!(archive(packed, "").is_err());
         }
-        // Not for arm64: refused.
-        assert!(parse_config(br#"{"architecture":"amd64"}"#).is_err());
+        // For another architecture than the build's: refused, saying how.
+        let err = parse_config(br#"{"architecture":"amd64"}"#, Arch::Aarch64).unwrap_err();
+        assert!(err.to_string().contains("--arch x86_64"), "{err:#}");
+        assert!(parse_config(br#"{"architecture":"arm64"}"#, Arch::X86_64).is_err());
+        assert!(parse_config(br#"{"architecture":"amd64"}"#, Arch::X86_64).is_ok());
+        let err = load_archive(&dir.path.join("image.tar"), Arch::X86_64).err().unwrap();
+        assert!(err.to_string().contains("the image is for arm64"), "{err:#}");
+    }
+
+    /// Docker Hub's index for alpine:3.21, as it is: every platform, and
+    /// attestations (unknown/unknown).
+    const ALPINE_INDEX: &str = r#"{
+      "manifests": [
+        {"annotations": {"com.docker.official-images.bashbrew.arch": "amd64"},
+         "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "amd64", "os": "linux"}, "size": 1022},
+        {"annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+         "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "unknown", "os": "unknown"}, "size": 839},
+        {"digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "arm", "os": "linux", "variant": "v6"}, "size": 1022},
+        {"digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "arm", "os": "linux", "variant": "v7"}, "size": 1022},
+        {"digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}, "size": 1022},
+        {"digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "386", "os": "linux"}, "size": 1022},
+        {"digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+         "mediaType": "application/vnd.oci.image.manifest.v1+json",
+         "platform": {"architecture": "s390x", "os": "linux"}, "size": 1022}
+      ],
+      "mediaType": "application/vnd.oci.image.index.v1+json",
+      "schemaVersion": 2
+    }"#;
+
+    #[test]
+    fn platforms_for_each_architecture() {
+        let index: Value = serde_json::from_str(ALPINE_INDEX).unwrap();
+        let digest = |n: char| format!("sha256:{}", n.to_string().repeat(64));
+        assert_eq!(pick_platform(&index, Arch::Aarch64).unwrap(), digest('5'));
+        assert_eq!(pick_platform(&index, Arch::X86_64).unwrap(), digest('1'));
+        // An image only for the other one, or for neither: refused, saying
+        // what there is.
+        let only = |arch: &str, variant: Option<&str>| {
+            serde_json::json!({"manifests": [{"digest": digest('9'),
+                "platform": {"architecture": arch, "os": "linux", "variant": variant}}]})
+        };
+        let err = pick_platform(&only("amd64", None), Arch::Aarch64).unwrap_err();
+        assert_eq!(err.to_string(), "no linux/arm64 image (there's linux/amd64)");
+        assert!(pick_platform(&only("arm64", Some("v8")), Arch::X86_64).is_err());
+        assert!(pick_platform(&only("arm", Some("v7")), Arch::Aarch64).is_err());
+        // amd64's microarchitecture levels past v1 aren't every x86_64.
+        assert!(pick_platform(&only("amd64", Some("v3")), Arch::X86_64).is_err());
+        assert!(pick_platform(&only("amd64", Some("v1")), Arch::X86_64).is_ok());
+        // An index of one without a platform: its config decides.
+        let bare = serde_json::json!({"manifests": [{"digest": digest('8')}]});
+        assert_eq!(pick_platform(&bare, Arch::X86_64).unwrap(), digest('8'));
+    }
+
+    #[test]
+    fn applied_layers_are_cached_per_architecture() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        assert_ne!(applied_layers_key(&d, Arch::Aarch64), applied_layers_key(&d, Arch::X86_64));
+        assert_eq!(applied_layers_key(&d, Arch::X86_64), applied_layers_key(&d, Arch::X86_64));
     }
 
     /// Hard links' copies, names and link targets all count against the
@@ -1337,7 +1431,7 @@ mod tests {
             let reg = FakeRegistry::start(bearer, blobs.clone(), manifest.clone());
             let source = format!("localhost:{}/team/private:1", reg.port);
             // Without a login: refused, saying how to log in.
-            let err = load_with(&source, &dir.path, Store::none(), local()).err().unwrap();
+            let err = load_with(&source, &dir.path, Store::none(), local(), Arch::Aarch64).err().unwrap();
             assert!(format!("{err:#}").contains(&format!("grix login localhost:{}", reg.port)), "{err:#}");
             // With one (as Docker keeps it): pulled.
             std::fs::write(
@@ -1345,9 +1439,10 @@ mod tests {
                 serde_json::json!({"auths": {format!("localhost:{}", reg.port): {"auth": auth}}}).to_string(),
             )
             .unwrap();
-            let pulled = load_with(&source, &dir.path, Store::file(&creds), local()).unwrap();
+            let pulled = load_with(&source, &dir.path, Store::file(&creds), local(), Arch::Aarch64).unwrap();
             // Unless registries on this machine are off limits.
-            let err = load_with(&source, &dir.path, Store::file(&creds), Reach::default()).err().unwrap();
+            let err =
+                load_with(&source, &dir.path, Store::file(&creds), Reach::default(), Arch::Aarch64).err().unwrap();
             assert!(err.to_string().contains("on this machine"), "{err:#}");
             assert_eq!(pulled.config.cmd, ["/hello"]);
             assert!(pulled.files.contains_key("/hello"));
@@ -1358,8 +1453,13 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            let err =
-                load_with(&format!("localhost:{}/team/other:1", reg.port), &dir.path, Store::file(&creds), local());
+            let err = load_with(
+                &format!("localhost:{}/team/other:1", reg.port),
+                &dir.path,
+                Store::file(&creds),
+                local(),
+                Arch::Aarch64,
+            );
             assert!(err.is_err());
         }
     }

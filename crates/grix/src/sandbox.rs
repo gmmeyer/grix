@@ -214,10 +214,31 @@ impl Arch {
 
     /// `GRIX_ARCH` (`aarch64`/`arm64` or `x86_64`/`amd64`), or the host's.
     pub fn from_env() -> Arch {
-        match std::env::var("GRIX_ARCH").as_deref() {
-            Ok("x86_64" | "amd64") => Arch::X86_64,
-            Ok("aarch64" | "arm64") => Arch::Aarch64,
-            _ => Arch::host(),
+        Arch::env().unwrap_or_else(Arch::host)
+    }
+
+    /// `GRIX_ARCH`'s, if it names one.
+    fn env() -> Option<Arch> {
+        std::env::var("GRIX_ARCH").ok().as_deref().and_then(Arch::parse)
+    }
+
+    /// `aarch64`/`arm64` or `x86_64`/`amd64`.
+    pub fn parse(name: &str) -> Option<Arch> {
+        match name {
+            "x86_64" | "amd64" => Some(Arch::X86_64),
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// What an ELF file (a kernel or a program) is built for: its
+    /// `e_machine`. None if it isn't a 64-bit little-endian ELF file for
+    /// either.
+    pub fn of_elf(data: &[u8]) -> Option<Arch> {
+        match elf_machine(data)? {
+            EM_AARCH64 => Some(Arch::Aarch64),
+            EM_X86_64 => Some(Arch::X86_64),
+            _ => None,
         }
     }
 
@@ -225,6 +246,14 @@ impl Arch {
         match self {
             Arch::Aarch64 => "aarch64",
             Arch::X86_64 => "x86_64",
+        }
+    }
+
+    /// Its name in Docker/OCI platforms (`linux/arm64`, `linux/amd64`).
+    pub fn oci_name(self) -> &'static str {
+        match self {
+            Arch::Aarch64 => "arm64",
+            Arch::X86_64 => "amd64",
         }
     }
 
@@ -251,6 +280,23 @@ impl Arch {
         };
         std::env::var_os(var).map_or_else(|| name.into(), PathBuf::from)
     }
+}
+
+impl std::fmt::Display for Arch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+/// An ELF file's `e_machine`, if it's a 64-bit little-endian ELF file.
+pub(crate) fn elf_machine(data: &[u8]) -> Option<u16> {
+    if !data.starts_with(b"\x7fELF\x02\x01") {
+        return None;
+    }
+    data.get(18..20).map(|m| u16::from_le_bytes([m[0], m[1]]))
 }
 
 /// Hardware virtualization if this host can run `arch`'s guests natively,
@@ -429,6 +475,13 @@ pub struct SandboxBuilder {
     uid: u32,
     gid: u32,
     arch: Arch,
+    /// Who chose `arch`, if anyone did (`GRIX_ARCH`, or `arch`): an image
+    /// for another is an error then, rather than a reason to switch.
+    arch_chosen_by: Option<&'static str>,
+    /// The architecture of the image whose kernel this runs, if any.
+    image_arch: Option<Arch>,
+    /// Where grix is installed, if not beside the running program.
+    install: Option<PathBuf>,
     kernel: PathBuf,
     qemu: PathBuf,
     accel: String,
@@ -465,6 +518,9 @@ impl Default for SandboxBuilder {
             uid: 1000,
             gid: 1000,
             arch,
+            arch_chosen_by: Arch::env().map(|_| "GRIX_ARCH"),
+            image_arch: None,
+            install: None,
             kernel: default_kernel(arch),
             qemu: arch.default_qemu(),
             accel: std::env::var("GRIX_ACCEL").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| default_accel().into()),
@@ -549,9 +605,7 @@ impl SandboxBuilder {
         let path = translator.as_ref();
         // The file itself (through links), and one that can run here.
         let data = std::fs::read(path).with_context(|| format!("reading the x86_64 translator {}", path.display()))?;
-        let arm64 = data.starts_with(b"\x7fELF\x02\x01")
-            && data.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == 183);
-        if !arm64 {
+        if elf_machine(&data) != Some(EM_AARCH64) {
             bail!(
                 "the x86_64 translator {} isn't an arm64 Linux program (it runs inside the sandbox, which is arm64)",
                 path.display()
@@ -855,7 +909,23 @@ impl SandboxBuilder {
         let dir = dir.as_ref();
         self.kernel = kernel_in(Some(dir), self.arch);
         self.vmm = vmm_for(Some(dir), self.arch);
+        self.install = Some(dir.to_path_buf());
         self
+    }
+
+    /// The grix kernel installed for the guest's architecture (the one
+    /// `kernel` replaces, an image's for instance).
+    pub fn installed_kernel(&self) -> PathBuf {
+        match &self.install {
+            Some(dir) => kernel_in(Some(dir), self.arch),
+            None => default_kernel(self.arch),
+        }
+    }
+
+    /// The guest's architecture: the host's, `GRIX_ARCH`'s, `arch`'s or
+    /// an image's.
+    pub fn guest_arch(&self) -> Arch {
+        self.arch
     }
 
     pub fn kernel(mut self, path: impl Into<PathBuf>) -> Self {
@@ -878,6 +948,7 @@ impl SandboxBuilder {
     pub fn image(mut self, image: &crate::Image) -> Result<Self> {
         self = self.image_files_only(image)?;
         let c = &image.config;
+        crate::container::check_programs(&image.files, &c.command, self.arch)?;
         for e in &c.env {
             let (k, v) = e.split_once('=').unwrap_or((e, ""));
             self.env.retain(|(key, _)| key != k);
@@ -896,8 +967,24 @@ impl SandboxBuilder {
         Ok(self)
     }
 
-    /// An image's files, kernel and working directory.
+    /// An image's files, kernel and working directory, and its kernel's
+    /// architecture: the machine is that one's, unless one was chosen
+    /// (`GRIX_ARCH`, [`arch`](Self::arch)) and it isn't.
     pub(crate) fn image_files_only(mut self, image: &crate::Image) -> Result<Self> {
+        let arch = image.arch()?;
+        if arch != self.arch {
+            if let Some(who) = self.arch_chosen_by {
+                bail!(
+                    "the image is for {arch} (its kernel is), and {who} asks for {}: an image runs on its own \
+                     architecture, so leave {who} out (or build the image for {} with `grix build --arch {}`)",
+                    self.arch,
+                    self.arch,
+                    self.arch
+                );
+            }
+            self = self.switch_arch(arch);
+        }
+        self.image_arch = Some(arch);
         for (path, node) in &image.files {
             self.files.insert(path.clone(), node.clone());
         }
@@ -931,14 +1018,30 @@ impl SandboxBuilder {
     /// The guest's architecture (the host's by default, or `GRIX_ARCH`'s):
     /// its kernel, QEMU and accelerator follow. Programs must be built for
     /// it. Another architecture than the host's is emulated (slowly).
+    /// An image's architecture is its kernel's: choosing another for it
+    /// fails the build.
     pub fn arch(mut self, arch: Arch) -> Self {
+        self.arch_chosen_by = Some("--arch");
         if arch != self.arch {
-            self.arch = arch;
-            self.kernel = default_kernel(arch);
-            self.qemu = arch.default_qemu();
-            self.accel = default_accel_for(arch).into();
-            self.vmm = default_vmm_for(arch);
+            self = self.switch_arch(arch);
         }
+        self
+    }
+
+    /// Run `arch`'s guests: its kernel, QEMU, accelerator and grix-vmm.
+    fn switch_arch(mut self, arch: Arch) -> Self {
+        self.arch = arch;
+        self.kernel = self.installed_kernel();
+        self.qemu = arch.default_qemu();
+        // GRIX_ACCEL's, for the host's own: another's is emulated.
+        self.accel = match std::env::var("GRIX_ACCEL") {
+            Ok(a) if !a.is_empty() && arch == Arch::host() => a,
+            _ => default_accel_for(arch).into(),
+        };
+        self.vmm = match &self.install {
+            Some(dir) => vmm_for(Some(dir), arch),
+            None => default_vmm_for(arch),
+        };
         self
     }
 
@@ -954,7 +1057,20 @@ impl SandboxBuilder {
         self.vmm.as_deref()
     }
 
+    /// What a run boots, and in what: "an x86_64 machine in grix-vmm",
+    /// "an aarch64 machine in qemu-system-aarch64 (tcg)".
+    pub fn machine(&self) -> String {
+        match &self.vmm {
+            Some(_) => format!("an {} machine in grix-vmm", self.arch),
+            None => format!("an {} machine in {} ({})", self.arch, self.qemu.display(), self.accel),
+        }
+    }
+
     pub fn build(mut self) -> Result<Sandbox> {
+        // `arch` after `image`: the image's programs and kernel are another's.
+        if let Some(image) = self.image_arch.filter(|&a| a != self.arch) {
+            bail!("the image is for {image}, and --arch asks for {}: an image runs on its own architecture", self.arch);
+        }
         for (guest, _) in self.mount_points() {
             let inside = format!("{guest}/");
             if let Some(p) = self.files.keys().find(|p| *p == guest || p.starts_with(&inside)) {
@@ -1480,7 +1596,7 @@ pub(crate) fn run_snapshot(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1495,5 +1611,127 @@ mod tests {
         assert!(len <= MAX_KERNEL_LOG + 100 && log.ends_with("the rest is dropped\n"), "{len}");
         add_log(&mut log, "more");
         assert_eq!(log.len(), len);
+    }
+
+    /// The start of a 64-bit little-endian ELF file for `machine`.
+    pub(crate) fn elf(machine: u16) -> Vec<u8> {
+        let mut e = b"\x7fELF\x02\x01\x01".to_vec();
+        e.resize(64, 0);
+        e[18..20].copy_from_slice(&machine.to_le_bytes());
+        e
+    }
+
+    fn other() -> Arch {
+        match Arch::host() {
+            Arch::Aarch64 => Arch::X86_64,
+            Arch::X86_64 => Arch::Aarch64,
+        }
+    }
+
+    fn elf_for(arch: Arch) -> Vec<u8> {
+        elf(match arch {
+            Arch::Aarch64 => EM_AARCH64,
+            Arch::X86_64 => EM_X86_64,
+        })
+    }
+
+    #[test]
+    fn architectures_of_elf_files() {
+        assert_eq!(Arch::of_elf(&elf(183)), Some(Arch::Aarch64));
+        assert_eq!(Arch::of_elf(&elf(62)), Some(Arch::X86_64));
+        // Another machine, 32-bit, big-endian, cut off or not ELF at all.
+        assert_eq!(Arch::of_elf(&elf(40)), None);
+        let mut e32 = elf(62);
+        e32[4] = 1;
+        assert_eq!(Arch::of_elf(&e32), None);
+        let mut big = elf(183);
+        big[5] = 2;
+        assert_eq!(Arch::of_elf(&big), None);
+        assert_eq!(Arch::of_elf(&elf(62)[..19]), None);
+        assert_eq!(Arch::of_elf(b"#!/bin/sh\n"), None);
+        // The kernels this source tree builds, where they're built.
+        for arch in [Arch::Aarch64, Arch::X86_64] {
+            let path = Path::new(SOURCE_TREE.unwrap_or("/nowhere")).join(arch.kernel_names().1);
+            if let Ok(kernel) = std::fs::read(&path) {
+                assert_eq!(Arch::of_elf(&kernel), Some(arch), "{}", path.display());
+            }
+        }
+        assert_eq!(Arch::parse("amd64"), Some(Arch::X86_64));
+        assert_eq!(Arch::parse("arm64"), Some(Arch::Aarch64));
+        assert_eq!(Arch::parse("riscv64"), None);
+        assert_eq!((Arch::Aarch64.oci_name(), Arch::X86_64.oci_name()), ("arm64", "amd64"));
+    }
+
+    #[test]
+    fn images_run_on_their_own_architecture() {
+        let image = |arch: Arch| crate::Image::new(BTreeMap::new(), Default::default(), elf_for(arch));
+        // Nobody chose: the image's architecture, emulated if it isn't the
+        // host's, with the image's kernel.
+        let b = SandboxBuilder { arch_chosen_by: None, ..Default::default() };
+        let b = b.image(&image(other())).unwrap();
+        assert_eq!(b.guest_arch(), other());
+        assert_eq!((b.accel.as_str(), b.vmm.is_none()), ("tcg", true));
+        assert_eq!(std::fs::read(b.kernel_path()).unwrap(), elf_for(other()));
+        assert_eq!(b.qemu, other().default_qemu());
+        // GRIX_ARCH or --arch for another: an error, saying what to do.
+        for who in ["GRIX_ARCH", "--arch"] {
+            let mut b = SandboxBuilder::default().arch(Arch::host());
+            b.arch_chosen_by = Some(who);
+            let err = b.image(&image(other())).err().unwrap().to_string();
+            assert!(err.contains(&format!("the image is for {}", other())) && err.contains(who), "{err}");
+        }
+        // The same as the image's: fine.
+        assert!(SandboxBuilder::default().arch(other()).image(&image(other())).is_ok());
+        // --arch after the image: the build fails.
+        let b = SandboxBuilder { arch_chosen_by: None, ..Default::default() };
+        let err = b.image(&image(other())).unwrap().arch(Arch::host()).build().err().unwrap().to_string();
+        assert!(err.contains("an image runs on its own architecture"), "{err}");
+    }
+
+    #[test]
+    fn kernels_boot_only_in_their_own_machine() {
+        assert!(crate::vmm::check_machine(&elf(183), Arch::Aarch64).is_ok());
+        assert!(crate::vmm::check_machine(&elf(62), Arch::X86_64).is_ok());
+        let err = crate::vmm::check_machine(&elf(183), Arch::X86_64).unwrap_err().to_string();
+        assert!(err.contains("it's for aarch64, and the machine about to boot it is x86_64's"), "{err}");
+        assert!(crate::vmm::check_machine(&elf(62), Arch::Aarch64).is_err());
+        assert!(crate::vmm::check_machine(b"not a kernel", Arch::Aarch64).is_err());
+    }
+
+    #[test]
+    fn programs_must_be_the_kernels() {
+        use crate::container::check_programs;
+        let file = |data: Vec<u8>| Node::File { data, mode: 0o755, mtime_ns: 0 };
+        let link = |t: &str| Node::Symlink { target: t.into(), mtime_ns: 0 };
+        let mut files: BTreeMap<String, Node> = [
+            ("/bin/busybox".to_string(), file(elf(183))),
+            ("/bin/sh".to_string(), link("busybox")),
+            ("/usr/bin/env".to_string(), link("../../bin/busybox")),
+            ("/app/run.sh".to_string(), file(b"#!/bin/sh\necho hi\n".to_vec())),
+            ("/app/amd".to_string(), file(elf(62))),
+        ]
+        .into_iter()
+        .collect();
+        let none: &[String] = &[];
+        assert!(check_programs(&files, none, Arch::Aarch64).is_ok());
+        // An x86_64 kernel with arm64 programs (what grix before images had
+        // architectures built on x86_64 hosts): refused, naming one.
+        let err = check_programs(&files, none, Arch::X86_64).unwrap_err().to_string();
+        assert!(err.starts_with("/bin/sh is an aarch64 program, and the image's kernel is x86_64's"), "{err}");
+        assert!(err.contains("grix build --arch aarch64"), "{err}");
+        // The command's program, found on PATH, through links.
+        let err = check_programs(&files, &["env".into()], Arch::X86_64).unwrap_err().to_string();
+        assert!(err.starts_with("/usr/bin/env is an aarch64 program"), "{err}");
+        // An x86_64 program in an arm64 image may run with a translator.
+        assert!(check_programs(&files, &["/app/amd".into()], Arch::Aarch64).is_ok());
+        let err = check_programs(&files, &["/app/amd".into()], Arch::X86_64).unwrap_err().to_string();
+        assert!(err.starts_with("/bin/sh is an aarch64"), "{err}");
+        // Scripts, and programs that aren't there, are the kernel's to judge.
+        files.remove("/bin/busybox");
+        assert!(check_programs(&files, &["/app/run.sh".into()], Arch::X86_64).is_ok());
+        assert!(check_programs(&files, &["/nowhere".into()], Arch::X86_64).is_ok());
+        // Links that go round in circles end.
+        files.insert("/bin/sh".into(), link("/bin/sh"));
+        assert!(check_programs(&files, none, Arch::X86_64).is_ok());
     }
 }

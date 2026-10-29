@@ -463,7 +463,10 @@ fn tools(config: &McpConfig) -> Value {
                 "type": "object",
                 "properties": {
                     "grixfile": {"type": "string", "description": "Path of the Grixfile."},
-                    "output": {"type": "string", "description": "Where to write the image (under an allowed directory)."}
+                    "output": {"type": "string", "description": "Where to write the image (under an allowed directory)."},
+                    "arch": {"type": "string", "enum": ["aarch64", "x86_64"],
+                             "description": "The architecture to build for (default: the host's, which runs fastest). \
+                                             An image runs on its own; another than the host's is emulated."}
                 },
                 "required": ["grixfile", "output"]
             }
@@ -647,9 +650,11 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
                 bail!("the image asks for the {name} capability, which this server doesn't allow");
             }
         }
-        // Its files and settings, with the server's kernel (the one it trusts).
-        let kernel = b.kernel_path().to_path_buf();
-        b = b.image(&image)?.kernel(kernel);
+        // Its files, settings and architecture, with the server's kernel
+        // for that (the one it trusts).
+        b = b.image(&image)?;
+        let kernel = b.installed_kernel();
+        b = b.kernel(kernel);
     }
     for imp in args["imports"].as_array().into_iter().flatten() {
         let host = imp["host"].as_str().context("import without host")?;
@@ -820,10 +825,15 @@ fn build_image(
     }
     let grixfile = config.host_path(args["grixfile"].as_str().context("no grixfile")?)?;
     let out = output_path(config, args)?;
+    let arch = match args["arch"].as_str() {
+        Some(a) => Some(crate::Arch::parse(a).with_context(|| format!("arch {a:?}: aarch64 or x86_64"))?),
+        None => None,
+    };
     let mut log = Vec::new();
     let image = Grixfile::build_file(
         &grixfile,
         BuildOptions {
+            arch,
             kernel: None,
             on_output: &mut |s, d| {
                 progress.output(s, d);

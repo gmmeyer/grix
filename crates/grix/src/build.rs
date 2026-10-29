@@ -21,6 +21,11 @@
 //! content = "hello\n"
 //! ```
 //!
+//! An image is for one architecture, arm64 or x86_64: the host's by
+//! default (or `GRIX_ARCH`'s), or `BuildOptions::arch`. Its kernel is that
+//! one's, and so is the Docker/OCI image it's built from (linux/arm64 or
+//! linux/amd64), and a grix image it builds on.
+//!
 //! `from` takes a registry reference (`alpine:3.21`,
 //! `ghcr.io/owner/repo:tag`), `oci:DIR` (an OCI image layout),
 //! `docker-archive:FILE` (`docker save` output), `docker:NAME` (from the
@@ -35,8 +40,8 @@
 //!
 //! What a step leaves is cached (`treecache`), by everything that went
 //! into it: the files before it (contents and modes), the step, the
-//! environment, the user, the working directory, the kernel and what the
-//! network allowed. A step whose inputs haven't changed isn't run again,
+//! environment, the user, the working directory, the kernel, the
+//! architecture and what the network allowed. A step whose inputs haven't changed isn't run again,
 //! as with Docker's build cache; `grix build --no-cache` runs them all.
 
 use std::collections::BTreeMap;
@@ -50,7 +55,7 @@ use serde::Deserialize;
 use crate::container::{Image, ImageConfig};
 use crate::export::ExportContent;
 use crate::image::{self, Node};
-use crate::sandbox::{ExitStatus, Sandbox, Stream};
+use crate::sandbox::{Arch, ExitStatus, Sandbox, Stream};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,7 +141,11 @@ pub struct FileSpec {
 /// How to build: where the kernel and QEMU are, and where build steps'
 /// output goes.
 pub struct BuildOptions<'a> {
-    /// The kernel to put in the image (by default the one `Sandbox` uses).
+    /// The architecture to build for: `kernel`'s if one is given, otherwise
+    /// the host's or `GRIX_ARCH`'s by default.
+    pub arch: Option<Arch>,
+    /// The kernel to put in the image (by default the grix kernel
+    /// installed for the architecture); it must be the architecture's.
     pub kernel: Option<PathBuf>,
     /// Each build step's output, as it comes.
     pub on_output: &'a mut dyn FnMut(Stream, &[u8]),
@@ -202,6 +211,7 @@ impl Grixfile {
 
     /// Build the image, taking relative paths from `base`.
     pub fn build(&self, base: &Path, opts: BuildOptions) -> Result<Image> {
+        let (arch, kernel_path) = target(opts.arch, opts.kernel.as_deref())?;
         let mut files = BTreeMap::new();
         let mut config = ImageConfig::default();
         match self.from.as_deref() {
@@ -214,6 +224,14 @@ impl Grixfile {
             Some(path) if path.starts_with("image:") => {
                 let path = in_context(base, Path::new(&path[6..]), self.from_outside_context)?;
                 let base_image = Image::open(&path)?;
+                let theirs = base_image.arch()?;
+                if theirs != arch {
+                    bail!(
+                        "{} is an image for {theirs}, and this build is for {arch}: build for {theirs} \
+                         (`--arch {theirs}`), or build the base for {arch}",
+                        path.display()
+                    );
+                }
                 files = base_image.files;
                 config = base_image.config;
             }
@@ -242,7 +260,7 @@ impl Grixfile {
                     allow: (!allow.is_empty()).then_some(allow),
                     local: opts.policy.local_registries,
                 };
-                let pulled = crate::oci::load(source, base, opts.policy.credentials, reach)
+                let pulled = crate::oci::load(source, base, opts.policy.credentials, reach, arch)
                     .with_context(|| format!("from {source}"))?;
                 files = pulled.files;
                 let c = pulled.config;
@@ -300,10 +318,17 @@ impl Grixfile {
             };
             files.insert(path, node);
         }
-        let kernel_path = opts.kernel.clone().unwrap_or_else(|| Sandbox::builder().kernel_path().to_path_buf());
         let kernel =
             std::fs::read(&kernel_path).with_context(|| format!("reading the kernel {}", kernel_path.display()))?;
+        match Arch::of_elf(&kernel) {
+            Some(a) if a == arch => {}
+            Some(a) => bail!("the kernel {} is for {a}, and this build is for {arch}", kernel_path.display()),
+            None => bail!("the kernel {} isn't an arm64 or x86_64 ELF file", kernel_path.display()),
+        }
         crate::container::check_kernel(&kernel).with_context(|| format!("the kernel {}", kernel_path.display()))?;
+        // The kernel runs only its own architecture's programs: say so now,
+        // not when a step or the image's program fails to start.
+        crate::container::check_programs(&files, &config.command, arch)?;
         let mut image = Image::new(files, config, kernel);
         for step in &self.run {
             if opts.control.as_ref().is_some_and(|c| c.is_cancelled()) {
@@ -321,15 +346,36 @@ impl Grixfile {
     }
 }
 
+/// The architecture a build is for, and the kernel it packs.
+fn target(arch: Option<Arch>, kernel: Option<&Path>) -> Result<(Arch, PathBuf)> {
+    let arch = match (arch, kernel) {
+        (Some(a), _) => a,
+        // A kernel given says what it's for.
+        (None, Some(k)) => {
+            let data = std::fs::read(k).with_context(|| format!("reading the kernel {}", k.display()))?;
+            Arch::of_elf(&data)
+                .with_context(|| format!("the kernel {} isn't an arm64 or x86_64 ELF file", k.display()))?
+        }
+        (None, None) => Arch::from_env(),
+    };
+    let kernel = match kernel {
+        Some(k) => k.to_path_buf(),
+        None => Sandbox::builder().arch(arch).installed_kernel(),
+    };
+    Ok((arch, kernel))
+}
+
 /// What a step's result depends on: the files before it, the step, and
 /// how it runs.
 fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     use sha2::{Digest, Sha256};
     let tree = crate::treecache::tree_hash(&image.files);
     let kernel: String = Sha256::digest(image.kernel_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let arch = image.arch().map_or("?", |a| a.name());
     let c = &image.config;
     let net = if policy.net { policy.allow_hosts.join("\0") } else { "\0no net".into() };
     let parts = [
+        arch.as_bytes(),
         tree.as_bytes(),
         argv.join("\0").as_bytes(),
         c.env.join("\0").as_bytes(),
@@ -340,7 +386,7 @@ fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     ]
     .map(|p| p.to_vec());
     let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    crate::treecache::key("build-step-v1", &parts)
+    crate::treecache::key("build-step-v2", &parts)
 }
 
 /// Run one build step in `image` and take the file tree it leaves (or
@@ -367,7 +413,9 @@ fn run_step(
     let (_, bytes) = image.size();
     // Room for the tree, what the step adds, and the export of it all.
     let memory_mb = (bytes * 3 / (1 << 20) + 512).min(policy.step_memory_mb);
+    // The image's own architecture, whatever GRIX_ARCH says.
     let mut b = Sandbox::builder()
+        .arch(image.arch()?)
         .image_files_only(&image)?
         .memory_mb(memory_mb)
         .timeout(policy.step_timeout)
@@ -412,4 +460,47 @@ fn run_step(
     let _ = crate::treecache::put(&key, &files);
     let kernel = image.kernel_bytes().to_vec();
     Ok(Image::new(files, image.config, kernel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::tests::elf;
+
+    #[test]
+    fn steps_are_cached_per_architecture() {
+        let files: BTreeMap<String, Node> =
+            [("/a".to_string(), Node::File { data: b"x".to_vec(), mode: 0o644, mtime_ns: 0 })].into_iter().collect();
+        let argv = ["/bin/sh".to_string(), "-c".into(), "true".into()];
+        let policy = BuildPolicy::default();
+        let key =
+            |machine: u16| step_key(&Image::new(files.clone(), ImageConfig::default(), elf(machine)), &argv, &policy);
+        assert_ne!(key(183), key(62));
+        assert_eq!(key(62), key(62));
+    }
+
+    #[test]
+    fn builds_are_for_one_architecture() {
+        let dir = std::env::temp_dir().join(format!("grix-arch-{}", crate::container::random_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A kernel given says what the build is for, unless told otherwise.
+        let kernel = dir.join("kernel");
+        std::fs::write(&kernel, elf(62)).unwrap();
+        assert_eq!(target(None, Some(&kernel)).unwrap(), (Arch::X86_64, kernel.clone()));
+        assert_eq!(target(Some(Arch::Aarch64), None).unwrap().0, Arch::Aarch64);
+        // ... and must be its kernel.
+        let err = |g: &Grixfile, arch| {
+            let opts = BuildOptions {
+                arch: Some(arch),
+                kernel: Some(kernel.clone()),
+                on_output: &mut |_, _| {},
+                control: None,
+                policy: BuildPolicy::default(),
+            };
+            g.build(&dir, opts).err().unwrap().to_string()
+        };
+        let e = err(&Grixfile::default(), Arch::Aarch64);
+        assert!(e.contains("is for x86_64, and this build is for aarch64"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
