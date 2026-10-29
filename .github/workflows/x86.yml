@@ -1,0 +1,59 @@
+# The x86_64 kernel on x86 hardware: the end-to-end tests with
+# GRIX_ARCH=x86_64 on a GitHub x86 runner, with KVM (QEMU microvm, -accel
+# kvm; grix-vmm on x86 KVM when it's there). For every push to main, and to
+# ci/** branches, to try things without making a release.
+name: x86
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+
+jobs:
+  kvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # GitHub's x86 runners have KVM; the device needs opening up.
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          grep -c -E 'vmx|svm' /proc/cpuinfo
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 golang-go
+          curl -sSfL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" -o zig.tar.xz
+          echo "$ZIG_SHA256  zig.tar.xz" | sha256sum -c
+          mkdir -p "$HOME/zig" && tar xf zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-none
+      - name: The x86_64 kernel, and grix
+        run: |
+          (cd kernel && cargo build --release --target x86_64-unknown-none)
+          cargo build --release -p grix
+      - name: Fixtures
+        run: |
+          ./fixtures/build.sh
+          python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/alpine-x86_64 busybox-static busybox
+          python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/python-x86_64 python3 ca-certificates-bundle
+          python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/node-x86_64 nodejs
+      - name: Unit tests
+        run: cargo test -p grix --lib
+      - name: End-to-end tests on the x86_64 kernel, with KVM
+        run: GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes
