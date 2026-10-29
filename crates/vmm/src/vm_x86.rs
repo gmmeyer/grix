@@ -5,6 +5,7 @@
 //! IOAPIC and local APICs. The kernel is entered as PVH says.
 
 use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -19,7 +20,9 @@ use crate::mem::GuestMemory;
 /// COM1, transmit only, to the socket. Each byte costs an exit, so the
 /// kernel uses it only before the console is up and for panics.
 struct Uart {
-    out: Option<UnixStream>,
+    /// The connected socket, as a plain file: written with write(2), which
+    /// the seccomp filter allows (a socket's own writes are sendto).
+    out: Option<std::fs::File>,
     /// The line control register (its DLAB bit makes the data port the
     /// divisor's).
     lcr: u8,
@@ -72,7 +75,10 @@ impl Machine {
             return Err(format!("the boot image ({} MiB) doesn't fit in RAM", img.len() >> 20));
         }
         let out = match &args.uart {
-            Some(p) => Some(UnixStream::connect(p).map_err(|e| format!("connecting to {}: {e}", p.display()))?),
+            Some(p) => {
+                let s = UnixStream::connect(p).map_err(|e| format!("connecting to {}: {e}", p.display()))?;
+                Some(std::fs::File::from(OwnedFd::from(s)))
+            }
             None => None,
         };
         Ok(Machine { mem, entry, uart: Mutex::new(Uart { out, lcr: 0 }) })
