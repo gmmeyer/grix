@@ -2290,11 +2290,7 @@ fn network_escape_attempts_are_contained() {
     assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.stderr_str());
     assert_eq!(
         out.stdout_str(),
-        concat!(
-            "localhost is 127.0.0.1 ::1\n",
-            "netlink interfaces: lo\n",
-            "netescape without ok\n",
-        )
+        concat!("localhost is 127.0.0.1 ::1\n", "netlink interfaces: lo\n", "netescape without ok\n",)
     );
     // Every denial names `net` (socket creation is the one gate: without a
     // socket, no connect, sendto or resolve can egress).
