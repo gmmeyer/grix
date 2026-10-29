@@ -5,6 +5,27 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Demos · grix</title>
 <meta name="description" content="grix demos, running in your browser.">
+<script>
+  // The palette (palettes.css) and light or dark, before anything paints:
+  // ?palette= and ?scheme= choose and are remembered; the system decides
+  // the scheme otherwise.
+  (() => {
+    const root = document.documentElement, q = new URLSearchParams(location.search);
+    const pick = (key) => {
+      let v = q.get(key);
+      try { if (v) localStorage.setItem('grix-' + key, v); else v = localStorage.getItem('grix-' + key); } catch {}
+      return v;
+    };
+    const palette = pick('palette'), scheme = pick('scheme');
+    if (palette && palette !== 'blue') root.dataset.palette = palette;
+    if (palette) root.dataset.chooser = '';
+    const dark = matchMedia('(prefers-color-scheme: dark)');
+    const apply = () => (root.dataset.scheme = scheme === 'light' || scheme === 'dark' ? scheme : dark.matches ? 'dark' : 'light');
+    apply();
+    dark.addEventListener('change', apply);
+  })();
+</script>
+<link rel="stylesheet" href="/palettes.css">
 <link rel="stylesheet" href="/site.css">
 <script src="/coi-serviceworker.js"></script>
 <script type="module" src="/grix-example.js"></script>
@@ -114,6 +135,41 @@ needs <code>fs_write</code>: stop, tick it and start again).</p>
   <a href="/blog/">Blog</a>
 </div></footer>
 <script>
+  // Comparing palettes: a chooser, once one was picked with ?palette=.
+  (() => {
+    const root = document.documentElement;
+    if (!('chooser' in root.dataset)) return;
+    const palettes = [['blue', 'Blue'], ['claude', 'Claude Code'], ['tokyo-night', 'Tokyo Night'],
+                      ['catppuccin', 'Catppuccin'], ['dracula', 'Dracula'], ['gruvbox', 'Gruvbox']];
+    const schemes = [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']];
+    const box = document.createElement('div');
+    box.className = 'palette-chooser';
+    const save = (k, v) => { try { localStorage.setItem('grix-' + k, v); } catch {} };
+    const render = () => {
+      const palette = root.dataset.palette || 'blue';
+      let scheme = 'auto';
+      try { scheme = localStorage.getItem('grix-scheme') || 'auto'; } catch {}
+      box.innerHTML = '<span>Palette</span>' + palettes.map(([k, n]) =>
+        `<button data-palette="${k}" aria-pressed="${k === palette}">${n}</button>`).join('') +
+        '<span style="margin-left:6px">Scheme</span>' + schemes.map(([k, n]) =>
+        `<button data-scheme="${k}" aria-pressed="${k === scheme}">${n}</button>`).join('');
+    };
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      if (b.dataset.palette) {
+        save('palette', b.dataset.palette);
+        if (b.dataset.palette === 'blue') delete root.dataset.palette; else root.dataset.palette = b.dataset.palette;
+      } else {
+        save('scheme', b.dataset.scheme);
+        const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+        root.dataset.scheme = b.dataset.scheme === 'auto' ? (dark ? 'dark' : 'light') : b.dataset.scheme;
+      }
+      render();
+    });
+    render();
+    document.body.append(box);
+  })();
   // The demos need SharedArrayBuffer (QEMU's threads); say so where the
   // page couldn't get it.
   if (!crossOriginIsolated) {

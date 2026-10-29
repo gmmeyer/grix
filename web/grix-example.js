@@ -109,20 +109,26 @@ export function splitCommand(s) {
 }
 
 const STYLE = `
+/* A page themes its examples with --grix-* properties (bg, fg, muted,
+   border, panel, term, term-fg, err, event, ok, bad, accent, accent-fg). */
 :host {
-  --gx-bg: #ffffff; --gx-fg: #1d1f23; --gx-muted: #6a6f78; --gx-border: #d9dce1;
-  --gx-panel: #f6f7f9; --gx-term: #15171b; --gx-term-fg: #e6e8eb; --gx-err: #f0a38b;
-  --gx-event: #8fc1ff; --gx-ok: #7bd389; --gx-bad: #f28b82; --gx-accent: #2f6fde;
+  --gx-bg: var(--grix-bg, #ffffff); --gx-fg: var(--grix-fg, #1d1f23); --gx-muted: var(--grix-muted, #6a6f78);
+  --gx-border: var(--grix-border, #d9dce1); --gx-panel: var(--grix-panel, #f6f7f9);
+  --gx-term: var(--grix-term, #15171b); --gx-term-fg: var(--grix-term-fg, #e6e8eb);
+  --gx-err: var(--grix-err, #f0a38b); --gx-event: var(--grix-event, #8fc1ff); --gx-ok: var(--grix-ok, #7bd389);
+  --gx-bad: var(--grix-bad, #f28b82); --gx-accent: var(--grix-accent, #2f6fde);
+  --gx-accent-fg: var(--grix-accent-fg, #ffffff);
   display: block; margin: 1.25rem 0; font: 14px/1.45 system-ui, sans-serif; color: var(--gx-fg);
 }
 @media (prefers-color-scheme: dark) {
-  :host { --gx-bg: #1b1d21; --gx-fg: #e6e8eb; --gx-muted: #9aa0a9; --gx-border: #33373e;
-          --gx-panel: #22252a; --gx-accent: #78a6ff; }
+  :host { --gx-bg: var(--grix-bg, #1b1d21); --gx-fg: var(--grix-fg, #e6e8eb); --gx-muted: var(--grix-muted, #9aa0a9);
+          --gx-border: var(--grix-border, #33373e); --gx-panel: var(--grix-panel, #22252a);
+          --gx-accent: var(--grix-accent, #78a6ff); --gx-accent-fg: var(--grix-accent-fg, #0d1117); }
 }
 .box { border: 1px solid var(--gx-border); border-radius: 8px; overflow: hidden; background: var(--gx-bg); }
 .bar { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 8px 10px;
        background: var(--gx-panel); border-bottom: 1px solid var(--gx-border); }
-.cmd { flex: 1 1 260px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cmd { flex: 1 1 160px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .cmd span { color: var(--gx-muted); font-family: ui-monospace, monospace; }
 input.command { flex: 1; min-width: 0; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
        padding: 5px 7px; border: 1px solid var(--gx-border); border-radius: 5px;
@@ -132,7 +138,7 @@ input.command { flex: 1; min-width: 0; font: 13px ui-monospace, SFMono-Regular, 
 .caps { display: flex; gap: 10px; flex-wrap: wrap; font: 12px ui-monospace, monospace; }
 .caps label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; white-space: nowrap; }
 button { font: 600 13px system-ui, sans-serif; padding: 5px 14px; border-radius: 5px; cursor: pointer;
-         border: 1px solid var(--gx-accent); background: var(--gx-accent); color: #fff; }
+         border: 1px solid var(--gx-accent); background: var(--gx-accent); color: var(--gx-accent-fg); }
 button.secondary { background: transparent; color: var(--gx-accent); }
 button:disabled { opacity: .5; cursor: default; }
 textarea { display: block; width: 100%; box-sizing: border-box; border: 0;
@@ -219,6 +225,13 @@ class GrixExample extends HTMLElement {
     if (atEnd) pre.scrollTop = pre.scrollHeight;
   }
 
+  // The terminal in the page's colours (xterm.js takes them as values).
+  xtermTheme() {
+    const css = getComputedStyle(this);
+    const v = (name) => css.getPropertyValue(name).trim();
+    return { background: v('--gx-term'), foreground: v('--gx-term-fg'), cursor: v('--gx-accent') };
+  }
+
   async terminal() {
     if (this.term) return this.term;
     // Each example's shadow root needs the stylesheet; the script, once.
@@ -237,7 +250,7 @@ class GrixExample extends HTMLElement {
       });
     }
     this.term = new globalThis.Terminal({ rows: 20, cols: 80, convertEol: false, fontSize: 13,
-      theme: { background: '#15171b' } });
+      theme: this.xtermTheme() });
     this.$('.term .idle')?.remove();
     this.term.open(this.$('.term'));
     this.term.onData((d) => this.running?.write?.(new TextEncoder().encode(d)));

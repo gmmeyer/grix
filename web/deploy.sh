@@ -41,11 +41,11 @@ done
 # grixos.dev's zone has browsers keep .js and .css for 4 hours (its Browser
 # Cache TTL), but not the pages: the pages name this deploy's code, so a
 # new deploy is new URLs, fetched at once.
-stamp=$(cat "$SITE"/grix-example.js "$SITE"/grix.js "$SITE"/tar.js "$SITE"/site.css | sha256sum | cut -c1-12)
+stamp=$(cat "$SITE"/grix-example.js "$SITE"/grix.js "$SITE"/tar.js "$SITE"/palettes.css "$SITE"/site.css | sha256sum | cut -c1-12)
 sed -i "s|from './grix.js'|from './grix.js?v=$stamp'|; s|from './tar.js'|from './tar.js?v=$stamp'|" "$SITE/grix-example.js"
 grep -q "grix.js?v=$stamp" "$SITE/grix-example.js"
 find "$SITE" -name '*.html' -print0 | while IFS= read -r -d '' page; do
-    sed -i "s|href=\"/site.css\"|href=\"/site.css?v=$stamp\"|; s|src=\"/grix-example.js\"|src=\"/grix-example.js?v=$stamp\"|" "$page"
+    sed -i "s|href=\"/site.css\"|href=\"/site.css?v=$stamp\"|; s|href=\"/palettes.css\"|href=\"/palettes.css?v=$stamp\"|; s|src=\"/grix-example.js\"|src=\"/grix-example.js?v=$stamp\"|" "$page"
     grep -q "grix-example.js?v=$stamp" "$page"
 done
 "${WRANGLER[@]}" pages deploy "$SITE" --project-name "$PROJECT" --branch main --commit-dirty=true

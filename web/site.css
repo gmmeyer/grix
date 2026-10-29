@@ -1,37 +1,11 @@
 /* grixos.dev: the landing page, the demos and the blog. */
 
 :root {
-  --bg: #fbfbfa;
-  --bg-alt: #f2f3f1;
-  --fg: #17191c;
-  --muted: #5d636b;
-  --border: #dcdfe2;
-  --code-bg: #eceeef;
-  --accent: #2f6fde;
-  --accent-fg: #ffffff;
-  --term: #15171b;
-  --term-fg: #e6e8eb;
-  --ok: #2e8b57;
-  --deny: #c2410c;
+  /* Colours are in palettes.css. */
   --radius: 10px;
   --wide: 1080px;
   --prose: 760px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121417;
-    --bg-alt: #181b1f;
-    --fg: #e6e8eb;
-    --muted: #9aa1aa;
-    --border: #2c3036;
-    --code-bg: #20242a;
-    --accent: #78a6ff;
-    --accent-fg: #0d1117;
-    --ok: #7bd389;
-    --deny: #f0a38b;
-  }
 }
 
 * { box-sizing: border-box; }
@@ -98,12 +72,12 @@ section { padding: 64px 0 0; }
 /* Code */
 .code-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 1.6rem; }
 .code { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--term); }
-.code .label { font: 600 .75rem/1 var(--mono); color: #9aa1aa; padding: 10px 14px; border-bottom: 1px solid #2c3036;
+.code .label { font: 600 .75rem/1 var(--mono); color: var(--term-muted); padding: 10px 14px; border-bottom: 1px solid var(--term-border);
                text-transform: uppercase; letter-spacing: .06em; }
 .code pre { color: var(--term-fg); padding: 14px; font-size: .82rem; line-height: 1.55; overflow-x: auto;
-             scrollbar-color: #3a3f47 transparent; }
-.code .c { color: #8b949e; }
-.code .deny { color: #f0a38b; }
+             scrollbar-color: var(--term-border) transparent; }
+.code .c { color: var(--term-muted); }
+.code .deny { color: var(--term-err); }
 
 /* How it works */
 .diagram { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 14px; align-items: stretch; margin-top: 1.6rem; }
@@ -133,11 +107,7 @@ td:first-child { font-family: var(--mono); font-size: .88rem; white-space: nowra
 .prose .byline { color: var(--muted); font-size: .95rem; margin-bottom: 2rem; }
 .prose p { margin: 1.05rem 0; }
 .prose figure { margin: 1.8rem 0; }
-/* Demos wider than the text, where there's room: their bar fits on one row. */
-@media (min-width: 1000px) {
-  .prose figure, .prose > grix-example { margin-left: -70px; margin-right: -70px; }
-  .prose figure figcaption { padding: 0 70px; }
-}
+
 .prose figcaption { font-size: .9rem; color: var(--muted); margin-top: .4rem; }
 .prose figure grix-example { margin: 0; }
 .post-list { list-style: none; padding: 0; margin: 1.5rem 0; }

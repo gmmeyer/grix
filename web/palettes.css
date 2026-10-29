@@ -1,0 +1,105 @@
+/* grixos.dev's colours: a palette (data-palette on <html>) in a scheme
+   (data-scheme: light or dark, from the system unless chosen). Each sets
+   the site's tokens; the demos take theirs from the --grix-* ones below.
+
+   Tokens: bg, bg-alt (cards), fg, muted, border, code-bg (inline code),
+   accent, accent-fg (text on accent), ok, deny; and the terminal's: term,
+   term-fg, term-muted, term-border, term-err (stderr), term-event (grix's
+   events), term-ok, term-bad. */
+
+/* Blue: the site as it launched. */
+:root {
+  --bg: #fbfbfa; --bg-alt: #f2f3f1; --fg: #17191c; --muted: #5d636b; --border: #dcdfe2; --code-bg: #eceeef;
+  --accent: #2f6fde; --accent-fg: #ffffff; --ok: #2e8b57; --deny: #c2410c;
+  --term: #15171b; --term-fg: #e6e8eb; --term-muted: #8b949e; --term-border: #2c3036;
+  --term-err: #f0a38b; --term-event: #8fc1ff; --term-ok: #7bd389; --term-bad: #f28b82;
+  color-scheme: light;
+}
+:root[data-scheme="dark"] {
+  --bg: #121417; --bg-alt: #181b1f; --fg: #e6e8eb; --muted: #9aa1aa; --border: #2c3036; --code-bg: #20242a;
+  --accent: #78a6ff; --accent-fg: #0d1117; --ok: #7bd389; --deny: #f0a38b;
+  color-scheme: dark;
+}
+
+/* Claude Code: Anthropic's ivory, slate and clay. */
+:root[data-palette="claude"] {
+  --bg: #faf9f5; --bg-alt: #f0eee6; --fg: #141413; --muted: #5e5d59; --border: #e3e0d5; --code-bg: #ebe8de;
+  --accent: #c15f3c; --accent-fg: #ffffff; --ok: #5f7a3f; --deny: #b5452a;
+  --term: #1f1e1d; --term-fg: #ece9df; --term-muted: #8e8c84; --term-border: #34332f;
+  --term-err: #e8a385; --term-event: #d97757; --term-ok: #a3b77f; --term-bad: #e47e6b;
+}
+:root[data-palette="claude"][data-scheme="dark"] {
+  --bg: #262624; --bg-alt: #2f2f2c; --fg: #f5f4ee; --muted: #a8a59b; --border: #3e3d38; --code-bg: #34332f;
+  --accent: #d97757; --accent-fg: #1a1918; --ok: #a3b77f; --deny: #e8a385;
+  --term: #1a1918;
+}
+
+/* Tokyo Night (and Tokyo Night Day). */
+:root[data-palette="tokyo-night"] {
+  --bg: #e1e2e7; --bg-alt: #d5d6dd; --fg: #343b58; --muted: #565a6e; --border: #c4c8da; --code-bg: #cfd1db;
+  --accent: #2e7de9; --accent-fg: #ffffff; --ok: #387068; --deny: #b15c00;
+  --term: #1a1b26; --term-fg: #c0caf5; --term-muted: #565f89; --term-border: #292e42;
+  --term-err: #ff9e64; --term-event: #7dcfff; --term-ok: #9ece6a; --term-bad: #f7768e;
+}
+:root[data-palette="tokyo-night"][data-scheme="dark"] {
+  --bg: #1a1b26; --bg-alt: #1f2335; --fg: #c0caf5; --muted: #9aa5ce; --border: #292e42; --code-bg: #24283b;
+  --accent: #7aa2f7; --accent-fg: #1a1b26; --ok: #9ece6a; --deny: #ff9e64;
+  --term: #16161e;
+}
+
+/* Catppuccin: Latte, and Mocha in the dark. */
+:root[data-palette="catppuccin"] {
+  --bg: #eff1f5; --bg-alt: #e6e9ef; --fg: #4c4f69; --muted: #6c6f85; --border: #ccd0da; --code-bg: #dce0e8;
+  --accent: #8839ef; --accent-fg: #ffffff; --ok: #40a02b; --deny: #fe640b;
+  --term: #1e1e2e; --term-fg: #cdd6f4; --term-muted: #6c7086; --term-border: #313244;
+  --term-err: #fab387; --term-event: #89b4fa; --term-ok: #a6e3a1; --term-bad: #f38ba8;
+}
+:root[data-palette="catppuccin"][data-scheme="dark"] {
+  --bg: #1e1e2e; --bg-alt: #181825; --fg: #cdd6f4; --muted: #a6adc8; --border: #313244; --code-bg: #313244;
+  --accent: #cba6f7; --accent-fg: #1e1e2e; --ok: #a6e3a1; --deny: #fab387;
+  --term: #11111b;
+}
+
+/* Dracula (and Alucard, its light side). */
+:root[data-palette="dracula"] {
+  --bg: #fffbeb; --bg-alt: #f5f0dc; --fg: #1f1f1f; --muted: #6c664b; --border: #e2dcc4; --code-bg: #efe9d2;
+  --accent: #644ac9; --accent-fg: #ffffff; --ok: #14710a; --deny: #a34d14;
+  --term: #282a36; --term-fg: #f8f8f2; --term-muted: #6272a4; --term-border: #44475a;
+  --term-err: #ffb86c; --term-event: #8be9fd; --term-ok: #50fa7b; --term-bad: #ff5555;
+}
+:root[data-palette="dracula"][data-scheme="dark"] {
+  --bg: #282a36; --bg-alt: #21222c; --fg: #f8f8f2; --muted: #a9aecb; --border: #44475a; --code-bg: #44475a;
+  --accent: #bd93f9; --accent-fg: #282a36; --ok: #50fa7b; --deny: #ffb86c;
+  --term: #21222c;
+}
+
+/* Gruvbox. */
+:root[data-palette="gruvbox"] {
+  --bg: #fbf1c7; --bg-alt: #f2e5bc; --fg: #3c3836; --muted: #7c6f64; --border: #d5c4a1; --code-bg: #ebdbb2;
+  --accent: #af3a03; --accent-fg: #fbf1c7; --ok: #79740e; --deny: #9d0006;
+  --term: #282828; --term-fg: #ebdbb2; --term-muted: #928374; --term-border: #3c3836;
+  --term-err: #fe8019; --term-event: #83a598; --term-ok: #b8bb26; --term-bad: #fb4934;
+}
+:root[data-palette="gruvbox"][data-scheme="dark"] {
+  --bg: #282828; --bg-alt: #32302f; --fg: #ebdbb2; --muted: #a89984; --border: #504945; --code-bg: #3c3836;
+  --accent: #fe8019; --accent-fg: #282828; --ok: #b8bb26; --deny: #fb4934;
+  --term: #1d2021;
+}
+
+/* The demos' colours, from the palette's. */
+:root {
+  --grix-bg: var(--bg); --grix-fg: var(--fg); --grix-muted: var(--muted); --grix-border: var(--border);
+  --grix-panel: var(--bg-alt); --grix-term: var(--term); --grix-term-fg: var(--term-fg);
+  --grix-err: var(--term-err); --grix-event: var(--term-event); --grix-ok: var(--term-ok);
+  --grix-bad: var(--term-bad); --grix-accent: var(--accent); --grix-accent-fg: var(--accent-fg);
+}
+
+/* The palette chooser (shown with ?palette=). */
+.palette-chooser { position: fixed; right: 16px; bottom: 16px; z-index: 20; display: flex; flex-wrap: wrap; gap: 6px;
+  align-items: center; max-width: calc(100vw - 32px); padding: 8px 10px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--bg-alt); box-shadow: 0 6px 24px rgb(0 0 0 / .18);
+  font: 13px/1.2 system-ui, sans-serif; color: var(--fg); }
+.palette-chooser button { font: inherit; padding: 5px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+.palette-chooser button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--accent-fg); }
+.palette-chooser span { color: var(--muted); margin-right: 2px; }
