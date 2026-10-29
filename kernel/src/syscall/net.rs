@@ -897,7 +897,7 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
 }
 
 fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u64) -> SysResult {
-    let to = read_sockaddr(p, addr, len)?;
+    let to = read_sockaddr(p, addr, len)?.or_loopback();
     if s.dgram {
         // Nothing is sent: resolvers and "what's my address" code connect a
         // UDP socket just to see the route. From now on datagrams come only
@@ -936,7 +936,7 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u
         s.state = State::Local { end, local, peer: to };
         return Ok(0);
     }
-    if to.is_unspecified() || to.port == 0 {
+    if to.port == 0 {
         return Err(ECONNREFUSED);
     }
     s.state = State::Remote(Conn::connect(to)?);

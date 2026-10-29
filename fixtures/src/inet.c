@@ -181,6 +181,27 @@ static int test_loopback(void) {
     CHECK(write(c, "x", 1) == 1 && read(a, buf, sizeof buf) == 1);
     close(c);
     close(a);
+    // Connecting to the unspecified address is connecting to loopback, as
+    // on Linux (Go dials ":port" so).
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    c = connect_to(any);
+    CHECK(c >= 0 && (a = accept(l, (struct sockaddr *)&peer, &len)) >= 0);
+    CHECK(peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    close(c);
+    close(a);
+    close(l);
+    l = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 any6 = {.sin6_family = AF_INET6};
+    CHECK(bind(l, (struct sockaddr *)&any6, sizeof any6) == 0 && listen(l, 4) == 0);
+    len = sizeof any6;
+    CHECK(getsockname(l, (struct sockaddr *)&any6, &len) == 0);
+    c = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(connect(c, (struct sockaddr *)&any6, sizeof any6) == 0);
+    struct sockaddr_in6 peer6;
+    len = sizeof peer6;
+    CHECK((a = accept(l, (struct sockaddr *)&peer6, &len)) >= 0 && IN6_IS_ADDR_LOOPBACK(&peer6.sin6_addr));
+    close(c);
+    close(a);
     close(l);
     return 0;
 }

@@ -69,6 +69,16 @@ impl SockAddr {
         self.is_loopback() || self.addr == Addr::V4(link::GUEST_V4)
     }
 
+    /// Where a connect to it goes: the unspecified address means loopback,
+    /// as Linux's tcp_v4_connect, tcp_v6_connect and UDP's connect have it.
+    pub fn or_loopback(self) -> SockAddr {
+        match self.addr {
+            Addr::V4([0, 0, 0, 0]) => SockAddr::v4([127, 0, 0, 1], self.port),
+            Addr::V6(a) if a == [0; 16] => SockAddr { addr: Addr::V6(LOOPBACK_V6), port: self.port },
+            _ => self,
+        }
+    }
+
     pub fn is_unspecified(&self) -> bool {
         match self.addr {
             Addr::V4(a) => a == [0; 4],
