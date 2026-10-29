@@ -446,6 +446,17 @@ fn non_executable_program() {
 }
 
 #[test]
+fn program_for_another_machine() {
+    // hello for this guest, with RISC-V's e_machine: the kernel names its own.
+    let mut elf = std::fs::read(fixture("hello")).unwrap();
+    elf[18..20].copy_from_slice(&243u16.to_le_bytes());
+    let out = run(Sandbox::builder().file("/bin/x", elf, 0o755).unwrap(), &["/bin/x"]);
+    assert_eq!(out.status, ExitStatus::Exited(126));
+    let want = if x86_64_guest() { "/bin/x: not an x86_64 binary" } else { "/bin/x: not an AArch64 binary" };
+    assert!(matches!(&out.events[..], [GuestEvent::ExecFailed { reason, .. }] if reason == want), "{:?}", out.events);
+}
+
+#[test]
 fn reserved_and_relative_guest_paths_are_rejected() {
     assert!(Sandbox::builder().file("/dev/x", "", 0o644).is_err());
     assert!(Sandbox::builder().file("relative", "", 0o644).is_err());
@@ -2305,6 +2316,30 @@ fn network_escape_attempts_are_contained() {
         .collect();
     assert_eq!(denied.len(), 2, "{denied:?}");
     assert!(denied.iter().all(|(_, cap)| *cap == "net"), "{denied:?}");
+}
+
+/// x86_64's AVX state (XSAVE): ymm registers survive context switches
+/// and signal handlers, whose frame holds them in Linux's layout, and a
+/// frame whose XSAVE header xrstor would refuse is a SIGSEGV, not a fault
+/// in the kernel. (On arm64 the fixture only says ok.)
+#[test]
+fn vector_registers_are_the_programs_own() {
+    let out = run(with("fpstate").allow(Capability::Threads), &["/bin/fpstate"]);
+    assert_eq!(out.stdout_str(), "fpstate ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    if !x86_64_guest() {
+        return;
+    }
+    for bad in ["badheader", "badfeatures"] {
+        let out = run(with("fpstate").allow(Capability::Threads), &["/bin/fpstate", bad]);
+        assert_eq!(out.status, ExitStatus::Signaled(11), "{bad}: {}", out.stdout_str());
+        assert!(
+            matches!(&out.events[..], [GuestEvent::Fault { signal: 11, detail, .. }] if detail.contains("rt_sigreturn")),
+            "{bad}: {:?}",
+            out.events
+        );
+    }
 }
 
 /// More CPUs: programs see them, threads run in parallel on them, and

@@ -7,8 +7,7 @@
 # Sandboxes are x86_64 without /dev/kvm. The guest defaults to the host's architecture, so tests
 # boot the x86_64 kernel in qemu-system-x86_64 under TCG (no grix-vmm without KVM);
 # GRIX_ARCH=aarch64 runs them on the arm64 kernel in qemu-system-aarch64. Both are slower than
-# on HVF/KVM. crates/grix/tests/mcp.rs and python/tests import only the arm64 busybox, so they
-# pass only with GRIX_ARCH=aarch64 here.
+# on HVF/KVM.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

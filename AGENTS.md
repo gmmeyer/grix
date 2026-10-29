@@ -102,8 +102,9 @@ syscall table (`syscall/table.rs`) has each architecture's numbers for
 the same names; x86_64's older calls (`open`, `stat`, `fork`, ...) are
 turned into the calls that replaced them (`syscall/x86.rs`), gated as
 those are. Test with both: `GRIX_ARCH=x86_64 cargo test -p grix --test
-guest --test runtimes` runs the end-to-end tests on the x86_64 kernel
-(fixtures in `fixtures/build/amd64`, and `<name>-x86_64` roots).
+guest --test runtimes --test mcp` (and `python3 -m unittest discover -s
+python/tests`) runs the end-to-end tests on the x86_64 kernel (fixtures
+in `fixtures/build/amd64`, and `<name>-x86_64` roots).
 
 x86_64 (`kernel/src/arch/x86_64`): PVH entry (32-bit, the ELF note) to
 long mode in `boot.S`; the high half at `0xffff8000_00000000` (static,
@@ -115,7 +116,10 @@ idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
 instruction), as a masked one waits in the GIC on arm64. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
-PIT; the APIC timer is one-shot. FP state is fxsave's (no AVX). One CPU
+PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
+x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
+in Linux's signal frame layout, and `sigframe::read_fp` keeps a frame's
+XSAVE header to what xrstor accepts (invariant 12). One CPU
 and no snapshots for now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
 `kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
 COM1 by port I/O, PVH's entry state, the hypervisor timing leaf filled

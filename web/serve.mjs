@@ -23,7 +23,9 @@ http.createServer((req, res) => {
       'Content-Type': types[path.extname(file)] ?? 'application/octet-stream',
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
-      'Cross-Origin-Resource-Policy': 'same-origin',
+      // Embeddable from pages elsewhere, as from a CDN.
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'no-cache',
     });
     res.end(data);

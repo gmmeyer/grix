@@ -8,7 +8,8 @@
 //                                             or {"tar": "rootfs/python.tar.gz", "path": "/"},
 //                                             or {"text": "...", "path": "/data/x"},
 //                                             or {"symlink": "busybox", "path": "/bin/sh"}; `src`
-//                                             and `tar` are relative to this script
+//                                             and `tar` are relative to this script, or to
+//                                             <meta name="grix-files" content="URL/"> if the page has one
 //     caps="net"                              capabilities the reader may grant
 //     allow=""                                ...and those granted to begin with
 //     env="GREETING=hi"                       space-separated, or a JSON array
@@ -27,6 +28,10 @@ import { fetchTar } from './tar.js';
 
 const BASE = new URL('.', import.meta.url);
 const asset = (p) => new URL(p, BASE).href;
+// The examples' programs and root filesystems: beside this script, or
+// where the page's <meta name="grix-files" content="URL/"> says.
+const FILES = document.querySelector('meta[name="grix-files"]')?.content;
+const exampleFile = (p) => new URL(p, FILES ? new URL(FILES, location.href) : BASE).href;
 
 let grixPromise = null;
 function loadGrix() {
@@ -58,8 +63,8 @@ function loadFiles(specs) {
     if (f.text !== undefined) return [{ path: f.path, data: new TextEncoder().encode(f.text), mode: f.mode ?? 0o644 }];
     const key = f.tar ?? f.src;
     if (!fileCache.has(key)) {
-      const p = f.tar ? fetchTar(asset(f.tar), f.path ?? '/')
-        : fetch(asset(f.src)).then((r) => {
+      const p = f.tar ? fetchTar(exampleFile(f.tar), f.path ?? '/')
+        : fetch(exampleFile(f.src)).then((r) => {
           if (!r.ok) throw new Error(`${f.src}: ${r.status}`);
           return r.arrayBuffer();
         }).then((b) => [{ path: f.path, data: new Uint8Array(b), mode: f.mode ?? 0o755 }]);
