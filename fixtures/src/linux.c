@@ -1,6 +1,6 @@
 // Assorted Linux interfaces: memfd_create (with seals), signalfd, CPU-time
-// clocks, membarrier, mincore, prctl, /etc/localtime, sendmmsg/recvmmsg and
-// user ids. No capabilities beyond `threads` are needed for any of them.
+// clocks, membarrier, mincore, prctl, /etc/localtime, sendmmsg/recvmmsg,
+// user ids and /proc/self/auxv. No capabilities beyond `threads` are needed for any of them.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +21,7 @@
 #include <sys/uio.h>
 #include <grp.h>
 #include <sys/stat.h>
+#include <sys/auxv.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -261,6 +262,28 @@ static int test_ids(void) {
     return 0;
 }
 
+// /proc/self/auxv is the vector the program started with (Go's
+// golang.org/x/sys/cpu reads it for AT_HWCAP).
+static int test_auxv(void) {
+    unsigned long v[128];
+    int fd = open("/proc/self/auxv", O_RDONLY);
+    CHECK(fd >= 0);
+    ssize_t n = read(fd, v, sizeof v);
+    close(fd);
+    CHECK(n > 0 && n % 16 == 0 && n < (ssize_t)sizeof v);
+    int seen = 0, pairs = n / 16;
+    for (int i = 0; i < pairs; i++) {
+        unsigned long type = v[2 * i], val = v[2 * i + 1];
+        if (i == pairs - 1) CHECK(type == AT_NULL && val == 0);
+        else if (type == AT_HWCAP || type == AT_PAGESZ || type == AT_RANDOM || type == AT_ENTRY) {
+            CHECK(val == getauxval(type));
+            seen++;
+        }
+    }
+    CHECK(seen == 4);
+    return 0;
+}
+
 int main(void) {
     RUN(test_memfd);
     RUN(test_signalfd);
@@ -268,6 +291,7 @@ int main(void) {
     RUN(test_misc);
     RUN(test_mmsg);
     RUN(test_ids);
+    RUN(test_auxv);
     printf("linux ok\n");
     return 0;
 }

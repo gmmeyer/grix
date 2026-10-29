@@ -270,6 +270,9 @@ pub struct Process {
     pub exe: String,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
+    /// The auxiliary vector the program started with, as (type, value)
+    /// words ending in AT_NULL: /proc/<pid>/auxv.
+    pub auxv: Vec<u64>,
     /// The kernel memory `argv` and `envp` take (every fork copies them).
     pub args_charge: crate::kmem::Charge,
 
@@ -384,6 +387,7 @@ impl Process {
             exe: String::new(),
             argv: Vec::new(),
             envp: Vec::new(),
+            auxv: Vec::new(),
             args_charge: Default::default(),
             threads: BTreeMap::from([(pid, Thread::new(pid))]),
             current: pid,
@@ -428,6 +432,7 @@ impl Process {
         c.exe = self.exe.clone();
         c.argv = self.argv.clone();
         c.envp = self.envp.clone();
+        c.auxv = self.auxv.clone();
         c.io_seen = self.io_seen;
         c.timers.fds = self.timers.fds.clone();
         c.uses_signalfd = self.uses_signalfd;
@@ -814,6 +819,7 @@ pub struct Program {
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
+    auxv: Vec<u64>,
 }
 
 /// Find `path` (relative to directory `base`), follow `#!` lines, and load
@@ -908,8 +914,9 @@ pub fn load_program(
         build_stack(&mut aspace, &args, &env, path, &auxv)
     };
     p.aspace.activate();
-    let sp = sp.map_err(|e| exec_error(e, alloc::format!("could not build the initial stack (errno {})", e.0)))?;
-    Ok(Program { aspace, args_charge, entry, sp, exe, argv, envp })
+    let (sp, auxv) =
+        sp.map_err(|e| exec_error(e, alloc::format!("could not build the initial stack (errno {})", e.0)))?;
+    Ok(Program { aspace, args_charge, entry, sp, exe, argv, envp, auxv })
 }
 
 impl Program {
@@ -925,6 +932,7 @@ impl Program {
         p.exe = self.exe;
         p.argv = self.argv;
         p.envp = self.envp;
+        p.auxv = self.auxv;
         p.args_charge = self.args_charge;
         (self.entry, self.sp)
     }
@@ -1009,13 +1017,14 @@ fn resolve_interpreters(
 }
 
 /// Lay out argc/argv/envp/auxv at the top of the stack as Linux does.
+/// Returns the stack pointer and the auxiliary vector as written.
 fn build_stack(
     a: &mut AddressSpace,
     argv: &[&str],
     envp: &[&str],
     execfn: &str,
     aux: &[(u64, u64)],
-) -> Result<u64, Errno> {
+) -> Result<(u64, Vec<u64>), Errno> {
     let total: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1;
     if total > 1 << 20 {
         return Err(E2BIG);
@@ -1040,18 +1049,20 @@ fn build_stack(
     rng::fill(&mut random);
     let random_ptr = push(a, &random)?;
 
+    let mut auxv: Vec<u64> = Vec::new();
+    for &(k, v) in aux.iter().chain(&[(15, platform_ptr), (25, random_ptr), (31, execfn_ptr), (0, 0)]) {
+        auxv.push(k);
+        auxv.push(v);
+    }
     let mut words: Vec<u64> = Vec::new();
     words.push(argv.len() as u64);
     words.extend(&arg_ptrs);
     words.push(0);
     words.extend(&env_ptrs);
     words.push(0);
-    for &(k, v) in aux.iter().chain(&[(15, platform_ptr), (25, random_ptr), (31, execfn_ptr), (0, 0)]) {
-        words.push(k);
-        words.push(v);
-    }
+    words.extend(&auxv);
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let sp = (random_ptr - bytes.len() as u64) & !15;
     copy_out(a, sp, &bytes)?;
-    Ok(sp)
+    Ok((sp, auxv))
 }

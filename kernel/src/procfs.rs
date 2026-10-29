@@ -31,6 +31,7 @@ pub enum ProcFile {
     Statm,
     Cmdline,
     Environ,
+    Auxv,
     Comm,
     Limits,
     Mountinfo,
@@ -61,6 +62,7 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("statm", ProcFile::Statm),
     ("cmdline", ProcFile::Cmdline),
     ("environ", ProcFile::Environ),
+    ("auxv", ProcFile::Auxv),
     ("comm", ProcFile::Comm),
     ("limits", ProcFile::Limits),
     ("mountinfo", ProcFile::Mountinfo),
@@ -133,6 +135,9 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             }
             return v;
         }
+        // Go's golang.org/x/sys/cpu reads this when it can't get the
+        // vector from its runtime, and otherwise reads the ID registers.
+        ProcFile::Auxv => return p.auxv.iter().flat_map(|w| w.to_le_bytes()).collect(),
         ProcFile::Comm => {
             let _ = writeln!(s, "{}", comm(p));
         }
