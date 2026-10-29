@@ -79,6 +79,13 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("oom_score_adj", ProcFile::Text("0\n")),
 ];
 
+/// Files of /proc/<pid> that are its owner's (0400), and that another
+/// process may open only if it may inspect this one: Linux's environ and
+/// auxv, which need ptrace_may_access(PTRACE_MODE_READ_FSCREDS).
+pub fn private(f: ProcFile) -> bool {
+    matches!(f, ProcFile::Environ | ProcFile::Auxv)
+}
+
 /// The other files to create, by path.
 pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/cpuinfo", ProcFile::Cpuinfo),

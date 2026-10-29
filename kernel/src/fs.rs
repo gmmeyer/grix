@@ -1075,7 +1075,8 @@ impl Fs {
             self.pid_dirs.insert(pid, dir);
             self.dir_pids.insert(dir, pid);
             for &(name, file) in procfs::PID_FILES {
-                self.add_node(dir, name, Kind::Proc(file), 0o444, owner)?;
+                let perm = if procfs::private(file) { 0o400 } else { 0o444 };
+                self.add_node(dir, name, Kind::Proc(file), perm, owner)?;
             }
             let fd = self.add_node(dir, "fd", Kind::Dir(BTreeMap::new()), 0o500, owner)?;
             self.fd_dirs.insert(fd, pid);

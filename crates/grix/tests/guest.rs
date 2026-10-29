@@ -546,6 +546,7 @@ fn images_built_from_oci_images() {
     // a run.
     let dir = temp_dir("image");
     std::fs::write(dir.join("hello.sh"), "echo \"$GREETING from $(cat /etc/alpine-release) in $PWD\"\n").unwrap();
+    std::fs::copy(fixture("procperm"), dir.join("procperm")).unwrap();
     let grixfile = format!(
         r#"
 from = "oci:{}"
@@ -560,6 +561,10 @@ GREETING = "hi"
 [[copy]]
 host = "hello.sh"
 guest = "/app/hello.sh"
+
+[[copy]]
+host = "procperm"
+guest = "/bin/procperm"
 
 [[file]]
 guest = "/app/note"
@@ -609,6 +614,13 @@ content = "a note"
     assert_eq!(out.stdout_str(), "built\na note");
     let out = sb.run(&["ls", "/etc/motd"]).unwrap();
     assert_eq!(out.status, ExitStatus::Exited(1));
+    // The image's user is root (as in Docker): /proc/<pid>/environ and
+    // auxv are each process's owner's, and only those who may inspect it
+    // (ptrace's rule) read another's.
+    let out = sb.run(&["/bin/procperm"]).unwrap();
+    assert_eq!(out.stdout_str(), "procperm ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
     let out = sb.run(&["uname", "-m"]).unwrap();
     assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
     assert_eq!(image.arch().unwrap(), grix::Arch::from_env());
