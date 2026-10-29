@@ -29,7 +29,7 @@
 
 <p>In early 2016 I went to a conference in Brooklyn. I had to look up the name, because I didn't remember. It was called <a href="https://www.composeconference.org/2016/">Compose</a>. If you want a real flashback, the conference was sponsored by Jet. I remember their talk, it was largely about how they picked F# because they wanted to be the place that had the coolest tech you could have if you worked on Windows. An interesting strategy, it did seem to work out pretty well for them overall. (I used to buy a lot of discount stuff on Jet!)</p>
 
-<p>A few of the talks there were on Unikernels. They were a then pretty interesting idea. It is a program that is statically linked to the kernel itself. The program is compiled in (or perhaps shipped in with) just the libraries and kernel modules it needs. Do you need glibc? No? It's not gonna be there. Do you need kernel level networking? No? It's not gonna be there either.</p>
+<p>A few of the talks there were on <a href="https://anil.recoil.org/papers/2013-asplos-mirage.pdf">Unikernels</a>. They were a then pretty interesting idea. It is a program that is statically linked to the kernel itself. The program is compiled in (or perhaps shipped in with) just the libraries and kernel modules it needs. Do you need glibc? No? It's not gonna be there. Do you need kernel level networking? No? It's not gonna be there either.</p>
 
 <figure>
 <grix-example command="/bin/busybox wc -l /data/report.csv /etc/shadow"
@@ -39,7 +39,7 @@
 <figcaption>Try it: only the imported files exist. The program looks for <code>/etc/shadow</code>, and grix reports it wasn't imported.</figcaption>
 </figure>
 
-<p>You didn't have to accept that the chunky monolithic-kerneled Linux needed to have SMB and webcam drivers loaded in every program you were making. They also seemed tailor made for the container age. You could build out a container that just had a small handful of things on it.</p>
+<p>You didn't have to accept that the chunky <a href="https://en.wikipedia.org/wiki/Monolithic_kernel">monolithic-kerneled</a> Linux needed to have SMB and webcam drivers loaded in every program you were making. They also seemed tailor made for the container age. You could build out a container that just had a small handful of things on it.</p>
 
 <p>They lost to containers, though. More limited Linux distros won because they were easier to use. Unikernels required too much of a developer. And, while they had some security promises, it's hard to justify that they were so much more secure than Linux. Linux is the most battle tested technology in history.</p>
 
