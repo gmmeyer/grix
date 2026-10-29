@@ -5,7 +5,7 @@
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 const KVMIO: u64 = 0xae;
 
@@ -465,8 +465,11 @@ pub fn handle_kicks() -> Result<(), String> {
 /// interrupt line. Anything else fails with EPERM. If guest input ever
 /// found a bug in this process, that's all it would have. A run that may
 /// take a `snapshot` also reads its own vCPUs' and GIC's state, kicks its
-/// own threads, and writes the snapshot file it holds.
-pub fn confine(snapshot: bool) -> Result<(), String> {
+/// own threads, and writes the snapshot file it holds. One `restoring` a
+/// snapshot may also put its vCPUs' and GIC's state back, and add a
+/// filter: confined again without `restoring` once that's done, it has
+/// those no more.
+pub fn confine(snapshot: bool, restoring: bool) -> Result<(), String> {
     // aarch64 system call numbers.
     const IOCTL: u32 = 29;
     const TGKILL: u32 = 131;
@@ -505,12 +508,19 @@ pub fn confine(snapshot: bool) -> Result<(), String> {
         46, // ftruncate
         68, // pwrite64
     ];
+    const SECCOMP: u32 = 277;
     let mut ioctls = vec![KVM_RUN, KVM_IRQ_LINE];
     let mut allowed = ALLOWED.to_vec();
     if snapshot {
         ioctls.extend([KVM_GET_ONE_REG, KVM_SET_ONE_REG, KVM_GET_REG_LIST, KVM_GET_MP_STATE, KVM_GET_DEVICE_ATTR]);
         allowed.extend(SNAPSHOT_ALLOWED);
     }
+    if restoring {
+        ioctls.extend([KVM_GET_REG_LIST, KVM_SET_ONE_REG, KVM_SET_MP_STATE, KVM_SET_DEVICE_ATTR]);
+        allowed.push(SECCOMP);
+    }
+    ioctls.sort_unstable();
+    ioctls.dedup();
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
@@ -558,10 +568,13 @@ pub fn confine(snapshot: bool) -> Result<(), String> {
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
     prog.push(stmt(RET_K, RET_ALLOW));
     let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_mut_ptr() };
+    // A second filter (after a restore): no_new_privs is on already, and
+    // prctl isn't allowed.
+    static CONFINED: AtomicBool = AtomicBool::new(false);
     // SAFETY: prctl and seccomp with a filter that outlives the calls (the
     // kernel copies it). TSYNC applies it to the threads already running.
     unsafe {
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        if !CONFINED.swap(true, Ordering::SeqCst) && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
         }
         const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;

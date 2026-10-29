@@ -230,10 +230,17 @@ fn vcpu_loop(mut cpu: kvm_x86::Cpu, shared: &Shared) -> Result<(), String> {
     let (m, console) = (&shared.m, &*shared.console);
     loop {
         match cpu.run().map_err(|e| e.to_string())? {
-            Exit::Io { port, write: true, data, .. } => m.port_out(port, data),
-            Exit::Io { port, len, write: false, .. } => {
-                let v = m.port_in(port);
-                cpu.complete_in(v, len);
+            // One unit at a time, as the instruction would have done them.
+            Exit::Io { port, len, write } => {
+                for unit in cpu.io_data().chunks_exact_mut(len as usize) {
+                    if write {
+                        let mut v = [0u8; 4];
+                        v[..unit.len()].copy_from_slice(unit);
+                        m.port_out(port, u32::from_le_bytes(v));
+                    } else {
+                        unit.copy_from_slice(&m.port_in(port).to_le_bytes()[..unit.len()]);
+                    }
+                }
             }
             Exit::Mmio { addr, write: true, data, .. } => m.mmio_write(console, addr, data),
             Exit::Mmio { addr, len, write: false, .. } => {
