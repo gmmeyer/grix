@@ -87,18 +87,22 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 17. [~] **SMP**: several processes in parallel (each CPU runs a thread
     of any process; three busy processes on four CPUs use 2.5 CPUs'
     worth, one at a time before). Left: finer locking than one kernel
-    lock.
+    lock. It shows most where the host has few cores for the vCPUs: on a
+    4-core runner shared with other machines, 4 threads on x86_64's 4
+    CPUs ran at 0.5 to 1.2 times one (2.0 alone), as vCPUs wait for the
+    lock or a TLB flush on one the host descheduled (KVM's PV TLB flush
+    and spinlock hints would help).
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
-19. [~] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
+19. [x] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
     Done: the kernel's arm64 code under `arch/aarch64`, and `arch/x86_64`
     (PVH boot, traps and `syscall`, paging, LAPIC/IOAPIC, the 16550, the
     signal frame, the vDSO), the x86_64 syscall table, its older calls
     and structure layouts; QEMU microvm (`--arch x86_64`); grix-vmm on
     x86 KVM; every end-to-end test passes on it, in CI on an x86 runner
     with KVM (`x86.yml`); x86_64 Linux releases; AVX and AVX-512 state
-    (XSAVE, in Linux's signal frame). Left: SMP (INIT/SIPI), and
-    snapshots of x86_64 machines.
+    (XSAVE, in Linux's signal frame); more CPUs (INIT/SIPI, TLB flushes
+    by IPI); snapshots of x86_64 machines (grix-vmm on KVM).
 20. **An outside security review** (after the above).
 
 ## Agent integrations

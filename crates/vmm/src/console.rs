@@ -74,7 +74,6 @@ struct State {
 }
 
 impl State {
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// The device as the driver set it up, for a snapshot.
     fn save(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -96,7 +95,6 @@ impl State {
         w.buf
     }
 
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     fn load(b: &[u8]) -> Option<State> {
         let mut r = Reader::new(b);
         let mut s = State {
@@ -151,17 +149,13 @@ impl Console {
         Self::start_with(mem, line, State::default())
     }
 
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// The device as `save` left it, for a run restored from a snapshot.
+    /// Its interrupt is raised again when it goes (`go`).
     pub fn restore(mem: Arc<GuestMemory>, line: Line, saved: &[u8]) -> Result<Arc<Console>, String> {
         let state = State::load(saved).ok_or("the snapshot's console state is malformed")?;
-        let raised = state.interrupt_status != 0;
-        let console = Self::start_with(mem, line, state);
-        (console.line)(raised);
-        Ok(console)
+        Ok(Self::start_with(mem, line, state))
     }
 
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// Take a snapshot with `f`, given the device's state, while nothing
     /// moves through the device (the lock keeps the reader and writer from
     /// touching guest memory). `None` if something is on its way (output,
@@ -201,8 +195,13 @@ impl Console {
         console
     }
 
-    /// Let the threads move data: the VMM is confined.
+    /// Let the threads move data: the VMM is confined, and a restored
+    /// machine's interrupt controller is back, so a restored device's
+    /// interrupt can be raised again.
     pub fn go(&self) {
+        if self.lock().interrupt_status != 0 {
+            (self.line)(true);
+        }
         *self.started.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.start.notify_all();
     }

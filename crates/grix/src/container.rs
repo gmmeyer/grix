@@ -293,7 +293,9 @@ pub(crate) fn read_node<R: Read>(
         bail!("the image has more than {MAX_FILES} entries");
     }
     let h = entry.header();
-    let mode = h.mode().unwrap_or(0o644) & 0o7777;
+    // Not setuid or setgid, as an OCI image's layers: an image may be
+    // anyone's, and nothing in the sandbox honours them.
+    let mode = h.mode().unwrap_or(0o644) & 0o1777;
     let mtime_ns = h.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
     Ok(Some(match h.entry_type() {
         tar::EntryType::Directory => Node::Dir { mode, mtime_ns },

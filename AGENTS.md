@@ -111,20 +111,28 @@ long mode in `boot.S`; the high half at `0xffff8000_00000000` (static,
 large code model). User mode is CPL 3 with IF set; every trap from it
 lands at the top of the CPU's stack (TSS.rsp0, or `syscall_entry` by
 hand, with `swapgs`) and leaves by `iretq` (`sanitize` makes a
-non-canonical rip fault at 0 in user mode instead of in the kernel). The
-idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
+non-canonical rip or rsp fault at 0 in user mode instead of in the
+kernel). Every way in clears the program's flags (AC especially): SMEP
+and SMAP are on when the CPU has them (`init_protection`), so the kernel
+touches user memory only inside `arch::user_access`. The GDT has no 32-bit
+user code segment, so user code can't enter compatibility mode (AMD's
+`syscall` from there would go to CSTAR). The idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
 instruction), as a masked one waits in the GIC on arm64. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
 PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
 x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
 in Linux's signal frame layout, and `sigframe::read_fp` keeps a frame's
-XSAVE header to what xrstor accepts (invariant 12). One CPU
-and no snapshots for now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
+XSAVE header to what xrstor accepts (invariant 12). More CPUs start
+with INIT and a startup IPI at a real-mode trampoline (`boot.S`
+`ap_trampoline`, copied below 1 MiB), which comes into long mode as CPU
+0 did and finds its stack by its APIC ID (`ap_main`). grix-vmm runs it on x86 KVM (`vm_x86.rs`,
 `kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
-COM1 by port I/O, PVH's entry state, the hypervisor timing leaf filled
-in (`KVM_GET_TSC_KHZ`), and a seccomp filter of x86_64's numbers that
-kills the x32 ABI's. `.github/workflows/x86.yml` runs the end-to-end
+COM1 by port I/O, PVH's entry state, a CPUID with nothing of the host's
+but the CPU's model and features (`guest_cpuid`: made-up brand, caches
+and topology, no KVM signature) and the hypervisor timing leaf filled in
+(`KVM_GET_TSC_KHZ`), and a seccomp filter of x86_64's numbers that kills
+the x32 ABI's. `.github/workflows/x86.yml` runs the end-to-end
 tests on a GitHub x86 runner with KVM, in grix-vmm and in QEMU (push to a
 `ci/**` branch to try something without a release).
 
@@ -260,7 +268,11 @@ they leave at their next schedule (`exclusive_wanted`, `kick_others`), and
 a process killed while it runs elsewhere is finished off there
 (`smp::running_anywhere`, `procs::reap_others`). Signals for a thread on
 another CPU kick it (`kick_thread`).
-TLB flushes and instruction-cache invalidation are broadcast; free pages
+TLB flushes and instruction-cache invalidation are broadcast (on
+x86_64, which has no broadcast invalidation, `flush_tlb` IPIs the other
+CPUs and waits for each, except one in the kernel: IF is clear there and
+it may be waiting for the lock, so it catches up when it gets it,
+`tlb_sync`, before it touches user memory); free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
 (`publish_barrier`). User memory other threads use at the same time is
@@ -268,7 +280,7 @@ updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
 a fixture that checks whole lines writes each with one `write`. Secondaries start with PSCI CPU_ON (`boot.S`
-`secondary_entry`).
+`secondary_entry`) on arm64, INIT and SIPI on x86_64.
 
 x86_64 programs (`Image::x86_64`, `SandboxBuilder::x86_64`, `--x86-64`):
 the guest stays arm64; an x86_64 ELF that execve meets is run by the
@@ -293,7 +305,9 @@ host (`inet::host_state`), the kernel flushes the console, takes whatever
 the host sent (`console::take_all_input`: anything there means not now)
 and makes `SNAPSHOT_CALL` (an HVC in SMCCC's OEM range: Hypervisor.framework
 answers the vendor-hypervisor range itself; KVM forwards it only because
-grix-vmm installs an SMCCC filter, `kvm::Vm::forward`, Linux 6.4+).
+grix-vmm installs an SMCCC filter, `kvm::Vm::forward`, Linux 6.4+; on
+x86_64, where KVM answers `vmcall` itself, an `out` to
+`machine::x86_64::VMM_PORT`).
 grix-vmm stops every other vCPU between exits (`pause.rs`: each saves its
 own registers, as only its thread may on Hypervisor.framework; on KVM a
 kick is `immediate_exit` plus a signal, and a vCPU first finishes its last
@@ -304,11 +318,16 @@ the vCPUs, GIC, console device and RAM to its fd 3 and exits, or answers
 vCPU's and the GIC's state are is the hypervisor's (`snapshot_hvf.rs`; on
 KVM, `snapshot_kvm.rs`: every register `KVM_GET_REG_LIST` names and the
 power state, and the vGIC's attributes in one fixed order, so a file only
-supplies values), and a snapshot runs only where it was taken. A restore
-makes every vCPU, puts the GIC back before the console can raise its
-interrupt, and confines grix-vmm before any vCPU runs or the console's
-threads touch the device (`Console::go`): its queues are the file's. On
-KVM the counter is set last, once for the VM. A `--restore` run maps that RAM
+supplies values; on x86 KVM, `snapshot_kvm_x86.rs`: what QEMU saves of a
+vCPU, registers to XSAVE area, MSRs, local APIC and pending events, put
+back in QEMU's order, and the IOAPIC and 8259s), and a snapshot runs only
+where it was taken. A restore
+makes every vCPU, confines grix-vmm before it puts any of the file's state
+back (on KVM, with the ioctls that takes until a second filter goes on),
+puts the GIC back before the console raises its interrupt (`Console::go`,
+which also lets the console's threads touch the device: its queues are
+the file's), and only then runs a vCPU. On KVM the counter is set last,
+once for the VM. A `--restore` run maps that RAM
 copy-on-write, puts the rest back with the guest's counter continuous (as
 after a suspend), and returns `SNAPSHOT_RESTORED`, fresh entropy
 (`rng::reseed`) and the time since, which moves the kernel's time of day
@@ -385,7 +404,8 @@ treated as deadlocked.
    encoding, address or constant on both sides; put it in `abi`. The `abi`
    crate must stay `no_std` (plus `alloc`).
 2. **The kernel never faults on user memory.** Every access to a user pointer
-   goes through `uaccess.rs` (`copy_in`, `copy_out`, `read_cstr`, …).
+   goes through `uaccess.rs` (`copy_in`, `copy_out`, `read_cstr`, …), each
+   inside `arch::user_access` (SMAP on x86_64 faults anything else).
    `AddressSpace::ensure` validates against VMAs and pre-faults the pages. An
    EL1 fault is a kernel bug and panics.
 3. **The kernel is softfloat** and never touches FP/SIMD registers, which is

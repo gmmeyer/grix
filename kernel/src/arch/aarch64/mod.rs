@@ -194,6 +194,13 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("dsb sy", "wfi") };
 }
 
+/// Run `f`, which touches user memory: plain loads and stores reach it
+/// (PAN, arm64's SMAP, is off).
+#[inline(always)]
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Order memory writes (a virtqueue's) before a device register write.
 pub fn device_barrier() {
     // SAFETY: a barrier.
@@ -465,6 +472,10 @@ pub fn pte_barrier() {
 pub fn flush_tlb() {
     unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
+
+/// Flushes another CPU asked for and this one missed: none (`flush_tlb`
+/// broadcasts).
+pub fn tlb_sync() {}
 
 /// Make freshly written instructions at kernel address `kva` visible to instruction fetch.
 pub fn sync_icache(kva: u64, len: u64) {

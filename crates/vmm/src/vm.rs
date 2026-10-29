@@ -554,16 +554,6 @@ mod kvm_loop {
         if args.snapshot {
             vm.forward(grix_abi::image::SNAPSHOT_CALL as u32).map_err(|e| e.to_string())?;
         }
-        // A restored machine: every vCPU (from this thread: none runs yet),
-        // then the GIC, then the counter; all before the console can raise
-        // its interrupt.
-        if let Some(s) = &restored {
-            for (n, cpu) in cpus.iter_mut().enumerate() {
-                snapshot_kvm::restore_cpu(s, n, cpu)?;
-            }
-            snapshot_kvm::restore_gic(vm.gic_fd(), s)?;
-            snapshot_kvm::set_counter(s, &mut cpus[0])?;
-        }
         let irq_fd = vm.irq_fd();
         let line: Line = Box::new(move |level| kvm::set_spi(irq_fd, CONSOLE_IRQ, level));
         let console = match &restored {
@@ -581,30 +571,46 @@ mod kvm_loop {
             snapshot: args.snapshot,
             gic: vm.gic_fd(),
         });
-        let mut cpus = cpus.into_iter();
-        let first = cpus.next().ok_or("no vCPU")?;
         // The threads first (the seccomp filter allows none to be made),
-        // then confined, then any guest code (a restored machine's other
-        // vCPUs run at once).
-        let confined = Arc::new(std::sync::Barrier::new(shared.kicks.len()));
-        for (n, cpu) in cpus.enumerate() {
-            let (shared, confined) = (shared.clone(), confined.clone());
+        // each given its vCPU once the VMM is confined and a restored
+        // machine is back (its other vCPUs run at once).
+        let mut given = Vec::new();
+        for n in 1..cpus.len() {
+            let (tx, rx) = std::sync::mpsc::channel::<kvm::Cpu>();
+            let shared = shared.clone();
             std::thread::spawn(move || {
-                confined.wait();
-                let result = vcpu_loop(n + 1, cpu, &shared);
+                let Ok(cpu) = rx.recv() else { return };
+                let result = vcpu_loop(n, cpu, &shared);
                 if let Err(e) = &result {
-                    eprintln!("grix-vmm: vCPU {}: {e}", n + 1);
+                    eprintln!("grix-vmm: vCPU {n}: {e}");
                 }
                 // A vCPU's end is the machine's.
                 std::process::exit(if result.is_ok() { 0 } else { 1 });
             });
+            given.push(tx);
         }
-        kvm::confine(args.snapshot)?;
+        kvm::confine(args.snapshot, restored.is_some())?;
+        // A restored machine, confined first (the file may be anyone's):
+        // every vCPU (from this thread: none runs yet), then the GIC, then
+        // the counter; all before the console can raise its interrupt. Then
+        // what putting them back took is given up too.
+        if let Some(s) = &restored {
+            for (n, cpu) in cpus.iter_mut().enumerate() {
+                snapshot_kvm::restore_cpu(s, n, cpu)?;
+            }
+            snapshot_kvm::restore_gic(vm.gic_fd(), s)?;
+            snapshot_kvm::set_counter(s, &mut cpus[0])?;
+            kvm::confine(args.snapshot, false)?;
+        }
         shared.console.go();
         if !args.restore {
             shared.m.stamp_boot_time();
         }
-        confined.wait();
+        let mut cpus = cpus.into_iter();
+        let first = cpus.next().ok_or("no vCPU")?;
+        for (tx, cpu) in given.into_iter().zip(cpus) {
+            tx.send(cpu).map_err(|_| "a vCPU's thread is gone")?;
+        }
         vcpu_loop(0, first, &shared)
     }
 

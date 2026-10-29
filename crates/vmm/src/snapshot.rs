@@ -2,21 +2,23 @@
 //!
 //! The kernel asks for one with `SNAPSHOT_CALL` when the program first
 //! sits idle waiting for input. Every vCPU stops (`pause.rs`) and saves its
-//! own registers, and we save them, the GIC, the console device and RAM to
+//! own registers, and we save them, the interrupt controller (arm64's GIC,
+//! x86's IOAPIC and 8259s), the console device and RAM to
 //! the file the host gave us as fd 3, and end the process. A restored run
 //! maps that RAM copy-on-write straight from the file, so it starts in
 //! milliseconds however big the runtime is, puts the rest back, and returns
 //! from the call with `SNAPSHOT_RESTORED` and fresh entropy.
 //!
-//! What a vCPU's and the GIC's state are is the hypervisor's
-//! (`snapshot_hvf.rs`, `snapshot_kvm.rs`): a snapshot runs only where it
-//! was taken.
+//! What a vCPU's and the interrupt controller's state are is the
+//! hypervisor's (`snapshot_hvf.rs`, `snapshot_kvm.rs`, `snapshot_kvm_x86.rs`):
+//! a snapshot runs only where it was taken.
 //!
 //! Layout (little-endian):
 //!
 //! ```text
 //!   0   magic "GRIXSNP1" (written last: a file without it is incomplete)
-//!   8   version u32, hypervisor u32 (1: Hypervisor.framework, 2: KVM)
+//!   8   version u32, hypervisor u32 (1: Hypervisor.framework, 2: arm64
+//!       KVM, 3: x86_64 KVM)
 //!   16  ram_size u64, ram_offset u64, state_len u64
 //!   40  state (state_len bytes, `grix_abi::codec`)
 //!   ram_offset (64 KiB aligned): guest RAM, written only where it isn't zero
@@ -42,8 +44,16 @@ const RAM_ALIGN: u64 = 64 * 1024;
 
 #[cfg(target_os = "macos")]
 const HYPERVISOR: u32 = 1;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const HYPERVISOR: u32 = 2;
+#[cfg(target_arch = "x86_64")]
+const HYPERVISOR: u32 = 3;
+
+/// Where guest RAM starts.
+#[cfg(target_arch = "aarch64")]
+const RAM_BASE: u64 = grix_abi::image::RAM_BASE;
+#[cfg(target_arch = "x86_64")]
+const RAM_BASE: u64 = grix_abi::machine::x86_64::RAM_BASE;
 
 /// The file the host passes us.
 pub const FD: i32 = 3;
@@ -59,9 +69,10 @@ fn snapshot_file() -> File {
 }
 
 /// Save the machine to fd 3. vCPU `caller` asked, stopped at its call
-/// with its PC past the HVC; `cpus` holds each vCPU's state (none for one
-/// that was never started), all stopped; `gic` the GIC's; `counter` is the
-/// guest's counter now; `console` the device's saved state.
+/// with its PC past the HVC (or `out`); `cpus` holds each vCPU's state
+/// (none for one that was never started), all stopped; `gic` the interrupt
+/// controller's; `counter` is the guest's counter now; `console` the
+/// device's saved state.
 pub fn save(
     caller: usize,
     cpus: &[Option<Vec<u8>>],
@@ -183,7 +194,7 @@ pub fn open() -> Result<Saved, String> {
     let gic = r.bytes().map_err(malformed)?.to_vec();
     let (counter, then) = (r.u64().map_err(malformed)?, r.u64().map_err(malformed)?);
     let console = r.bytes().map_err(malformed)?.to_vec();
-    let mem = GuestMemory::map_file(file.as_raw_fd(), ram_offset, grix_abi::image::RAM_BASE, ram_size as usize)
+    let mem = GuestMemory::map_file(file.as_raw_fd(), ram_offset, RAM_BASE, ram_size as usize)
         .map_err(|e| format!("mapping the snapshot's memory: {e}"))?;
     let mut entropy = [0u8; 32];
     // SAFETY: a buffer of the size given.
@@ -221,7 +232,7 @@ impl State {
         self.cpus.get(n).and_then(Option::as_deref).ok_or_else(|| format!("vCPU {n} wasn't saved"))
     }
 
-    /// The GIC's saved state.
+    /// The interrupt controller's saved state.
     pub fn gic(&self) -> &[u8] {
         &self.gic
     }
@@ -239,7 +250,8 @@ impl State {
     }
 
     /// If vCPU `n` asked for the snapshot, what it returns from the call
-    /// with in x0..x5: restored, fresh entropy, and the time since.
+    /// with in x0..x5 (rax, rdi, rsi, rdx, rcx, r8 on x86_64): restored,
+    /// fresh entropy, and the time since.
     pub fn returns(&self, n: usize) -> Option<[u64; 6]> {
         if n != self.caller {
             return None;

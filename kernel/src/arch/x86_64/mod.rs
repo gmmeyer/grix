@@ -10,7 +10,7 @@
 //! as a masked interrupt waits in the GIC on arm64.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::signal::{self, *};
 use crate::{process, sched, syscall};
@@ -74,8 +74,9 @@ const _: () = assert!(core::mem::size_of::<TrapFrame>() == 192);
 /// `TrapFrame::vector` for a `syscall`.
 const SYSCALL: u64 = 0x100;
 
-/// Selectors (GDT order: null, kernel code, kernel data, user 32-bit code
-/// (for `sysret`'s layout), user data, user code, then each CPU's TSS).
+/// Selectors (GDT order: null, kernel code, kernel data, an empty slot
+/// (`sysret`'s layout has user 32-bit code there), user data, user code,
+/// then each CPU's TSS).
 const KERNEL_CS: u64 = 0x08;
 const USER_SS: u64 = 0x20 | 3;
 const USER_CS: u64 = 0x28 | 3;
@@ -103,8 +104,12 @@ impl TrapFrame {
         }
     }
 
+    /// The system call's number: what the `syscall` saved, or in a frame
+    /// that trapped at a rewound call before it ran again (an interrupt at
+    /// its `syscall`, where a signal is then delivered), rax, which
+    /// rewinding put it back in, as arm64's x8 always has it.
     pub fn syscall_nr(&self) -> u64 {
-        self.orig_rax
+        if self.orig_rax != !0 { self.orig_rax } else { self.rax }
     }
 
     /// Argument `n` (0..6) of the system call.
@@ -228,6 +233,8 @@ unsafe extern "C" {
     static __stacks: u8;
     static __df_stack_top: u8;
     fn boot_pml4_phys() -> u64;
+    fn ap_trampoline_phys() -> u64;
+    fn ap_trampoline_len() -> u64;
     fn empty_pml4_phys() -> u64;
 }
 
@@ -238,11 +245,13 @@ pub fn stack_top(cpu: usize) -> u64 {
     (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
 }
 
-/// Where a secondary CPU starts (physical). They don't, yet: `start_cpu`
-/// says so.
+/// Where a secondary CPU starts (physical): the trampoline's copy
+/// (boot.S), whose page is the startup IPI's vector.
 pub fn secondary_entry_phys() -> u64 {
-    0
+    AP_TRAMPOLINE
 }
+
+const AP_TRAMPOLINE: u64 = 0x8000;
 
 /// A user page table that maps nothing: only the kernel's half (physical).
 pub fn empty_page_table() -> u64 {
@@ -290,6 +299,7 @@ pub fn restore_fp(state: &FpState) {
 const MSR_EFER: u32 = 0xc000_0080;
 const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
+const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SFMASK: u32 = 0xc000_0084;
 const MSR_FS_BASE: u32 = 0xc000_0100;
 const MSR_GS_BASE: u32 = 0xc000_0101;
@@ -373,17 +383,63 @@ pub fn device_barrier() {
     fence(Ordering::SeqCst);
 }
 
-/// Start CPU `cpu`: not on x86_64 yet (`smp::start` goes on with one).
-pub fn start_cpu(_cpu: usize, _entry: u64, _stack: u64) -> i64 {
-    -1
+/// Each CPU says it's up (`ap_main`), for `start_cpu`.
+static UP: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Start CPU `cpu` (APIC ID `cpu`) at the trampoline, which finds its
+/// stack by its APIC ID: 0 once it's up, -1 if it didn't come in a second.
+pub fn start_cpu(cpu: usize, entry: u64, _stack: u64) -> i64 {
+    if cpu >= MAX_CPUS {
+        return -1;
+    }
+    // SAFETY: low memory nothing else uses (the kernel is at 2 MiB, the
+    // frames after it), mapped linearly; the same bytes for every CPU.
+    unsafe {
+        let (from, len) = (ap_trampoline_phys(), ap_trampoline_len());
+        core::ptr::copy_nonoverlapping(
+            (KERNEL_OFFSET + from) as *const u8,
+            (KERNEL_OFFSET + entry) as *mut u8,
+            len as usize,
+        );
+    }
+    irq::start_ap(cpu as u32, (entry >> 12) as u8);
+    let start = counter();
+    while !UP[cpu].load(Ordering::Acquire) {
+        if counter() - start > counter_freq() {
+            return -1;
+        }
+        core::hint::spin_loop();
+    }
+    0
+}
+
+/// A secondary CPU on its own stack (boot.S's ap_high), in long mode with
+/// the boot tables: the rest of what `arch_init` does for CPU 0, then
+/// `smp::secondary_main`, which puts the empty root in CR3.
+#[unsafe(no_mangle)]
+extern "C" fn ap_main(cpu: u64, frame: *mut TrapFrame) -> ! {
+    let cpu = cpu as usize;
+    init_cpu(cpu);
+    init_fpu();
+    init_protection();
+    UP[cpu].store(true, Ordering::Release);
+    crate::smp::secondary_main(frame)
 }
 
 /// Tell the VMM CPU `cpu` was kicked: the IPI is enough on x86.
 pub fn vmm_kick(_cpu: usize) {}
 
-/// `SNAPSHOT_CALL`: not on x86_64 yet (the kernel refuses).
+/// `SNAPSHOT_CALL`: rax, rdi, rsi, rdx, rcx and r8 as the VMM leaves them
+/// (a restored run returns here, the rest of the registers as they were).
 pub fn snapshot_call() -> [u64; 6] {
-    [!0; 6]
+    let (rax, rdi, rsi, rdx, rcx, r8): (u64, u64, u64, u64, u64, u64);
+    // SAFETY: port I/O the VMM answers (or ignores); it saves every register.
+    unsafe {
+        asm!("out dx, eax", inout("rax") grix_abi::image::SNAPSHOT_CALL => rax,
+             inout("rdx") grix_abi::machine::x86_64::VMM_PORT as u64 => rdx, out("rdi") rdi, out("rsi") rsi,
+             out("rcx") rcx, out("r8") r8, options(nostack));
+    }
+    [rax, rdi, rsi, rdx, rcx, r8]
 }
 
 /// Drop to user mode at `entry` with stack pointer `sp`. Never returns:
@@ -402,6 +458,10 @@ pub fn enter_user(entry: u64, sp: u64) -> ! {
 /// Every trap from user mode, and interrupts in the idle loop (entry.S).
 #[unsafe(no_mangle)]
 extern "C" fn trap_entry(tf: &mut TrapFrame) {
+    if tf.vector == irq::FLUSH_INTID as u64 {
+        flush_ipi();
+        return;
+    }
     if tf.cs & 3 == 0 {
         if (32..256).contains(&tf.vector) {
             irq::taken(tf.vector as u8);
@@ -556,9 +616,14 @@ pub fn hwcap() -> u64 {
 }
 
 pub fn set_user_page_table(root_pa: u64) {
+    ROOTS[cpu_number() % MAX_CPUS].store(root_pa, Ordering::Relaxed);
     // SAFETY: a root with the kernel's half in it (`pte::new_root`).
     unsafe { asm!("mov cr3, {}", in(reg) root_pa, options(nostack)) };
 }
+
+/// Each CPU's CR3 (0 until it has set one), for `flush_tlb`. It changes
+/// only with the kernel lock held.
+static ROOTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Order what was written to a page before the entry that publishes it:
 /// x86 keeps stores in order, so only the compiler must.
@@ -571,12 +636,69 @@ pub fn pte_barrier() {
     fence(Ordering::SeqCst);
 }
 
-/// Forget cached translations (one CPU: reloading CR3 does it).
-pub fn flush_tlb() {
+/// Forget this CPU's cached translations (nothing is global: reloading
+/// CR3 does it).
+fn reload_cr3() {
     let v: u64;
     // SAFETY: CR3 back as it was.
     unsafe { asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) v, options(nostack)) };
     let _ = v;
+}
+
+/// Flushes asked for (`flush_tlb`), and the last each CPU has done.
+static FLUSH_WANTED: AtomicU64 = AtomicU64::new(0);
+static FLUSHED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Forget cached translations on every CPU. x86 has no broadcast
+/// invalidation: this CPU reloads CR3, and each other one does when its
+/// IPI comes (`flush_ipi`), which this waits for. One in the kernel
+/// can't take it (IF is clear there) and may be waiting for the kernel
+/// lock this CPU holds: it touches no user memory before it has the lock,
+/// and catches up then (`tlb_sync`), so it isn't waited for. Nor is one
+/// with the empty root (idle): it caches no user translations, and any
+/// other root it loads, with the lock, comes without them.
+pub fn flush_tlb() {
+    reload_cr3();
+    if crate::smp::count() == 1 {
+        return;
+    }
+    let me = cpu_number() % MAX_CPUS;
+    let want = FLUSH_WANTED.fetch_add(1, Ordering::SeqCst) + 1;
+    FLUSHED[me].fetch_max(want, Ordering::Relaxed);
+    let online = crate::smp::online().min(MAX_CPUS);
+    let empty = empty_page_table();
+    let mut sent = [false; MAX_CPUS];
+    for (cpu, sent) in sent.iter_mut().enumerate().take(online) {
+        let root = ROOTS[cpu].load(Ordering::Relaxed);
+        if cpu != me && root != empty && root != 0 && !crate::smp::in_kernel(cpu) {
+            irq::send_ipi(cpu as u32, irq::FLUSH_INTID);
+            *sent = true;
+        }
+    }
+    for (cpu, _) in sent.iter().enumerate().filter(|(_, s)| **s) {
+        while FLUSHED[cpu].load(Ordering::Acquire) < want && !crate::smp::in_kernel(cpu) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// The flush IPI, from user mode or the idle loop: no lock needed.
+fn flush_ipi() {
+    let want = FLUSH_WANTED.load(Ordering::SeqCst);
+    reload_cr3();
+    FLUSHED[cpu_number() % MAX_CPUS].fetch_max(want, Ordering::Release);
+    irq::eoi(irq::FLUSH_INTID);
+}
+
+/// With the kernel lock, before any user memory: the flushes this CPU
+/// missed while it couldn't take their IPI.
+pub fn tlb_sync() {
+    let want = FLUSH_WANTED.load(Ordering::SeqCst);
+    let me = cpu_number() % MAX_CPUS;
+    if FLUSHED[me].load(Ordering::Relaxed) < want {
+        reload_cr3();
+        FLUSHED[me].fetch_max(want, Ordering::Release);
+    }
 }
 
 /// Instruction fetch sees what was written (x86 keeps them coherent).
@@ -674,9 +796,10 @@ pub fn cpuinfo(s: &mut alloc::string::String, cpus: u32) {
 
 // ---------------------------------------------------------------- setup
 
-/// The GDT: null, kernel code and data, user 32-bit code (unused, for
-/// `sysret`'s layout), user data and code, then a 16-byte TSS descriptor
-/// per CPU. The CPU writes it (the TSS's busy bit), hence atomics.
+/// The GDT: null, kernel code and data, an empty slot (`sysret`'s layout
+/// has user 32-bit code there), user data and code, then a 16-byte TSS
+/// descriptor per CPU. The CPU writes it (the TSS's busy bit), hence
+/// atomics.
 #[repr(C, align(16))]
 struct Gdt([AtomicU64; 6 + 2 * MAX_CPUS]);
 
@@ -713,7 +836,9 @@ extern "C" fn arch_init() {
     let g = &GDT.0;
     g[1].store(0x00af_9a00_0000_ffff, Ordering::Relaxed); // kernel code: 64-bit, DPL 0
     g[2].store(0x00cf_9200_0000_ffff, Ordering::Relaxed); // kernel data
-    g[3].store(0x00cf_fa00_0000_ffff, Ordering::Relaxed); // user code, 32-bit (never used)
+    // No 32-bit user code: a far return to 0x1b faults (#GP), so user code
+    // can't enter compatibility mode, which this kernel has no entry for
+    // (on AMD, its `syscall` would go to CSTAR).
     g[4].store(0x00cf_f200_0000_ffff, Ordering::Relaxed); // user data: DPL 3
     g[5].store(0x00af_fa00_0000_ffff, Ordering::Relaxed); // user code: 64-bit, DPL 3
     for (n, &handler) in unsafe { isr_table.iter() }.enumerate() {
@@ -727,7 +852,15 @@ extern "C" fn arch_init() {
         IDT.0[2 * n + 1].store(handler >> 32, Ordering::Relaxed);
     }
     init_cpu(0);
-    // x87 and SSE for user code, SSE exceptions as #XM; then XSAVE.
+    init_xsave();
+    init_fpu();
+    init_protection();
+    TSC_HZ.store(irq::measure_tsc(), Ordering::Relaxed);
+}
+
+/// x87 and SSE for user code, SSE exceptions as #XM, on this CPU; then
+/// XSAVE, with what `init_xsave` chose on CPU 0.
+fn init_fpu() {
     // SAFETY: control register setup on this CPU.
     unsafe {
         asm!("mov {t}, cr0", "and {t}, {clear}", "or {t}, {set}", "mov cr0, {t}",
@@ -737,8 +870,58 @@ extern "C" fn arch_init() {
              set = in(reg) (1u64 << 9) | (1 << 10), options(nostack));
         asm!("fninit", options(nomem, nostack));
     }
-    init_xsave();
-    TSC_HZ.store(irq::measure_tsc(), Ordering::Relaxed);
+    let mask = xsave_features();
+    if mask != 0 {
+        // SAFETY: CR4.OSXSAVE, then XCR0 as CPU 0 has it (the CPUs are alike).
+        unsafe {
+            asm!("mov {t}, cr4", "or {t}, {set}", "mov cr4, {t}", t = out(reg) _, set = in(reg) 1u64 << 18,
+                 options(nostack));
+            asm!("xsetbv", in("ecx") 0, in("eax") mask as u32, in("edx") (mask >> 32) as u32, options(nostack));
+        }
+    }
+}
+
+/// SMEP and SMAP, when the CPU has them (CPUID 7's EBX bits 7 and 20): the
+/// kernel can't run code in user memory, nor touch it but in
+/// `user_access` (uaccess.rs). A kernel bug that follows a user pointer
+/// then faults (a panic) instead of doing what the program set up there.
+fn init_protection() {
+    if cpuid(0, 0)[0] < 7 {
+        return;
+    }
+    let b = cpuid(7, 0)[1];
+    let (smep, smap) = (b & (1 << 7) != 0, b & (1 << 20) != 0);
+    // First: `stac` works without CR4.SMAP, and a user access needs it once
+    // CR4 has it.
+    SMAP.store(smap, Ordering::Relaxed);
+    let set = (smep as u64) << 20 | (smap as u64) << 21;
+    // SAFETY: CR4 bits the CPU has; AC is clear (entry.S clears it on every
+    // way in), so the kernel's own accesses to user memory are only
+    // `user_access`'s.
+    unsafe {
+        asm!("mov {t}, cr4", "or {t}, {set}", "mov cr4, {t}", t = out(reg) _, set = in(reg) set, options(nostack));
+    }
+}
+
+/// CR4.SMAP is on: the kernel reaches user memory only with RFLAGS.AC set.
+static SMAP: AtomicBool = AtomicBool::new(false);
+
+/// Run `f`, which touches user memory: with SMAP, that takes AC, which the
+/// kernel has set nowhere else.
+#[inline(always)]
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    let smap = SMAP.load(Ordering::Relaxed);
+    if smap {
+        // SAFETY: user memory reachable until the `clac`. Not `nomem`: the
+        // asm orders f's accesses after it (and before the `clac`).
+        unsafe { asm!("stac", options(nostack)) };
+    }
+    let r = f();
+    if smap {
+        // SAFETY: as above.
+        unsafe { asm!("clac", options(nostack)) };
+    }
+    r
 }
 
 /// This CPU's GDT, TSS, IDT and `syscall` MSRs.
@@ -772,6 +955,10 @@ fn init_cpu(cpu: usize) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1 | (1 << 11)); // SCE, NXE
     wrmsr(MSR_STAR, KERNEL_CS << 32 | (0x18 | 3) << 48);
     wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+    // `syscall` from compatibility mode (AMD's; Intel's is #UD), which the
+    // GDT leaves no way into: should there ever be one, the same entry,
+    // not a jump to 0 in kernel mode on the program's stack.
+    wrmsr(MSR_CSTAR, syscall_entry as *const () as u64);
     // As Linux masks them: TF, IF, DF, IOPL, NT, RF, AC and ID. NT
     // especially, which user code may set (popf) and which would make the
     // kernel's own iretq fault.

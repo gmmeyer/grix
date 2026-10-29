@@ -1051,7 +1051,11 @@ common_entry:
     jz 1f
     swapgs
 1:  SAVE_REGS $-1
-    cld
+    // The kernel's flags, none of the program's: DF clear, and AC, which
+    // would let the kernel reach user memory past SMAP. (syscall_entry's
+    // are SFMASK's.) IF stays clear.
+    pushq $2
+    popfq
     movq %rsp, %rdi
     call trap_entry
     // fall through

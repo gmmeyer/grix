@@ -114,7 +114,10 @@ pub struct Image<'a> {
 /// it there), [`SNAPSHOT_RESTORED`] in each run restored from it, with 32
 /// bytes of fresh entropy in x1..x4 and the nanoseconds since the snapshot
 /// in x5, [`SNAPSHOT_RETRY`] if input arrived meanwhile (call again when
-/// next idle), or PSCI's NOT_SUPPORTED (-1) when the VMM can't.
+/// next idle), or PSCI's NOT_SUPPORTED (-1) when the VMM can't. On x86_64
+/// it's an `out` to [`crate::machine::x86_64::VMM_PORT`], and the
+/// registers are rax, rdi, rsi, rdx, rcx and r8; a VMM that can't leaves
+/// rax as it was.
 pub const SNAPSHOT_CALL: u64 = 0xc300_0001;
 pub const SNAPSHOT_TAKEN: u64 = 0;
 pub const SNAPSHOT_RESTORED: u64 = 1;

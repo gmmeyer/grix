@@ -85,6 +85,7 @@ pub fn lock() {
     while SERVING.load(Ordering::Acquire) != ticket {
         core::hint::spin_loop();
     }
+    arch::tlb_sync();
     let me = me();
     let cpu = CPUS.lock()[me];
     let mut guard = PROCESS.lock();
@@ -196,8 +197,16 @@ pub fn running_since(tid: u32) -> Option<u64> {
     CPUS.lock().iter().enumerate().find(|(i, c)| *i != me && c.tid == Some(tid)).map(|(_, c)| c.slice_start)
 }
 
-fn online() -> usize {
+/// How many CPUs are up.
+pub fn online() -> usize {
     ONLINE.load(Ordering::Relaxed) as usize
+}
+
+/// Is CPU `cpu` in the kernel, or waiting for it (with interrupts off)?
+/// For x86_64's TLB flushes (arm64's are broadcast).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub fn in_kernel(cpu: usize) -> bool {
+    IN_KERNEL[cpu % N].load(Ordering::SeqCst)
 }
 
 /// Is no other CPU running threads of process `pid`?
@@ -369,7 +378,7 @@ pub fn start(cpus: u32) {
 /// and its timer, then run threads as they come.
 /// `frame` is the top of its stack, above the Rust code's.
 #[unsafe(no_mangle)]
-extern "C" fn secondary_main(frame: *mut TrapFrame) -> ! {
+pub extern "C" fn secondary_main(frame: *mut TrapFrame) -> ! {
     let me = me();
     irq::init_cpu(me);
     arch::allow_user_counter();

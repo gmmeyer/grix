@@ -16,9 +16,11 @@ use super::uart::{inb, outb};
 use crate::mm::KERNEL_OFFSET;
 use crate::time;
 
-/// The APIC timer's vector, and the kick IPI's (`smp::kick`).
+/// The APIC timer's vector, the kick IPI's (`smp::kick`), and the TLB
+/// flush IPI's (`flush_tlb`), which never reaches `ack`.
 pub const TIMER_INTID: u32 = 0xec;
 pub const KICK_INTID: u32 = 0xed;
+pub const FLUSH_INTID: u32 = 0xee;
 const SPURIOUS: u32 = 0xff;
 /// Device GSI `g` interrupts on vector `DEVICE_VECTOR + g` (`ack` gives `g`).
 const DEVICE_VECTOR: u32 = 0x30;
@@ -98,12 +100,33 @@ pub fn enable_device_irq(gsi: u32) {
     ioapic(0x10 + 2 * gsi, (DEVICE_VECTOR + gsi) | 1 << 15);
 }
 
-/// Send the kick IPI to CPU `cpu` (APIC ID `cpu`).
-pub fn send_sgi(cpu: u32) {
+/// An IPI to the CPU with APIC ID `cpu`: the ICR's low word (vector,
+/// delivery mode, level), once the last one has gone.
+fn ipi(cpu: u32, low: u32) {
     write(0x310, cpu << 24);
-    write(0x300, KICK_INTID | 1 << 14);
+    write(0x300, low);
     while read(0x300) & (1 << 12) != 0 {
         core::hint::spin_loop();
+    }
+}
+
+/// Send the kick IPI to CPU `cpu` (APIC ID `cpu`).
+pub fn send_sgi(cpu: u32) {
+    send_ipi(cpu, KICK_INTID);
+}
+
+/// Send fixed-delivery vector `vector` to CPU `cpu`.
+pub fn send_ipi(cpu: u32, vector: u32) {
+    ipi(cpu, vector | 1 << 14);
+}
+
+/// Start CPU `cpu` in real mode at physical `vector << 12`: INIT, then the
+/// startup IPI twice, as the MP specification has it (its waits are for
+/// real hardware: KVM's and QEMU's APICs need none).
+pub fn start_ap(cpu: u32, vector: u8) {
+    ipi(cpu, 0x500 | 1 << 14);
+    for _ in 0..2 {
+        ipi(cpu, 0x600 | 1 << 14 | vector as u32);
     }
 }
 

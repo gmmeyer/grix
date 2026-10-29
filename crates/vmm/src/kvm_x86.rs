@@ -5,6 +5,9 @@
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+pub use crate::kick::{Kick, handle_kicks};
 
 const KVMIO: u64 = 0xae;
 
@@ -38,6 +41,26 @@ const KVM_GET_SREGS: u64 = ior(0x83, 312);
 const KVM_SET_SREGS: u64 = iow(0x84, 312);
 const KVM_SET_CPUID2: u64 = iow(0x90, 8);
 const KVM_GET_TSC_KHZ: u64 = io(0xa3);
+// A snapshot's state (`snapshot_kvm_x86.rs`).
+const KVM_CHECK_EXTENSION: u64 = io(0x03);
+const KVM_GET_IRQCHIP: u64 = iowr(0x62, 520);
+const KVM_SET_IRQCHIP: u64 = ior(0x63, 520);
+const KVM_GET_MSRS: u64 = iowr(0x88, 8);
+const KVM_SET_MSRS: u64 = iow(0x89, 8);
+const KVM_GET_LAPIC: u64 = ior(0x8e, 1024);
+const KVM_SET_LAPIC: u64 = iow(0x8f, 1024);
+const KVM_GET_MP_STATE: u64 = ior(0x98, 4);
+const KVM_SET_MP_STATE: u64 = iow(0x99, 4);
+const KVM_GET_VCPU_EVENTS: u64 = ior(0x9f, 64);
+const KVM_SET_VCPU_EVENTS: u64 = iow(0xa0, 64);
+const KVM_GET_DEBUGREGS: u64 = ior(0xa1, 128);
+const KVM_SET_DEBUGREGS: u64 = iow(0xa2, 128);
+const KVM_GET_XSAVE: u64 = ior(0xa4, 4096);
+const KVM_SET_XSAVE: u64 = iow(0xa5, 4096);
+const KVM_GET_XCRS: u64 = ior(0xa6, 392);
+const KVM_SET_XCRS: u64 = iow(0xa7, 392);
+const KVM_GET_XSAVE2: u64 = ior(0xcf, 4096);
+const KVM_CAP_XSAVE2: u64 = 208;
 
 const EXIT_IO: u32 = 2;
 const EXIT_MMIO: u32 = 6;
@@ -69,9 +92,12 @@ fn ioctl(fd: RawFd, req: u64, arg: u64) -> Result<i32, Error> {
     Ok(r)
 }
 
+/// kvm_cpuid_entry2's flags: the leaf has subleaves (`index`).
+const KVM_CPUID_FLAG_SIGNIFCANT_INDEX: u32 = 1;
+
 /// struct kvm_cpuid_entry2.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CpuidEntry {
     function: u32,
     index: u32,
@@ -133,10 +159,51 @@ pub struct Vm {
     vm: OwnedFd,
 }
 
+/// A piece of a vCPU's state, as the ioctl that gets it (and the one that
+/// sets it) has it: plain bytes, which a snapshot keeps.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Part {
+    Regs,
+    Sregs,
+    Xcrs,
+    Lapic,
+    Events,
+    Debugregs,
+}
+
+impl Part {
+    /// Its size, and the get and set requests.
+    fn ioctl(self) -> (usize, u64, u64) {
+        match self {
+            Part::Regs => (144, KVM_GET_REGS, KVM_SET_REGS),
+            Part::Sregs => (312, KVM_GET_SREGS, KVM_SET_SREGS),
+            Part::Xcrs => (392, KVM_GET_XCRS, KVM_SET_XCRS),
+            Part::Lapic => (1024, KVM_GET_LAPIC, KVM_SET_LAPIC),
+            Part::Events => (64, KVM_GET_VCPU_EVENTS, KVM_SET_VCPU_EVENTS),
+            Part::Debugregs => (128, KVM_GET_DEBUGREGS, KVM_SET_DEBUGREGS),
+        }
+    }
+
+    pub fn size(self) -> usize {
+        self.ioctl().0
+    }
+}
+
+/// KVM_MP_STATE_*: runnable, waiting for INIT, for a startup IPI, halted,
+/// startup IPI received.
+pub const MP_STATES: [u32; 5] = [0, 1, 2, 3, 4];
+
+/// IA32_TSC: the guest's counter.
+pub const MSR_TSC: u32 = 0x10;
+
 /// A vCPU and its shared `kvm_run` page, for the thread that runs it.
 pub struct Cpu {
     fd: OwnedFd,
     run: *mut u8,
+    run_size: usize,
+    /// Where the last port I/O exit's data is in the run page, and its
+    /// length (every unit of a string instruction's).
+    io: (usize, usize),
 }
 
 // SAFETY: the kvm_run page belongs to the vCPU's fd, which moves with it;
@@ -191,8 +258,8 @@ impl Vm {
             if run == libc::MAP_FAILED {
                 return Err(Error(format!("mapping kvm_run: {}", std::io::Error::last_os_error())));
             }
-            let cpu = Cpu { fd, run: run.cast() };
-            cpu.set_cpuid(&supported, n)?;
+            let cpu = Cpu { fd, run: run.cast(), run_size, io: (0, 0) };
+            cpu.set_cpuid(&supported, n, cpus.max(1))?;
             vcpus.push(cpu);
         }
         vcpus[0].enter_pvh(entry)?;
@@ -203,6 +270,43 @@ impl Vm {
     pub fn irq_fd(&self) -> RawFd {
         self.vm.as_raw_fd()
     }
+
+    /// The size of a vCPU's XSAVE area as KVM_GET_XSAVE2 gives it (4096
+    /// unless the guest may use bigger state, AMX's), or KVM_GET_XSAVE's.
+    pub fn xsave_size(&self) -> usize {
+        match ioctl(self.vm.as_raw_fd(), KVM_CHECK_EXTENSION, KVM_CAP_XSAVE2) {
+            Ok(n) if n as usize > 4096 => n as usize,
+            _ => 4096,
+        }
+    }
+
+    /// In-kernel interrupt controller `chip` (0, 1: the 8259s; 2: the
+    /// IOAPIC): struct kvm_irqchip.
+    pub fn irqchip(&self, chip: u32) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; 520];
+        buf[..4].copy_from_slice(&chip.to_le_bytes());
+        ioctl(self.vm.as_raw_fd(), KVM_GET_IRQCHIP, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    /// Put one back: its own chip id, in it.
+    pub fn set_irqchip(&self, saved: &[u8]) -> Result<(), Error> {
+        if saved.len() != 520 {
+            return Err(Error("an interrupt controller's state isn't 520 bytes".into()));
+        }
+        ioctl(self.vm.as_raw_fd(), KVM_SET_IRQCHIP, saved.as_ptr() as u64).map(|_| ())
+    }
+}
+
+/// struct kvm_msrs with its entries (index, reserved, data), as u64s.
+fn msr_buf(entries: impl Iterator<Item = (u32, u64)>) -> Vec<u64> {
+    let mut buf = vec![0u64];
+    for (index, value) in entries {
+        buf.push(index as u64);
+        buf.push(value);
+    }
+    buf[0] = (buf.len() as u64 - 1) / 2; // nmsrs, and padding
+    buf
 }
 
 /// Drive IOAPIC pin (GSI) `gsi` on VM `vm` (any thread).
@@ -215,12 +319,13 @@ pub fn set_irq(vm: RawFd, gsi: u32, level: bool) {
 
 /// What a run stopped for.
 pub enum Exit {
-    /// Port I/O: an `out` of `data` (`len` bytes), or an `in` to fill.
+    /// Port I/O of `len`-byte units: one, or every one of a string
+    /// instruction's (`rep outsb` and the like), written out or to be
+    /// filled in, in `Cpu::io_data`.
     Io {
         port: u16,
         len: u32,
         write: bool,
-        data: u32,
     },
     /// A load (`write` false: fill `data`) or store at `addr`.
     Mmio {
@@ -236,34 +341,122 @@ pub enum Exit {
     Other(u32),
 }
 
-impl Cpu {
-    /// The CPUID KVM can give, with this vCPU's APIC ID, and the hypervisor
-    /// timing leaf (VMware's, which KVM-based VMMs fill in too): the TSC's
-    /// rate, which the kernel would otherwise measure.
-    fn set_cpuid(&self, supported: &Cpuid, n: u32) -> Result<(), Error> {
-        let tsc_khz = ioctl(self.fd.as_raw_fd(), KVM_GET_TSC_KHZ, 0)? as u32;
-        let mut c = Box::new(Cpuid { nent: 0, padding: 0, entries: [CpuidEntry::default(); 256] });
-        let mut have_timing = false;
-        for e in &supported.entries[..(supported.nent as usize).min(255)] {
-            let mut e = *e;
-            match e.function {
-                1 => e.ebx = (e.ebx & 0x00ff_ffff) | n << 24,
-                0xb | 0x1f => e.edx = n,
-                0x4000_0000 => e.eax = e.eax.max(0x4000_0010),
-                0x4000_0010 => {
-                    (e.eax, e.ebx) = (tsc_khz, 1_000_000);
-                    have_timing = true;
+/// What the guest's CPUID says its caches are, whatever the host's: L1
+/// data and instruction caches of 32 KiB, 8 ways, a 1 MiB L2 of 16 and a
+/// 16 MiB L3 of 16, 64-byte lines. As (type, level, ways, sets): leaf 4's
+/// (and AMD's 0x8000001d's) encoding.
+const CACHES: [(u32, u32, u32, u32); 4] = [(1, 1, 8, 64), (2, 1, 8, 64), (3, 2, 16, 1024), (3, 3, 16, 16384)];
+
+/// The guest's brand string (CPUID 0x80000002..4), as /proc/cpuinfo's.
+const BRAND: &[u8; 48] = b"grix virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+/// The CPUID vCPU `n` of `cpus` sees: what KVM can give (`supported`),
+/// less what describes the host rather than the CPU's features, so a
+/// program can't tell one host from another of the same model, or that
+/// it's KVM. Vendor, family, model and stepping and the feature flags
+/// stay, as MIDR does on arm64: software needs them to run right. The
+/// brand string, cache and topology leaves are made up; the physical
+/// address width is 36 bits (every x86_64 CPU's least; RAM and the
+/// devices are below 4 GiB); and the only hypervisor leaves are the
+/// timing leaf (VMware's, which KVM-based VMMs fill in too: the TSC's
+/// rate, `tsc_khz`, which the kernel would otherwise measure) and the
+/// one that says it's there, with no vendor.
+fn guest_cpuid(supported: &[CpuidEntry], n: u32, cpus: u32, tsc_khz: u32) -> Vec<CpuidEntry> {
+    let cpus = cpus.max(1);
+    let leaf = |function, index| CpuidEntry { function, index, ..CpuidEntry::default() };
+    let max_ext = supported.iter().find(|e| e.function == 0x8000_0000).map_or(0, |e| e.eax);
+    // "AuthenticAMD", in EBX, EDX and ECX.
+    let amd =
+        supported.iter().any(|e| e.function == 0 && [e.ebx, e.edx, e.ecx] == [0x6874_7541, 0x6974_6e65, 0x444d_4163]);
+    // Leaf 4's and 0x8000001d's: a cache per subleaf, then an empty one.
+    // The L3 is every CPU's; the rest each one's own.
+    let caches = |function: u32| {
+        let mut v: Vec<CpuidEntry> = CACHES
+            .iter()
+            .enumerate()
+            .map(|(i, &(ty, level, ways, sets))| {
+                let sharing = if level == 3 { cpus - 1 } else { 0 };
+                let cores = if function == 4 { (cpus - 1) << 26 } else { 0 };
+                CpuidEntry {
+                    eax: ty | level << 5 | 1 << 8 | sharing << 14 | cores,
+                    ebx: (ways - 1) << 22 | 63,
+                    ecx: sets - 1,
+                    flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    ..leaf(function, i as u32)
                 }
-                _ => {}
+            })
+            .collect();
+        v.push(CpuidEntry { flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX, ..leaf(function, CACHES.len() as u32) });
+        v
+    };
+    let mut out = Vec::new();
+    for e in supported {
+        let mut e = *e;
+        match e.function {
+            // The APIC ID, and how many logical processors there are; no
+            // brand index.
+            1 => e.ebx = (e.ebx & 0x0000_ff00) | n << 24 | (cpus & 0xff) << 16,
+            // Leaf 2's descriptors (Intel's): none, see leaf 4.
+            2 if !amd => (e.eax, e.ebx, e.ecx, e.edx) = (0xff01, 0, 0, 0),
+            // The serial number.
+            3 => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0, 0),
+            4 | 0x8000_001d if e.index == 0 => {
+                // An AMD CPU has no leaf 4, nor an Intel one 0x8000001d.
+                if e.eax & 0x1f != 0 {
+                    out.extend(caches(e.function));
+                }
+                continue;
             }
-            c.entries[c.nent as usize] = e;
-            c.nent += 1;
+            4 | 0x8000_001d => continue,
+            // No topology (EBX 0): software goes by leaf 1 and the APIC ID.
+            0xb | 0x1f => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, e.index & 0xff, n),
+            // KVM's own leaves.
+            0x4000_0000..=0x4fff_ffff => continue,
+            0x8000_0002..=0x8000_0004 => continue,
+            // The caches leaf 4 has, as each vendor encodes them here (AMD's
+            // L1, its L2 and L3; Intel's L2 only, with no lines per tag);
+            // no TLBs.
+            0x8000_0005 if amd => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0x2008_0140, 0x2008_0140),
+            0x8000_0006 if amd => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0x0400_8140, 0x0080_8140),
+            0x8000_0005 => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0, 0),
+            0x8000_0006 => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0x0400_8040, 0),
+            // 36 bits physical, 48 virtual; AMD's core count, without the
+            // host's APIC ID size.
+            0x8000_0008 => {
+                e.eax = 36 | 48 << 8;
+                if amd {
+                    e.ecx = (e.ecx & !0xf0ff) | ((cpus - 1) & 0xff);
+                }
+            }
+            // AMD's topology: the extended APIC ID, and a core of its own.
+            0x8000_001e => (e.eax, e.ebx, e.ecx, e.edx) = (n, n & 0xff, 0, 0),
+            _ => {}
         }
-        if !have_timing {
-            c.entries[c.nent as usize] =
-                CpuidEntry { function: 0x4000_0010, eax: tsc_khz, ebx: 1_000_000, ..CpuidEntry::default() };
-            c.nent += 1;
+        out.push(e);
+    }
+    if max_ext >= 0x8000_0004 {
+        for (i, w) in BRAND.as_chunks::<16>().0.iter().enumerate() {
+            let [eax, ebx, ecx, edx] =
+                core::array::from_fn(|k| u32::from_le_bytes(w[4 * k..4 * k + 4].try_into().unwrap()));
+            out.push(CpuidEntry { eax, ebx, ecx, edx, ..leaf(0x8000_0002 + i as u32, 0) });
         }
+    }
+    out.push(CpuidEntry { eax: 0x4000_0010, ..leaf(0x4000_0000, 0) });
+    out.push(CpuidEntry { eax: tsc_khz, ebx: 1_000_000, ..leaf(0x4000_0010, 0) });
+    out
+}
+
+impl Cpu {
+    /// The CPUID the guest sees (`guest_cpuid`).
+    fn set_cpuid(&self, supported: &Cpuid, n: u32, cpus: u32) -> Result<(), Error> {
+        let tsc_khz = ioctl(self.fd.as_raw_fd(), KVM_GET_TSC_KHZ, 0)? as u32;
+        let entries = guest_cpuid(&supported.entries[..(supported.nent as usize).min(256)], n, cpus, tsc_khz);
+        let mut c = Box::new(Cpuid { nent: 0, padding: 0, entries: [CpuidEntry::default(); 256] });
+        if entries.len() > c.entries.len() {
+            return Err(Error(format!("{} CPUID entries is more than {}", entries.len(), c.entries.len())));
+        }
+        c.entries[..entries.len()].copy_from_slice(&entries);
+        c.nent = entries.len() as u32;
         ioctl(self.fd.as_raw_fd(), KVM_SET_CPUID2, &*c as *const Cpuid as u64).map(|_| ())
     }
 
@@ -304,12 +497,100 @@ impl Cpu {
         ioctl(self.fd.as_raw_fd(), KVM_SET_REGS, regs.as_ptr() as u64).map(|_| ())
     }
 
+    /// A piece of its state.
+    pub fn get(&self, part: Part) -> Result<Vec<u8>, Error> {
+        let (size, get, _) = part.ioctl();
+        let mut buf = vec![0u8; size];
+        ioctl(self.fd.as_raw_fd(), get, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    /// Put a piece back, as `get` gave it.
+    pub fn set(&self, part: Part, saved: &[u8]) -> Result<(), Error> {
+        let (size, _, set) = part.ioctl();
+        if saved.len() != size {
+            return Err(Error(format!("{part:?} isn't {size} bytes")));
+        }
+        ioctl(self.fd.as_raw_fd(), set, saved.as_ptr() as u64).map(|_| ())
+    }
+
+    /// Its XSAVE area (`size`: `Vm::xsave_size`).
+    pub fn xsave(&self, size: usize) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; size.max(4096)];
+        let req = if size > 4096 { KVM_GET_XSAVE2 } else { KVM_GET_XSAVE };
+        ioctl(self.fd.as_raw_fd(), req, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    pub fn set_xsave(&self, saved: &[u8], size: usize) -> Result<(), Error> {
+        if saved.len() != size.max(4096) {
+            return Err(Error("the XSAVE area isn't this KVM's size".into()));
+        }
+        ioctl(self.fd.as_raw_fd(), KVM_SET_XSAVE, saved.as_ptr() as u64).map(|_| ())
+    }
+
+    pub fn mp_state(&self) -> Result<u32, Error> {
+        let mut state = 0u32;
+        ioctl(self.fd.as_raw_fd(), KVM_GET_MP_STATE, &mut state as *mut u32 as u64)?;
+        Ok(state)
+    }
+
+    pub fn set_mp_state(&self, state: u32) -> Result<(), Error> {
+        ioctl(self.fd.as_raw_fd(), KVM_SET_MP_STATE, &state as *const u32 as u64).map(|_| ())
+    }
+
+    /// MSRs `which`: (index, value) for each, in order; an error if KVM
+    /// doesn't have one.
+    pub fn msrs(&self, which: &[u32]) -> Result<Vec<(u32, u64)>, Error> {
+        let mut buf = msr_buf(which.iter().map(|&i| (i, 0)));
+        let n = ioctl(self.fd.as_raw_fd(), KVM_GET_MSRS, buf.as_mut_ptr() as u64)? as usize;
+        if n != which.len() {
+            return Err(Error(format!("MSR {:#x} can't be read", which[n.min(which.len() - 1)])));
+        }
+        Ok(buf[1..].chunks(2).map(|e| (e[0] as u32, e[1])).collect())
+    }
+
+    pub fn set_msrs(&self, msrs: &[(u32, u64)]) -> Result<(), Error> {
+        let buf = msr_buf(msrs.iter().copied());
+        let n = ioctl(self.fd.as_raw_fd(), KVM_SET_MSRS, buf.as_ptr() as u64)? as usize;
+        if n != msrs.len() {
+            return Err(Error(format!("MSR {:#x} can't be set", msrs[n.min(msrs.len() - 1)].0)));
+        }
+        Ok(())
+    }
+
+    /// Finish what the last exit left (a port's `in` value, ...): the
+    /// state isn't consistent until KVM_RUN has seen it. With
+    /// `immediate_exit` set, KVM does that and runs nothing.
+    pub fn complete(&mut self) -> Result<(), Error> {
+        self.immediate_exit().store(1, Ordering::SeqCst);
+        match self.run()? {
+            Exit::Interrupted => Ok(()),
+            _ => Err(Error("KVM_RUN with immediate_exit ran the guest".into())),
+        }
+    }
+
+    fn immediate_exit(&self) -> &AtomicU8 {
+        // SAFETY: kvm_run's immediate_exit, a byte at 1, in a page mapped
+        // for as long as the process lives.
+        unsafe { &*(self.run.add(1) as *const AtomicU8) }
+    }
+
+    /// What makes this vCPU's thread leave KVM_RUN, for other threads.
+    pub fn kick(&self) -> Kick {
+        // SAFETY: the run page is never unmapped.
+        unsafe { Kick::new(self.immediate_exit()) }
+    }
+
     pub fn run(&mut self) -> Result<Exit, Error> {
         // SAFETY: KVM_RUN takes no argument; the run page is ours.
         let r = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_RUN as _, 0) };
         if r < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
+            // EAGAIN: a CPU that waited for its startup IPI (Linux's
+            // KVM_MP_STATE_UNINITIALIZED) has it, and runs from the next
+            // KVM_RUN, as QEMU takes it.
+            if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(libc::EAGAIN) {
                 return Ok(Exit::Interrupted);
             }
             return Err(Error(format!("KVM_RUN: {e}")));
@@ -321,17 +602,15 @@ impl Cpu {
                 EXIT_IO => {
                     // struct { u8 direction; u8 size; u16 port; u32 count; u64 data_offset; }
                     let write = self.run.add(32).read_volatile() == 1;
-                    let len = (self.run.add(33).read_volatile() as u32).min(4);
+                    let len = (self.run.add(33).read_volatile() as u32).clamp(1, 4);
                     let port = (self.run.add(34) as *const u16).read_volatile();
                     let count = (self.run.add(36) as *const u32).read_volatile();
                     let at = (self.run.add(40) as *const u64).read_volatile() as usize;
-                    // String I/O (rep outsb, ...): only its first unit.
-                    let _ = count;
-                    let mut data = [0u8; 4];
-                    if write {
-                        std::ptr::copy_nonoverlapping(self.run.add(at), data.as_mut_ptr(), len as usize);
-                    }
-                    Exit::Io { port, len, write, data: u32::from_le_bytes(data) }
+                    // Every unit KVM put in the page (a string instruction's
+                    // take up to a page), and never past its end.
+                    let room = self.run_size.saturating_sub(at) / len as usize;
+                    self.io = (at, (count as usize).min(room) * len as usize);
+                    Exit::Io { port, len, write }
                 }
                 EXIT_MMIO => {
                     let addr = (self.run.add(32) as *const u64).read_volatile();
@@ -348,14 +627,13 @@ impl Cpu {
         }
     }
 
-    /// The value an `in` that exited gets, when the run resumes.
-    pub fn complete_in(&mut self, value: u32, len: u32) {
-        // SAFETY: kvm_run's io.data_offset says where, within the run page.
-        unsafe {
-            let at = (self.run.add(40) as *const u64).read_volatile() as usize;
-            let bytes = value.to_le_bytes();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.run.add(at), len.min(4) as usize);
-        }
+    /// The last port I/O exit's data: what an `out` wrote, or the room for
+    /// what an `in` reads, which the guest gets when the run resumes.
+    pub fn io_data(&mut self) -> &mut [u8] {
+        let (at, len) = self.io;
+        // SAFETY: inside the run page (`run` bounds it), which is ours
+        // between runs.
+        unsafe { std::slice::from_raw_parts_mut(self.run.add(at), len) }
     }
 
     /// The value a load that exited gets, when the run resumes.
@@ -371,10 +649,19 @@ impl Cpu {
 /// threads make on what's already open, and of ioctls only running a vCPU
 /// and driving an interrupt line; anything else fails with EPERM. The x32
 /// ABI's calls (another table of numbers on the same entry) kill the
-/// process.
-pub fn confine() -> Result<(), String> {
+/// process. A run that may take a snapshot may also read the machine's
+/// state, kick its own threads and write the file; one being restored may
+/// also put the state back, until a second filter (`restoring` false)
+/// takes that away again.
+pub fn confine(snapshot: bool, restoring: bool) -> Result<(), String> {
     // x86_64 system call numbers.
     const IOCTL: u32 = 16;
+    const TGKILL: u32 = 234;
+    const SNAPSHOT_ALLOWED: &[u32] = &[
+        18, // pwrite64
+        77, // ftruncate
+    ];
+    const SECCOMP: u32 = 317;
     const ALLOWED: &[u32] = &[
         0,   // read
         1,   // write
@@ -417,7 +704,43 @@ pub fn confine() -> Result<(), String> {
     const RET_ERRNO: u32 = 0x0005_0000;
     let stmt = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
     let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
-    let ioctls = [KVM_RUN as u32, KVM_IRQ_LINE as u32];
+    let mut ioctls = vec![KVM_RUN, KVM_IRQ_LINE];
+    let mut allowed = ALLOWED.to_vec();
+    if snapshot {
+        ioctls.extend([
+            KVM_GET_REGS,
+            KVM_SET_REGS,
+            KVM_GET_SREGS,
+            KVM_GET_XSAVE,
+            KVM_GET_XSAVE2,
+            KVM_GET_XCRS,
+            KVM_GET_MSRS,
+            KVM_GET_LAPIC,
+            KVM_GET_MP_STATE,
+            KVM_GET_VCPU_EVENTS,
+            KVM_GET_DEBUGREGS,
+            KVM_GET_IRQCHIP,
+        ]);
+        allowed.extend(SNAPSHOT_ALLOWED);
+    }
+    if restoring {
+        ioctls.extend([
+            KVM_SET_REGS,
+            KVM_SET_SREGS,
+            KVM_SET_XSAVE,
+            KVM_SET_XCRS,
+            KVM_SET_MSRS,
+            KVM_SET_LAPIC,
+            KVM_SET_MP_STATE,
+            KVM_SET_VCPU_EVENTS,
+            KVM_SET_DEBUGREGS,
+            KVM_SET_IRQCHIP,
+        ]);
+        allowed.push(SECCOMP);
+    }
+    let mut ioctls: Vec<u32> = ioctls.into_iter().map(|r| r as u32).collect();
+    ioctls.sort_unstable();
+    ioctls.dedup();
     let mut prog = vec![
         stmt(LD_W_ABS, 4), // seccomp_data.arch
         jump(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
@@ -434,18 +757,34 @@ pub fn confine() -> Result<(), String> {
     }
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
     prog.push(stmt(RET_K, RET_ALLOW));
-    // Everything else, by number (the accumulator still holds it).
-    for (i, &nr) in ALLOWED.iter().enumerate() {
-        let rest = (ALLOWED.len() - i - 1) as u8;
+    // Not ioctl (the accumulator still holds the number). tgkill, for a
+    // snapshot's kicks: only to our own threads (args[0], the process).
+    if snapshot {
+        // SAFETY: getpid has no arguments.
+        let pid = unsafe { libc::getpid() } as u32;
+        prog.extend([
+            jump(JEQ_K, TGKILL, 0, 4),
+            stmt(LD_W_ABS, 16),
+            jump(JEQ_K, pid, 1, 0),
+            stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
+            stmt(RET_K, RET_ALLOW),
+        ]);
+    }
+    // Everything else, by number.
+    for (i, &nr) in allowed.iter().enumerate() {
+        let rest = (allowed.len() - i - 1) as u8;
         prog.push(jump(JEQ_K, nr, rest + 1, 0));
     }
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
     prog.push(stmt(RET_K, RET_ALLOW));
     let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_mut_ptr() };
+    // A second filter (after a restore): no_new_privs is on already, and
+    // prctl isn't allowed.
+    static CONFINED: AtomicBool = AtomicBool::new(false);
     // SAFETY: prctl and seccomp with a filter that outlives the calls (the
     // kernel copies it). TSYNC applies it to the threads already running.
     unsafe {
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        if !CONFINED.swap(true, Ordering::SeqCst) && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
         }
         const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;
@@ -461,4 +800,121 @@ pub fn confine() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(function: u32, index: u32, [eax, ebx, ecx, edx]: [u32; 4]) -> CpuidEntry {
+        CpuidEntry { function, index, eax, ebx, ecx, edx, ..CpuidEntry::default() }
+    }
+
+    fn get(v: &[CpuidEntry], function: u32, index: u32) -> Option<[u32; 4]> {
+        v.iter().find(|x| x.function == function && x.index == index).map(|x| [x.eax, x.ebx, x.ecx, x.edx])
+    }
+
+    fn words(s: &[u8]) -> [u32; 4] {
+        let mut b = [0u8; 16];
+        b[..s.len().min(16)].copy_from_slice(&s[..s.len().min(16)]);
+        core::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
+    }
+
+    /// An Intel host as KVM describes it: `brand`, its caches (L3 of
+    /// `l3_sets`), `cores`, `phys` address bits.
+    fn intel(brand: &[u8], l3_sets: u32, cores: u32, phys: u32) -> Vec<CpuidEntry> {
+        let mut v = vec![
+            e(0, 0, [0x1f, 0x756e_6547, 0x6c65_746e, 0x4965_6e69]), // GenuineIntel
+            e(1, 0, [0x0006_06a6, 0x0040_0800 | (cores * 2) << 16 | 0x17 << 24 | 0x01, 0xfeda_3223, 0x1f8b_fbff]),
+            e(2, 0, [0x00fe_ff01, 0xf0, 0, 0]),
+        ];
+        let l = (cores - 1) << 26;
+        v.extend([
+            e(4, 0, [0x121 | l, 0x02c0_003f, 63, 0]),
+            e(4, 1, [0x122 | l, 0x01c0_003f, 63, 0]),
+            e(4, 2, [0x143 | 1 << 14 | l, 0x04c0_003f, 1023, 0]),
+            e(4, 3, [0x163 | (cores * 2 - 1) << 14 | l, 0x02c0_003f, l3_sets - 1, 4]),
+            e(4, 4, [0, 0, 0, 0]),
+            e(0xb, 0, [1, 2, 0x100, 0x17]),
+            e(0xb, 1, [6, cores * 2, 0x201, 0x17]),
+            e(0x4000_0000, 0, [0x4000_0001, 0x4b4d_564b, 0x564b_4d56, 0x4d]), // KVMKVMKVM
+            e(0x4000_0001, 0, [0x0100_7afb, 0, 0, 0]),
+            e(0x8000_0000, 0, [0x8000_0008, 0, 0, 0]),
+            e(0x8000_0001, 0, [0, 0, 0x121, 0x2c10_0800]),
+            e(0x8000_0002, 0, words(brand)),
+            e(0x8000_0003, 0, words(brand.get(16..).unwrap_or(&[]))),
+            e(0x8000_0004, 0, words(brand.get(32..).unwrap_or(&[]))),
+            e(0x8000_0006, 0, [0, 0, 0x0500_7040, 0]),
+            e(0x8000_0008, 0, [0x3000 | phys, 0x0100_d000, 0, 0]),
+        ]);
+        v
+    }
+
+    #[test]
+    fn the_guest_cant_tell_hosts_of_a_model_apart() {
+        let a = guest_cpuid(&intel(b"Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz", 49152, 32, 46), 0, 2, 2_900_000);
+        let b = guest_cpuid(&intel(b"Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz", 32768, 16, 52), 0, 2, 2_900_000);
+        assert_eq!(a, b);
+        let brand: Vec<u8> =
+            (0x8000_0002..=0x8000_0004).flat_map(|f| get(&a, f, 0).unwrap()).flat_map(u32::to_le_bytes).collect();
+        assert_eq!(&brand[..], &BRAND[..]);
+        // No KVM signature, only the timing leaf.
+        assert_eq!(get(&a, 0x4000_0000, 0), Some([0x4000_0010, 0, 0, 0]));
+        assert_eq!(get(&a, 0x4000_0001, 0), None);
+        assert_eq!(get(&a, 0x4000_0010, 0), Some([2_900_000, 1_000_000, 0, 0]));
+        assert_eq!(get(&a, 0x8000_0008, 0).unwrap()[0], 36 | 48 << 8);
+        // The features, family and model are the CPU's.
+        let host = intel(b"x", 49152, 32, 46);
+        let [eax, ebx, ecx, edx] = get(&a, 1, 0).unwrap();
+        let h = get(&host, 1, 0).unwrap();
+        assert_eq!((eax, ecx, edx), (h[0], h[2], h[3]));
+        assert_eq!(ebx, 0x0002_0800);
+        assert_eq!(get(&a, 0x8000_0001, 0), get(&host, 0x8000_0001, 0));
+        // No topology, and leaf 2 says to look at leaf 4.
+        assert_eq!(get(&a, 0xb, 1), Some([0, 0, 1, 0]));
+        assert_eq!(get(&a, 2, 0), Some([0xff01, 0, 0, 0]));
+    }
+
+    #[test]
+    fn caches_are_made_up() {
+        let v = guest_cpuid(&intel(b"x", 49152, 32, 46), 3, 4, 1);
+        let size = |[eax, ebx, ecx, _]: [u32; 4]| {
+            (
+                eax & 0x1f,
+                (eax >> 5) & 7,
+                ((ebx >> 22) + 1) * ((ebx >> 12 & 0x3ff) + 1) * ((ebx & 0xfff) + 1) * (ecx + 1),
+            )
+        };
+        let caches: Vec<_> = (0..4).map(|i| size(get(&v, 4, i).unwrap())).collect();
+        assert_eq!(caches, [(1, 1, 32 << 10), (2, 1, 32 << 10), (3, 2, 1 << 20), (3, 3, 16 << 20)]);
+        assert_eq!(get(&v, 4, 4), Some([0, 0, 0, 0]));
+        assert_eq!(get(&v, 4, 5), None);
+        // Four cores, the L3 shared by all of them.
+        assert_eq!(get(&v, 4, 0).unwrap()[0] >> 26, 3);
+        assert_eq!(get(&v, 4, 3).unwrap()[0] >> 14 & 0xfff, 3);
+        // This vCPU's APIC ID.
+        assert_eq!(get(&v, 1, 0).unwrap()[1] >> 24, 3);
+        assert_eq!(get(&v, 0xb, 0).unwrap()[3], 3);
+    }
+
+    #[test]
+    fn amd_caches_and_topology() {
+        let mut host = vec![
+            e(0, 0, [0x10, 0x6874_7541, 0x444d_4163, 0x6974_6e65]), // AuthenticAMD
+            e(1, 0, [0x00a0_0f11, 0x0420_0800, 0x7ef8_3203, 0x178b_fbff]),
+            e(0x8000_0000, 0, [0x8000_0021, 0, 0, 0]),
+            e(0x8000_0005, 0, [0xff40_ff40, 0xff40_ff40, 0x2008_0140, 0x2008_0140]),
+            e(0x8000_0006, 0, [0x5c00_2200, 0x6c00_4200, 0x0200_6140, 0x0100_9140]),
+            e(0x8000_0008, 0, [0x3030, 0x0100_d000, 0x0000_703f, 0]),
+            e(0x8000_001e, 0, [5, 0x0102, 0x0300, 0]),
+        ];
+        host.extend((0..4).map(|i| e(0x8000_001d, i, [0x121 + i, 0x01c0_003f, 63, 0])));
+        host.push(e(0x8000_001d, 4, [0, 0, 0, 0]));
+        let v = guest_cpuid(&host, 1, 2, 1);
+        assert_eq!(get(&v, 0x8000_0006, 0), Some([0, 0, 0x0400_8140, 0x0080_8140]));
+        assert_eq!(get(&v, 0x8000_0008, 0).unwrap()[2], 1);
+        assert_eq!(get(&v, 0x8000_001e, 0), Some([1, 1, 0, 0]));
+        assert_eq!(get(&v, 0x8000_001d, 3).unwrap()[0], 0x163 | 1 << 14);
+        assert_eq!(get(&v, 4, 0), None);
+    }
 }

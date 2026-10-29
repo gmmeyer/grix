@@ -185,11 +185,12 @@ class GrixExample extends HTMLElement {
     this.$('.command').value = this.getAttribute('command') ?? '';
     for (const cap of caps) {
       const label = document.createElement('label');
-      label.innerHTML = `<input type="checkbox"> ${cap}`;
-      label.title = `Grant the ${cap} capability`;
-      const box = label.querySelector('input');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
       box.value = cap;
       box.checked = allow.has(cap);
+      label.append(box, ` ${cap}`);
+      label.title = `Grant the ${cap} capability`;
       this.$('.caps').append(label);
     }
     if (this.hasAttribute('stdin')) {

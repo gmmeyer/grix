@@ -650,8 +650,7 @@ fn python_from_live_mounts() {
 #[test]
 fn python_from_a_snapshot() {
     let b = sandbox("python").cpus(1);
-    // Not on x86_64 yet.
-    if b.vmm_path().is_none() || grix::Arch::from_env() == grix::Arch::X86_64 {
+    if b.vmm_path().is_none() {
         return; // Only grix-vmm can (the guest tests check QEMU says so).
     }
     let dir = std::env::temp_dir().join(format!("grix-pysnap-{}", std::process::id()));

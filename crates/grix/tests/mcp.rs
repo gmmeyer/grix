@@ -196,9 +196,7 @@ fn a_writable_server_builds_images_and_writes_mounts() {
             "output": dir.join("sh.snap"),
         }),
     );
-    if x86_64_guest() {
-        assert!(text(&r).contains("snapshots of x86_64 machines"), "{}", text(&r));
-    } else if grix::Sandbox::builder().vmm_path().is_some() {
+    if grix::Sandbox::builder().vmm_path().is_some() {
         assert_eq!(r["isError"], false, "{r}");
         for who in ["agent", "again"] {
             let r = server.tool("run", json!({"snapshot": dir.join("sh.snap"), "stdin": format!("{who}\n")}));
