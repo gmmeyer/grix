@@ -1832,6 +1832,19 @@ fn system_v_shared_memory() {
 }
 
 #[test]
+fn mkdir_of_an_existing_name_without_fs_write() {
+    let out = run(with("popular"), &["/bin/popular", "mkdirexist"]);
+    assert_eq!(out.stdout_str(), "mkdirexist ok\n");
+    assert_eq!(
+        out.events,
+        [
+            GuestEvent::MissingPath { path: "/nope/x".into() },
+            GuestEvent::Denied { syscall: "mkdirat".into(), capability: "fs_write".into(), detail: "/tmp/new".into() }
+        ]
+    );
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

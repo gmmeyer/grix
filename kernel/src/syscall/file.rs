@@ -1426,6 +1426,13 @@ fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
 pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, dirfd, &path)?;
+    // A name that exists is EEXIST before a read-only filesystem is EROFS,
+    // as on Linux: `mkdir -p` (busybox's tries "/" too) and makedirs
+    // stop there without fs_write.
+    if matches!(name.as_str(), "" | "." | "..") || fs::lock().child_of(dir, &name).is_some() {
+        return Err(EEXIST);
+    }
+    need_write(p, nr::mkdirat, &path)?;
     let perm = mode as u32 & 0o1777 & !p.umask();
     fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
 }

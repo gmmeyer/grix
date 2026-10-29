@@ -60,7 +60,7 @@ syscalls! {
     29 ioctl Core;
     32 flock Core;
     33 mknodat Cap(FsWrite);
-    34 mkdirat Cap(FsWrite);
+    34 mkdirat Core; // fs_write, unless the name exists: see file.rs
     35 unlinkat Cap(FsWrite);
     36 symlinkat Cap(FsWrite);
     37 linkat Cap(FsWrite);
@@ -352,7 +352,7 @@ syscalls! {
     80 chdir Core;
     81 fchdir Core;
     82 rename Cap(FsWrite);
-    83 mkdir Cap(FsWrite);
+    83 mkdir Core; // as mkdirat
     84 rmdir Cap(FsWrite);
     85 creat Core;
     86 link Cap(FsWrite);
@@ -489,7 +489,7 @@ syscalls! {
     254 inotify_add_watch Core;
     255 inotify_rm_watch Core;
     257 openat Core;
-    258 mkdirat Cap(FsWrite);
+    258 mkdirat Core; // fs_write, unless the name exists: see file.rs
     259 mknodat Cap(FsWrite);
     260 fchownat Cap(FsWrite);
     261 futimesat Cap(FsWrite);

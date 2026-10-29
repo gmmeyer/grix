@@ -473,6 +473,20 @@ static int sysvshm(void) {
     return 0;
 }
 
+// Without fs_write the filesystem is read-only, and on Linux a name that
+// exists is EEXIST before that's EROFS: `mkdir -p` (busybox's tries "/"
+// too) and Python's makedirs stop at existing directories.
+static int mkdirexist(void) {
+    CHECK(mkdir("/", 0755) == -1 && errno == EEXIST);
+    CHECK(mkdir("/tmp", 0755) == -1 && errno == EEXIST);
+    CHECK(mkdir("/tmp/.", 0755) == -1 && errno == EEXIST);
+    CHECK(mkdir("/proc/self/exe", 0755) == -1 && errno == EEXIST);
+    CHECK(mkdir("/nope/x", 0755) == -1 && errno == ENOENT);
+    // Something new still needs fs_write.
+    CHECK(mkdir("/tmp/new", 0755) == -1 && errno == EPERM);
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -534,6 +548,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "sendfile") == 0) r = sendfile_out();
         if (strcmp(argv[i], "rwv2") == 0) r = rwv2();
         if (strcmp(argv[i], "sysvshm") == 0) r = sysvshm();
+        if (strcmp(argv[i], "mkdirexist") == 0) r = mkdirexist();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
