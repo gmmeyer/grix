@@ -399,7 +399,12 @@ pub fn confine() -> Result<(), String> {
         228, // clock_gettime
         230, // clock_nanosleep
         231, // exit_group
+        273, // set_robust_list
         318, // getrandom
+        // A new thread's own: glibc registers it as the thread starts (which
+        // may be after the filter is on, for threads made just before), and
+        // gives up if refused.
+        334, // rseq
     ];
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const X32_SYSCALL_BIT: u32 = 0x4000_0000;
