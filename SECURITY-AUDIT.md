@@ -576,6 +576,43 @@ does not make the mistake.
 
 ## Verified clean (this pass; recorded so it isn't re-derived)
 
+- **The network with no `net` (live battery, both architectures:
+  `fixtures/src/netescape.c`, driven by
+  `crates/grix/tests/guest.rs::network_escape_attempts_are_contained`).**
+  Socket creation is the single gate and it holds: every AF_INET/AF_INET6
+  socket (stream, dgram, raw) and an AF_INET socketpair come back EPERM
+  with a `Denied` event naming `net` — without a socket, no connect,
+  sendto or resolve can egress. AF_PACKET/AX25/APPLETALK return
+  EAFNOSUPPORT (unimplemented — capability-neutral, still contained).
+  AF_UNIX is ungated by design (local IPC: a socketpair round-trips; a
+  path connect gets ENOENT, since nothing of the host's filesystem is in
+  the sandbox). The resolver answers `localhost` from the synthetic
+  /etc/hosts (127.0.0.1 and ::1, no socket needed) and fails for any
+  other name (its query would need a socket). A NETLINK_ROUTE socket
+  works ungated but is entirely synthetic: a link dump shows only `lo`,
+  and the interface ioctls answer for `lo` only (SIOCGIFCONF is
+  unimplemented). Nothing egresses.
+- **The host proxy re-checks everything a hostile kernel might forge**
+  (per I1, the image brings its own kernel): `Proxy::connect`,
+  `udp_allow` and `lookup` each check `policy.enabled` first and refuse
+  (EPERM / verdict refused / SERVFAIL, each reporting a `Denied` event)
+  without `net` — the guest kernel is not the only check
+  (`crates/grix/src/net.rs`). With `net`: 10.0.2.2 (the host's
+  loopback) is reachable only by a rule naming `host.grix.internal` or
+  `10.0.2.2` (NetPolicy::check); DNS over TCP to 10.0.2.3 is refused;
+  the guest's own address never goes to the host; names resolve only
+  under a matching name rule (`may_resolve` — a DNS query name is not an
+  exfil channel unless the operator allowed the name), so the
+  "datagram to port 53 goes to the resolver" path
+  (`kernel/src/syscall/net.rs::udp_send`) is policy-gated at the host
+  end. Forwarded ports are operator-configured. (Granted-path behaviour
+  is pinned by `networking_through_the_host`.)
+- Design notes confirmed: in-guest loopback (127.0.0.1, ::1, 10.0.2.15)
+  connections never leave the guest — they are socket pairs queued on
+  the listener — but they do need `net`, since socket creation is gated;
+  netlink is ungated but synthetic. A stuck fixture (my own first draft:
+  a netlink dump that never saw its DONE) was killed by the deadlock
+  watchdog, which worked as designed.
 - x86_64 entry: `swapgs` symmetric on entry/exit, GS never settable by user
   code (`ARCH_SET_GS` unimplemented, `ARCH_SET_FS` gated by `valid_tls`),
   per-CPU kernel rsp only through `syscall`'s `%gs:0`. IDT: every vector

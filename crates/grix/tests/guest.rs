@@ -2278,6 +2278,39 @@ fn escape_attempts_are_contained() {
     assert!(matches!(esc(&["/bin/escape", "gates", "iret"]).status, ExitStatus::Signaled(11)));
 }
 
+/// Escape attempts to the network with no `net` capability (either
+/// architecture): every socket family is denied or unimplemented, local
+/// IPC still works, the resolver answers only the synthetic hosts file,
+/// netlink shows only `lo`, and nothing egresses. The granted side (what
+/// the policy lets through, and the special addresses it guards) is
+/// `networking_through_the_host` below.
+#[test]
+fn network_escape_attempts_are_contained() {
+    let out = run(with("netescape"), &["/bin/netescape", "without"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.stderr_str());
+    assert_eq!(
+        out.stdout_str(),
+        concat!(
+            "localhost is 127.0.0.1 ::1\n",
+            "netlink interfaces: lo\n",
+            "netescape without ok\n",
+        )
+    );
+    // Every denial names `net` (socket creation is the one gate: without a
+    // socket, no connect, sendto or resolve can egress).
+    assert_eq!(out.missing_capabilities(), ["net"]);
+    let denied: Vec<(&str, &str)> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            GuestEvent::Denied { syscall, capability, .. } => Some((syscall.as_str(), capability.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(denied.len(), 2, "{denied:?}");
+    assert!(denied.iter().all(|(_, cap)| *cap == "net"), "{denied:?}");
+}
+
 /// More CPUs: programs see them, threads run in parallel on them, and
 /// execve and exit work while other threads spin on other CPUs.
 #[test]
