@@ -2220,6 +2220,64 @@ fn user_registers_stay_out_of_the_kernel() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// Escape attempts through the kernel's return-to-user path (x86_64): a
+/// system call with a stack pointer in the kernel's half or beyond the
+/// canonical range, a forged signal frame (rt_sigreturn) with a kernel-half
+/// or non-canonical rip or rsp or privileged rflags (IOPL, NT, VM), a 32-bit
+/// compatibility mode entered by a far return through the GDT's unused
+/// 32-bit code segment, and the IDT's gates (int3 is a trap for the program;
+/// anything else a program raises must fault to it, not be taken as a system
+/// call or device vector). Each must end in a clean errno or a signal
+/// delivered to the program — the kernel never faults on one, so no run
+/// ever ends in a panic (ExitStatus::KernelPanic), and no privileged
+/// register state is ever loaded.
+#[test]
+fn escape_attempts_are_contained() {
+    if !x86_64_guest() {
+        return;
+    }
+    let esc = |args: &[&str]| run(with("escape"), args);
+    // A system call with a bad stack pointer: the kernel returns to it
+    // without using it (it's the program's own), and a program that then
+    // does use it faults in the program.
+    assert_eq!(esc(&["/bin/escape", "rsp"]).status, ExitStatus::Exited(0));
+    assert_eq!(esc(&["/bin/escape", "rsp-kernel"]).status, ExitStatus::Exited(0));
+    assert!(matches!(esc(&["/bin/escape", "rsp-use"]).status, ExitStatus::Signaled(11)));
+    // 32-bit compatibility mode through the GDT: what the CPU allows of it
+    // faults to the program, not in the kernel.
+    assert!(matches!(esc(&["/bin/escape", "compat"]).status, ExitStatus::Signaled(11)));
+    // A forged signal frame: rip in the kernel's half is refused (the
+    // thread dies by the kernel's SIGSEGV, as Linux forces), and what it
+    // restores — rsp of the program's choosing, rflags with IOPL or NT or
+    // VM — never reaches the registers the kernel returns through, and
+    // never faults in the kernel (an rsp it can't load is refused too).
+    assert!(matches!(esc(&["/bin/escape", "sigreturn-rip"]).status, ExitStatus::Signaled(11)));
+    assert!(matches!(esc(&["/bin/escape", "sigreturn-rsp"]).status, ExitStatus::Signaled(11)));
+    assert!(matches!(esc(&["/bin/escape", "sigreturn-rsp2"]).status, ExitStatus::Signaled(11)));
+    let out = esc(&["/bin/escape", "sigreturn-rflags"]);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(out.stdout_str(), "sigreturn-rflags: kill() = 0, rflags = 0x202 (IOPL 0)\n");
+    // The kernel's half is not mappable, by hint or by MAP_FIXED, and
+    // neither is what wraps past the top of user addresses. (The hint's
+    // address the kernel picks varies; it just has to stay below the top.)
+    let out = esc(&["/bin/escape", "mmap"]);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let stdout = out.stdout_str().to_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{}", out.stdout_str());
+    assert!(lines[0].ends_with("Invalid argument"), "{}", lines[0]);
+    let hint = lines[1].rsplit("0x").next().unwrap();
+    assert!(u64::from_str_radix(hint, 16).unwrap() < 0x7fff_ffff_ffff, "{}", lines[1]);
+    assert!(lines[2].ends_with("Invalid argument"), "{}", lines[2]);
+    assert!(lines[3].ends_with("Out of memory"), "{}", lines[3]);
+    // The IDT: int3 (DPL 3) is delivered; int $0x80, a device vector and
+    // iretq fault to the program instead of reaching the kernel as one.
+    assert!(matches!(esc(&["/bin/escape", "gates", "int3"]).status, ExitStatus::Signaled(5)));
+    assert!(matches!(esc(&["/bin/escape", "gates", "int80"]).status, ExitStatus::Signaled(11)));
+    assert!(matches!(esc(&["/bin/escape", "gates", "intdev"]).status, ExitStatus::Signaled(11)));
+    assert!(matches!(esc(&["/bin/escape", "gates", "iret"]).status, ExitStatus::Signaled(11)));
+}
+
 /// More CPUs: programs see them, threads run in parallel on them, and
 /// execve and exit work while other threads spin on other CPUs.
 #[test]

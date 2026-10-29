@@ -455,3 +455,163 @@ the commit above:
 3. **M1** — `.mode(0o600)` + private socket dir (one-liner plus).
 4. **M2** — `MMAP_MIN_ADDR` check in the hint branch (one line).
 5. Then the mediums and lows in the order listed.
+
+---
+
+# 2026-10-29: adversarial re-audit — escape battery against the sandbox
+
+Point-in-time, like the October 2026 audit above (which was against 0.0.7):
+this one covers everything that landed after it — the x86_64 kernel
+(0.0.10), grix-vmm on x86 KVM (0.0.11), the web page (0.0.14) and
+setfsuid/setfsgid (0.0.15). The method was adversarial: attack programs
+(`fixtures/src/escape.c`, driven by
+`crates/grix/tests/guest.rs::escape_attempts_are_contained`) run against the
+real kernel in a real VM, plus line-by-line review of the new surfaces.
+Threat model as above: the guest (kernel *and* program, per I1) is hostile,
+and the question is what it can reach outside the sandbox.
+
+## Index
+
+| # | Severity | Component | Issue | Where | Status |
+|---|----------|-----------|-------|-------|--------|
+| R1 | Medium | kernel (x86_64) | `iretq` loads an unvalidated `rsp`: a system call or `rt_sigreturn` with a non-canonical stack faults #SS **in the kernel** → panic, whole sandbox gone | `kernel/src/arch/x86_64/mod.rs` (`sanitize`), `sigframe.rs` (`sigreturn`); also `clone`'s unbounded `stack` | fixed |
+| R2 | Medium | web | stdin credit (`u64`) truncated through `usize` on wasm32: a full counter reads 0, wedging the page's main thread in a 4-byte-header loop to OOM | `crates/web/src/lib.rs` (`input`) | fixed |
+| R3 | Low | VMM (x86) | string port I/O (`rep ins/outs`) fills/forwards only the first unit; the rest read stale `kvm_run` bytes | `crates/vmm/src/kvm_x86.rs` (`Exit::Io` handling) | open |
+| R4 | Low | VMM (x86) | CPUID passthrough hands the sandboxed agent the host's brand string, topology and physical-address width (fingerprinting), and the KVM signature | `crates/vmm/src/kvm_x86.rs` (`set_cpuid`) | open |
+| R5 | Low | VMM (KVM snapshots) | hostile snapshot state is restored before `kvm::confine()` (the L11 fix covered only HVF) | `crates/vmm/src/vm.rs` | open |
+| R6 | Low | web | `smoke.html` takes capabilities, extra QEMU argv and paths from the URL; `grix-example.js` builds one label with `innerHTML`; `serve.mjs` prefix path check and an uncaught `decodeURIComponent` | `web/smoke.html`, `web/grix-example.js`, `web/serve.mjs` | open |
+| R7 | hardening | web | image modes keep setuid/setgid/sticky bits (`0o7777`), unlike the 0.0.12 OCI fix | `crates/web/src/lib.rs` | open (inert) |
+| R8 | hardening | kernel (x86_64) | no SMEP/SMAP: the uaccess/`ensure` discipline is the only thing between a future kernel bug and user code at CPL0 | `kernel/src/arch/x86_64/mod.rs` (`init_cpu`) | open |
+| R9 | info | kernel (x86_64) | 32-bit compatibility mode is reachable by a far return through the GDT's "never used" 32-bit code segment; observed #GP → SIGSEGV in user mode | `kernel/src/arch/x86_64/mod.rs` (GDT) | by design |
+
+## R1. `iretq` loads the frame's `rsp` unvalidated
+
+**Status:** fixed (this changeset): `sanitize` bounds `rsp` like `rip`
+(fault at 0, in user mode), and `sigreturn` refuses a frame whose `rsp` is
+not a user address.
+
+- **Where:** `kernel/src/arch/x86_64/mod.rs` — `sanitize()` checked `rip`
+  only; every return to user loads `rsp` from the `TrapFrame`
+  (`return_from_trap` → `iretq`). `sigframe.rs` `sigreturn()` restored
+  `rsp` from the forged frame unchecked, and `clone`'s `stack` argument was
+  never bounded (`kernel/src/syscall/thread.rs` — `checked_add` only).
+- **Confirmed** by code reading and by running the attempts live
+  (`escape rsp`, `sigreturn-rsp`, `compat`-adjacent paths). The fault
+  itself could not be reproduced here: this machine has no `/dev/kvm`, and
+  TCG loads a non-canonical `rsp` silently (all attempts came back clean);
+  on KVM or hardware, `iret` with a non-canonical stack raises #SS *at
+  CPL0* (`trap_entry`'s kernel-exception branch → panic). Verify with
+  `make test-kvm` on x86 KVM.
+- **Attack (guest-only):** `movabs $0x8000000000000000, %rsp; syscall`, or
+  patch `uc_mcontext.gregs[REG_RSP]` in a delivered signal frame and return
+  through the sigpage trampoline; or `clone(CLONE_SETTLS|..., stack =
+  0x8000000000000000)` for the first return of the new thread.
+- **Impact:** the whole sandbox dies (the run reports `KernelPanic`);
+  availability, not a leak — an agent kills its own box, and everything
+  the host kept is discarded. It violates the kernel's own rule: panic
+  only on kernel bugs, never on bad user input. arm64 is structurally safe
+  (`eret` never reloads sp from the frame; a bogus sp faults on use, in
+  user mode).
+
+## R2. stdin credit truncates on wasm32
+
+**Status:** fixed (this changeset): the credit is capped to `u32::MAX`
+before it is used as a `usize`.
+
+A hostile guest kernel adds credit (`wire::ToHost::StdinCredit`,
+`u64`) without bound; on wasm32 `self.credit as usize` truncates, so a
+counter ≥ 2³² reads 0 and `input()`'s loop (`while !stdin.is_empty() &&
+credit > 0`) spins appending a 4-byte `Input::Stdin` header each pass,
+on the page's main thread, until the 1.5 GiB wasm heap traps — the
+reader's tab is gone for good. ~600 KB of console traffic suffices. The
+native paths are 64-bit (unaffected), and the crate's own tests run
+native, so nothing saw it. Same shape as the guest's `StdinGate`, which
+does not make the mistake.
+
+## R3–R9 (open)
+
+- **R3** (grix-vmm, x86): a `rep ins`/`rep outs` exit carries a unit
+  count; the handler fills one unit and relies on KVM to copy the rest
+  from stale bytes of the run page (only guest-derived data can be
+  there — verified — so it is a correctness bug, not a host leak, but the
+  UART bytes a panicking kernel sent can drop). Fix direction: loop over
+  `count`, or clamp what is reported.
+- **R4** (grix-vmm, x86): `KVM_SET_CPUID2` passes
+  `KVM_GET_SUPPORTED_CPUID` through with only the APIC-id, topology and
+  hypervisor-timing leaves adjusted — the host's brand string
+  (0x80000002‑4), cache parameters (leaf 4, 0x8000001d), physical-address
+  width (0x80000008) and the `KVMKVMKVM` signature reach the guest, and
+  `/proc/cpuinfo` prints them. Same-hand runs correlate. Mask the
+  identifying leaves if runs should not fingerprint their host (the arm64
+  HVF path passes `MIDR` through — accepted there).
+- **R5** (grix-vmm): the KVM snapshot path applies
+  `restore_cpu`/`restore_gic` before `kvm::confine()`; the L11 fix
+  (`f810523`) moved only the HVF path. All parsing this side is
+  bounds-checked `grix_abi` (the file reaches no Apple/other in-process
+  parser), and the values would go into KVM identically after confinement
+  — ordering only, for symmetry with L11.
+- **R6** (web): `smoke.html` reads `allow`, `qemu`, `bin`, `tar` from the
+  URL (a crafted link makes a reader's tab boot a same-origin file with
+  URL-chosen capabilities and extra QEMU argv — keep it out of `dist/`);
+  `grix-example.js` sets one checkbox label with `innerHTML` (the page's
+  only HTML sink; everything else is `textContent`); `serve.mjs`'s
+  `file.startsWith(root)` without a separator check, and a lone `%`
+  crashes the dev server with an uncaught `URIError`.
+- **R7** (web): the wasm image builder keeps `mode & 0o7777`, setuid bits
+  included — inert (the kernel never honours them and the web path has no
+  host-side exits), but the one place 0.0.12's `04edcf0` masking doesn't
+  reach.
+- **R8** (kernel, x86_64): CR4 comes up without SMEP/SMAP. The boundary is
+  the uaccess/`ensure` discipline (invariant 2), which held everywhere it
+  was tested this pass — but SMEP would mean a future bug that derefs a
+  user *code* pointer in the kernel cannot execute it. Set it when CPUID
+  has it (QEMU's default x86 model may not).
+- **R9** (kernel, x86_64): a far return through GDT slot 0x18 ("never
+  used") puts user mode in 32-bit compatibility mode; registers and every
+  pointer still go through the same uaccess paths (and compat ops
+  zero-extend), the kernel doesn't special-case it, and what was observed
+  faults #GP → SIGSEGV in user mode. If ia32 guests aren't wanted, drop
+  the descriptor (its only other role is `sysret`'s layout, which this
+  kernel never uses).
+
+## Verified clean (this pass; recorded so it isn't re-derived)
+
+- x86_64 entry: `swapgs` symmetric on entry/exit, GS never settable by user
+  code (`ARCH_SET_GS` unimplemented, `ARCH_SET_FS` gated by `valid_tls`),
+  per-CPU kernel rsp only through `syscall`'s `%gs:0`. IDT: every vector
+  DPL 0 but int3 — `int $0x80`, a device vector and `iretq` from CPL 3 all
+  land as #GP → SIGSEGV, never dispatched as a syscall or device
+  interrupt (run live). `syscall`'s SFMASK (TF|IF|DF|IOPL|NT|RF|AC|ID) and
+  `sigreturn`'s `FIX_EFLAGS|USER_RFLAGS` keep privileged rflags out (a
+  forged IOPL 3 / NT / VM frame comes back 0x202 — run live); `cs`/`ss`
+  are forced `USER_CS`/`USER_SS` on every return path, so no forged frame
+  can name a kernel descriptor.
+- mmap/mprotect bounds (run live): `MAP_FIXED` in the kernel's half or
+  past `USER_TOP` → EINVAL; a wrapping range → ENOMEM; a kernel-half hint
+  is ignored (the allocation stays in user addresses).
+- setfsuid/setfsgid: nothing can set the file-system id apart from the
+  effective one (the change is refused as unimplemented), so no
+  permission-check confusion is reachable.
+- grix-vmm x86 KVM (line-by-line, its own pass): the seccomp filter — a
+  26-number allowlist with no open/socket/exec/clone/ptrace, x32 ABI
+  kill, ioctls restricted to `KVM_RUN`/`KVM_IRQ_LINE`, TSYNC over every
+  thread (console threads held back until `Console::go`), no thread can
+  be created after confinement; PIO gated to COM1's 8 ports; every
+  guest-RAM access through `mem.at()` (`checked_sub`, `len ≤ size − off`);
+  `KVM_SET_REGS`/`KVM_SET_SREGS` carry no file-supplied state on x86 (the
+  snapshot path is a refusal); machine layout, PVH entry state and
+  `--mem`/`--cpus` bounds checked.
+- web: guest bytes reach JS only through the Rust `grix_abi` decoders (the
+  L12 `r.done()` fix is in this path); no `eval`/`Function`/`innerHTML`
+  sink touches guest data; QEMU argv never sees image bytes; the wasm
+  module is instantiated with an empty import object; `net` is never
+  granted by the page and `ToHost` socket messages are dropped.
+
+## Verdict
+
+No guest-to-host escape path was found on the production paths. What an
+agent can do is kill its own sandbox (R1, fixed) or wedge a reader's tab
+on the web path (R2, fixed); what remains open is fingerprinting (R4) and
+hardening (R3, R5–R8). The October 2026 audit's standing trust-model notes
+(I1 especially: an image brings its own kernel, and only the operator's
+policy — never the image's — gates the host) were re-checked and hold.

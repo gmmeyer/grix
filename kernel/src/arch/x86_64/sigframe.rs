@@ -172,7 +172,9 @@ pub fn sigreturn(a: &mut AddressSpace, tf: &mut TrapFrame) -> Result<(u64, (u64,
     for (i, r) in regs(&mut new).into_iter().enumerate() {
         *r = get_u64(&b, MC_REGS + i * 8);
     }
-    if new.rip >= USER_END {
+    // iretq loads both from the frame; one it would fault on in the
+    // kernel (a non-canonical address, or the kernel's half) is refused.
+    if new.rip >= USER_END || new.rsp >= USER_END {
         return Err(EINVAL);
     }
     new.rflags = (new.rflags & FIX_EFLAGS) | USER_RFLAGS;
