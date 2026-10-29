@@ -49,7 +49,7 @@ pub(super) const CHUNK: usize = 4096;
 
 fn dir_base(p: &Process, dirfd: u64) -> Result<Ino, Errno> {
     if dirfd as i32 == AT_FDCWD {
-        return Ok(p.cwd);
+        return Ok(p.cwd());
     }
     let f = p.fds.get(dirfd)?;
     let f = f.lock();
@@ -91,7 +91,7 @@ fn parent_in(p: &mut Process, base: Ino, path: &str) -> Result<(Ino, String), Er
 /// A file's node for *at(fd, "", AT_EMPTY_PATH) and f* calls.
 pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     if fd as i32 == AT_FDCWD {
-        return Ok(p.cwd);
+        return Ok(p.cwd());
     }
     match p.fds.get(fd)?.lock().kind {
         FileKind::Node(ino) | FileKind::Dev(_, ino) => Ok(ino),
@@ -124,7 +124,7 @@ fn at_node(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Ino, E
 /// The node an fd refers to, for *at(fd, "", AT_EMPTY_PATH) and fstat.
 fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
     if fd as i32 == AT_FDCWD {
-        return Ok(fs::lock().stat(p.cwd));
+        return Ok(fs::lock().stat(p.cwd()));
     }
     let f = p.fds.get(fd)?;
     let f = f.lock();
@@ -202,7 +202,7 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
     if !p.fds.has_room() {
         return Err(EMFILE); // before creating or truncating anything
     }
-    let perm = mode as u32 & 0o7777 & !p.umask;
+    let perm = mode as u32 & 0o7777 & !p.umask();
     if flags & O_TMPFILE == O_TMPFILE {
         if acc == O_RDONLY {
             return Err(EINVAL);
@@ -396,14 +396,15 @@ pub fn close(p: &mut Process, fd: u64) -> SysResult {
 
 /// A descriptor for `file` is about to close: the process's POSIX record
 /// locks on the file go with it, whichever descriptor they were taken
-/// through (POSIX's rule).
+/// through (POSIX's rule). They're its descriptor table's, so with
+/// CLONE_FILES a close in either process drops them, as on Linux.
 pub(crate) fn closing(p: &Process, file: &crate::fd::FileRef) {
     let f = file.lock();
     // (An O_PATH descriptor doesn't count, as on Linux.)
-    if p.posix_locks && !f.path_only {
+    if !f.path_only && p.fds.posix_locks() {
         let key = f.lock_key();
         drop(f);
-        locks::release(key, locks::Owner::Process(p.pid));
+        locks::release(key, p.fds.lock_owner());
     }
 }
 
@@ -415,9 +416,7 @@ pub fn close_range(p: &mut Process, first: u64, last: u64, flags: u64) -> SysRes
     let last = last.min(p.fds.len() as u64);
     for fd in first..=last {
         if flags & CLOSE_RANGE_CLOEXEC != 0 {
-            if let Ok(e) = p.fds.entry_mut(fd) {
-                e.cloexec = true;
-            }
+            let _ = p.fds.set_cloexec(fd, true);
         } else {
             if let Ok(file) = p.fds.get(fd) {
                 closing(p, &file);
@@ -1204,12 +1203,13 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
 // ---------------------------------------------------------------- cwd
 
 pub fn getcwd(p: &mut Process, buf: u64, size: u64) -> SysResult {
+    let cwd = p.cwd();
     let mut path = {
         let fs = fs::lock();
-        if fs.node(p.cwd).nlink == 0 {
+        if fs.node(cwd).nlink == 0 {
             return Err(ENOENT); // the working directory was removed
         }
-        fs.path_of(p.cwd)
+        fs.path_of(cwd)
     };
     path.push('\0');
     if (size as usize) < path.len() {
@@ -1230,13 +1230,22 @@ pub fn fchdir(p: &mut Process, fd: u64) -> SysResult {
 }
 
 fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
+    // Every process sharing it (CLONE_FS) has a new /proc/<pid>/cwd.
+    let mut pids = alloc::vec![p.pid];
+    if p.fs.shared() {
+        let procs = crate::procs::PROCS.lock();
+        pids.extend(procs.others.values().filter(|q| !q.dead && q.fs.same(&p.fs)).map(|q| q.pid));
+    }
     let mut fs = fs::lock();
     if !fs.is_dir(ino) {
         return Err(ENOTDIR);
     }
-    (p.cwd, p.cwd_pin) = (ino, Some(fs.pin(ino)));
+    let pin = Some(fs.pin(ino));
+    p.fs.update(|f| (f.cwd, f.cwd_pin) = (ino, pin));
     let path = fs.path_of(ino);
-    fs.proc_set(p.pid, "cwd", &path);
+    for pid in pids {
+        fs.proc_set(pid, "cwd", &path);
+    }
     Ok(0)
 }
 
@@ -1249,7 +1258,7 @@ fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
 pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, dirfd, &path)?;
-    let perm = mode as u32 & 0o1777 & !p.umask;
+    let perm = mode as u32 & 0o1777 & !p.umask();
     fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
 }
 
@@ -1781,7 +1790,7 @@ fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         return Err(EINVAL);
     }
     let (s, e) = (s as u64, e.unwrap_or(u64::MAX));
-    let owner = if ofd { locks::Owner::File(id) } else { locks::Owner::Process(p.pid) };
+    let owner = if ofd { locks::Owner::File(id) } else { p.fds.lock_owner() };
     if matches!(cmd, F_GETLK | F_OFD_GETLK) {
         let Some(want) = write else { return Err(EINVAL) };
         match locks::conflict(key, owner, want, s, e) {
@@ -1807,7 +1816,7 @@ fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             if ofd {
                 file.lock().locked = true;
             } else {
-                p.posix_locks = true;
+                p.fds.set_posix_locks();
             }
             Ok(0)
         }
@@ -1825,24 +1834,28 @@ fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
 
 /// Would waiting for `held` close a circle of processes waiting for each
 /// other's POSIX locks (Linux's posix_locks_deadlock)? Each one waits in
-/// fcntl(F_SETLKW) for a lock someone in the circle holds.
+/// fcntl(F_SETLKW) for a lock someone in the circle holds. Lock owners are
+/// descriptor tables (see `locks`), so a holder is any process using one.
 fn deadlock(p: &mut Process, held: locks::Lock) -> bool {
-    let me = p.pid;
+    let me = p.fds.lock_owner();
     let procs = crate::procs::PROCS.lock();
     let mut holder = held.owner;
     for _ in 0..64 {
-        let locks::Owner::Process(pid) = holder else { return false };
-        if pid == me {
+        if !matches!(holder, locks::Owner::Files(_)) {
+            return false;
+        }
+        if holder == me {
             return true;
         }
-        let Some(q) = procs.others.get(&pid) else { return false };
-        // A thread of it blocked in F_SETLKW, and what it waits for.
-        let waiting = q.threads.values().find_map(|t| {
-            let blocked = t.wait.is_some() && t.regs.syscall_nr() == nr::fcntl as u64 && t.regs.arg(1) == F_SETLKW;
-            blocked.then_some(t.lock_wait).flatten()
+        // A thread blocked in F_SETLKW, and what it waits for.
+        let waiting = procs.others.values().filter(|q| q.fds.lock_owner() == holder).find_map(|q| {
+            q.threads.values().find_map(|t| {
+                let blocked = t.wait.is_some() && t.regs.syscall_nr() == nr::fcntl as u64 && t.regs.arg(1) == F_SETLKW;
+                blocked.then_some(t.lock_wait).flatten()
+            })
         });
         let Some((key, s, e, write)) = waiting else { return false };
-        match locks::conflict(key, locks::Owner::Process(pid), write, s, e) {
+        match locks::conflict(key, holder, write, s, e) {
             Some(next) => holder = next.owner,
             None => return false,
         }
@@ -1866,11 +1879,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             let file = p.fds.get(fd)?;
             p.fds.alloc(FdEntry { file, cloexec: cmd == F_DUPFD_CLOEXEC }, arg as usize)
         }
-        F_GETFD => Ok(p.fds.entry_mut(fd)?.cloexec as u64),
-        F_SETFD => {
-            p.fds.entry_mut(fd)?.cloexec = arg & 1 != 0;
-            Ok(0)
-        }
+        F_GETFD => Ok(p.fds.cloexec(fd)? as u64),
+        F_SETFD => p.fds.set_cloexec(fd, arg & 1 != 0).map(|_| 0),
         F_GETFL => Ok(p.fds.get(fd)?.lock().flags as u64),
         F_SETFL => {
             let file = p.fds.get(fd)?;
@@ -1989,9 +1999,9 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     {
         return super::tty::ioctl(p, fd, tty, master, req, arg);
     }
-    let entry = p.fds.entry_mut(fd)?;
+    let file = p.fds.get(fd)?;
     let socket = matches!(
-        entry.file.lock().kind,
+        file.lock().kind,
         FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_)
     );
     if socket && req == SIOCGIFCONF {
@@ -2014,10 +2024,9 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             None => p.unimplemented(nr::ioctl, "ioctl", &alloc::format!("socket ioctl {req:#x}"), EOPNOTSUPP),
         };
     }
-    let entry = p.fds.entry_mut(fd)?;
     match req {
         FIONREAD => {
-            let avail = match &entry.file.lock().kind {
+            let avail = match &file.lock().kind {
                 FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
                 FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
                 FileKind::Inet(s) => super::net::inet_available(s) as u32,
@@ -2034,10 +2043,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             f.flags = if on { f.flags | O_NONBLOCK } else { f.flags & !O_NONBLOCK };
             Ok(0)
         }
-        FIOCLEX | FIONCLEX => {
-            entry.cloexec = req == FIOCLEX;
-            Ok(0)
-        }
+        FIOCLEX | FIONCLEX => p.fds.set_cloexec(fd, req == FIOCLEX).map(|_| 0),
         // stdio is not a terminal (TCGETS, TIOCGWINSZ, ...).
         _ => Err(ENOTTY),
     }

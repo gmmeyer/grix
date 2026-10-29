@@ -136,7 +136,7 @@ pub fn bind(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResult {
             require(p, nr::bind, Capability::FsWrite, &path)?;
             let base = base_of(p, AT_FDCWD as u64, &path)?;
             let id = unix::node_id();
-            let perm = 0o777 & !p.umask;
+            let perm = 0o777 & !p.umask();
             let mut fs = fs::lock();
             let (dir, leaf) = fs.lookup_parent(base, &path)?;
             match fs.create(dir, &leaf, Kind::Socket(id), perm, p.uid, p.gid) {

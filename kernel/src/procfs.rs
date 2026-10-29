@@ -291,8 +291,9 @@ pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> R
 
 /// Signals ignored and caught, as /proc shows them (bit n-1 for signal n).
 fn dispositions(p: &Process) -> (u64, u64) {
-    let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
-    let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
+    let acts = p.sigactions.get();
+    let ignored: u64 = (1..=64).filter(|&i| acts[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
+    let caught: u64 = (1..=64).filter(|&i| acts[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
     (ignored, caught)
 }
 
@@ -387,7 +388,7 @@ fn shown(p: &Process) -> Shown<'_> {
         sid: p.sid,
         comm: comm(p),
         state: state(p),
-        umask: Some(p.umask),
+        umask: Some(p.umask()),
         uid: p.uid,
         gid: p.gid,
         ids: &p.ids,

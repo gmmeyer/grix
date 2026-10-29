@@ -3,8 +3,10 @@
 //! - flock(2): a shared or exclusive lock on the whole file, held by an
 //!   open file description (so dup and fork share it), gone when that
 //!   closes.
-//! - POSIX record locks (fcntl F_SETLK): byte ranges held by a process,
-//!   gone when it closes any descriptor for the file, or ends.
+//! - POSIX record locks (fcntl F_SETLK): byte ranges held by a process
+//!   (by its descriptor table, as Linux's are by its files_struct, which
+//!   processes made with CLONE_FILES share), gone when it closes any
+//!   descriptor for the file, or the table goes (the process ends).
 //! - Open file description locks (F_OFD_SETLK): byte ranges held by an
 //!   open file description.
 //!
@@ -23,8 +25,8 @@ pub type Key = usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
-    /// POSIX record locks: the process.
-    Process(u32),
+    /// POSIX record locks: the descriptor table (`FdTable::lock_owner`).
+    Files(u64),
     /// flock and OFD locks: the open file description (`OpenFile` address).
     File(usize),
 }

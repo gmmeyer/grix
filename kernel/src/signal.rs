@@ -408,7 +408,7 @@ pub enum Target {
 pub fn send(p: &mut Process, target: Target, info: SigInfo) -> Result<(), Errno> {
     let sig = info.signo;
     let b = bit(sig);
-    let act = p.sigactions[sig as usize];
+    let act = p.action(sig);
     // Continuing and stopping cancel each other's pending signals.
     if sig == SIGCONT {
         resume(p);
@@ -482,7 +482,7 @@ pub fn raise(p: &mut Process, sig: u32, why: &'static str) {
 /// on the way back to EL0 with the faulting pc; if it is blocked or ignored
 /// the program dies, as with Linux's force_sig_fault.
 pub fn fault(p: &mut Process, sig: u32, code: i32, fault: Fault, why: &'static str) {
-    let act = p.sigactions[sig as usize];
+    let act = p.action(sig);
     let t = p.cur();
     if act.handler == SIG_DFL || act.handler == SIG_IGN || t.sigmask & bit(sig) != 0 {
         p.kill(sig, fault.addr, fault.pc, why, true);
@@ -507,7 +507,7 @@ fn die(p: &mut Process, info: &SigInfo) {
 /// (ignored ones are skipped at delivery), in `return_to_user`'s order.
 fn acting_signal(p: &Process, t: &Thread) -> Option<u32> {
     let blocked = t.sigmask;
-    let acts = |sig: &u32| !is_ignored(&p.sigactions[*sig as usize], *sig);
+    let acts = |sig: &u32| !is_ignored(&p.action(*sig), *sig);
     in_order(t.pending.mask & !blocked).find(acts).or_else(|| in_order(p.shared_pending.mask & !blocked).find(acts))
 }
 
@@ -665,7 +665,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         if crate::timer::delivered(p, &mut info) {
             p.timer_dirty = true;
         }
-        let act = p.sigactions[info.signo as usize];
+        let act = p.action(info.signo);
         if is_ignored(&act, info.signo) {
             continue;
         }
@@ -728,7 +728,7 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     }
     t.sigmask = mask & !UNBLOCKABLE;
     if act.flags & SA_RESETHAND != 0 {
-        p.sigactions[sig as usize].handler = SIG_DFL;
+        p.sigactions.update(|a| a[sig as usize].handler = SIG_DFL);
     }
     arch::sigframe::enter_handler(tf, frame, sig, act.handler, restorer, act.flags & SA_SIGINFO != 0);
     Ok(())

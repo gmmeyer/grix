@@ -113,7 +113,7 @@ syscalls! {
     94 exit_group Core;
     95 waitid Cap(Process);
     96 set_tid_address Core;
-    97 unshare Privileged;
+    97 unshare Core; // new namespaces refused in the handler
     98 futex Core;
     99 set_robust_list Core;
     100 get_robust_list Core;
@@ -492,7 +492,7 @@ syscalls! {
     269 faccessat Core;
     270 pselect6 Core;
     271 ppoll Core;
-    272 unshare Privileged;
+    272 unshare Core; // new namespaces refused in the handler
     273 set_robust_list Core;
     274 get_robust_list Core;
     280 utimensat Cap(FsWrite);

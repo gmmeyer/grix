@@ -160,7 +160,17 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Init (the program) ignores signals from other processes it has no handler for, as in a pid namespace.
 - [x] `pidfd_open`/`pidfd_send_signal`/`pidfd_getfd`/`CLONE_PIDFD`/`waitid(P_PIDFD)`
       (newer Python, Go's `os/exec`, systemd), pollable for the process's end.
-- [ ] `CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` without `CLONE_THREAD`, `CLONE_PARENT` (reported).
+- [x] `CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` without `CLONE_THREAD`, `CLONE_PARENT`
+      (by `clone` and `clone3`, with `CLONE_CLEAR_SIGHAND`): a shared descriptor
+      table (owning its POSIX locks, as Linux's files_struct does), working
+      directory and umask, signal actions (with `CLONE_VM`, so only for vfork).
+      `execve` unshares the table and actions; `unshare(2)` the table and
+      working directory (and allows what it allows with nothing to unshare).
+- [ ] `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` (and so `CLONE_SIGHAND`
+      without vfork): a process sharing the caller's memory (reported).
+      `CLONE_INTO_CGROUP` (reported). Threads with their own descriptor table or
+      working directory: `CLONE_THREAD` without `CLONE_FILES`/`CLONE_FS` (they
+      share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more threads (reported).
 - [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
       `/proc/self` is the caller's. Another process's descriptors need its user (or root).
 - [ ] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).

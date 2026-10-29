@@ -7,22 +7,22 @@ use grix_abi::policy::Capability;
 use grix_abi::stats::{Limit, Resource};
 
 use super::thread::{
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_VFORK, CLONE_VM, CloneArgs,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_CLEAR_SIGHAND, CLONE_NAMESPACES, CLONE_NEWTIME, CLONE_PARENT,
+    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM, CloneArgs,
 };
 use super::{require, table};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, O_NONBLOCK, O_RDWR, new_file};
-use crate::process::{self, JobReport, Process, SigAction, Thread, WaitOn};
+use crate::process::{self, JobReport, Process, Share, SigAction, Thread, WaitOn};
 use crate::procs::{MAX_PROCESSES, PROCS};
 use crate::signal::{self, SIG_IGN, SIGCHLD, SigInfo};
 use crate::uaccess::*;
 
 const CLONE_FS: u64 = 0x200;
 const CLONE_FILES: u64 = 0x400;
-const CLONE_SIGHAND: u64 = 0x800;
 const CLONE_PIDFD: u64 = 0x1000;
-const CLONE_PARENT: u64 = 0x8000;
+const CLONE_SYSVSEM: u64 = 0x4_0000;
 
 /// clone without CLONE_THREAD: a new process with a copy-on-write copy of
 /// this one's memory, its files, handlers and working directory, and one
@@ -30,23 +30,23 @@ const CLONE_PARENT: u64 = 0x8000;
 /// or without CLONE_VM) is the same copy, with the parent waiting until the
 /// child execs or exits: what vfork users rely on works on a copy too, as
 /// long as the child only execs or _exits, as POSIX requires.
+///
+/// The descriptor table (CLONE_FILES), working directory and umask
+/// (CLONE_FS) and signal actions (CLONE_SIGHAND, which Linux allows only
+/// with CLONE_VM, so here only for vfork) are shared instead of copied
+/// when asked. With CLONE_PARENT the child is the caller's parent's, and
+/// tells it of its end as the caller would (Linux's copy_process).
 pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResult {
     let (name, _) = table::info(n);
     let flags = args.flags;
     require(p, n, Capability::Process, "")?;
     let vfork = flags & CLONE_VFORK != 0;
+    // Shared handlers imply shared memory (copy_process).
+    if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
+        return Err(EINVAL);
+    }
     if flags & CLONE_VM != 0 && !vfork {
         return p.unimplemented(n, name, "CLONE_VM without CLONE_THREAD or CLONE_VFORK", EINVAL);
-    }
-    for (bit, what) in [
-        (CLONE_FILES, "CLONE_FILES without CLONE_THREAD"),
-        (CLONE_FS, "CLONE_FS without CLONE_THREAD"),
-        (CLONE_SIGHAND, "CLONE_SIGHAND without CLONE_THREAD"),
-        (CLONE_PARENT, "CLONE_PARENT"),
-    ] {
-        if flags & bit != 0 {
-            return p.unimplemented(n, name, what, EINVAL);
-        }
     }
     let exit_signal = (flags & 0xff) as u32;
     if exit_signal > signal::NSIG {
@@ -63,10 +63,22 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         write_u32(&mut p.aspace, args.parent_tid, pid)?;
     }
     let aspace = p.aspace.fork()?;
-    let mut c = p.fork(pid, aspace)?;
-    c.exit_signal = exit_signal;
+    let share =
+        Share { files: flags & CLONE_FILES != 0, fs: flags & CLONE_FS != 0, sighand: flags & CLONE_SIGHAND != 0 };
+    let mut c = p.fork(pid, aspace, share)?;
+    if flags & CLONE_CLEAR_SIGHAND != 0 {
+        // clone3: handled signals start out default in the child (ignored
+        // ones stay ignored), as after an exec.
+        c.sigactions.update(reset_handlers);
+    }
+    if flags & CLONE_PARENT != 0 {
+        c.ppid = p.ppid;
+        c.exit_signal = p.exit_signal;
+    } else {
+        c.exit_signal = exit_signal;
+    }
     // The parent's pidfd for the child, made after the child's copy of the
-    // descriptors (it has none).
+    // descriptors (it has none, unless it shares the table).
     let pidfd = if flags & CLONE_PIDFD != 0 {
         let fd = new_pidfd(p, pid, false)?;
         if let Err(e) = write_u32(&mut p.aspace, args.pidfd, fd as u32) {
@@ -115,10 +127,69 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     drop(procs);
     {
         let mut fs = crate::fs::lock();
-        let cwd = fs.path_of(p.cwd);
+        let cwd = fs.path_of(p.cwd());
         fs.proc_add(pid, owner, &p.exe, &cwd);
     }
     if vfork { p.block(WaitOn::Vfork, None, Ok(pid as u64)) } else { Ok(pid as u64) }
+}
+
+/// Every action but ignoring goes back to the default (Linux's
+/// flush_signal_handlers).
+fn reset_handlers(acts: &mut process::SigActions) {
+    for act in acts.iter_mut() {
+        if act.handler != SIG_IGN {
+            *act = SigAction::default();
+        }
+    }
+}
+
+/// unshare(flags): stop sharing what clone shared. A descriptor table
+/// (CLONE_FILES) and working directory (CLONE_FS) become copies of the
+/// process's own. The rest Linux allows only when there's nothing to
+/// unshare (one thread, signal actions not shared), and does nothing
+/// then; there are no System V semaphores, so no undo list to drop
+/// (CLONE_SYSVSEM). New namespaces are refused, and a thread can't have a
+/// table or directory apart from the other threads (reported).
+pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
+    let namespaces = CLONE_NAMESPACES | CLONE_NEWTIME;
+    let known = CLONE_THREAD | CLONE_FS | CLONE_SIGHAND | CLONE_VM | CLONE_FILES | CLONE_SYSVSEM | namespaces;
+    if flags & !known != 0 {
+        return Err(EINVAL);
+    }
+    // What each implies (ksys_unshare); CLONE_NEWUSER and CLONE_NEWNS
+    // imply more, but are refused anyway.
+    let mut flags = flags;
+    if flags & CLONE_VM != 0 {
+        flags |= CLONE_SIGHAND;
+    }
+    if flags & CLONE_SIGHAND != 0 {
+        flags |= CLONE_THREAD;
+    }
+    // check_unshare_flags.
+    if flags & CLONE_THREAD != 0 && p.threads.len() > 1 {
+        return Err(EINVAL);
+    }
+    if flags & CLONE_SIGHAND != 0 && p.sigactions.shared() {
+        return Err(EINVAL);
+    }
+    let (name, _) = table::info(table::nr::unshare);
+    if flags & namespaces != 0 {
+        let detail = super::thread::namespaces_denied(flags & namespaces);
+        return p.deny(table::nr::unshare, name, "privileged", &detail);
+    }
+    // On Linux that gives the calling thread a table or directory of its
+    // own; here threads share their process's.
+    if flags & (CLONE_FS | CLONE_FILES) != 0 && p.threads.len() > 1 {
+        let what = "CLONE_FILES or CLONE_FS with more threads (one thread's own)";
+        return p.unimplemented(table::nr::unshare, name, what, EINVAL);
+    }
+    if flags & CLONE_FS != 0 {
+        p.fs.unshare();
+    }
+    if flags & CLONE_FILES != 0 {
+        p.fds.unshare();
+    }
+    Ok(0)
 }
 
 /// The most argv + envp may hold (Linux allows a quarter of the stack).
@@ -213,16 +284,18 @@ pub fn execve(
     t.saved_sigmask = None;
     p.current = p.pid;
     p.threads.insert(p.pid, t);
+    // A descriptor table or signal actions shared with another process
+    // (CLONE_FILES, CLONE_SIGHAND) become this one's own first, as Linux's
+    // exec unshares them (unshare_files, de_thread). A working directory
+    // shared by CLONE_FS stays shared.
+    p.fds.unshare();
+    p.sigactions.unshare();
     for file in p.fds.cloexec_files() {
         super::file::closing(p, &file);
     }
     p.fds.close_on_exec();
     // Handlers point into the old program; ignoring a signal survives exec.
-    for act in p.sigactions.iter_mut() {
-        if act.handler != SIG_IGN {
-            *act = SigAction::default();
-        }
-    }
+    p.sigactions.update(reset_handlers);
     // POSIX timers go; setitimer's survives.
     p.timers.posix.clear();
     crate::timer::resync(p);
@@ -486,5 +559,5 @@ pub fn setsid(p: &mut Process) -> SysResult {
 /// Is `sig`'s disposition in `q` the default? Init ignores signals from
 /// other processes it has no handler for, as in a Linux pid namespace.
 pub fn shields_init(q: &Process, sender: u32, sig: u32) -> bool {
-    q.pid == process::INIT && sender != process::INIT && q.sigactions[sig as usize].handler == signal::SIG_DFL
+    q.pid == process::INIT && sender != process::INIT && q.action(sig).handler == signal::SIG_DFL
 }

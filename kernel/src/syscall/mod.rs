@@ -215,6 +215,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         // threads (processes are gated in clone, not implemented yet)
         nr::clone => thread::clone(p, tf, clone_args(a)),
         nr::clone3 => thread::clone3(p, tf, a[0], a[1]),
+        nr::unshare => proc::unshare(p, a[0]),
         nr::exit => thread::exit_thread(p, (a[0] & 0xff) as i32),
         nr::exit_group => {
             p.terminate(crate::process::exited((a[0] & 0xff) as i32));

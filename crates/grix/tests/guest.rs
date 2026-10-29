@@ -1584,6 +1584,54 @@ fn pidfds() {
 }
 
 #[test]
+fn clone_sharing_flags() {
+    // CLONE_FILES, CLONE_FS, CLONE_SIGHAND (with vfork), CLONE_PARENT and
+    // CLONE_CLEAR_SIGHAND, by clone and clone3; unsharing by execve and
+    // unshare(2). Nothing is reported missing.
+    let b = with("cloneflags").allow(Capability::Process).allow(Capability::FsWrite).allow(Capability::Threads);
+    let sb = b.build().unwrap();
+    let out = sb.run(&["/bin/cloneflags"]).unwrap();
+    assert_eq!(out.stdout_str(), "cloneflags ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // What isn't there: a thread with a descriptor table of its own.
+    let out = sb.run(&["/bin/cloneflags", "threads"]).unwrap();
+    assert_eq!(out.stdout_str(), "cloneflags threads ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { syscall, .. }] if syscall == "unshare"),
+        "{:?}",
+        out.events
+    );
+    // New namespaces stay refused, unshare's too though it's no longer
+    // privileged as a whole: EPERM and a denial for each kind.
+    let out = sb.run(&["/bin/cloneflags", "namespaces"]).unwrap();
+    assert_eq!(out.stdout_str(), "cloneflags namespaces ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let denied: std::collections::BTreeSet<(String, String)> = out
+        .events
+        .iter()
+        .map(|e| match e {
+            GuestEvent::Denied { syscall, capability, detail } if capability == "privileged" => {
+                (syscall.clone(), detail.clone())
+            }
+            e => panic!("unexpected event {e:?}"),
+        })
+        .collect();
+    let kinds = ["NEWNS", "NEWUSER", "NEWPID", "NEWNET", "NEWUTS", "NEWIPC", "NEWCGROUP", "NEWTIME"];
+    let mut want = std::collections::BTreeSet::new();
+    for k in kinds {
+        let detail = format!("new namespaces (CLONE_{k})");
+        want.insert(("unshare".to_string(), detail.clone()));
+        if k != "NEWTIME" {
+            want.insert(("clone".to_string(), detail.clone()));
+            want.insert(("clone3".to_string(), detail));
+        }
+    }
+    assert_eq!(denied, want);
+}
+
+#[test]
 fn cpu_time_timers() {
     let b = with("cputimers").allow(Capability::Process).allow(Capability::Threads);
     let out = run(b, &["/bin/cputimers"]);

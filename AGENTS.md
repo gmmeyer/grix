@@ -256,7 +256,19 @@ is `process::current_pid`). A zombie's is generated from what
 makes its `exe`, `cwd` and `root` fail with ENOENT); a pidfd (`FileKind::PidFd`) is just the pid,
 which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
-caller running. Credentials: `Process::uid`/`gid` are the effective ids
+caller running. What clone can share between processes is a handle to
+one value: the descriptor table (`fd::FdTable`, CLONE_FILES), the
+working directory and umask (`Process::fs`, a `process::Shared<FsInfo>`,
+CLONE_FS) and the signal actions (`Process::sigactions`, CLONE_SIGHAND,
+which needs CLONE_VM: vfork only). Fork copies each (`share`/`copy`);
+`execve` unshares the table and the actions (Linux's `unshare_files`,
+`de_thread`), `unshare(2)` the table and fs. POSIX record locks belong
+to the table (`locks::Owner::Files`, as Linux's to the files_struct) and
+go when it does. A zombie keeps none of them (`Remains::of` takes its
+signal dispositions before `finalize` lets them go). CLONE_PARENT makes
+the caller's parent the child's, with the caller's exit signal: that
+parent reaps the zombie, and a vfork caller isn't always the parent
+(`vfork_parent`). New namespaces are denied, by clone and by unshare. Credentials: `Process::uid`/`gid` are the effective ids
 (permission checks, new files); `Process::ids` keeps the real and saved
 ones and supplementary groups, changed by Linux's rules (uid 0 may set
 anything). They only matter inside the guest filesystem: root bypasses

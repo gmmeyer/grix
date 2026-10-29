@@ -12,16 +12,42 @@ use crate::time;
 use crate::uaccess::*;
 
 pub const CLONE_VM: u64 = 0x100;
-const CLONE_SIGHAND: u64 = 0x800;
+pub const CLONE_SIGHAND: u64 = 0x800;
 const CLONE_PIDFD: u64 = 0x1000;
 pub const CLONE_VFORK: u64 = 0x4000;
-const CLONE_THREAD: u64 = 0x10000;
+pub const CLONE_PARENT: u64 = 0x8000;
+pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_SETTLS: u64 = 0x80000;
 pub const CLONE_PARENT_SETTID: u64 = 0x10_0000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
 pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+/// clone3 only: the child's handlers are reset to the default.
+pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+/// clone3 only: the child goes into a cgroup.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// CLONE_NEWNS | NEWCGROUP | NEWUTS | NEWIPC | NEWUSER | NEWPID | NEWNET
-const CLONE_NAMESPACES: u64 = 0x2_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+pub const CLONE_NAMESPACES: u64 =
+    0x2_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000;
+
+/// unshare's (in clone, these bits are the exit signal).
+pub const CLONE_NEWTIME: u64 = 0x80;
+
+/// "new namespaces (CLONE_NEWUSER|...)" for the namespace flags in `flags`,
+/// so each kind is reported.
+pub fn namespaces_denied(flags: u64) -> alloc::string::String {
+    const NAMES: [(u64, &str); 8] = [
+        (0x2_0000, "CLONE_NEWNS"),
+        (0x200_0000, "CLONE_NEWCGROUP"),
+        (0x400_0000, "CLONE_NEWUTS"),
+        (0x800_0000, "CLONE_NEWIPC"),
+        (0x1000_0000, "CLONE_NEWUSER"),
+        (0x2000_0000, "CLONE_NEWPID"),
+        (0x4000_0000, "CLONE_NEWNET"),
+        (CLONE_NEWTIME, "CLONE_NEWTIME"),
+    ];
+    let names: Vec<&str> = NAMES.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, n)| *n).collect();
+    alloc::format!("new namespaces ({})", names.join("|"))
+}
 
 pub struct CloneArgs {
     pub flags: u64,
@@ -35,7 +61,9 @@ pub struct CloneArgs {
 
 /// clone(flags, stack, parent_tid, tls, child_tid) — arm64 argument order.
 pub fn clone(p: &mut Process, tf: &TrapFrame, a: [u64; 6]) -> SysResult {
-    let args = CloneArgs { flags: a[0], stack: a[1], parent_tid: a[2], tls: a[3], child_tid: a[4], pidfd: a[2] };
+    // Only the low 32 bits are flags (clone3 has the rest).
+    let args =
+        CloneArgs { flags: a[0] & 0xffff_ffff, stack: a[1], parent_tid: a[2], tls: a[3], child_tid: a[4], pidfd: a[2] };
     // clone puts both at parent_tid.
     if args.flags & (CLONE_PIDFD | CLONE_PARENT_SETTID) == CLONE_PIDFD | CLONE_PARENT_SETTID {
         return Err(EINVAL);
@@ -52,11 +80,22 @@ pub fn clone3(p: &mut Process, tf: &TrapFrame, uargs: u64, size: u64) -> SysResu
     let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     // struct clone_args: flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls
     let (stack, stack_size) = (w(5), w(6));
-    if w(4) > crate::signal::NSIG as u64 || w(0) & 0xff != 0 {
+    let (flags, exit_signal) = (w(0), w(4));
+    // clone3_args_valid: no unknown flags, no exit signal in the flags,
+    // and none at all for a thread or a sibling (whose exit signal is the
+    // caller's).
+    if exit_signal > crate::signal::NSIG as u64
+        || flags & 0xff != 0
+        || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
+        || (flags & (CLONE_THREAD | CLONE_PARENT) != 0 && exit_signal != 0)
+    {
         return Err(EINVAL);
     }
+    if flags & CLONE_INTO_CGROUP != 0 {
+        return p.unimplemented(nr::clone3, "clone3", "CLONE_INTO_CGROUP", EINVAL);
+    }
     let args = CloneArgs {
-        flags: w(0) | (w(4) & 0xff),
+        flags: flags | exit_signal,
         stack: if stack == 0 { 0 } else { stack.checked_add(stack_size).ok_or(EINVAL)? },
         parent_tid: w(3),
         tls: w(7),
@@ -74,7 +113,14 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return Err(EPERM);
     }
     if flags & CLONE_NAMESPACES != 0 {
-        return p.deny(n, name, "privileged", "new namespaces");
+        return p.deny(n, name, "privileged", &namespaces_denied(flags & CLONE_NAMESPACES));
+    }
+    // Siblings of init would have no parent to reap them (copy_process).
+    if flags & CLONE_PARENT != 0 && p.pid == process::INIT {
+        return Err(EINVAL);
+    }
+    if flags & (CLONE_SIGHAND | CLONE_CLEAR_SIGHAND) == CLONE_SIGHAND | CLONE_CLEAR_SIGHAND {
+        return Err(EINVAL);
     }
     if flags & CLONE_THREAD == 0 {
         return super::proc::fork(p, tf, n, args);

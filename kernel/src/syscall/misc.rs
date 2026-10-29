@@ -87,8 +87,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
         nr::setfsuid | nr::setfsgid => set_fs_id(p, n, name, a[0] as u32),
         nr::umask => {
-            let old = p.umask;
-            p.umask = a[0] as u32 & 0o777;
+            let old = p.fs.update(|f| core::mem::replace(&mut f.umask, a[0] as u32 & 0o777));
             Ok(old as u64)
         }
         nr::prctl => prctl(p, a),

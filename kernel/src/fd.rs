@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::errno::*;
@@ -177,12 +177,32 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
-/// A process's descriptors. Forking copies the table; the open files are
-/// shared, as on Linux.
-#[derive(Clone)]
-pub struct FdTable {
-    slots: Vec<Option<FdEntry>>,
+/// A process's descriptors (Linux's files_struct). Forking copies the
+/// table, sharing the open files, as on Linux; processes made with
+/// CLONE_FILES share the table itself: this is a handle to it (`share`
+/// another, `copy` a table of one's own). Every access is under the big
+/// kernel lock, so the mutex is only ever held for a moment, and never
+/// while an open file is dropped (which may take other locks).
+pub struct FdTable(Arc<Mutex<Slots>>);
+
+struct Slots {
+    /// The owner of the POSIX record locks taken through it: the table,
+    /// not the process, as Linux's fl_owner is the files_struct.
+    id: u64,
+    entries: Vec<Option<FdEntry>>,
+    /// POSIX record locks have been taken through it (they go when it does).
+    posix_locks: bool,
 }
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        if self.posix_locks {
+            crate::locks::release_all(crate::locks::Owner::Files(self.id));
+        }
+    }
+}
+
+static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
     OPEN_FILES.fetch_add(1, Ordering::Relaxed);
@@ -200,56 +220,102 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
 }
 
 impl FdTable {
+    fn new(entries: Vec<Option<FdEntry>>) -> Self {
+        let id = NEXT_TABLE.fetch_add(1, Ordering::Relaxed);
+        FdTable(Arc::new(Mutex::new(Slots { id, entries, posix_locks: false })))
+    }
+
     pub fn with_stdio() -> Self {
-        let mut t = FdTable { slots: Vec::new() };
-        for (kind, flags) in [(FileKind::Stdin, O_RDONLY), (FileKind::Stdout, O_WRONLY), (FileKind::Stderr, O_WRONLY)] {
-            t.slots.push(Some(FdEntry { file: new_file(kind, flags), cloexec: false }));
-        }
-        t
+        let entries = [(FileKind::Stdin, O_RDONLY), (FileKind::Stdout, O_WRONLY), (FileKind::Stderr, O_WRONLY)]
+            .into_iter()
+            .map(|(kind, flags)| Some(FdEntry { file: new_file(kind, flags), cloexec: false }))
+            .collect();
+        Self::new(entries)
     }
 
     /// TTY mode: stdin, stdout and stderr are one open terminal.
     pub fn with_terminal(file: FileRef) -> Self {
-        let slots = (0..3).map(|_| Some(FdEntry { file: file.clone(), cloexec: false })).collect();
-        FdTable { slots }
+        Self::new((0..3).map(|_| Some(FdEntry { file: file.clone(), cloexec: false })).collect())
     }
 
     /// No descriptors at all (a process that has ended).
     pub fn empty() -> Self {
         ipc::changed();
-        FdTable { slots: Vec::new() }
+        Self::new(Vec::new())
+    }
+
+    /// The same table (CLONE_FILES).
+    pub fn share(&self) -> Self {
+        FdTable(self.0.clone())
+    }
+
+    /// A table of its own with the same descriptors (fork, and unsharing).
+    /// It holds no POSIX locks: they stay with this one.
+    pub fn copy(&self) -> Self {
+        Self::new(self.0.lock().entries.clone())
+    }
+
+    /// Other processes use this table too.
+    pub fn shared(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
+    /// Make it a table of this process's own, if it's shared (exec, unshare).
+    pub fn unshare(&mut self) {
+        if self.shared() {
+            *self = self.copy();
+        }
+    }
+
+    /// The owner of POSIX record locks taken through it.
+    pub fn lock_owner(&self) -> crate::locks::Owner {
+        crate::locks::Owner::Files(self.0.lock().id)
+    }
+
+    pub fn posix_locks(&self) -> bool {
+        self.0.lock().posix_locks
+    }
+
+    pub fn set_posix_locks(&mut self) {
+        self.0.lock().posix_locks = true;
     }
 
     /// execve: close what's marked close-on-exec.
     /// What `close_on_exec` will close.
     pub fn cloexec_files(&self) -> Vec<FileRef> {
-        self.slots.iter().flatten().filter(|e| e.cloexec).map(|e| e.file.clone()).collect()
+        self.0.lock().entries.iter().flatten().filter(|e| e.cloexec).map(|e| e.file.clone()).collect()
     }
 
     pub fn close_on_exec(&mut self) {
-        let mut closed = false;
-        for s in self.slots.iter_mut() {
+        let mut closed = Vec::new();
+        for s in self.0.lock().entries.iter_mut() {
             if s.as_ref().is_some_and(|e| e.cloexec) {
-                *s = None;
-                closed = true;
+                closed.extend(s.take());
             }
         }
-        if closed {
+        if !closed.is_empty() {
             ipc::changed();
         }
     }
 
-    fn slot(&self, fd: u64) -> Option<&FdEntry> {
-        self.slots.get(usize::try_from(fd as i32).ok()?)?.as_ref()
+    fn index(fd: u64) -> Result<usize, Errno> {
+        usize::try_from(fd as i32).map_err(|_| EBADF)
     }
 
     pub fn get(&self, fd: u64) -> Result<FileRef, Errno> {
-        Ok(self.slot(fd).ok_or(EBADF)?.file.clone())
+        let i = Self::index(fd)?;
+        Ok(self.0.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.file.clone())
     }
 
-    pub fn entry_mut(&mut self, fd: u64) -> Result<&mut FdEntry, Errno> {
-        let i = usize::try_from(fd as i32).map_err(|_| EBADF)?;
-        self.slots.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)
+    pub fn cloexec(&self, fd: u64) -> Result<bool, Errno> {
+        let i = Self::index(fd)?;
+        Ok(self.0.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.cloexec)
+    }
+
+    pub fn set_cloexec(&mut self, fd: u64, on: bool) -> Result<(), Errno> {
+        let i = Self::index(fd)?;
+        self.0.lock().entries.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)?.cloexec = on;
+        Ok(())
     }
 
     /// Install at the lowest free descriptor >= `min`. Fails with ENFILE
@@ -260,44 +326,46 @@ impl FdTable {
             crate::stats::hit(grix_abi::stats::Limit::OpenFiles);
             return Err(ENFILE);
         }
+        let mut t = self.0.lock();
         let start = min.min(MAX_FDS);
-        let i = (start..MAX_FDS).find(|&i| self.slots.get(i).is_none_or(|s| s.is_none())).ok_or(EMFILE)?;
-        if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
+        let i = (start..MAX_FDS).find(|&i| t.entries.get(i).is_none_or(|s| s.is_none())).ok_or(EMFILE)?;
+        if i >= t.entries.len() {
+            t.entries.resize(i + 1, None);
         }
-        self.slots[i] = Some(entry);
+        t.entries[i] = Some(entry);
         Ok(i as u64)
     }
 
     /// Install at exactly `fd`, replacing whatever was there (dup2/dup3).
     pub fn set(&mut self, fd: u64, entry: FdEntry) -> Result<(), Errno> {
         let i = usize::try_from(fd as i32).ok().filter(|&i| i < MAX_FDS).ok_or(EBADF)?;
-        if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
-        }
-        self.slots[i] = Some(entry);
+        let old = {
+            let mut t = self.0.lock();
+            if i >= t.entries.len() {
+                t.entries.resize(i + 1, None);
+            }
+            t.entries[i].replace(entry)
+        };
+        drop(old);
         ipc::changed();
         Ok(())
     }
 
     pub fn close(&mut self, fd: u64) -> Result<(), Errno> {
-        let i = usize::try_from(fd as i32).map_err(|_| EBADF)?;
-        match self.slots.get_mut(i) {
-            Some(s @ Some(_)) => {
-                *s = None;
-                ipc::changed();
-                Ok(())
-            }
-            _ => Err(EBADF),
-        }
+        let i = Self::index(fd)?;
+        let old = self.0.lock().entries.get_mut(i).and_then(|s| s.take()).ok_or(EBADF)?;
+        drop(old);
+        ipc::changed();
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.0.lock().entries.len()
     }
 
     /// Is there a free descriptor (so open can fail with EMFILE before it creates anything)?
     pub fn has_room(&self) -> bool {
-        self.slots.len() < MAX_FDS || self.slots.iter().any(Option::is_none)
+        let t = self.0.lock();
+        t.entries.len() < MAX_FDS || t.entries.iter().any(Option::is_none)
     }
 }

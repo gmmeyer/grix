@@ -32,7 +32,7 @@ fn job_control(p: &mut Process, tty: &TtyRef, sig: u32) -> Result<(), Errno> {
     if fg == 0 || fg == p.pgid {
         return Ok(());
     }
-    let refused = p.sigactions[sig as usize].handler == SIG_IGN || p.cur().sigmask & signal::bit(sig) != 0;
+    let refused = p.action(sig).handler == SIG_IGN || p.cur().sigmask & signal::bit(sig) != 0;
     if refused {
         return if sig == SIGTTIN { Err(EIO) } else { Ok(()) };
     }

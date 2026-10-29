@@ -156,6 +156,66 @@ impl Thread {
     }
 }
 
+/// What processes made with a clone flag share (CLONE_FS: `FsInfo`,
+/// CLONE_SIGHAND: `SigActions`; descriptors are `FdTable`'s own handle):
+/// a handle to one value. Every access is under the big kernel lock, so
+/// the mutex is only held for a moment.
+pub struct Shared<T>(alloc::sync::Arc<Mutex<T>>);
+
+impl<T: Clone> Shared<T> {
+    pub fn new(v: T) -> Self {
+        Shared(alloc::sync::Arc::new(Mutex::new(v)))
+    }
+
+    /// The same value (the clone flag given).
+    pub fn share(&self) -> Self {
+        Shared(self.0.clone())
+    }
+
+    /// A value of its own, as it is now (fork without the flag).
+    pub fn copy(&self) -> Self {
+        Self::new(self.get())
+    }
+
+    pub fn get(&self) -> T {
+        self.0.lock().clone()
+    }
+
+    pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self.0.lock())
+    }
+
+    /// Other processes use it too.
+    pub fn shared(&self) -> bool {
+        alloc::sync::Arc::strong_count(&self.0) > 1
+    }
+
+    /// Is `other` the same one?
+    pub fn same(&self, other: &Self) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Make it this process's own, if it's shared (exec, unshare).
+    pub fn unshare(&mut self) {
+        if self.shared() {
+            *self = self.copy();
+        }
+    }
+}
+
+/// Linux's fs_struct: the working directory and umask (the root is always
+/// the sandbox's).
+#[derive(Clone)]
+pub struct FsInfo {
+    pub cwd: Ino,
+    /// Keeps the working directory's slot from being reused if it's removed.
+    pub cwd_pin: Option<alloc::sync::Arc<()>>,
+    pub umask: u32,
+}
+
+/// Linux's sighand_struct: each signal's action.
+pub type SigActions = [SigAction; 65];
+
 /// The ids besides the effective ones (`Process::uid`/`gid`, which
 /// permission checks and new files use), as Linux keeps them: real, saved
 /// and supplementary groups. They mean nothing outside the sandbox; uid 0
@@ -194,15 +254,14 @@ pub struct Process {
     pub children_cpu_ns: u64,
     pub aspace: AddressSpace,
     pub fds: FdTable,
-    pub cwd: Ino,
-    /// Keeps the working directory's slot from being reused if it's removed.
-    pub cwd_pin: Option<alloc::sync::Arc<()>>,
+    /// The working directory and umask (`cwd`, `umask`).
+    pub fs: Shared<FsInfo>,
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
     pub ids: Ids,
-    pub umask: u32,
-    pub sigactions: [SigAction; 65],
+    /// Signal actions (`action`, `set_action`).
+    pub sigactions: Shared<SigActions>,
     /// Signals sent to the whole process (kill), taken by any thread that doesn't block them.
     pub shared_pending: SigQueue,
     pub rlimits: [(u64, u64); 16],
@@ -254,9 +313,17 @@ pub struct Process {
     pub job_notice: Option<crate::signal::SigInfo>,
     /// The controlling terminal (the session's, inherited across fork).
     pub ctty: Option<crate::tty::TtyRef>,
-    /// It has taken POSIX record locks (which go when it closes any
-    /// descriptor for the file, or ends).
-    pub posix_locks: bool,
+}
+
+/// What a child made by clone shares with its parent instead of copying.
+#[derive(Clone, Copy, Default)]
+pub struct Share {
+    /// CLONE_FILES: the descriptor table.
+    pub files: bool,
+    /// CLONE_FS: the working directory and umask.
+    pub fs: bool,
+    /// CLONE_SIGHAND: the signal actions.
+    pub sighand: bool,
 }
 
 /// A change a parent's wait can report besides an exit.
@@ -305,14 +372,12 @@ impl Process {
             children_cpu_ns: 0,
             aspace,
             fds: FdTable::with_stdio(),
-            cwd: ROOT,
-            cwd_pin: None,
+            fs: Shared::new(FsInfo { cwd: ROOT, cwd_pin: None, umask: 0o022 }),
             policy,
             uid,
             gid,
             ids: Ids { ruid: uid, suid: uid, rgid: gid, sgid: gid, groups: alloc::vec![gid] },
-            umask: 0o022,
-            sigactions: [SigAction::default(); 65],
+            sigactions: Shared::new([SigAction::default(); 65]),
             shared_pending: SigQueue::default(),
             rlimits,
             name: [0; 16],
@@ -338,15 +403,15 @@ impl Process {
             job_report: None,
             job_notice: None,
             ctty: None,
-            posix_locks: false,
         }
     }
 
     /// A child, as fork makes it: the same memory (`aspace`, already
     /// copied), files, handlers, limits and working directory, and one
-    /// thread, which the caller sets up. Timers aren't inherited (timerfds
-    /// are, being files).
-    pub fn fork(&self, pid: u32, aspace: AddressSpace) -> Result<Process, Errno> {
+    /// thread, which the caller sets up. Descriptors, working directory
+    /// and handlers are copies, or the same ones for what `share` says.
+    /// Timers aren't inherited (timerfds are, being files).
+    pub fn fork(&self, pid: u32, aspace: AddressSpace, share: Share) -> Result<Process, Errno> {
         let args_charge = crate::kmem::Charge::new(self.args_charge.bytes())?;
         let mut c = Process::new(pid, self.policy, self.uid, self.gid, aspace);
         c.args_charge = args_charge;
@@ -354,12 +419,10 @@ impl Process {
         c.pgid = self.pgid;
         c.sid = self.sid;
         c.ctty = self.ctty.clone();
-        c.fds = self.fds.clone();
-        c.cwd = self.cwd;
-        c.cwd_pin = self.cwd_pin.clone();
-        c.umask = self.umask;
+        c.fds = if share.files { self.fds.share() } else { self.fds.copy() };
+        c.fs = if share.fs { self.fs.share() } else { self.fs.copy() };
         c.ids = self.ids.clone();
-        c.sigactions = self.sigactions;
+        c.sigactions = if share.sighand { self.sigactions.share() } else { self.sigactions.copy() };
         c.rlimits = self.rlimits;
         c.name = self.name;
         c.exe = self.exe.clone();
@@ -369,6 +432,22 @@ impl Process {
         c.timers.fds = self.timers.fds.clone();
         c.uses_signalfd = self.uses_signalfd;
         Ok(c)
+    }
+
+    pub fn cwd(&self) -> Ino {
+        self.fs.get().cwd
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.fs.get().umask
+    }
+
+    pub fn action(&self, sig: u32) -> SigAction {
+        self.sigactions.update(|a| a[sig as usize])
+    }
+
+    pub fn set_action(&self, sig: u32, act: SigAction) {
+        self.sigactions.update(|a| a[sig as usize] = act);
     }
 
     /// The command name (comm), for reports.
@@ -683,8 +762,8 @@ pub fn start(img: Image<'static>) -> ! {
         (tty.lock().session, tty.lock().fg) = (INIT, INIT);
         p.ctty = Some(tty);
     }
-    p.cwd = cwd;
-    p.cwd_pin = Some(fs::lock().pin(cwd));
+    let cwd_pin = Some(fs::lock().pin(cwd));
+    p.fs.update(|f| (f.cwd, f.cwd_pin) = (cwd, cwd_pin));
     p.running = true;
     // One process and its thread, until the scheduler counts.
     crate::stats::tasks(1, 1);
@@ -764,9 +843,10 @@ pub fn load_program(
         .map_err(|e| exec_error(ENOEXEC, alloc::format!("{exe}: {e}")))?;
     let (entry, interp_base) = match &loaded.interp {
         Some(ipath) => {
+            let cwd = p.cwd();
             let (isrc, iino) = {
                 let mut fs = fs::lock();
-                let ino = fs.lookup(p.cwd, ipath, true).map_err(|_| {
+                let ino = fs.lookup(cwd, ipath, true).map_err(|_| {
                     exec_error(ENOENT, alloc::format!("ELF interpreter {ipath} not found (was it imported?)"))
                 })?;
                 match &fs.node(ino).kind {

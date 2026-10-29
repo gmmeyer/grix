@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::fd::FdTable;
-use crate::process::{INIT, Ids, Process};
+use crate::process::{FsInfo, INIT, Ids, Process, Shared};
 use crate::signal::{self, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SigInfo, Target};
 
 /// Processes, zombies included, that may exist at once. Each holds page
@@ -101,17 +101,20 @@ impl Procs {
 pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut Procs) {
     let status = dead.exit_status.expect("finalizing a live process");
     let cpu_ns = dead.process_cpu_ns() + dead.children_cpu_ns;
+    // What /proc/<pid> keeps of it, before anything goes.
     let remains = crate::procfs::Remains::of(dead);
-    if dead.posix_locks {
-        crate::locks::release_all(crate::locks::Owner::Process(dead.pid));
-    }
+    // Its POSIX locks go with its descriptor table, unless another process
+    // (CLONE_FILES) still uses that.
     dead.fds = FdTable::empty();
     dead.threads.clear();
     dead.runq.clear();
     dead.futexes.clear();
     dead.timers = Default::default();
     dead.shared_pending = Default::default();
-    dead.cwd_pin = None;
+    // What it shared with others (CLONE_FS, CLONE_SIGHAND) is theirs alone.
+    let umask = dead.umask();
+    dead.fs = Shared::new(FsInfo { cwd: crate::fs::ROOT, cwd_pin: None, umask });
+    dead.sigactions.unshare();
     dead.dead = true;
     let (pid, ppid) = (dead.pid, dead.ppid);
     // Its pidfds are readable.
@@ -133,6 +136,16 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
             z.ppid = INIT;
         }
     }
+    // The vfork caller isn't the parent with CLONE_PARENT.
+    if let Some((vpid, tid)) = dead.vfork_parent.take() {
+        let caller = match cur.as_deref_mut() {
+            Some(c) if c.pid == vpid => Some(c),
+            _ => procs.others.get_mut(&vpid),
+        };
+        if let Some(caller) = caller {
+            caller.wake(tid, Some(pid as u64));
+        }
+    }
     let parent = match cur {
         Some(c) if c.pid == ppid => Some(c),
         _ => procs.others.get_mut(&ppid),
@@ -142,10 +155,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
         crate::fs::proc_gone(pid);
         return;
     };
-    if let Some((_, tid)) = dead.vfork_parent.take() {
-        parent.wake(tid, Some(pid as u64));
-    }
-    let act = parent.sigactions[SIGCHLD as usize];
+    let act = parent.action(SIGCHLD);
     // Linux reaps at once for a parent that ignores SIGCHLD (or asked with
     // SA_NOCLDWAIT): its wait4 then just waits for the last child.
     // Its /proc/<pid> stays while it's a zombie.
@@ -187,7 +197,7 @@ pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
         for (ppid, info) in notices {
             let parent = if cur.pid == ppid { Some(&mut *cur) } else { procs.others.get_mut(&ppid) };
             if let Some(parent) = parent
-                && parent.sigactions[SIGCHLD as usize].flags & SA_NOCLDSTOP == 0
+                && parent.action(SIGCHLD).flags & SA_NOCLDSTOP == 0
             {
                 let _ = signal::send(parent, Target::Process, info);
             }

@@ -36,7 +36,7 @@ pub fn rt_sigaction(p: &mut Process, sig: u64, act: u64, oact: u64, size: u64) -
         None
     };
     if oact != 0 {
-        let o = p.sigactions[sig as usize];
+        let o = p.action(sig);
         let mut b = [0u8; 32];
         for (i, v) in [o.handler, o.flags, o.restorer, o.mask].iter().enumerate() {
             b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
@@ -44,7 +44,7 @@ pub fn rt_sigaction(p: &mut Process, sig: u64, act: u64, oact: u64, size: u64) -
         copy_out(&mut p.aspace, oact, &b)?;
     }
     if let Some(new) = new {
-        p.sigactions[sig as usize] = new;
+        p.set_action(sig, new);
         // POSIX: setting a pending signal to be ignored discards it.
         if signal::is_ignored(&new, sig) {
             signal::discard(p, sig);
