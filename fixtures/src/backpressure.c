@@ -5,12 +5,22 @@
 // program's other threads, and a signal handler interrupting it makes it
 // return what it sent (or EINTR if nothing). Writes 14 MiB of
 // (i % 1 MiB) % 251 to stdout and reports on stderr.
+//
+// `backpressure stress N` writes N MiB the way the last phase does, with
+// other threads making the writer's CPU enter the kernel all the while for
+// nothing of the writer's (their short sleeps' timer interrupts, and
+// membarrier): a write the host's taking output has rewound to run again
+// may be interrupted that way before it does, and SIGALRM after that, and
+// it must still return what it sent.
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -33,14 +43,76 @@ static void *ticker(void *arg) {
 
 static void on_alarm(int sig) { (void)sig; }
 
+// Writes buf to stdout, resuming after a short write or EINTR. Returns how
+// many writes were interrupted, or -1.
+static long write_buf(void) {
+    long interrupted = 0;
+    for (size_t at = 0; at < sizeof buf;) {
+        ssize_t n = write(1, buf + at, sizeof buf - at);
+        if (n < 0 && errno == EINTR) {
+            interrupted++;
+            continue;
+        }
+        if (n <= 0) {
+            fprintf(stderr, "write: errno %d\n", errno);
+            return -1;
+        }
+        interrupted += (size_t)n < sizeof buf - at;
+        at += n;
+    }
+    return interrupted;
+}
+
+static atomic_int stop;
+
+static void *sleeper(void *arg) {
+    struct timespec ts = {0, (long)arg};
+    while (!stop) nanosleep(&ts, 0);
+    return 0;
+}
+
+static void *barrier(void *arg) {
+    (void)arg;
+    struct timespec ts = {0, 5000};
+    while (!stop) {
+        syscall(SYS_membarrier, 8 /* MEMBARRIER_CMD_PRIVATE_EXPEDITED */, 0);
+        nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
+static int stress(long mib) {
+    struct sigaction sa = {.sa_handler = on_alarm};
+    sigaction(SIGALRM, &sa, 0);
+    syscall(SYS_membarrier, 16 /* MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED */, 0);
+    pthread_t t[3];
+    pthread_create(&t[0], 0, sleeper, (void *)20000);
+    pthread_create(&t[1], 0, sleeper, (void *)28000);
+    pthread_create(&t[2], 0, barrier, 0);
+    struct itimerval every = {{0, 10000}, {0, 10000}}, off = {0};
+    setitimer(ITIMER_REAL, &every, 0);
+    long interrupted = 0;
+    for (long i = 0; i < mib; i++) {
+        long n = write_buf();
+        if (n < 0) return 1;
+        interrupted += n;
+    }
+    setitimer(ITIMER_REAL, &off, 0);
+    stop = 1;
+    for (int i = 0; i < 3; i++) pthread_join(t[i], 0);
+    fprintf(stderr, "interrupted=%d\n", interrupted > 0);
+    return 0;
+}
+
 static long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof buf; i++) buf[i] = (char)(i % 251);
+    if (argc > 2 && strcmp(argv[1], "stress") == 0) return stress(atol(argv[2]));
 
     // One thread and no timers: only the host taking output can wake it.
     int full = write(1, buf, MIB) == MIB;
@@ -99,19 +171,9 @@ int main(void) {
     setitimer(ITIMER_REAL, &every, 0);
     long interrupted = 0;
     for (int round = 0; round < 4; round++) {
-        for (size_t at = 0; at < sizeof buf;) {
-            ssize_t n = write(1, buf + at, sizeof buf - at);
-            if (n < 0 && errno == EINTR) {
-                interrupted++;
-                continue;
-            }
-            if (n <= 0) {
-                fprintf(stderr, "write: errno %d\n", errno);
-                return 1;
-            }
-            interrupted += (size_t)n < sizeof buf - at;
-            at += n;
-        }
+        long n = write_buf();
+        if (n < 0) return 1;
+        interrupted += n;
     }
     setitimer(ITIMER_REAL, &off, 0);
     fprintf(stderr, "full=%d eagain=%d waited=%d ticker_ran=%d interrupted=%d\n", full, eagain > 0, slow > 0,

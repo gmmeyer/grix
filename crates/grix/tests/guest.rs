@@ -1574,6 +1574,32 @@ fn stdout_backpressure() {
 }
 
 #[test]
+fn stdout_backpressure_with_signals() {
+    // Blocking writes waiting on a host that keeps stalling, rewound to run
+    // again whenever it takes some output, while other threads make the
+    // writer's CPU enter the kernel for nothing of its own and SIGALRM
+    // interrupts it (see the fixture's stress mode). A signal that comes
+    // after such an entry but before the write runs again once made it run
+    // again from the start after the handler, repeating what it had sent.
+    let sb = with("backpressure").allow(Capability::Threads).cpus(4).build().unwrap();
+    let mut seen = 0;
+    let out = sb
+        .run_streaming(&["/bin/backpressure", "stress", "16"], |_, bytes| {
+            if (seen + bytes.len()) >> 15 != seen >> 15 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            seen += bytes.len();
+        })
+        .unwrap();
+    assert_eq!(out.stderr_str(), "interrupted=1\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let want: Vec<u8> = (0..16usize << 20).map(|i| ((i % (1 << 20)) % 251) as u8).collect();
+    let first = out.stdout.iter().zip(&want).position(|(a, b)| a != b);
+    assert!(out.stdout == want, "stdout differs: {} bytes, first difference at {first:?}", out.stdout.len());
+}
+
+#[test]
 fn large_transfers_are_lossless() {
     // Megabytes each way, with a reader that keeps stalling: the guest is
     // held back, and nothing is dropped or reordered.

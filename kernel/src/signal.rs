@@ -691,10 +691,12 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         frames += 1;
     }
     // Without a handler, a rewound syscall simply runs again (with its
-    // original deadline, see `Process::block`).
-    if let Some(t) = p.threads.get_mut(&tid) {
-        t.restarting = false;
-    }
+    // original deadline, see `Process::block`). It stays `restarting` until
+    // it does: an interrupt pending as it returns to user mode brings it
+    // back here first, perhaps with a signal, which must still end the call
+    // as above. A handler run over the rewound call unawares would have it
+    // start again afterwards, a write sending again what it had already
+    // sent (`Thread::io_done`).
 }
 
 /// Build a signal frame for `info` and redirect `tf` to the handler
