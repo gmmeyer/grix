@@ -118,6 +118,30 @@ static int v6only(void) {
     return 0;
 }
 
+// etcd's gRPC gateway dials 0.0.0.0:2379, where etcd listens: on Linux,
+// the unspecified address is this host.
+static int anyaddr(void) {
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(7001)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 8) == 0);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+    struct sockaddr_in peer;
+    socklen_t len = sizeof peer;
+    CHECK(getpeername(c, (struct sockaddr *)&peer, &len) == 0 && peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    int x = accept(l, 0, 0);
+    CHECK(x >= 0 && write(c, "hi", 2) == 2 && read(x, buf, 2) == 2 && memcmp(buf, "hi", 2) == 0);
+    struct sockaddr_in6 a6 = {.sin6_family = AF_INET6, .sin6_port = htons(7001)};
+    // [::] is ::1, where nothing listens: the listener is v4's.
+    int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(connect(c6, (struct sockaddr *)&a6, sizeof a6) == -1 && errno == ECONNREFUSED);
+    // Port 0 is nowhere.
+    a.sin_port = 0;
+    int z = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(z, (struct sockaddr *)&a, sizeof a) == -1 && errno == ECONNREFUSED);
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -170,6 +194,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "fdlink") == 0) r = fdlink();
         if (strcmp(argv[i], "v6only") == 0) r = v6only();
         if (strcmp(argv[i], "smaps") == 0) r = smaps();
+        if (strcmp(argv[i], "anyaddr") == 0) r = anyaddr();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

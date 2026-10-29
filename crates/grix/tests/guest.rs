@@ -1774,6 +1774,12 @@ fn proc_self_smaps() {
 }
 
 #[test]
+fn connecting_to_the_unspecified_address() {
+    // etcd's gateway dials 0.0.0.0:2379.
+    popular(with("popular").allow(Capability::Net), &["anyaddr"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.
