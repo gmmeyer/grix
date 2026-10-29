@@ -1,0 +1,38 @@
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index e86fd64e09..f49323cc40 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -190,7 +190,23 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+     const uint32_t qemu_map_flags = (shared ? QEMU_MAP_SHARED : 0) |
+                                     (noreserve ? QEMU_MAP_NORESERVE : 0);
+     size_t align = QEMU_VMALLOC_ALIGN;
++#ifdef EMSCRIPTEN
++    /*
++     * emscripten's mmap zero-fills what it maps, which writes (and so makes
++     * the browser commit) all of the guest's RAM before it boots. Memory
++     * past the break of a new WebAssembly.Memory is zero already: take it
++     * from there, and touch only what the guest uses. It is never given
++     * back (see qemu_anon_ram_free); guest RAM lives as long as QEMU.
++     */
++    void *ptr = sbrk(size + align);
++    if (ptr == (void *)-1) {
++        return NULL;
++    }
++    ptr = (void *)ROUND_UP((uintptr_t)ptr, align);
++    (void)qemu_map_flags;
++#else
+     void *ptr = qemu_ram_mmap(-1, size, align, qemu_map_flags, 0);
++#endif
+ 
+     if (ptr == MAP_FAILED) {
+         return NULL;
+@@ -207,7 +223,9 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
+ void qemu_anon_ram_free(void *ptr, size_t size)
+ {
+     trace_qemu_anon_ram_free(ptr, size);
++#ifndef EMSCRIPTEN
+     qemu_ram_munmap(-1, ptr, size);
++#endif
+ }
+ 
+ void qemu_socket_set_block(int fd)

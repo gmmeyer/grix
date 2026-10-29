@@ -19,9 +19,14 @@ class Web {
     this.x = instance.exports;
   }
 
-  static async load(url) {
-    const { instance } = await WebAssembly.instantiateStreaming(fetch(url), {});
-    return new Web(instance);
+  static async compile(url) {
+    return WebAssembly.compileStreaming(fetch(url));
+  }
+
+  // A new instance has a new memory: the last run's images and buffers go
+  // with the old one (a wasm memory only grows).
+  static fresh(module) {
+    return new Web(new WebAssembly.Instance(module, {}));
   }
 
   // Copy bytes into grix-web's memory; returns [ptr, len] to free after.
@@ -181,10 +186,11 @@ class Console {
 const RECORD = { 1: 'stdout', 2: 'stderr', 3: 'log', 4: 'event', 5: 'exit', 6: 'event' };
 
 export class Grix {
-  constructor(web, qemuFactory, qemuUrl, kernel) {
-    this.web = web;
+  constructor(webModule, qemuFactory, qemuUrl, qemuWasm, kernel) {
+    this.webModule = webModule;
     this.qemuFactory = qemuFactory;
     this.qemuUrl = qemuUrl;
+    this.qemuWasm = qemuWasm;
     this.kernel = kernel;
     this.busy = false;
   }
@@ -209,14 +215,35 @@ export class Grix {
           Grix.workers.push(this);
         }
       };
+      // With nothing to do, emscripten's main thread waits on QEMU's memory
+      // (Atomics.waitAsync) for its threads to wake it. A run ends by
+      // terminating them, and a wait no one can end is one the browser
+      // keeps forever, and with it the memory (1.5 GiB) and all of QEMU:
+      // each run's, until the page closed (a phone ran out after two). So
+      // note the waits, and when a run ends, wake them and let no more begin
+      // on that memory.
+      if (Atomics.waitAsync) {
+        const wait = Atomics.waitAsync;
+        Grix.waits = new Map();
+        Grix.ended = new WeakSet();
+        Atomics.waitAsync = (array, index, ...rest) => {
+          if (Grix.ended.has(array.buffer)) return { async: true, value: new Promise(() => {}) };
+          const w = wait.call(Atomics, array, index, ...rest);
+          if (w.async) Grix.waits.set(`${index}`, array);
+          return w;
+        };
+      }
     }
     const qemuUrl = new URL(qemu, location.href).href;
-    const [w, factory, k] = await Promise.all([
-      Web.load(web),
+    // QEMU's wasm, compiled once for every run (it's 18 MB: compiling it
+    // again each time took the time and memory of a second copy).
+    const [w, factory, wasm, k] = await Promise.all([
+      Web.compile(web),
       import(qemuUrl).then(m => m.default),
+      WebAssembly.compileStreaming(fetch(new URL('qemu-system-aarch64.wasm', qemuUrl))),
       fetch(kernel).then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
     ]);
-    return new Grix(w, factory, qemuUrl, k);
+    return new Grix(w, factory, qemuUrl, wasm, k);
   }
 
   // One program in a fresh machine. `files`: [{ path, data, mode }] or
@@ -225,7 +252,7 @@ export class Grix {
   run(opts) {
     if (this.busy) throw new Error('one run at a time');
     this.busy = true;
-    const web = this.web;
+    const web = (this.web = Web.fresh(this.webModule));
     web.reset();
     for (const f of opts.files ?? []) {
       if (f.dir) web.import(1, f.path, f.mode ?? 0o755, new Uint8Array());
@@ -287,6 +314,13 @@ export class Grix {
       result.finished = true;
       console_.stop();
       for (const w of workers) w.terminate();
+      workers.length = 0;
+      if (Grix.waits) {
+        const waits = [...Grix.waits];
+        Grix.waits.clear();
+        for (const [, array] of waits) Grix.ended.add(array.buffer);
+        for (const [index, array] of waits) Atomics.notify(array, Number(index));
+      }
       result.qemu = how;
       if (result.status === null) {
         try {
@@ -299,6 +333,8 @@ export class Grix {
           }
         } catch {}
       }
+      // Nothing of this run's QEMU stays reachable from here.
+      module = null;
       this.busy = false;
       resolve(result);
     };
@@ -314,9 +350,15 @@ export class Grix {
         m.FS.writeFile('/grix-kernel', this.kernel);
         m.FS.writeFile('/grix-image', image);
       }],
+      instantiateWasm: (imports, receive) => {
+        WebAssembly.instantiate(this.qemuWasm, imports).then(
+          (instance) => receive(instance, this.qemuWasm),
+          (e) => finish(`QEMU failed: ${e}`));
+        return {};
+      },
       onExit: (code) => finish(`QEMU exited (${code})`),
       onAbort: (what) => finish(`QEMU aborted: ${what}`),
-    }).then(m => (module = result.module = m), e => finish(`QEMU failed: ${e}`));
+    }).then(m => { if (!result.finished) module = m; }, e => finish(`QEMU failed: ${e}`));
     result.qemuLog = qemuLog;
     if (opts.timeoutMs) {
       // As the CLI does: SIGTERM, then a grace period.

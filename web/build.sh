@@ -26,7 +26,9 @@ if [ ! -f "$DIST/qemu-system-aarch64.wasm" ] || [ "${REBUILD_QEMU:-}" = 1 ]; the
         git clone "$QEMU_WASM_REPO" "$src"
     fi
     git -C "$src" fetch -q origin "$QEMU_WASM_COMMIT" || true
-    git -C "$src" checkout -q "$QEMU_WASM_COMMIT"
+    git -C "$src" checkout -q -f "$QEMU_WASM_COMMIT"
+    # Ours: guest RAM without emscripten's mmap writing all of it first.
+    git -C "$src" apply "$PWD/web/qemu-wasm.patch"
     # zlib.net keeps only the newest release; the same tarball is on GitHub.
     sed 's#https://zlib.net/zlib-\$ZLIB_VERSION.tar.xz#https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.xz#' \
         "$src/Dockerfile" | docker build -t grix-qemu-wasm-build -
