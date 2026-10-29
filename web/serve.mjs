@@ -10,6 +10,7 @@ const port = Number(process.argv[3] ?? 8080);
 const types = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
 };
 
 http.createServer((req, res) => {

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Future of Software Engineering · grix</title>
+<meta name="description" content="Unikernels lost to containers. What happens when friction goes to zero?">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/site.css">
+<script src="/coi-serviceworker.js"></script>
+<script type="module" src="/grix-example.js"></script>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/">grix<span>_</span></a>
+  <nav class="site-nav"><a href="/#what" class="hide-sm">What is it</a><a href="/demos/">Demos</a><a href="/blog/" aria-current="page">Blog</a><a href="https://github.com/gmmeyer/grix">GitHub</a></nav>
+</div></header>
+<main class="prose">
+<article>
+<h1>The Future of Software Engineering</h1>
+<p class="byline">Greg Meyer · October 2026</p>
+<p class="isolation-warning" hidden>Your browser didn't give this page cross-origin isolation, so the demos can't run here. They need SharedArrayBuffer, for QEMU's threads.</p>
+<p>What would software engineering be like if we didn't have to care about friction? This is the question we have to ask in the age of AI. Developer experience is now mitigated through AI. We only have to care about whether the agents can understand what we are doing.</p>
+
+<p>Does this open us up to new modalities of development that were rejected? Many technologies were, strictly, better in some ways. But they were not used because they were too difficult and cumbersome. In the last 15 years, especially, developer experience has been the main thing we cared about: Is this maintainable?</p>
+
+<p>I chatted with my friend at a coding AI startup the other day who said that pre AI he never would have chosen Rust to build apps in. Yes, maybe you would choose it for the few things that really need it. But by and large the overhead is simply too big for most things. I'm sure <a href="https://bun.com">Jarred from Bun</a> would tell you the same.</p>
+
+<p>This same pattern will emerge in other areas too.</p>
+
+<p>In early 2016 I went to a conference in Brooklyn. I had to look up the name, because I didn't remember. It was called <a href="https://www.composeconference.org/2016/">Compose</a>. If you want a real flashback, the conference was sponsored by Jet. I remember their talk, it was largely about how they picked F# because they wanted to be the place that had the coolest tech you could have if you worked on Windows. An interesting strategy, it did seem to work out pretty well for them overall. (I used to buy a lot of discount stuff on Jet!)</p>
+
+<p>A few of the talks there were on <a href="https://en.wikipedia.org/wiki/Unikernel">Unikernels</a>. They were a then pretty interesting idea. It is a program that is statically linked to the kernel itself. The program is compiled in (or perhaps shipped in with) just the libraries and kernel modules it needs. Do you need glibc? No? It's not gonna be there. Do you need kernel level networking? No? It's not gonna be there either.</p>
+
+<figure>
+<grix-example command="/bin/busybox wc -l /data/report.csv /etc/shadow"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"text": "region,total\nnorth,12\nsouth,7\n", "path": "/data/report.csv"}]'
+  download="660 KB"
+  show-missing></grix-example>
+<figcaption>Try it: only the imported files exist. The program looks for <code>/etc/shadow</code>, and grix reports it wasn't imported.</figcaption>
+</figure>
+
+<p>You didn't have to accept that the chunky <a href="https://en.wikipedia.org/wiki/Monolithic_kernel">monolithic-kerneled</a> Linux needed to have SMB and webcam drivers loaded in every program you were making. They also seemed tailor made for the container age. You could build out a container that just had a small handful of things on it.</p>
+
+<p>They lost to containers, though. More limited Linux distros won because they were easier to use. Unikernels required too much of a developer. And, while they had some security promises, it's hard to justify that they were so much more secure than Linux. Linux is the most battle tested technology in history.</p>
+
+<p>There are a bunch of reasons why they lost out. But the main reason why is that kubernetes and docker simply offered too much. Now we're in a brand new age. AI has made it so much easier to run a unikernel. This is the kind of thing that might happen when friction goes to zero. And why not build out a very limited container from a unikernel, instead of running the unikernel directly on the hypervisor (<a href="https://anil.recoil.org/papers/2013-asplos-mirage.pdf">as people imagined you'd do in 2013</a>)?</p>
+
+<h2>I decided to try to build a unikernel.</h2>
+
+<p>Why build one? I'm between jobs briefly, I start my new job Monday, so I don't have a real use for one yet. So instead of trying to find a contrived application for one, I'd prefer to build one. Also, I always kinda wanted to build a toy OS, and this seemed like a fun time to do that.</p>
+
+<p>What do you need to do to build a unikernel? What features does it need?</p>
+
+<p>It needs all the features of an OS. Multitasking, networking, forking, threads.</p>
+
+<figure>
+<grix-example command="sh -c &#x27;echo hello world | tr a-z A-Z; seq 1 5 | sort -r | head -3; uname -a&#x27;"
+  caps="process"
+  env="PATH=/bin"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"symlink": "busybox", "path": "/bin/sh"}, {"symlink": "busybox", "path": "/bin/cat"}, {"symlink": "busybox", "path": "/bin/ls"}, {"symlink": "busybox", "path": "/bin/tr"}, {"symlink": "busybox", "path": "/bin/sort"}, {"symlink": "busybox", "path": "/bin/uniq"}, {"symlink": "busybox", "path": "/bin/wc"}, {"symlink": "busybox", "path": "/bin/grep"}, {"symlink": "busybox", "path": "/bin/head"}, {"symlink": "busybox", "path": "/bin/seq"}, {"symlink": "busybox", "path": "/bin/sleep"}, {"symlink": "busybox", "path": "/bin/uname"}, {"symlink": "busybox", "path": "/bin/id"}, {"symlink": "busybox", "path": "/bin/ps"}, {"symlink": "busybox", "path": "/bin/yes"}, {"symlink": "busybox", "path": "/bin/env"}, {"symlink": "busybox", "path": "/bin/mkdir"}, {"symlink": "busybox", "path": "/bin/rm"}, {"symlink": "busybox", "path": "/bin/touch"}, {"symlink": "busybox", "path": "/bin/echo"}]'
+  download="660 KB"></grix-example>
+<figcaption>Try it: the shell can't fork until you grant <code>process</code>.</figcaption>
+</figure>
+
+<p>It has to be able to run programs that the OS can run. I specifically chose to give it Linux compatibility, to ensure that you (or I) wouldn't have to fool around with compile targets. Unmodified programs can run on my kernel, though some will fail as not everything is currently supported.</p>
+
+<figure>
+<grix-example command="python3"
+  caps="threads fs_write process net"
+  allow="threads"
+  env='["TERM=xterm-256color", "HOME=/tmp"]'
+  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]'
+  download="15 MB"
+  tty memory="512"></grix-example>
+<figcaption>Try it: Alpine's Python 3.12, unmodified, in a terminal. Downloads 15 MB the first time.</figcaption>
+</figure>
+
+<p>I decided not to statically link the program to the kernel, instead it compiles to a more limited kernel and allows you to run your program on top of that. It gives it more freedom (you don't need to write rust, you can run anything on it.)</p>
+
+<p>One reason that unikernels lost, is that they strip out most of the observability from the operating system. They didn't have /proc, you usually couldn't use lsof or ps. I made sure /proc existed, so you could use these and other tools. I know that this makes it a little bigger, but it gets around one of the biggest issues unikernels had.</p>
+
+<p>In addition, you can observe grix from the host as a normal process. If you choose to run it in a container, it will also report any process (or container) metrics that you would normally expect. These small changes makes this fairly usable as a sandbox operating system.</p>
+
+<h2>Limited Sandbox</h2>
+
+<p>I built my unikernel as an agent sandbox. It's meant for your agent to run in and execute code safely, and without having to deal with the overhead of modern sandboxed environments. The security is in part built in.</p>
+
+<figure>
+<grix-example command="/bin/net"
+  caps="net"
+  files='[{"src": "bin/net", "path": "/bin/net", "mode": 493}]'></grix-example>
+<figcaption>Try it: the socket is denied, and grix says which capability would allow it. Tick <code>net</code> and run it again.</figcaption>
+</figure>
+
+<p>Because there's less going on, there's also significantly less overhead. That means that you can get away with a smaller footprint in your sandboxed environments. You don't have to just accept that your Claude will need room to stretch out. He can fit just fine in just the ram he needs, without the OS overhead.</p>
+
+<figure>
+<grix-example command="bash"
+  caps="process fs_write"
+  allow="process"
+  env='["PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/tmp", "TERM=xterm-256color", "PS1=grix:\\w\\$ "]'
+  files='[{"tar": "rootfs/bash.tar.gz", "path": "/"}]'
+  download="1.8 MB"
+  tty></grix-example>
+<figcaption>Try it: bash and busybox in a terminal. Try <code>echo hi &gt; /tmp/x</code> without <code>fs_write</code>.</figcaption>
+</figure>
+
+<p>I was going to put in a few code examples here, but I realized they aren't necessary. You aren't going to be writing the code anyway. So, instead, I've sprinkled a few demos of this through this. These aren't running on a server. I have compiled QEMU to WASM and the kernel is running on that in your browser.</p>
+
+<p>This is the future we're looking at. We need to rethink the fundamentals we have taken for granted. These choices got us through the last 15 years of SaaS hypergrowth. But we don't need to accept these choices anymore. They are limiting us. And we can do much better.</p>
+</article>
+</main>
+<footer class="site-footer"><div class="wrap">
+  <span>grix is open source, under the MIT license.</span>
+  <a href="https://github.com/gmmeyer/grix">Source</a>
+  <a href="https://github.com/gmmeyer/grix/releases">Releases</a>
+  <a href="https://github.com/gmmeyer/grix#readme">Documentation</a>
+  <a href="/blog/">Blog</a>
+</div></footer>
+<script>
+  // The demos need SharedArrayBuffer (QEMU's threads); say so where the
+  // page couldn't get it.
+  if (!crossOriginIsolated) {
+    for (const el of document.querySelectorAll('.isolation-warning')) el.hidden = false;
+  }
+</script>
+</body>
+</html>

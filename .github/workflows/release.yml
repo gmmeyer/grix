@@ -103,7 +103,7 @@ jobs:
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-linux-arm64
           mkdir -p "$d/python/grix"
-          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md "$d/"
+          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md LICENSE "$d/"
           cp python/grix/__init__.py "$d/python/grix/"
           cp target/release/lib_native.so "$d/python/grix/_native.abi3.so"
           PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'
@@ -158,7 +158,7 @@ jobs:
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-linux-x86_64
           mkdir -p "$d/python/grix"
-          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md "$d/"
+          cp out-bin/grix out-bin/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md LICENSE "$d/"
           cp python/grix/__init__.py "$d/python/grix/"
           cp target/release/lib_native.so "$d/python/grix/_native.abi3.so"
           PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'
@@ -195,7 +195,7 @@ jobs:
           v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           d=grix-$v-macos-arm64
           mkdir -p "$d/python/grix"
-          cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md "$d/"
+          cp target/release/grix target/release/grix-vmm kernel-out/grix-kernel kernel-out/grix-kernel-x86_64 README.md LICENSE "$d/"
           cp python/grix/__init__.py "$d/python/grix/"
           cp target/release/lib_native.dylib "$d/python/grix/_native.abi3.so"
           PYTHONPATH="$d/python" GRIX_BIN="$d/grix" python3 -c 'import grix; assert grix.native()'

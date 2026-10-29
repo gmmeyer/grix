@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blog · grix</title>
+<meta name="description" content="The grix blog.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/site.css">
+<script src="/coi-serviceworker.js"></script>
+<script type="module" src="/grix-example.js"></script>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/">grix<span>_</span></a>
+  <nav class="site-nav"><a href="/#what" class="hide-sm">What is it</a><a href="/demos/">Demos</a><a href="/blog/" aria-current="page">Blog</a><a href="https://github.com/gmmeyer/grix">GitHub</a></nav>
+</div></header>
+<main class="prose">
+<h1>Blog</h1>
+<ul class="post-list">
+  <li><a href="/blog/unikernels/">The Future of Software Engineering</a>
+    <p>Unikernels lost to containers because they asked too much of developers. What happens when friction
+    goes to zero? With live demos.</p></li>
+</ul>
+</main>
+<footer class="site-footer"><div class="wrap">
+  <span>grix is open source, under the MIT license.</span>
+  <a href="https://github.com/gmmeyer/grix">Source</a>
+  <a href="https://github.com/gmmeyer/grix/releases">Releases</a>
+  <a href="https://github.com/gmmeyer/grix#readme">Documentation</a>
+  <a href="/blog/">Blog</a>
+</div></footer>
+<script>
+  // The demos need SharedArrayBuffer (QEMU's threads); say so where the
+  // page couldn't get it.
+  if (!crossOriginIsolated) {
+    for (const el of document.querySelectorAll('.isolation-warning')) el.hidden = false;
+  }
+</script>
+</body>
+</html>
