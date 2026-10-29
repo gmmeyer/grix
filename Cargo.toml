@@ -6,6 +6,6 @@ default-members = ["crates/abi", "crates/grix", "crates/vmm"]
 exclude = ["kernel"]
 
 [workspace.package]
-version = "0.0.26"
+version = "0.0.27"
 edition = "2024"
 license = "MIT"

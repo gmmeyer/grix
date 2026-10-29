@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use grix_abi::stats::Limit;
 use spin::Mutex;
 
 use super::paging::{self, ADDR_MASK, PageTable, Prot};
@@ -239,6 +240,7 @@ impl AddressSpace {
     /// copies it (`fault`'s copy-on-write).
     pub fn fork(&mut self) -> Result<AddressSpace, Errno> {
         if VMAS_TOTAL.load(Ordering::Relaxed) + self.vmas.len() > MAX_VMAS_TOTAL {
+            crate::stats::hit(Limit::Mappings);
             return Err(ENOMEM);
         }
         let mut child = AddressSpace::new().ok_or(ENOMEM)?;
@@ -319,6 +321,7 @@ impl AddressSpace {
     /// Room for `more` mappings (an operation that may split some)?
     pub fn has_room(&self, more: usize) -> Result<(), Errno> {
         if self.vmas.len() + more > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + more > MAX_VMAS_TOTAL {
+            crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {
             Ok(())
@@ -336,6 +339,7 @@ impl AddressSpace {
         let after = self.vmas.len() - overlapping.len() + edges + if keep { overlapping.len() } else { 0 } + added;
         let growth = after.saturating_sub(self.vmas.len());
         if growth > 0 && (after > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + growth > MAX_VMAS_TOTAL) {
+            crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {
             Ok(())

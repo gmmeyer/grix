@@ -34,6 +34,9 @@ pub enum Channel {
     Link = 7,
     /// Live mounts: `hostfs::Request`s, a frame of a message each.
     Fs = 8,
+    /// The kernel's resources and counters: a `stats::Stats`, when the host
+    /// asks (`Input::Stats`) and as the program ends, before its status.
+    Stats = 9,
 }
 
 impl Channel {
@@ -47,6 +50,7 @@ impl Channel {
             6 => Some(Self::Export),
             7 => Some(Self::Link),
             8 => Some(Self::Fs),
+            9 => Some(Self::Stats),
             _ => None,
         }
     }
@@ -74,6 +78,9 @@ pub enum Input {
     /// TTY mode: the host's terminal changed size. Rows then columns, u16
     /// little-endian each.
     Resize = 6,
+    /// Send a `Channel::Stats` frame now (no payload). Answered only if
+    /// there's room in the console at once: the host asks again later.
+    Stats = 7,
 }
 
 impl Input {
@@ -85,6 +92,7 @@ impl Input {
             4 => Some(Self::Fs),
             5 => Some(Self::Signal),
             6 => Some(Self::Resize),
+            7 => Some(Self::Stats),
             _ => None,
         }
     }

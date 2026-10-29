@@ -119,6 +119,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       calls in parallel (`--max-parallel`).
 - [x] Native Python bindings (PyO3) instead of driving the CLI
       (`make python`; the CLI is the fallback).
+- [x] Monitoring: the kernel's report of its resources and limits hit
+      (`guest_stats`, live while a run goes on), the VM's cost to the host
+      (`host_usage`), Prometheus metrics (`Metrics`, `--metrics ADDR` for
+      `grix run` and `grix mcp`). For a server in a container: no time
+      limit (`--timeout 0`), output streamed without a cap or a copy,
+      events printed as they happen.
 
 ## Images
 

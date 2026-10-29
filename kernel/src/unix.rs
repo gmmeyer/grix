@@ -137,6 +137,7 @@ impl Rights {
         let n = files.len();
         if INFLIGHT.fetch_add(n, Ordering::Relaxed) + n > MAX_INFLIGHT {
             INFLIGHT.fetch_sub(n, Ordering::Relaxed);
+            crate::stats::hit(grix_abi::stats::Limit::PassedDescriptors);
             return Err(Errno(109)); // ETOOMANYREFS
         }
         Ok(Rights(files))

@@ -156,6 +156,7 @@ impl SigQueue {
         }
         if info.signo >= SIGRTMIN {
             if QUEUED_RT.load(Ordering::Relaxed) >= MAX_QUEUED_RT {
+                crate::stats::hit(grix_abi::stats::Limit::QueuedSignals);
                 return Err(EAGAIN);
             }
             QUEUED_RT.fetch_add(1, Ordering::Relaxed);

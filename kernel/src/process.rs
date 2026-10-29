@@ -504,6 +504,13 @@ impl Process {
     /// trap that got here unwinds normally first.
     pub fn terminate(&mut self, status: i32) {
         if self.pid == INIT {
+            // The running thread's time since `slice_start`: the scheduler
+            // won't count it, as the sandbox ends here.
+            if self.running {
+                let now = crate::time::monotonic_ns();
+                crate::stats::cpu(now.saturating_sub(self.slice_start));
+                self.slice_start = now;
+            }
             match status & 0x7f {
                 0 => finish(ExitKind::Exited, (status >> 8) & 0xff),
                 sig => finish(ExitKind::Signaled, sig),
@@ -579,8 +586,10 @@ impl Process {
 /// The program has ended: report its status, then send the exported
 /// directories. Status first, so a slow export can't cost the host it.
 pub fn finish(kind: ExitKind, code: i32) -> ! {
-    // What the terminal still has to show goes before the status.
+    // What the terminal still has to show goes before the status, and so
+    // do the final counts.
     crate::tty::flush_console();
+    console::report_stats();
     console::report_exit(kind, code);
     crate::export::send();
     console::power_off()
@@ -588,6 +597,7 @@ pub fn finish(kind: ExitKind, code: i32) -> ! {
 
 /// Demand paging for a user translation fault.
 pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
+    crate::stats::page_fault();
     let mut guard = PROCESS.lock();
     let p = guard.as_mut().expect("fault without a process");
     match p.aspace.fault(far, access) {
@@ -676,6 +686,8 @@ pub fn start(img: Image<'static>) -> ! {
     p.cwd = cwd;
     p.cwd_pin = Some(fs::lock().pin(cwd));
     p.running = true;
+    // One process and its thread, until the scheduler counts.
+    crate::stats::tasks(1, 1);
     let argv = img.argv.iter().map(|s| String::from(*s)).collect();
     let envp: Vec<String> = img.envp.iter().map(|s| String::from(*s)).collect();
     let exe = search_path(cwd, img.exe, &envp);

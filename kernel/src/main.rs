@@ -37,6 +37,7 @@ mod sched;
 mod signal;
 mod smp;
 mod snapshot;
+mod stats;
 mod syscall;
 mod time;
 mod timer;

@@ -1,6 +1,8 @@
 //! Physical frame allocator and kernel heap.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+use grix_abi::stats::{Limit, Resource};
 use spin::Mutex;
 use talc::{ErrOnOom, Span, Talc, Talck};
 
@@ -39,6 +41,9 @@ impl Frames {
 }
 
 static FRAMES: Mutex<Option<Frames>> = Mutex::new(None);
+/// `Frames::total` and `in_use`, for reading without the lock (`usage`).
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+static IN_USE: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(regions: &[(u64, u64)]) {
     let regions: Vec<(u64, u64)> = regions.iter().copied().filter(|(s, e)| s < e).collect();
@@ -48,6 +53,7 @@ pub fn init(regions: &[(u64, u64)]) {
     let top = regions.iter().map(|r| r.1).max().unwrap_or(0);
     let refs = alloc::vec![0; ((top - base) / PAGE_SIZE) as usize];
     *FRAMES.lock() = Some(Frames { regions, region: 0, next, free: Vec::new(), total, in_use: 0, refs, base });
+    TOTAL.store(total, Ordering::Relaxed);
 }
 
 /// Allocate a zeroed 4 KiB frame. Returns its physical address.
@@ -58,7 +64,10 @@ pub fn alloc() -> Option<u64> {
         let pa = match f.free.pop() {
             Some(pa) => pa,
             None => loop {
-                let &(start, end) = f.regions.get(f.region)?;
+                let Some(&(start, end)) = f.regions.get(f.region) else {
+                    crate::stats::hit(Limit::Memory);
+                    return None;
+                };
                 f.next = f.next.max(start);
                 if f.next + PAGE_SIZE <= end {
                     let pa = f.next;
@@ -69,6 +78,8 @@ pub fn alloc() -> Option<u64> {
             },
         };
         f.in_use += 1;
+        IN_USE.store(f.in_use, Ordering::Relaxed);
+        crate::stats::peak(Resource::Memory, f.in_use * PAGE_SIZE);
         *f.refs(pa) = 1;
         pa
     };
@@ -86,6 +97,7 @@ pub fn free(pa: u64) {
     if *refs == 0 {
         f.free.push(pa);
         f.in_use -= 1;
+        IN_USE.store(f.in_use, Ordering::Relaxed);
     }
 }
 
@@ -113,6 +125,12 @@ pub fn is_shared(pa: u64) -> bool {
     let mut guard = FRAMES.lock();
     let f = guard.as_mut().expect("frame allocator not initialised");
     *f.refs(pa) > 1
+}
+
+/// (total frames, frames in use), without the allocator's lock: for
+/// reports made whatever locks are held.
+pub fn usage() -> (u64, u64) {
+    (TOTAL.load(Ordering::Relaxed), IN_USE.load(Ordering::Relaxed))
 }
 
 /// (total frames, frames in use)

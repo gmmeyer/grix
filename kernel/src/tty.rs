@@ -795,6 +795,7 @@ pub fn new_pair(console: bool) -> Result<TtyRef, Errno> {
     let mut ptys = PTYS.lock();
     ptys.retain(|_, t| t.strong_count() > 0);
     if ptys.len() >= MAX_PTYS {
+        crate::stats::hit(grix_abi::stats::Limit::Ptys);
         return Err(ENOSPC);
     }
     let index = (0..).find(|i| !ptys.contains_key(i)).unwrap();

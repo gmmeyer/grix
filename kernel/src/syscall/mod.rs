@@ -26,6 +26,7 @@ use table::{Gate, nr};
 pub(crate) const AT_FDCWD: i32 = -100;
 
 pub fn handle(tf: &mut TrapFrame) {
+    crate::stats::syscall();
     let n = tf.syscall_nr();
     let a = tf.syscall_args();
     let mut guard = PROCESS.lock();

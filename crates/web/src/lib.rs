@@ -313,8 +313,8 @@ impl Session {
                 }
                 // Nothing else comes without `net`, which the page never grants.
             }
-            // Exports and live mounts: the page has neither.
-            Channel::Exit | Channel::Export | Channel::Fs => {}
+            // Exports and live mounts: the page has neither. Nor metrics.
+            Channel::Exit | Channel::Export | Channel::Fs | Channel::Stats => {}
         });
         out
     }

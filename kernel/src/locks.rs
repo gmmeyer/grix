@@ -98,6 +98,7 @@ pub fn flock(key: Key, owner: Owner, pid: u32, write: Option<bool>) -> Result<Ou
     };
     let added = matches!(outcome, Outcome::Done) && write.is_some();
     if added && t.count - removed + 1 > MAX_LOCKS {
+        crate::stats::hit(grix_abi::stats::Limit::FileLocks);
         t.flocks.get_mut(&key).unwrap().pop();
         t.count -= removed;
         t.forget_empty(key);
@@ -164,6 +165,7 @@ pub fn set_range(
     }
     let old_len = old.len();
     if t.count + new.len() > MAX_LOCKS + old_len {
+        crate::stats::hit(grix_abi::stats::Limit::FileLocks);
         return Err(ENOLCK);
     }
     t.count = t.count + new.len() - old_len;

@@ -196,6 +196,7 @@ impl Conn {
         let mut conns = CONNS.lock();
         conns.retain(|_, w| w.strong_count() > 0);
         if conns.len() >= MAX_CONNS {
+            crate::stats::hit(grix_abi::stats::Limit::Connections);
             return Err(Errno(105)); // ENOBUFS
         }
         let id = c.id;
@@ -334,6 +335,7 @@ impl Slot {
     pub fn take() -> Option<Slot> {
         if PENDING.fetch_add(1, Ordering::Relaxed) as usize >= MAX_PENDING {
             PENDING.fetch_sub(1, Ordering::Relaxed);
+            crate::stats::hit(grix_abi::stats::Limit::Connections);
             return None;
         }
         Some(Slot(()))

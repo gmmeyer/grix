@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::image::{IMAGE_BASE, Image, MAX_ENTRIES, MAX_RAM, RAM_BASE};
 use grix_abi::machine;
 use grix_abi::policy::{Capability, DenyAction, Policy};
+use grix_abi::stats::Stats as GuestStats;
 use grix_abi::wire::{Channel, Event, ExitKind};
 use serde::Serialize;
 
@@ -16,6 +17,7 @@ use crate::event::GuestEvent;
 use crate::export::{Collector, Export};
 use crate::hostfs::LiveMount;
 use crate::image::{self, Node};
+use crate::metrics::Metrics;
 use crate::mount::{Mount, MountChanges};
 use crate::net::{ForwardFrom, HostRule, NetPolicy, Publish, UdpFrom, forward_addr};
 use crate::vmm::{self, SnapshotFile, VmConfig, VmEnd};
@@ -97,6 +99,52 @@ pub struct RunOutput {
     pub kernel_log: String,
     #[serde(serialize_with = "millis")]
     pub duration: Duration,
+    /// What the guest kernel last said of its resources, normally as the
+    /// program ended (not if the VM was stopped, or the kernel panicked).
+    /// The guest's own say-so: [`host_usage`](RunOutput::host_usage) is
+    /// what the host measured.
+    #[serde(serialize_with = "guest_stats")]
+    pub guest_stats: Option<GuestStats>,
+    /// What the VM's process cost the host, if it could be measured.
+    pub host_usage: Option<HostUsage>,
+}
+
+/// What a run's VM process (grix-vmm or QEMU) cost the host, as the host's
+/// operating system counted it when the process ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HostUsage {
+    #[serde(rename = "cpu_user_ms", serialize_with = "millis")]
+    pub cpu_user: Duration,
+    #[serde(rename = "cpu_system_ms", serialize_with = "millis")]
+    pub cpu_system: Duration,
+    /// Its peak resident memory: the guest RAM it touched, and its own.
+    pub peak_memory_bytes: u64,
+}
+
+/// `{"cpu_ms", "syscalls", ..., "usage": {resource: {now, peak, limit}},
+/// "limits_hit": {limit: count}}`, with only the limits that were hit.
+fn guest_stats<S: serde::Serializer>(s: &Option<GuestStats>, ser: S) -> Result<S::Ok, S::Error> {
+    use grix_abi::stats::{Limit, Resource};
+    let Some(s) = s else { return ser.serialize_none() };
+    let usage: BTreeMap<&str, serde_json::Value> = Resource::ALL
+        .iter()
+        .map(|&r| {
+            let u = s.usage(r);
+            (r.name(), serde_json::json!({"now": u.now, "peak": u.peak, "limit": u.limit}))
+        })
+        .collect();
+    let hits: BTreeMap<&str, u64> =
+        Limit::ALL.iter().filter(|&&l| s.hits(l) > 0).map(|&l| (l.name(), s.hits(l))).collect();
+    serde_json::json!({
+        "cpu_ms": s.cpu_ns / 1_000_000,
+        "syscalls": s.syscalls,
+        "page_faults": s.page_faults,
+        "context_switches": s.context_switches,
+        "processes_started": s.processes_started,
+        "usage": usage,
+        "limits_hit": hits,
+    })
+    .serialize(ser)
 }
 
 fn lossy<S: serde::Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
@@ -376,6 +424,7 @@ pub struct SandboxBuilder {
     live: Vec<LiveMount>,
     net: NetPolicy,
     control: Option<RunControl>,
+    metrics: Option<Metrics>,
     grace: Duration,
     uid: u32,
     gid: u32,
@@ -411,6 +460,7 @@ impl Default for SandboxBuilder {
             live: Vec::new(),
             net: NetPolicy::default(),
             control: None,
+            metrics: None,
             grace: DEFAULT_GRACE,
             uid: 1000,
             gid: 1000,
@@ -543,14 +593,27 @@ impl SandboxBuilder {
         self.memory_mb
     }
 
+    /// How long the program may run (60 seconds by default): then it gets
+    /// SIGTERM and the [`grace`](Self::grace) period, and the status is
+    /// [`ExitStatus::Timeout`].
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
     }
 
-    /// Keep at most this many bytes of each of stdout and stderr (64 MiB by
-    /// default). The program keeps running; the rest is dropped and
-    /// [`RunOutput::stdout_truncated`] / `stderr_truncated` say so.
+    /// No time limit: the program runs until it ends, or is stopped
+    /// ([`RunControl::stop`]): a server's. Once it ends, its exports still
+    /// have 30 seconds to arrive.
+    pub fn no_timeout(self) -> Self {
+        self.timeout(Duration::MAX)
+    }
+
+    /// Keep at most this many bytes of each of stdout and stderr in the
+    /// [`RunOutput`] (64 MiB by default; 0 when it's only streamed). The
+    /// program keeps running; the rest isn't kept, and
+    /// [`RunOutput::stdout_truncated`] / `stderr_truncated` say so. What
+    /// [`run_streaming`](Sandbox::run_streaming) passes on as it comes is
+    /// all of it, whatever this says.
     pub fn max_output(mut self, bytes: usize) -> Self {
         self.max_output = bytes;
         self
@@ -687,6 +750,13 @@ impl SandboxBuilder {
     /// in progress.
     pub fn control(mut self, control: &RunControl) -> Self {
         self.control = Some(control.clone());
+        self
+    }
+
+    /// Count this sandbox's runs in `metrics` (see [`Metrics`]): how they
+    /// end, what they cost, and, while they run, what their kernels report.
+    pub fn metrics(mut self, metrics: &Metrics) -> Self {
+        self.metrics = Some(metrics.clone());
         self
     }
 
@@ -1076,6 +1146,7 @@ impl Sandbox {
         let vm = VmConfig {
             net,
             control: cfg.control.clone(),
+            metrics: cfg.metrics.clone(),
             grace: cfg.grace,
             live: cfg.live.clone(),
             arch: cfg.arch,
@@ -1150,8 +1221,8 @@ impl Sandbox {
             exports: cfg.exports.clone(),
             max_export: cfg.max_export,
             max_output: cfg.max_output,
-            timeout_ms: cfg.timeout.as_millis() as u64,
-            grace_ms: cfg.grace.as_millis() as u64,
+            timeout_ms: cfg.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            grace_ms: cfg.grace.as_millis().try_into().unwrap_or(u64::MAX),
             memory_mb: cfg.memory_mb,
             cpus: cfg.cpus,
             tty: cfg.tty.is_some(),
@@ -1238,38 +1309,61 @@ fn execute(
         mount_changes: Vec::new(),
         kernel_log: String::new(),
         duration: Duration::ZERO,
+        guest_stats: None,
+        host_usage: None,
     };
     let started = Instant::now();
+    // Counted from here: a run that fails to start counts as an error.
+    let mut recorder = vm.metrics.as_ref().map(Metrics::start);
     let max = max_output;
-    // Keep up to `max` bytes; mark the stream once anything is dropped.
-    let keep = |buf: &mut Vec<u8>, truncated: &mut bool, payload: &[u8]| -> usize {
+    // Keep up to `max` bytes; mark the stream once anything isn't kept.
+    let keep = |buf: &mut Vec<u8>, truncated: &mut bool, payload: &[u8]| {
         let room = max.saturating_sub(buf.len()).min(payload.len());
         buf.extend_from_slice(&payload[..room]);
         *truncated |= room < payload.len();
-        room
     };
     let mut event_bytes = 0usize;
     let run = vmm::run(vm, image, timeout, stdin, |ch, payload| match ch {
-        Channel::Stdout => {
-            let n = keep(&mut out.stdout, &mut out.stdout_truncated, payload);
-            on_output(Stream::Stdout, &payload[..n]);
-        }
-        Channel::Stderr => {
-            let n = keep(&mut out.stderr, &mut out.stderr_truncated, payload);
-            on_output(Stream::Stderr, &payload[..n]);
+        Channel::Stdout | Channel::Stderr => {
+            let (stream, buf, truncated) = match ch {
+                Channel::Stdout => (Stream::Stdout, &mut out.stdout, &mut out.stdout_truncated),
+                _ => (Stream::Stderr, &mut out.stderr, &mut out.stderr_truncated),
+            };
+            keep(buf, truncated, payload);
+            if let Some(r) = &recorder {
+                r.output(stream, payload.len());
+            }
+            on_output(stream, payload);
         }
         Channel::Log => add_log(&mut out.kernel_log, &String::from_utf8_lossy(payload)),
+        Channel::Stats => match GuestStats::decode(payload) {
+            Ok(s) => {
+                if let Some(r) = &mut recorder {
+                    r.guest(&s);
+                }
+                out.guest_stats = Some(s);
+            }
+            Err(_) => add_log(&mut out.kernel_log, "[grix] undecodable stats from guest\n"),
+        },
         Channel::Event => {
             event_bytes = event_bytes.saturating_add(payload.len());
             if event_bytes > MAX_EVENT_BYTES {
                 if event_bytes - payload.len() <= MAX_EVENT_BYTES {
                     add_log(&mut out.kernel_log, "[grix] over 4 MiB of events from the guest: the rest are dropped\n");
                 }
+                // Still counted (a fixed set of series): a server's
+                // metrics shouldn't stop after its first 4 MiB of events.
+                if let (Some(m), Ok(e)) = (&vm.metrics, Event::decode(payload)) {
+                    m.event(&e.into());
+                }
                 return;
             }
             match Event::decode(payload) {
                 Ok(e) => {
                     let e: GuestEvent = e.into();
+                    if let Some(m) = &vm.metrics {
+                        m.event(&e);
+                    }
                     if let Some(c) = &vm.control {
                         c.event(&e);
                     }
@@ -1281,7 +1375,9 @@ fn execute(
         Channel::Export => exports.push(payload),
         Channel::Exit | Channel::Link | Channel::Fs => {}
     })?;
+    // The host's own events (network policy) were passed on as they came.
     out.events.extend(run.events);
+    out.host_usage = run.usage;
     let run_timed_out = run.timed_out;
     let (exported, changes) = exports.finish();
     out.exports = exported;
@@ -1306,6 +1402,9 @@ fn execute(
             vmm_stderr.trim()
         )),
     };
+    if let Some(r) = recorder {
+        r.finish(&out);
+    }
     Ok((out, changes, taken))
 }
 
@@ -1361,6 +1460,7 @@ pub(crate) fn run_snapshot(
     let vm = VmConfig {
         net,
         control: snap.control.clone(),
+        metrics: snap.metrics.clone(),
         grace: Duration::from_millis(s.grace_ms),
         live,
         arch: Arch::Aarch64,

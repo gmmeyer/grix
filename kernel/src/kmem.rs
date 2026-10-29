@@ -7,11 +7,17 @@
 //! limits.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use grix_abi::stats::{Limit, Resource};
 
 use crate::errno::*;
 
-const LIMIT: u64 = 10 << 20;
+pub const LIMIT: u64 = 10 << 20;
 static USED: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes charged now.
+pub fn used() -> u64 {
+    USED.load(Ordering::Relaxed)
+}
 
 /// Bytes left in the budget.
 pub fn available() -> u64 {
@@ -40,9 +46,11 @@ impl Charge {
             let more = bytes - self.0;
             // One CPU, no preemption in the kernel: check-then-add doesn't race.
             if USED.load(Ordering::Relaxed) + more > LIMIT {
+                crate::stats::hit(Limit::KernelMemory);
                 return Err(ENOMEM);
             }
-            USED.fetch_add(more, Ordering::Relaxed);
+            let now = USED.fetch_add(more, Ordering::Relaxed) + more;
+            crate::stats::peak(Resource::KernelMemory, now);
         } else {
             USED.fetch_sub(self.0 - bytes, Ordering::Relaxed);
         }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use grix::{Capability, DenyAction, GuestEvent, Manifest, MountMode, RunControl, RunOutput, Sandbox, Stream};
+use grix::{Capability, DenyAction, GuestEvent, Manifest, Metrics, MountMode, RunControl, RunOutput, Sandbox, Stream};
 
 #[derive(Parser)]
 #[command(name = "grix", version, about = "Run Linux programs in a capability-scoped unikernel")]
@@ -90,6 +90,10 @@ struct McpArgs {
     /// How many tool calls run at once (default 2); more wait their turn.
     #[arg(long, value_name = "N")]
     max_parallel: Option<usize>,
+    /// Serve Prometheus metrics of the runs at http://ADDR/metrics
+    /// (HOST:PORT, e.g. 127.0.0.1:9090).
+    #[arg(long, value_name = "ADDR")]
+    metrics: Option<String>,
 }
 
 /// The flags add to the Grixfile, or make the whole image without one:
@@ -213,12 +217,20 @@ struct RunArgs {
     /// SIGTERM before it's stopped (default 5).
     #[arg(long, value_name = "SECS")]
     grace: Option<u64>,
-    /// Time limit in seconds.
-    #[arg(long)]
+    /// Time limit in seconds (default 60). 0: none, for a server that runs
+    /// until it's stopped.
+    #[arg(long, value_name = "SECS")]
     timeout: Option<u64>,
-    /// Keep at most this many MiB of each of stdout and stderr.
+    /// Show at most this many MiB of each of stdout and stderr (default:
+    /// all of it), or with --json, keep that much (default 64).
     #[arg(long, value_name = "MIB")]
     max_output: Option<usize>,
+    /// Serve Prometheus metrics of the run at http://ADDR/metrics while it
+    /// goes on (HOST:PORT, e.g. 0.0.0.0:9090 in a container): how it's
+    /// doing, what it was denied, and what its kernel reports of its
+    /// memory, processes and limits.
+    #[arg(long, value_name = "ADDR")]
+    metrics: Option<String>,
     /// Export at most this many MiB in all (default 256).
     #[arg(long, value_name = "MIB")]
     max_export: Option<usize>,
@@ -312,7 +324,8 @@ struct Prepared {
 }
 
 fn snapshot(args: SnapshotArgs) -> Result<i32> {
-    let p = prepare(&args.run)?;
+    let metrics = serve_metrics(&args.run)?;
+    let p = prepare(&args.run, metrics.as_ref(), false)?;
     let started = std::time::Instant::now();
     let snap = p.sandbox.snapshot(&p.command, &args.output)?;
     if !args.run.quiet {
@@ -329,11 +342,19 @@ fn snapshot(args: SnapshotArgs) -> Result<i32> {
 }
 
 fn run(args: RunArgs) -> Result<i32> {
+    let metrics = serve_metrics(&args)?;
+    // Shown as it comes, or (--json) kept for the answer.
+    let mut shown = Shown::new(&args);
     if let Some(path) = &args.snapshot {
         let control = RunControl::new();
         let mut snap = grix::Snapshot::open(path)?.control(&control);
-        if let Some(s) = args.timeout {
-            snap = snap.timeout(Duration::from_secs(s));
+        match args.timeout {
+            Some(0) => snap = snap.no_timeout(),
+            Some(s) => snap = snap.timeout(Duration::from_secs(s)),
+            None => {}
+        }
+        if let Some(m) = &metrics {
+            snap = snap.metrics(m);
         }
         // The file's network policy is never used (it may be anyone's):
         // net only as for an image, if granted here.
@@ -345,7 +366,9 @@ fn run(args: RunArgs) -> Result<i32> {
         for spec in &args.publish {
             snap = snap.publish(spec)?;
         }
-        if let Some(mb) = args.max_output {
+        if !args.json {
+            snap = snap.max_output(0);
+        } else if let Some(mb) = args.max_output {
             snap = snap.max_output(mb << 20);
         }
         if let Some(mb) = args.max_export {
@@ -385,31 +408,86 @@ fn run(args: RunArgs) -> Result<i32> {
             bail!("the snapshot wasn't taken in TTY mode (grix snapshot -t)");
         }
         let stdin = !args.no_stdin && (tty || !std::io::stdin().is_terminal());
+        let live = print_events(&args, &control);
         let raw = terminal(args.tty && stdin, &control, true);
         let input: Box<dyn std::io::Read + Send> =
             if stdin { Box::new(std::io::stdin()) } else { Box::new(std::io::empty()) };
-        let out =
-            if args.json { snap.run_streaming(input, |_, _| {})? } else { snap.run_streaming(input, write_stream)? };
+        let out = snap.run_streaming(input, |s, d| shown.write(s, d))?;
         drop(raw);
-        return report(&args, out, &exports);
+        return report(&args, out, &exports, live, shown.cut);
     }
-    let p = prepare(&args)?;
+    let p = prepare(&args, metrics.as_ref(), !args.json)?;
     forward_signals(p.control.clone(), args.quiet);
     // Piped or redirected input goes to the program; a terminal only in
     // TTY mode (otherwise the program sees end-of-file).
     let stdin = !args.no_stdin && (args.tty || !std::io::stdin().is_terminal());
+    let live = print_events(&args, &p.control);
     let raw = terminal(args.tty && stdin, &p.control, false);
     let (sandbox, command) = (&p.sandbox, &p.command);
-    let run = |on_output: &mut dyn FnMut(Stream, &[u8])| {
-        if stdin {
-            sandbox.run_streaming_with_stdin(command, std::io::stdin(), on_output)
-        } else {
-            sandbox.run_streaming(command, on_output)
-        }
+    let on_output = |s, d: &[u8]| shown.write(s, d);
+    let out = if stdin {
+        sandbox.run_streaming_with_stdin(command, std::io::stdin(), on_output)?
+    } else {
+        sandbox.run_streaming(command, on_output)?
     };
-    let out = if args.json { run(&mut |_, _| {})? } else { run(&mut write_stream)? };
     drop(raw);
-    report(&args, out, &p.exports)
+    report(&args, out, &p.exports, live, shown.cut)
+}
+
+/// `--metrics ADDR`: metrics served there for as long as grix runs.
+fn serve_metrics(args: &RunArgs) -> Result<Option<Metrics>> {
+    let Some(addr) = &args.metrics else { return Ok(None) };
+    let metrics = Metrics::new();
+    let at = metrics.serve(addr)?;
+    if !args.quiet {
+        eprintln!("grix: metrics at http://{at}/metrics");
+    }
+    Ok(Some(metrics))
+}
+
+/// Events as they happen, outside TTY mode (whose terminal is the
+/// program's) and --json: a server's denials show up while it runs.
+/// Missing paths only with -v (they're counted at the end). True if so.
+fn print_events(args: &RunArgs, control: &RunControl) -> bool {
+    if args.json || args.tty || args.quiet {
+        return false;
+    }
+    let verbose = args.verbose;
+    control.on_event(move |e| {
+        if verbose || !matches!(e, GuestEvent::MissingPath { .. }) {
+            eprintln!("grix: {e}");
+        }
+    });
+    true
+}
+
+/// The program's output, shown as it comes (up to `--max-output` of each
+/// stream), or with --json, not: it's in the answer.
+struct Shown {
+    json: bool,
+    limit: Option<usize>,
+    bytes: [usize; 2],
+    /// Whether any of stdout, stderr wasn't shown.
+    cut: [bool; 2],
+}
+
+impl Shown {
+    fn new(args: &RunArgs) -> Shown {
+        Shown { json: args.json, limit: args.max_output.map(|mb| mb << 20), bytes: [0; 2], cut: [false; 2] }
+    }
+
+    fn write(&mut self, stream: Stream, data: &[u8]) {
+        if self.json {
+            return;
+        }
+        let i = usize::from(stream == Stream::Stderr);
+        let n = self.limit.map_or(data.len(), |l| l.saturating_sub(self.bytes[i]).min(data.len()));
+        self.bytes[i] += n;
+        self.cut[i] |= n < data.len();
+        if n > 0 {
+            write_stream(stream, &data[..n]);
+        }
+    }
 }
 
 /// TTY mode with our terminal: raw, so every key goes to the program's,
@@ -523,7 +601,9 @@ fn write_stream(stream: Stream, data: &[u8]) {
     };
 }
 
-fn prepare(args: &RunArgs) -> Result<Prepared> {
+/// The sandbox `args` describe: counted in `metrics`, and with `streamed`,
+/// keeping none of the output (it's shown as it comes).
+fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<Prepared> {
     let manifest = match &args.manifest {
         Some(p) => Manifest::load(p)?,
         None => Manifest::default(),
@@ -618,14 +698,21 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
     if let Some(s) = args.grace {
         b = b.grace(Duration::from_secs(s));
     }
-    if let Some(s) = args.timeout {
-        b = b.timeout(Duration::from_secs(s));
+    match args.timeout {
+        Some(0) => b = b.no_timeout(),
+        Some(s) => b = b.timeout(Duration::from_secs(s)),
+        None => {}
     }
     if args.kill_on_deny {
         b = b.on_deny(DenyAction::Kill);
     }
-    if let Some(mb) = args.max_output {
+    if streamed {
+        b = b.max_output(0);
+    } else if let Some(mb) = args.max_output {
         b = b.max_output(mb << 20);
+    }
+    if let Some(m) = metrics {
+        b = b.metrics(m);
     }
     if let Some(mb) = args.max_export {
         b = b.max_export(mb << 20);
@@ -641,8 +728,15 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
     Ok(Prepared { sandbox, command, exports, control })
 }
 
-/// What a run did, for the user; the exit code.
-fn report(args: &RunArgs, out: RunOutput, exports: &grix::results::Destinations) -> Result<i32> {
+/// What a run did, for the user; the exit code. `live`: its events were
+/// shown as they happened; `cut`: stdout, stderr weren't all shown.
+fn report(
+    args: &RunArgs,
+    out: RunOutput,
+    exports: &grix::results::Destinations,
+    live: bool,
+    cut: [bool; 2],
+) -> Result<i32> {
     let mut notes = Vec::new();
     let say = |notes: &mut Vec<String>| {
         for n in notes.drain(..) {
@@ -668,6 +762,7 @@ fn report(args: &RunArgs, out: RunOutput, exports: &grix::results::Destinations)
         for e in &out.events {
             match e {
                 grix::GuestEvent::MissingPath { .. } if !args.verbose => missing += 1,
+                _ if live => {}
                 _ => eprintln!("grix: {e}"),
             }
         }
@@ -675,7 +770,7 @@ fn report(args: &RunArgs, out: RunOutput, exports: &grix::results::Destinations)
             eprintln!("grix: {missing} path(s) were looked up but not imported (-v lists them)");
         }
     }
-    for (truncated, name) in [(out.stdout_truncated, "stdout"), (out.stderr_truncated, "stderr")] {
+    for (truncated, name) in [(cut[0], "stdout"), (cut[1], "stderr")] {
         if truncated {
             eprintln!("grix: {name} was cut off at the output limit (--max-output)");
         }
@@ -858,6 +953,11 @@ fn mcp(args: McpArgs) -> Result<i32> {
         config.max_cpus = n;
     }
     config.writable = args.writable;
+    if let Some(addr) = &args.metrics {
+        let metrics = Metrics::new();
+        eprintln!("grix: metrics at http://{}/metrics", metrics.serve(addr)?);
+        config.metrics = Some(metrics);
+    }
     grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout())?;
     Ok(0)
 }

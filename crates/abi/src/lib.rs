@@ -6,6 +6,7 @@
 //! - [`policy`]: the capability model enforced by the guest kernel
 //! - [`wire`]: the framed protocol the guest uses to talk back to the host
 //! - [`link`]: networking and flow control between the guest kernel and the host
+//! - [`stats`]: what the guest kernel reports of its resources, for metrics
 
 #![cfg_attr(not(test), no_std)]
 
@@ -15,7 +16,7 @@ extern crate alloc;
 /// image, the wire format, `link` and `hostfs`. A grix image carries the
 /// kernel it was built with, and runs only with a host of the same
 /// version. Bump it with any change the other side couldn't read.
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// The kernel says which ABI it speaks with these bytes in its binary
 /// (`MARK` then `ABI_VERSION`, little-endian), so a host can tell before
@@ -50,4 +51,5 @@ pub mod image;
 pub mod link;
 pub mod machine;
 pub mod policy;
+pub mod stats;
 pub mod wire;

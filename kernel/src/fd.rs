@@ -275,6 +275,7 @@ impl FdTable {
     /// made, is then dropped by the caller).
     pub fn alloc(&mut self, entry: FdEntry, min: usize) -> Result<u64, Errno> {
         if OPEN_FILES.load(Ordering::Relaxed) > MAX_OPEN_FILES {
+            crate::stats::hit(grix_abi::stats::Limit::OpenFiles);
             return Err(ENFILE);
         }
         let start = min.min(MAX_FDS);

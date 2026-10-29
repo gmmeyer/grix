@@ -5,7 +5,7 @@
 //! capabilities = []          # fs_write, threads, process, net
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
-//! timeout_secs = 30
+//! timeout_secs = 30        # 0: no time limit (a server)
 //! grace_secs = 5             # after the time limit: SIGTERM, then this long to end
 //! max_export_mb = 256
 //!
@@ -58,6 +58,7 @@ pub struct Manifest {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
     pub memory_mb: Option<u64>,
+    /// 0: no time limit.
     pub timeout_secs: Option<u64>,
     /// After the time limit, seconds to end after SIGTERM.
     pub grace_secs: Option<u64>,
@@ -168,8 +169,10 @@ impl Manifest {
         if let Some(s) = self.grace_secs {
             b = b.grace(Duration::from_secs(s));
         }
-        if let Some(s) = self.timeout_secs {
-            b = b.timeout(Duration::from_secs(s));
+        match self.timeout_secs {
+            Some(0) => b = b.no_timeout(),
+            Some(s) => b = b.timeout(Duration::from_secs(s)),
+            None => {}
         }
         if let Some(mb) = self.max_export_mb {
             b = b.max_export(mb << 20);

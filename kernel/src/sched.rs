@@ -32,12 +32,15 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     p.resched = false;
     let mut procs = PROCS.lock();
     let prev = p.current;
+    let was = p.running.then_some((p.pid, prev));
     // CPU time: prev ran from slice_start until now (not while we idle).
     let now = time::monotonic_ns();
     if p.running
         && let Some(t) = p.threads.get_mut(&prev)
     {
-        t.cpu_ns += now.saturating_sub(p.slice_start);
+        let ran = now.saturating_sub(p.slice_start);
+        t.cpu_ns += ran;
+        crate::stats::cpu(ran);
         t.regs = *tf;
         // The kernel never touches FP/SIMD or the TLS register, so the CPU
         // still holds prev's values.
@@ -75,6 +78,9 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     if !alone && !smp::runs_here(p) {
         smp::kick_others(p.pid);
     }
+    // A finished-off process is a zombie in `procs` already.
+    let processes = procs.others.len() + procs.zombies.len() + usize::from(!p.dead);
+    crate::stats::tasks(processes, procs.threads(p));
     let Some(next) = pick(p, &procs, alone) else {
         idle(p, &mut procs);
         return;
@@ -99,6 +105,9 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     *tf = t.regs;
     p.current = tid;
     p.running = true;
+    if was != Some((p.pid, tid)) {
+        crate::stats::switched();
+    }
     p.slice_start = time::monotonic_ns();
     p.timer_dirty = true;
     update_timer(p);

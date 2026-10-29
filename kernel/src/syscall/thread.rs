@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
+use grix_abi::stats::{Limit, Resource};
 
 use super::{require, table::nr};
 use crate::arch::{self, FpState, TrapFrame};
@@ -86,7 +87,9 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & CLONE_PIDFD != 0 {
         return Err(EINVAL);
     }
-    if crate::procs::PROCS.lock().threads(p) >= MAX_THREADS {
+    let threads = crate::procs::PROCS.lock().threads(p);
+    if threads >= MAX_THREADS {
+        crate::stats::hit(Limit::Threads);
         return Err(EAGAIN);
     }
 
@@ -116,12 +119,18 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     p.threads.insert(tid, t);
     p.runq.push_back(tid);
     p.timer_dirty = true;
+    crate::stats::peak(Resource::Threads, threads as u64 + 1);
     Ok(tid as u64)
 }
 
 /// exit(2): end the calling thread only. The process ends with the last thread.
 pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     p.exited_cpu_ns += p.thread_cpu_ns(p.current).unwrap_or(0);
+    // Its time on the CPU since `slice_start`, which the scheduler won't
+    // count now that it's gone.
+    let now = time::monotonic_ns();
+    crate::stats::cpu(now.saturating_sub(p.slice_start));
+    p.slice_start = now;
     let t = p.threads.remove(&p.current).expect("current thread missing");
     // Its queued signals went with it, perhaps a timer's.
     crate::timer::resync(p);

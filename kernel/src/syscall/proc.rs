@@ -4,6 +4,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
+use grix_abi::stats::{Limit, Resource};
 
 use super::thread::{
     CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_VFORK, CLONE_VM, CloneArgs,
@@ -52,7 +53,9 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return Err(EINVAL);
     }
     let mut procs = PROCS.lock();
-    if procs.count() >= MAX_PROCESSES || procs.threads(p) >= process::MAX_THREADS {
+    let (count, threads) = (procs.count(), procs.threads(p));
+    if count >= MAX_PROCESSES || threads >= process::MAX_THREADS {
+        crate::stats::hit(if count >= MAX_PROCESSES { Limit::Processes } else { Limit::Threads });
         return Err(EAGAIN);
     }
     let pid = process::new_tid();
@@ -105,6 +108,9 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let owner = (c.uid, c.gid);
     procs.others.insert(pid, c);
+    crate::stats::forked();
+    crate::stats::peak(Resource::Processes, count as u64 + 1);
+    crate::stats::peak(Resource::Threads, threads as u64 + 1);
     p.timer_dirty = true;
     drop(procs);
     {

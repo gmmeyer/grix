@@ -105,6 +105,7 @@ pub struct Snapshot {
     pub(crate) timeout: Duration,
     pub(crate) vmm: Option<PathBuf>,
     pub(crate) control: Option<crate::RunControl>,
+    pub(crate) metrics: Option<crate::Metrics>,
     /// Guest RAM, as the VMM's header says (what a restored run maps).
     ram_size: u64,
     /// Host directories for its live mounts: (host, guest, read-only).
@@ -187,6 +188,7 @@ impl Snapshot {
             timeout,
             vmm: crate::sandbox::default_vmm(),
             control: None,
+            metrics: None,
             ram_size,
             mounts: Vec::new(),
         };
@@ -373,9 +375,21 @@ impl Snapshot {
         self
     }
 
+    /// No time limit for runs from here (see
+    /// [`SandboxBuilder::no_timeout`](crate::SandboxBuilder::no_timeout)).
+    pub fn no_timeout(self) -> Self {
+        self.timeout(Duration::MAX)
+    }
+
     /// Signal or stop runs from here (see [`RunControl`](crate::RunControl)).
     pub fn control(mut self, control: &crate::RunControl) -> Self {
         self.control = Some(control.clone());
+        self
+    }
+
+    /// Count runs from here in `metrics` (see [`Metrics`](crate::Metrics)).
+    pub fn metrics(mut self, metrics: &crate::Metrics) -> Self {
+        self.metrics = Some(metrics.clone());
         self
     }
 

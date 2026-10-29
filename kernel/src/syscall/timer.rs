@@ -166,6 +166,7 @@ pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResu
     const SIGEV_THREAD_ID: u32 = 4;
     let cpu = timer_clock(p, nr::timer_create, clock, true)?;
     if p.timers.posix.len() >= MAX_POSIX_TIMERS {
+        crate::stats::hit(grix_abi::stats::Limit::Timers);
         return Err(EAGAIN);
     }
     // The next id not in use (ids wrap, below the itimers' own).

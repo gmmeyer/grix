@@ -145,9 +145,11 @@ std::thread::spawn(move || {
 let out = sandbox.run(&["/bin/server"])?;
 ```
 
-- When the time limit runs out, the program gets SIGTERM and a grace
-  period (`grace`, 5 seconds by default) to end. If it does, its exports
-  and `mount_on_exit` changes come back. The status is `Timeout` either way.
+- When the time limit runs out (`timeout`, 60 seconds by default), the
+  program gets SIGTERM and a grace period (`grace`, 5 seconds by default)
+  to end. If it does, its exports and `mount_on_exit` changes come back.
+  The status is `Timeout` either way. A server has none: `no_timeout()`
+  (`--timeout 0`, a manifest's `timeout_secs = 0`).
 - A program whose threads are all blocked is ended at once and reported as
   a deadlock, unless one waits for a signal (`pause`, `sigsuspend`,
   `sigwait`): one may yet come, from a control or the time limit.
@@ -450,6 +452,72 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   set, and never more than the file's; the time limit is the file's or
   the default's, whichever is shorter, unless `--timeout` says.
 
+## Monitoring
+
+Every run says what it cost the host and what its kernel saw:
+
+- `RunOutput::host_usage` (`host_usage` in `--json`): the VM process's CPU
+  time and peak resident memory, measured by the host when it ends.
+- `RunOutput::guest_stats` (`guest_stats`): what the guest kernel reports
+  of itself as the program ends. That covers the program's CPU time, system
+  calls, page faults, context switches and forks. For memory, kernel memory,
+  file data, file metadata, processes and threads, it gives what's in use
+  now, the peak, and the limit. And for each kernel limit (`threads`,
+  `file_data`, `open_files`, `kernel_memory`, ...), how often it refused
+  something (`limits_hit`). Over MCP, the limits a program ran into are
+  in the answer. It's the guest's own say-so, which a program that took
+  over its kernel could make anything: alert and bill on `host_usage`.
+
+`Metrics` counts runs for Prometheus. `grix run --metrics ADDR` and `grix
+mcp --metrics ADDR` serve them at `http://ADDR/metrics`:
+
+```rust
+let metrics = grix::Metrics::new();
+metrics.serve("0.0.0.0:9090")?;                // or metrics.render(), the text
+let sandbox = Sandbox::builder().import("./server", "/bin/server")?.metrics(&metrics).build()?;
+```
+
+| Metric | What |
+|---|---|
+| `grix_runs_started_total`, `grix_runs_active` | runs started, and in progress |
+| `grix_runs_total{status}` | runs ended: `ok`, `exit_nonzero`, `signaled`, `timeout`, `stopped`, `kernel_panic`, `vm_failed`, `error` |
+| `grix_run_duration_seconds` | histogram of how long runs took |
+| `grix_events_total{kind,capability}` | `denied` (by capability, or `allow_host`), `unsupported`, `missing_path`, `fault`, `exec_failed`, `stopped`, `continued` |
+| `grix_output_bytes_total{stream}` | what programs wrote to stdout and stderr |
+| `grix_vmm_cpu_seconds_total{mode}`, `grix_vmm_peak_memory_bytes` | the VM processes' cost, measured by the host |
+| `grix_guest_resource_used{resource}`, `grix_guest_resource_limit{resource}` | what running sandboxes use now, and have (bytes, or a count for `processes` and `threads`) |
+| `grix_guest_peak_usage_ratio{resource}` | histogram of each run's peak as a fraction of its limit |
+| `grix_guest_limit_hits_total{limit}` | times a kernel limit refused a program something |
+| `grix_guest_cpu_seconds_total`, `grix_guest_syscalls_total`, `grix_guest_page_faults_total`, `grix_guest_context_switches_total`, `grix_guest_processes_started_total` | what programs did |
+
+While a run goes on, the host asks its kernel for a report every 5
+seconds, so the `grix_guest_*` gauges and counters move during long runs.
+They show what the program uses now. A container's memory metric can't:
+guest memory the program frees stays resident in the VMM's process until
+the run ends. Every label comes from a fixed set (a capability name the
+guest makes up is `other`), so no program can make the series grow.
+
+### In a container
+
+`grix run` can be a container's command, as for a server in Kubernetes
+(the container needs `/dev/kvm`; see the `Dockerfile`):
+
+```sh
+grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threads --image app.grix
+```
+
+- `--timeout 0`: no time limit (the default is 60 seconds).
+- The program's output goes to grix's stdout and stderr as it comes, all of
+  it (`--max-output MIB` caps that), and grix keeps none of it.
+- Events (`grix: denied ...`) are printed as they happen.
+- Forward ports on `0.0.0.0`: probes and Services connect to the pod's
+  address, not its loopback.
+- Kubernetes' SIGTERM goes to the program, and grix's exit code is the
+  program's (128 + signal if a signal killed it, 125 if the sandbox
+  failed).
+- The container's memory limit needs room for the guest's (`--mem`, 512
+  MiB by default) and grix's own.
+
 ## Images
 
 A grix image is a file tree, the settings to run it with, and the grix
@@ -541,7 +609,7 @@ capabilities = []        # fs_write, threads, process, net
 on_deny = "errno"        # "errno" (EPERM) or "kill" (SIGSYS, like seccomp)
 # allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
 memory_mb = 256
-timeout_secs = 30
+timeout_secs = 30        # 0: no time limit
 
 [env]
 LANG = "C"

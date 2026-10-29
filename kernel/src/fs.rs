@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 use core::ops::Bound;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use grix_abi::hostfs::{Attr, FileType};
+use grix_abi::stats::{Limit, Resource};
 use grix_abi::image::{Entry, EntryKind, LiveMount};
 use spin::{Mutex, MutexGuard};
 
@@ -84,11 +85,18 @@ pub fn usage() -> (u64, u64) {
     (PAGES_USED.load(Ordering::Relaxed), PAGES_LIMIT.load(Ordering::Relaxed))
 }
 
+/// (bytes of names and nodes in use, the limit)
+pub fn meta_usage() -> (u64, u64) {
+    (META_USED.load(Ordering::Relaxed), META_LIMIT)
+}
+
 fn charge(bytes: u64) -> Result<(), Errno> {
     if META_USED.load(Ordering::Relaxed) + bytes > META_LIMIT {
+        crate::stats::hit(Limit::FileMetadata);
         return Err(ENOSPC);
     }
-    META_USED.fetch_add(bytes, Ordering::Relaxed);
+    let now = META_USED.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    crate::stats::peak(Resource::FileMetadata, now);
     Ok(())
 }
 
@@ -344,10 +352,12 @@ impl FileData {
         }
         let (used, limit) = usage();
         if used >= limit {
+            crate::stats::hit(Limit::FileData);
             return Err(ENOSPC);
         }
         let pa = frame::alloc().ok_or(ENOSPC)?;
-        PAGES_USED.fetch_add(1, Ordering::Relaxed);
+        let pages = PAGES_USED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::stats::peak(Resource::FileData, pages * PAGE_SIZE);
         let p = page_mut(pa);
         let start = ((idx * PAGE_SIZE) as usize).min(self.base.len());
         let end = (start + PAGE_SIZE as usize).min(self.base.len());

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grix::{
-    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, RunControl, RunOutput, Sandbox,
-    SandboxBuilder, Stream,
+    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, Limit, Metrics, Resource, RunControl,
+    RunOutput, Sandbox, SandboxBuilder, Stream,
 };
 
 fn x86_64_guest() -> bool {
@@ -143,7 +143,12 @@ fn networking_through_the_host() {
     let port = echo_server();
     // (The fixture expects port + 1 to be denied, so that's not the closed one.)
     let closed = std::iter::repeat_with(free_port).find(|&c| c != port + 1).unwrap();
+    let control = RunControl::new();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = seen.clone();
+    control.on_event(move |e| s.lock().unwrap().push(e.to_string()));
     let b = with("inet")
+        .control(&control)
         .allow(Capability::Net)
         .allow_host(&format!("host.grix.internal:{port}"))
         .unwrap()
@@ -165,6 +170,12 @@ fn networking_through_the_host() {
     assert!(denied[1].starts_with("93.184.216.34:80 isn't in the allow-list"));
     // Not a missing capability: the policy said no.
     assert!(out.missing_capabilities().is_empty());
+    // The host's own denials are told as they happen, as the guest's are.
+    let mut seen = seen.lock().unwrap().clone();
+    let mut all: Vec<String> = out.events.iter().map(|e| e.to_string()).collect();
+    seen.sort();
+    all.sort();
+    assert_eq!(seen, all);
 
     // Names the guest doesn't know go to the host's resolver; with an
     // allow-list, only names on it.
@@ -364,6 +375,10 @@ fn filesystem_size_limit() {
     let mib: u64 =
         out.stdout_str().trim().strip_prefix("filled ").unwrap().strip_suffix(" MiB").unwrap().parse().unwrap();
     assert!((150..=256).contains(&mib), "{mib} MiB");
+    let stats = out.guest_stats.expect("the kernel's report");
+    assert!(stats.hits(Limit::FileData) > 0, "{stats:?}");
+    let data = stats.usage(Resource::FileData);
+    assert!(data.peak >= mib << 20 && data.peak <= data.limit, "{data:?}");
 }
 
 #[test]
@@ -372,6 +387,7 @@ fn filesystem_metadata_limit() {
     let out = run(with("files").allow(Capability::FsWrite), &["/bin/files", "meta"]);
     assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stdout_str());
     assert!(out.stdout_str().starts_with("meta "), "{}", out.stdout_str());
+    assert!(out.guest_stats.unwrap().hits(Limit::FileMetadata) > 0);
 }
 
 #[test]
@@ -1323,6 +1339,13 @@ fn kernel_memory_is_bounded() {
     assert_eq!(out.stdout_str(), "limits ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+    // Each limit it ran into is counted, for the host's metrics.
+    let stats = out.guest_stats.unwrap();
+    for l in [Limit::KernelMemory, Limit::QueuedSignals, Limit::Mappings, Limit::InotifyWatches] {
+        assert!(stats.hits(l) > 0, "{l:?}: {stats:?}");
+    }
+    let kmem = stats.usage(Resource::KernelMemory);
+    assert!(kmem.peak > kmem.limit / 2 && kmem.peak <= kmem.limit, "{kmem:?}");
 }
 
 // ---------------------------------------------------------------- stdin and output
@@ -1429,6 +1452,11 @@ fn output_limit() {
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert_eq!(out.stdout.len(), 1000);
     assert!(out.stdout_truncated && !out.stderr_truncated);
+    // The limit is on what's kept: what's streamed is all of it.
+    let mut streamed = 0;
+    let out =
+        sb.run_streaming(&["/bin/busybox", "head", "-c", "5000", "/dev/zero"], |_, d| streamed += d.len()).unwrap();
+    assert_eq!((streamed, out.stdout.len()), (5000, 1000));
 }
 
 #[test]
@@ -2219,6 +2247,11 @@ fn snapshots_resume_where_the_program_waited() {
             out.kernel_log
         );
         assert!(out.events.is_empty(), "{:?}", out.events);
+        // Its kernel's counts are this run's: `head | od` forked two (sh
+        // execs `date`, its last), and the pipeline before the snapshot
+        // two more.
+        let stats = out.guest_stats.as_ref().expect("no report from the kernel");
+        assert_eq!(stats.processes_started, 2, "{stats:?}");
     }
     assert_ne!(randoms[0], randoms[1], "every run from a snapshot draws its own randomness");
     // The file can be opened again later.
@@ -2514,4 +2547,117 @@ fn x86_64_programs_run_through_a_translator() {
     let out = b().build().unwrap().run(&["/bin/hello-x86_64"]).unwrap();
     assert_eq!(out.status, ExitStatus::Exited(126));
     assert!(out.events.iter().any(|e| e.to_string().contains("x86_64 translator")), "{:?}", out.events);
+}
+
+// ---------------------------------------------------------------- metrics
+
+#[test]
+fn the_kernel_reports_its_resources() {
+    let out = run(with("hello"), &["/bin/hello"]);
+    let s = out.guest_stats.as_ref().expect("no report from the kernel");
+    assert!(s.syscalls > 0 && s.page_faults > 0 && s.cpu_ns > 0, "{s:?}");
+    for r in Resource::ALL {
+        let u = s.usage(r);
+        assert!(u.now <= u.peak && u.peak <= u.limit && u.limit > 0, "{r:?}: {u:?}");
+    }
+    assert_eq!(s.usage(Resource::Processes).peak, 1);
+    assert!(s.usage(Resource::Memory).peak > 0);
+    assert!(s.limits_hit.iter().all(|&n| n == 0), "{s:?}");
+    // What the host measured of the VM's process.
+    let host = out.host_usage.expect("no usage from the host");
+    assert!(host.peak_memory_bytes > 0 && !(host.cpu_user + host.cpu_system).is_zero(), "{host:?}");
+}
+
+/// `GET /metrics` from `addr`: the body, if it answered.
+fn scrape(addr: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(addr).ok()?;
+    c.write_all(b"GET /metrics HTTP/1.1\r\nHost: grix\r\n\r\n").ok()?;
+    let mut s = String::new();
+    c.read_to_string(&mut s).ok()?;
+    s.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+}
+
+#[test]
+fn metrics_while_a_sandbox_runs() {
+    let metrics = Metrics::new();
+    let sb = Sandbox::builder()
+        .no_timeout()
+        .metrics(&metrics)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .build()
+        .unwrap();
+    let addr = metrics.serve("127.0.0.1:0").unwrap().to_string();
+    let runner = std::thread::spawn(move || sb.run(&["/bin/busybox", "sleep", "7"]).unwrap());
+    // Its kernel reports every few seconds while it runs.
+    let started = std::time::Instant::now();
+    loop {
+        let text = scrape(&addr).unwrap_or_default();
+        if text.contains("grix_guest_resource_used{resource=\"processes\"} 1\n") {
+            assert!(text.contains("grix_runs_active 1\n"), "{text}");
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no report while it ran:\n{text}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let out = runner.join().unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.kernel_log);
+    let text = metrics.render();
+    for want in [
+        "grix_runs_total{status=\"ok\"} 1\n",
+        "grix_runs_active 0\n",
+        "grix_guest_resource_used{resource=\"processes\"} 0\n",
+        "grix_run_duration_seconds_count 1\n",
+        "grix_vmm_peak_memory_bytes_count 1\n",
+    ] {
+        assert!(text.contains(want), "{want}\n{text}");
+    }
+    // What programs are denied, by capability.
+    let out = with("net").metrics(&metrics).build().unwrap().run(&["/bin/net"]).unwrap();
+    assert_eq!(out.missing_capabilities(), ["net"]);
+    let text = metrics.render();
+    assert!(text.contains("grix_events_total{kind=\"denied\",capability=\"net\"} 1\n"), "{text}");
+    assert!(text.contains("grix_runs_started_total 2\n"), "{text}");
+}
+
+/// `grix run` as a container's command: output as it comes, events as they
+/// happen, no time limit, metrics while it runs.
+#[test]
+fn the_cli_for_a_server() {
+    use std::process::{Command, Stdio};
+    let busybox = format!("{}:/bin/busybox", fixture("alpine/bin/busybox.static").display());
+    let grix = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_grix")).arg("run").args(args).output().unwrap();
+    // Shown up to --max-output; nothing's kept.
+    let out = grix(&["--max-output", "1", "-i", &busybox, "--", "/bin/busybox", "head", "-c", "3000000", "/dev/zero"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.stdout.len(), 1 << 20, "{err}");
+    assert!(err.contains("grix: stdout was cut off at the output limit (--max-output)"), "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let out = grix(&["-i", &busybox, "--", "/bin/busybox", "head", "-c", "3000000", "/dev/zero"]);
+    assert_eq!(out.stdout.len(), 3000000);
+    // A denial is shown when it happens, before what the program says next.
+    let out = grix(&["-i", &busybox, "--", "/bin/busybox", "wget", "-q", "-O-", "http://example.com/"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let at = err.find("grix: denied socket: needs capability `net`\n").unwrap_or_else(|| panic!("{err}"));
+    assert!(err[at..].contains("wget: "), "{err}");
+    assert_eq!(err.matches("denied socket").count(), 1, "{err}");
+    // --timeout 0: no limit; --metrics: served while it runs.
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut server = Command::new(env!("CARGO_BIN_EXE_grix"))
+        .args(["run", "--timeout", "0", "--metrics", &addr, "-i", &busybox, "--", "/bin/busybox", "sleep", "7"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let text = scrape(&addr).unwrap_or_default();
+        if text.contains("grix_guest_resource_used{resource=\"threads\"} 1\n") {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no metrics while it ran:\n{text}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(server.wait().unwrap().success());
 }

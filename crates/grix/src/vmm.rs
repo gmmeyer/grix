@@ -10,7 +10,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,11 +22,15 @@ use anyhow::{Context, Result};
 use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder, Input};
 
 use crate::event::GuestEvent;
+use crate::metrics::REPORT_EVERY;
 use crate::net::{NetPolicy, Outbox, Proxy, StdinGate};
+use crate::sandbox::HostUsage;
 
 pub(crate) struct VmConfig {
     pub net: NetPolicy,
     pub control: Option<crate::control::RunControl>,
+    /// Counts the run; the kernel is asked for reports while it goes on.
+    pub metrics: Option<crate::metrics::Metrics>,
     /// How long the program has to end after the SIGTERM a timeout sends.
     pub grace: Duration,
     pub live: Vec<crate::hostfs::LiveMount>,
@@ -68,12 +72,51 @@ pub(crate) enum VmEnd {
 }
 
 /// Kills the VMM if we bail out early (error, timeout, caller panic).
-struct ChildGuard(Child);
+/// `reaped` once `reap` has waited for it.
+struct ChildGuard(Child, bool);
+
+impl ChildGuard {
+    /// Wait for the VMM to end (killing it first, with `kill`): its status
+    /// and what it cost, as the operating system counted it.
+    fn reap(&mut self, kill: bool) -> Result<(std::process::ExitStatus, HostUsage)> {
+        if kill {
+            let _ = self.0.kill();
+        }
+        let pid = self.0.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: a zeroed rusage is a valid one for wait4 to fill.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: wait4 fills the status and rusage it's given. Our own
+            // child: nothing else waits for it (`Child` won't: `reaped`).
+            if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != ErrorKind::Interrupted {
+                return Err(e).context("waiting for the VMM");
+            }
+        }
+        self.1 = true;
+        let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+        // Linux counts the peak in KiB, macOS in bytes.
+        let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
+        let usage = HostUsage {
+            cpu_user: time(ru.ru_utime),
+            cpu_system: time(ru.ru_stime),
+            peak_memory_bytes: (ru.ru_maxrss as u64).saturating_mul(unit),
+        };
+        Ok((std::process::ExitStatus::from_raw(status), usage))
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Not once reaped: its pid may be another process's by now.
+        if !self.1 {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
@@ -215,6 +258,8 @@ pub(crate) struct VmRun {
     pub timed_out: bool,
     /// For a run that takes a snapshot: its live mounts' state.
     pub fs_state: Option<Vec<u8>>,
+    /// What the VMM's process cost the host.
+    pub usage: Option<HostUsage>,
 }
 
 /// How often a run with a `RunControl` looks for `stop`.
@@ -254,7 +299,18 @@ pub(crate) fn run(
     // through one writer, a frame at a time. Forwarded ports are bound
     // before QEMU starts, so a busy one fails the run at once.
     let to_guest = Outbox::new();
-    let proxy = Proxy::start(cfg.net.clone(), to_guest.clone())?;
+    // What the host refuses is passed on as it happens, as the guest's
+    // events are.
+    let (control, metrics) = (cfg.control.clone(), cfg.metrics.clone());
+    let on_event: crate::net::EventHook = Arc::new(move |e: &GuestEvent| {
+        if let Some(m) = &metrics {
+            m.event(e);
+        }
+        if let Some(c) = &control {
+            c.event(e);
+        }
+    });
+    let proxy = Proxy::start(cfg.net.clone(), to_guest.clone(), on_event)?;
     let fs = match &cfg.fs_state {
         Some(state) => crate::hostfs::Server::restore(&cfg.live, state)?,
         None => crate::hostfs::Server::new(&cfg.live)?,
@@ -331,7 +387,7 @@ pub(crate) fn run(
             format!("starting {}", vmm.display())
         }
     })?;
-    let mut child = ChildGuard(child);
+    let mut child = ChildGuard(child, false);
     let uart = accept_uart(&listener, &mut child.0)?;
     drop(listener);
     run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
@@ -428,15 +484,23 @@ fn run_vm(
     });
 
     let live = cfg.control.as_ref().map(|c| c.attach(to_guest.clone()));
-    let mut deadline = Instant::now() + timeout;
+    // None: no time limit (`SandboxBuilder::no_timeout`, or one too long
+    // to be a time).
+    let mut deadline = Instant::now().checked_add(timeout);
     let mut timed_out = false;
     let mut decoder = FrameDecoder::new();
     let mut exit = None;
+    // Reports for the metrics as the run goes on; never while taking a
+    // snapshot, whose moment is when nothing comes from the host.
+    let report_every =
+        (cfg.metrics.is_some() && !matches!(cfg.snapshot, Some(SnapshotFile::Take(_)))).then_some(REPORT_EVERY);
+    let mut next_report = report_every.map(|every| Instant::now() + every);
     loop {
         // Checked every time round, not just when the program is quiet: a
         // chatty one must stop or time out too.
         let stopped = live.as_ref().is_some_and(|l| l.stopped());
-        if stopped || Instant::now() >= deadline {
+        let now = Instant::now();
+        if stopped || deadline.is_some_and(|d| now >= d) {
             // Out of time while the program runs: ask it to end, as a
             // container runtime does, and give it a little longer.
             if !stopped && exit.is_none() && !timed_out && !cfg.grace.is_zero() {
@@ -444,7 +508,7 @@ fn run_vm(
                 let mut f = wire::input_header(Input::Signal, 1).to_vec();
                 f.push(SIGTERM);
                 to_guest.signal(f);
-                deadline = Instant::now() + cfg.grace;
+                deadline = now.checked_add(cfg.grace);
                 continue;
             }
             // If the program had ended, that's its status (and the exports
@@ -455,10 +519,24 @@ fn run_vm(
                 None => VmEnd::Timeout,
             };
             timed_out |= matches!(end, VmEnd::Timeout);
-            return Ok(VmRun { end, events: proxy.stop(), timed_out, fs_state: None });
+            let usage = child.reap(true).ok().map(|(_, usage)| usage);
+            return Ok(VmRun { end, events: proxy.stop(), timed_out, fs_state: None, usage });
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        let wait = if live.is_some() { left.min(STOP_POLL) } else { left };
+        if let Some(at) = next_report
+            && now >= at
+        {
+            // Asked again next time if it's lost: not `signal`, which
+            // queues whatever the guest has read.
+            to_guest.offer_lossy(wire::input_header(Input::Stats, 0).to_vec());
+            next_report = report_every.map(|every| now + every);
+        }
+        let mut wait = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(now));
+        if live.is_some() {
+            wait = wait.min(STOP_POLL);
+        }
+        if let Some(at) = next_report {
+            wait = wait.min(at.saturating_duration_since(now));
+        }
         let chunk = match rx.recv_timeout(wait) {
             Ok(chunk) => chunk,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -468,7 +546,10 @@ fn run_vm(
             Channel::Exit if exit.is_none() => {
                 exit = wire::decode_exit(payload);
                 if exit.is_some() {
-                    deadline = deadline.max(Instant::now() + EXPORT_GRACE);
+                    // The exports' time, even without a time limit.
+                    let grace = Instant::now() + EXPORT_GRACE;
+                    deadline = Some(deadline.map_or(grace, |d| d.max(grace)));
+                    next_report = None;
                 }
             }
             Channel::Exit => {}
@@ -477,7 +558,7 @@ fn run_vm(
             _ => on_frame(ch, payload),
         });
     }
-    let status = child.0.wait()?;
+    let (status, usage) = child.reap(false)?;
     let events = proxy.stop();
     // A panic's message and status come on the serial port.
     let early = uart_thread.join().unwrap_or_default();
@@ -491,5 +572,5 @@ fn run_vm(
         None => VmEnd::Lost { vmm_status: status.code(), vmm_stderr },
     };
     let fs_state = matches!(cfg.snapshot, Some(SnapshotFile::Take(_))).then(|| fs.save());
-    Ok(VmRun { end, events, timed_out, fs_state })
+    Ok(VmRun { end, events, timed_out, fs_state, usage: Some(usage) })
 }

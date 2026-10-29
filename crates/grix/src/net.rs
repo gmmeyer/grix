@@ -500,10 +500,11 @@ impl Outbox {
         }
     }
 
-    /// Queue a frame that may be lost (a datagram) only while the outbox is
-    /// under half full, so replies to the guest's own messages always fit.
-    /// Whether it was.
-    fn offer_lossy(&self, frame: Vec<u8>) -> bool {
+    /// Queue a frame that may be lost (a datagram, or a request for stats
+    /// the host repeats) only while the outbox is under half full, so
+    /// replies to the guest's own messages always fit, and a guest that
+    /// never reads can't make it grow. Whether it was.
+    pub(crate) fn offer_lossy(&self, frame: Vec<u8>) -> bool {
         let q = self.q.lock().unwrap();
         if !q.closed && q.bytes + frame.len() <= OUTBOX_BYTES / 2 {
             self.push(q, frame);
@@ -599,6 +600,8 @@ struct Shared {
     names: Mutex<HashMap<IpAddr, String>>,
     name_rules: bool,
     events: Mutex<Vec<GuestEvent>>,
+    /// Each of `events` as it happens.
+    on_event: EventHook,
     reported: Mutex<HashSet<String>>,
     lookups: AtomicU32,
     connecting: AtomicU32,
@@ -622,7 +625,8 @@ impl Shared {
     fn deny(&self, what: &str, detail: String) {
         let mut reported = self.reported.lock().unwrap();
         if reported.len() < MAX_REPORTED && reported.insert(detail.clone()) {
-            self.events.lock().unwrap().push(GuestEvent::Denied {
+            drop(reported);
+            self.report(GuestEvent::Denied {
                 syscall: what.into(),
                 capability: crate::event::NET_POLICY.into(),
                 detail,
@@ -635,12 +639,18 @@ impl Shared {
     fn deny_capability(&self, what: &str) {
         let mut reported = self.reported.lock().unwrap();
         if reported.insert(format!("no net: {what}")) {
-            self.events.lock().unwrap().push(GuestEvent::Denied {
+            drop(reported);
+            self.report(GuestEvent::Denied {
                 syscall: what.into(),
                 capability: "net".into(),
                 detail: "the sandbox doesn't have the net capability".into(),
             });
         }
+    }
+
+    fn report(&self, e: GuestEvent) {
+        (self.on_event)(&e);
+        self.events.lock().unwrap().push(e);
     }
 
     fn remember(&self, name: &str, addrs: &[IpAddr]) {
@@ -657,6 +667,9 @@ impl Shared {
         }
     }
 }
+
+/// Told of each event the proxy reports, as it happens.
+pub(crate) type EventHook = Arc<dyn Fn(&GuestEvent) + Send + Sync>;
 
 /// The host side of the guest's networking for one run.
 pub(crate) struct Proxy {
@@ -688,7 +701,7 @@ fn errno(e: &std::io::Error) -> u16 {
 impl Proxy {
     /// Listen on the forwarded ports (failing if one can't be had) and get
     /// ready for the guest's messages, which go out through `outbox`.
-    pub fn start(policy: NetPolicy, outbox: Arc<Outbox>) -> Result<Proxy> {
+    pub fn start(policy: NetPolicy, outbox: Arc<Outbox>, on_event: EventHook) -> Result<Proxy> {
         let mut listeners = Vec::new();
         for (from, guest) in &policy.forwards {
             let l = match from {
@@ -726,6 +739,7 @@ impl Proxy {
             udp_forwards,
             names: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
+            on_event,
             reported: Mutex::new(HashSet::new()),
             lookups: AtomicU32::new(0),
             connecting: AtomicU32::new(0),
@@ -1350,7 +1364,7 @@ mod tests {
     fn data_for_the_peer_is_bytes_within_the_window() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let proxy = Proxy::start(policy(&["127.0.0.1"]), Outbox::new()).unwrap();
+        let proxy = Proxy::start(policy(&["127.0.0.1"]), Outbox::new(), Arc::new(|_| {})).unwrap();
         proxy.handle(&ToHost::Connect { id: 1, addr: Addr::V4([127, 0, 0, 1]), port }.encode());
         let (mut peer, _) = listener.accept().unwrap();
         let conn = loop {
@@ -1412,7 +1426,7 @@ mod tests {
         let policy =
             NetPolicy { enabled, udp_forwards: vec![(UdpFrom::Socket(Arc::new(sock)), 53)], ..NetPolicy::default() };
         let outbox = Outbox::new();
-        (Proxy::start(policy, outbox.clone()).unwrap(), outbox, host)
+        (Proxy::start(policy, outbox.clone(), Arc::new(|_| {})).unwrap(), outbox, host)
     }
 
     fn wait_for(mut f: impl FnMut() -> bool) {

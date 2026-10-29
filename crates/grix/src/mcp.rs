@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::policy::Capability;
+use grix_abi::stats::Limit;
 use serde_json::{Value, json};
 
 use crate::RunControl;
@@ -56,6 +57,8 @@ pub struct McpConfig {
     /// How many tool calls run at once (each boots a VM, with up to
     /// `max_memory_mb`); more wait their turn.
     pub max_parallel: usize,
+    /// Where runs are counted (`grix mcp --metrics`).
+    pub metrics: Option<crate::Metrics>,
 }
 
 impl McpConfig {
@@ -75,6 +78,7 @@ impl McpConfig {
             writable: false,
             registry_credentials: false,
             max_parallel: 2,
+            metrics: None,
         })
     }
 
@@ -572,6 +576,9 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
                 bail!("the snapshot has {} CPUs; the server allows at most {}", snap.cpus(), config.max_cpus);
             }
             let t = timeout(config, args, snap.default_timeout())?;
+            if let Some(m) = &config.metrics {
+                snap = snap.metrics(m);
+            }
             snap.timeout(t).control(control).run_streaming(std::io::Cursor::new(stdin), |s, d| progress.output(s, d))?
         }
         None => {
@@ -626,6 +633,9 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
         bail!("{cpus} CPUs: the server allows at most {}", config.max_cpus);
     }
     let mut b = Sandbox::builder().max_output(OUTPUT_MAX * 4).cpus(cpus as u32);
+    if let Some(m) = &config.metrics {
+        b = b.metrics(m);
+    }
     if let Some(t) = args["x86_64"].as_str() {
         b = b.x86_64(config.host_path(t)?)?;
     }
@@ -731,6 +741,15 @@ fn describe(out: &crate::RunOutput) -> (String, Value, bool) {
     let missing = out.missing_capabilities();
     if !missing.is_empty() {
         text += &format!("--- missing capabilities ---\n{}\n", missing.join(", "));
+    }
+    // What the sandbox ran out of: no capability gives more.
+    let limits: Vec<String> = out
+        .guest_stats
+        .iter()
+        .flat_map(|s| Limit::ALL.iter().filter(|&&l| s.hits(l) > 0).map(|&l| format!("{} ({}x)", l.name(), s.hits(l))))
+        .collect();
+    if !limits.is_empty() {
+        text += &format!("--- sandbox limits hit ---\n{}\n", limits.join(", "));
     }
     // Exported files, as text where they are, within a budget.
     let mut budget = EXPORT_MAX;

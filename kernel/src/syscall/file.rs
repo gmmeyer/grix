@@ -2416,6 +2416,7 @@ pub fn inotify_add_watch(p: &mut Process, fd: u64, pathp: u64, mask: u64) -> Sys
     }
     use core::sync::atomic::Ordering;
     if crate::fd::WATCHES.load(Ordering::Relaxed) >= crate::fd::MAX_WATCHES {
+        crate::stats::hit(grix_abi::stats::Limit::InotifyWatches);
         return Err(ENOSPC);
     }
     crate::fd::WATCHES.fetch_add(1, Ordering::Relaxed);

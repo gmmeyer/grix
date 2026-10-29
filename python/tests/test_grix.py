@@ -48,6 +48,12 @@ class Common:
         self.assertTrue(r.ok, r)
         self.assertEqual(r.stdout, "hi\nalice\nbob\ncarol\nfrom stdin\n")
         self.assertEqual(r.events, [])
+        # What the kernel reported, and what the VM cost the host.
+        self.assertGreater(r.guest_stats["syscalls"], 0)
+        self.assertGreaterEqual(r.guest_stats["processes_started"], 1)
+        self.assertEqual(r.guest_stats["limits_hit"], {})
+        self.assertGreater(r.guest_stats["usage"]["memory"]["peak"], 0)
+        self.assertGreater(r.host_usage["peak_memory_bytes"], 0)
 
     def test_snapshots(self):
         # grix-vmm runs the host's own architecture's guests, unless QEMU is

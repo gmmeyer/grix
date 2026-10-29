@@ -120,6 +120,14 @@ class Result:
     mount_changes: list = field(default_factory=list)
     #: grix's own notes and warnings (its stderr), not the program's.
     messages: str = ""
+    #: What the guest kernel reported of its resources as the program
+    #: ended: ``cpu_ms``, ``syscalls``, ``usage`` (``{resource: {"now",
+    #: "peak", "limit"}}``) and ``limits_hit`` (``{limit: count}``). None
+    #: if the VM was stopped.
+    guest_stats: Optional[dict] = None
+    #: What the VM's process cost the host: ``cpu_user_ms``,
+    #: ``cpu_system_ms``, ``peak_memory_bytes``.
+    host_usage: Optional[dict] = None
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -363,6 +371,8 @@ def _result(out: dict, exit_code: int, messages: str) -> Result:
         exports=out.get("exports", []),
         mount_changes=out.get("mount_changes", []),
         messages=messages,
+        guest_stats=out.get("guest_stats"),
+        host_usage=out.get("host_usage"),
         raw=out,
     )
 

@@ -409,6 +409,26 @@ or a timeout's SIGTERM) are queued by the console and sent to init's
 process group from `sched::poll`; a thread waiting for a signal is never
 treated as deadlocked.
 
+Metrics (`kernel/src/stats.rs`, `crates/abi/src/stats.rs`,
+`crates/grix/src/metrics.rs`): the kernel counts in atomics only (CPU
+time where the scheduler and a thread's end count it, system calls,
+faults, switches, forks, each `Resource`'s peak, and each `Limit` that
+refused something), so a report can be made whatever locks are held. It
+reports on `Channel::Stats`: once before the exit status
+(`console::report_stats`), and when the host sends `wire::Input::Stats`,
+answered from `drain` with `try_send` (no room: no answer, and the host
+asks again). A restored snapshot's counts start again
+(`stats::restored`). With `Metrics`, the host asks every
+`metrics::REPORT_EVERY` (`Outbox::offer_lossy`: a kernel that doesn't
+read can't make requests pile up), never in a run taking a snapshot (and
+a request makes `take_all_input` not quiet). The report is the guest's say-so: the
+host's own measure is `HostUsage` (`wait4`'s rusage of the VMM, which is
+then reaped by hand: `ChildGuard`). Every label is from a fixed set
+(`capability_label`): never put a guest's string in one. A new limit
+gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
+`Resource`. Events the host itself reports (the proxy's denials) reach
+`RunControl::on_event` and the metrics as they happen, as the guest's do.
+
 ## Invariants: don't break these
 
 1. **Host and guest agree through `crates/abi` only.** Never duplicate an

@@ -63,6 +63,8 @@ struct Console {
     signals: Vec<u32>,
     /// TTY mode: the host's terminal's new size (rows, columns).
     resize: Option<(u16, u16)>,
+    /// Bumped for each `Input::Stats` the host sent.
+    stats_asked: u64,
 }
 
 /// Signals queued from the host at most (more are dropped, as a pending
@@ -97,6 +99,7 @@ pub fn init_virtio() {
         deferred: Vec::new(),
         signals: Vec::new(),
         resize: None,
+        stats_asked: 0,
     });
 }
 
@@ -228,9 +231,10 @@ pub fn interrupt(id: u32) -> bool {
 /// out, for `dispatch` once the console lock is released (handling them may
 /// send replies).
 fn drain(c: &mut Console) -> Vec<Vec<u8>> {
-    let Console { dev, stdin, fs, fs_reply, deferred, signals, resize, .. } = c;
+    let Console { dev, stdin, fs, fs_reply, deferred, signals, resize, stats_asked, .. } = c;
     let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
+    let mut stats = false;
     let mut link = core::mem::take(deferred);
     dev.receive(|bytes| {
         for &b in bytes {
@@ -258,11 +262,21 @@ fn drain(c: &mut Console) -> Vec<Vec<u8>> {
                     *eof = true;
                     changed = true;
                 }
+                Some((Input::Stats, _)) => {
+                    *stats_asked += 1;
+                    stats = true;
+                }
                 _ => {}
             }
         }
         true
     });
+    // Answered at once, from counters alone (whatever locks our caller
+    // holds), if there's room: otherwise the host asks again.
+    if stats {
+        let report = crate::stats::current().encode();
+        dev.try_send(&[&wire::frame_header(Channel::Stats, report.len()), &report]);
+    }
     if changed {
         *version += 1;
         crate::ipc::changed();
@@ -334,9 +348,13 @@ pub fn take_all_input() -> bool {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return true };
     c.dev.ack_interrupt();
-    let (version, signals) = (c.stdin.version, c.signals.len());
+    let (version, signals, asked) = (c.stdin.version, c.signals.len(), c.stats_asked);
     let link = drain(c);
-    let quiet = link.is_empty() && c.stdin.version == version && c.signals.len() == signals && c.stdin.decoder.idle();
+    let quiet = link.is_empty()
+        && c.stdin.version == version
+        && c.signals.len() == signals
+        && c.stats_asked == asked
+        && c.stdin.decoder.idle();
     drop(guard);
     dispatch(link);
     quiet
@@ -416,6 +434,11 @@ pub fn host_pending() -> bool {
         return true;
     }
     net || !c.stdin.eof || c.dev.in_flight()
+}
+
+/// The kernel's final counts, for the host's metrics.
+pub fn report_stats() {
+    write(Channel::Stats, &crate::stats::current().encode());
 }
 
 /// Report the program's final status. (Exports may follow.)
