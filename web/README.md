@@ -46,6 +46,22 @@ from another site's script, so `grix.js` starts each of QEMU's workers as a
 small module of the page's own that imports the real one. Cloudflare Pages
 takes files up to 25 MiB, which the Node root filesystem (28 MB) is over.
 
+**grixos.dev** is `web/dist`, deployed by `web/deploy.sh`. The page, the
+runner, QEMU and the kernel are on Cloudflare Pages (project `grixos`).
+The examples' programs and root filesystems are in R2 (bucket
+`grixos-files`, at `files.grixos.dev`, with CORS open to every origin
+for GET), and the page finds them through
+`<meta name="grix-files" content="https://files.grixos.dev/">`. Another
+page, such as a blog post, can use them the same way:
+
+```html
+<meta name="grix-files" content="https://files.grixos.dev/">
+<script src="/coi-serviceworker.js"></script>   <!-- if the host can't set COOP/COEP -->
+<script type="module" src="https://grixos.dev/grix-example.js"></script>
+<grix-example command="/bin/net" caps="net"
+  files='[{"src": "bin/net", "path": "/bin/net", "mode": 493}]'></grix-example>
+```
+
 Each run reserves 1.5 GiB of wasm memory (guest RAM, QEMU and its
 translation cache) and only one machine runs at a time: starting an
 example stops the one running. Phones may not have that much memory.
