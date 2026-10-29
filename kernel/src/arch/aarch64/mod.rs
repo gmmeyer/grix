@@ -194,6 +194,13 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("dsb sy", "wfi") };
 }
 
+/// Run `f`, which touches user memory: plain loads and stores reach it
+/// (PAN, arm64's SMAP, is off).
+#[inline(always)]
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Order memory writes (a virtqueue's) before a device register write.
 pub fn device_barrier() {
     // SAFETY: a barrier.

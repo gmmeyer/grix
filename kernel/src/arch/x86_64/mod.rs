@@ -10,7 +10,7 @@
 //! as a masked interrupt waits in the GIC on arm64.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::signal::{self, *};
 use crate::{process, sched, syscall};
@@ -74,8 +74,9 @@ const _: () = assert!(core::mem::size_of::<TrapFrame>() == 192);
 /// `TrapFrame::vector` for a `syscall`.
 const SYSCALL: u64 = 0x100;
 
-/// Selectors (GDT order: null, kernel code, kernel data, user 32-bit code
-/// (for `sysret`'s layout), user data, user code, then each CPU's TSS).
+/// Selectors (GDT order: null, kernel code, kernel data, an empty slot
+/// (`sysret`'s layout has user 32-bit code there), user data, user code,
+/// then each CPU's TSS).
 const KERNEL_CS: u64 = 0x08;
 const USER_SS: u64 = 0x20 | 3;
 const USER_CS: u64 = 0x28 | 3;
@@ -290,6 +291,7 @@ pub fn restore_fp(state: &FpState) {
 const MSR_EFER: u32 = 0xc000_0080;
 const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
+const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SFMASK: u32 = 0xc000_0084;
 const MSR_FS_BASE: u32 = 0xc000_0100;
 const MSR_GS_BASE: u32 = 0xc000_0101;
@@ -674,9 +676,10 @@ pub fn cpuinfo(s: &mut alloc::string::String, cpus: u32) {
 
 // ---------------------------------------------------------------- setup
 
-/// The GDT: null, kernel code and data, user 32-bit code (unused, for
-/// `sysret`'s layout), user data and code, then a 16-byte TSS descriptor
-/// per CPU. The CPU writes it (the TSS's busy bit), hence atomics.
+/// The GDT: null, kernel code and data, an empty slot (`sysret`'s layout
+/// has user 32-bit code there), user data and code, then a 16-byte TSS
+/// descriptor per CPU. The CPU writes it (the TSS's busy bit), hence
+/// atomics.
 #[repr(C, align(16))]
 struct Gdt([AtomicU64; 6 + 2 * MAX_CPUS]);
 
@@ -713,7 +716,9 @@ extern "C" fn arch_init() {
     let g = &GDT.0;
     g[1].store(0x00af_9a00_0000_ffff, Ordering::Relaxed); // kernel code: 64-bit, DPL 0
     g[2].store(0x00cf_9200_0000_ffff, Ordering::Relaxed); // kernel data
-    g[3].store(0x00cf_fa00_0000_ffff, Ordering::Relaxed); // user code, 32-bit (never used)
+    // No 32-bit user code: a far return to 0x1b faults (#GP), so user code
+    // can't enter compatibility mode, which this kernel has no entry for
+    // (on AMD, its `syscall` would go to CSTAR).
     g[4].store(0x00cf_f200_0000_ffff, Ordering::Relaxed); // user data: DPL 3
     g[5].store(0x00af_fa00_0000_ffff, Ordering::Relaxed); // user code: 64-bit, DPL 3
     for (n, &handler) in unsafe { isr_table.iter() }.enumerate() {
@@ -738,7 +743,51 @@ extern "C" fn arch_init() {
         asm!("fninit", options(nomem, nostack));
     }
     init_xsave();
+    init_protection();
     TSC_HZ.store(irq::measure_tsc(), Ordering::Relaxed);
+}
+
+/// SMEP and SMAP, when the CPU has them (CPUID 7's EBX bits 7 and 20): the
+/// kernel can't run code in user memory, nor touch it but in
+/// `user_access` (uaccess.rs). A kernel bug that follows a user pointer
+/// then faults (a panic) instead of doing what the program set up there.
+fn init_protection() {
+    if cpuid(0, 0)[0] < 7 {
+        return;
+    }
+    let b = cpuid(7, 0)[1];
+    let (smep, smap) = (b & (1 << 7) != 0, b & (1 << 20) != 0);
+    // First: `stac` works without CR4.SMAP, and a user access needs it once
+    // CR4 has it.
+    SMAP.store(smap, Ordering::Relaxed);
+    let set = (smep as u64) << 20 | (smap as u64) << 21;
+    // SAFETY: CR4 bits the CPU has; AC is clear (entry.S clears it on every
+    // way in), so the kernel's own accesses to user memory are only
+    // `user_access`'s.
+    unsafe {
+        asm!("mov {t}, cr4", "or {t}, {set}", "mov cr4, {t}", t = out(reg) _, set = in(reg) set, options(nostack));
+    }
+}
+
+/// CR4.SMAP is on: the kernel reaches user memory only with RFLAGS.AC set.
+static SMAP: AtomicBool = AtomicBool::new(false);
+
+/// Run `f`, which touches user memory: with SMAP, that takes AC, which the
+/// kernel has set nowhere else.
+#[inline(always)]
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    let smap = SMAP.load(Ordering::Relaxed);
+    if smap {
+        // SAFETY: user memory reachable until the `clac`. Not `nomem`: the
+        // asm orders f's accesses after it (and before the `clac`).
+        unsafe { asm!("stac", options(nostack)) };
+    }
+    let r = f();
+    if smap {
+        // SAFETY: as above.
+        unsafe { asm!("clac", options(nostack)) };
+    }
+    r
 }
 
 /// This CPU's GDT, TSS, IDT and `syscall` MSRs.
@@ -772,6 +821,10 @@ fn init_cpu(cpu: usize) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1 | (1 << 11)); // SCE, NXE
     wrmsr(MSR_STAR, KERNEL_CS << 32 | (0x18 | 3) << 48);
     wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
+    // `syscall` from compatibility mode (AMD's; Intel's is #UD), which the
+    // GDT leaves no way into: should there ever be one, the same entry,
+    // not a jump to 0 in kernel mode on the program's stack.
+    wrmsr(MSR_CSTAR, syscall_entry as *const () as u64);
     // As Linux masks them: TF, IF, DF, IOPL, NT, RF, AC and ID. NT
     // especially, which user code may set (popf) and which would make the
     // kernel's own iretq fault.

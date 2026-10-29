@@ -1,11 +1,14 @@
 //! Copying data between the kernel and user memory.
 //!
 //! Every access is validated against the VMAs first and the pages are faulted
-//! in up front, so the kernel never takes a fault on a user address.
+//! in up front, so the kernel never takes a fault on a user address. Each
+//! is in `arch::user_access`, the only place the kernel may touch user
+//! memory (SMAP on x86_64).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::arch;
 use crate::errno::*;
 use crate::mm::aspace::AddressSpace;
 use crate::mm::{PAGE_SIZE, page_down};
@@ -14,19 +17,19 @@ pub const PATH_MAX: usize = 4096;
 
 pub fn copy_in(a: &mut AddressSpace, addr: u64, out: &mut [u8]) -> Result<(), Errno> {
     a.ensure(addr, out.len() as u64, false)?;
-    unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len()) };
+    arch::user_access(|| unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len()) });
     Ok(())
 }
 
 pub fn copy_out(a: &mut AddressSpace, addr: u64, data: &[u8]) -> Result<(), Errno> {
     a.ensure(addr, data.len() as u64, true)?;
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+    arch::user_access(|| unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) });
     Ok(())
 }
 
 pub fn zero_out(a: &mut AddressSpace, addr: u64, len: u64) -> Result<(), Errno> {
     a.ensure(addr, len, true)?;
-    unsafe { core::ptr::write_bytes(addr as *mut u8, 0, len as usize) };
+    arch::user_access(|| unsafe { core::ptr::write_bytes(addr as *mut u8, 0, len as usize) });
     Ok(())
 }
 
@@ -59,9 +62,10 @@ pub fn update_u32(a: &mut AddressSpace, addr: u64, f: impl Fn(u32) -> u32) -> Re
     a.ensure(addr, 4, true)?;
     // SAFETY: validated, present and writable (ensure), and aligned.
     let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(addr as *mut u32) };
-    Ok(word
-        .try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |v| Some(f(v)))
-        .unwrap_or_else(|v| v))
+    Ok(arch::user_access(|| {
+        word.try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |v| Some(f(v)))
+            .unwrap_or_else(|v| v)
+    }))
 }
 
 /// Read a NUL-terminated string. Non-UTF-8 strings cannot name anything in
@@ -73,7 +77,7 @@ pub fn read_cstr(a: &mut AddressSpace, addr: u64, max: usize) -> Result<String, 
         a.ensure(p, 1, false)?;
         let page_end = page_down(p) + PAGE_SIZE;
         while p < page_end {
-            let b = unsafe { *(p as *const u8) };
+            let b = arch::user_access(|| unsafe { *(p as *const u8) });
             if b == 0 {
                 return String::from_utf8(out).map_err(|_| ENOENT);
             }

@@ -81,8 +81,10 @@ static void rsp_use_on_return(unsigned long rsp) {
 }
 
 // A round trip through 32-bit compatibility mode, entered by a far return
-// (the kernel doesn't load a 32-bit code segment, but the GDT has one),
-// with a system call from in there: nothing in the kernel may be confused.
+// to the GDT's 32-bit user code slot (sysret's layout has one), with a
+// system call from in there. On AMD, `syscall` in compatibility mode goes
+// to CSTAR, which the kernel once left at 0: a jump to 0 in kernel mode,
+// on this stack. The slot is empty now, so the far return faults (#GP).
 static void compat_roundtrip(void) {
     // A low page for the 32-bit stack (compat mode truncates rsp).
     void *low = mmap((void *)0x20000, 0x1000, PROT_READ | PROT_WRITE,
@@ -95,7 +97,7 @@ static void compat_roundtrip(void) {
     asm volatile(
         "movq %%rsp, %%r12\n"
         "leaq 1f(%%rip), %%rax\n"
-        "pushq $0x23\n"       // cs: the 32-bit user code segment
+        "pushq $0x1b\n"       // cs: the 32-bit user code segment (GDT slot 3)
         "pushq %%rax\n"
         "lretq\n"
         ".balign 4\n"
