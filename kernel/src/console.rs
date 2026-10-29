@@ -56,9 +56,9 @@ struct Console {
     /// A live mount's answer, as it arrives and once it's all there.
     fs: Assembler,
     fs_reply: Option<Vec<u8>>,
-    /// Networking messages that arrived while waiting for an answer, for
-    /// the next `dispatch`.
-    deferred: Vec<Vec<u8>>,
+    /// Networking messages and live mounts' notices that arrived while
+    /// waiting for an answer, for the next `dispatch`.
+    deferred: Taken,
     /// Signals from the host, for the scheduler to deliver.
     signals: Vec<u32>,
     /// TTY mode: the host's terminal's new size (rows, columns).
@@ -96,7 +96,7 @@ pub fn init_virtio() {
         out_version: 0,
         fs: Assembler::default(),
         fs_reply: None,
-        deferred: Vec::new(),
+        deferred: Taken::default(),
         signals: Vec::new(),
         resize: None,
         stats_asked: 0,
@@ -227,19 +227,40 @@ pub fn interrupt(id: u32) -> bool {
     true
 }
 
+/// Live mounts' notices held for `dispatch` at most; more are lost (and
+/// inotify says so).
+const MAX_NOTICES: usize = 1024;
+
+/// What `drain` took for `dispatch`.
+#[derive(Default)]
+struct Taken {
+    link: Vec<Vec<u8>>,
+    notices: Vec<Vec<u8>>,
+    /// Notices dropped for want of room.
+    lost: bool,
+}
+
+impl Taken {
+    fn is_empty(&self) -> bool {
+        self.link.is_empty() && self.notices.is_empty() && !self.lost
+    }
+}
+
 /// Take what the host sent: stdin into its buffer, and networking messages
-/// out, for `dispatch` once the console lock is released (handling them may
-/// send replies).
-fn drain(c: &mut Console) -> Vec<Vec<u8>> {
+/// and notices out, for `dispatch` once the console lock is released
+/// (handling them may send replies).
+fn drain(c: &mut Console) -> Taken {
     let Console { dev, stdin, fs, fs_reply, deferred, signals, resize, stats_asked, .. } = c;
     let Stdin { buf, eof, decoder, version, .. } = stdin;
     let mut changed = false;
     let mut stats = false;
-    let mut link = core::mem::take(deferred);
+    let mut taken = core::mem::take(deferred);
     dev.receive(|bytes| {
         for &b in bytes {
             match decoder.push(b) {
-                Some((Input::Link, msg)) => link.push(msg.to_vec()),
+                Some((Input::Link, msg)) => taken.link.push(msg.to_vec()),
+                Some((Input::FsEvent, msg)) if taken.notices.len() < MAX_NOTICES => taken.notices.push(msg.to_vec()),
+                Some((Input::FsEvent, _)) => taken.lost = true,
                 Some((Input::Signal, &[sig])) if (1..=64).contains(&sig) && signals.len() < MAX_HOST_SIGNALS => {
                     signals.push(sig as u32);
                 }
@@ -281,12 +302,15 @@ fn drain(c: &mut Console) -> Vec<Vec<u8>> {
         *version += 1;
         crate::ipc::changed();
     }
-    link
+    taken
 }
 
-fn dispatch(link: Vec<Vec<u8>>) {
-    for msg in link {
+fn dispatch(taken: Taken) {
+    for msg in taken.link {
         crate::inet::from_host(&msg);
+    }
+    if !taken.notices.is_empty() || taken.lost {
+        crate::inotify::from_host(&taken.notices, taken.lost);
     }
 }
 

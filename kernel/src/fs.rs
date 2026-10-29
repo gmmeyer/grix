@@ -774,6 +774,38 @@ fn proc_ended(pid: u32, gone: bool) {
     }
 }
 
+/// Live mounts' nodes the host said changed (watched directories and an
+/// entry's name, "" for the node itself), until the filesystem is free to
+/// fetch them again; `HOST_CHANGED_ALL` for everything (too many, or
+/// notices were lost).
+static HOST_CHANGED: Mutex<Vec<(Ino, String)>> = Mutex::new(Vec::new());
+static HOST_CHANGED_ANY: AtomicBool = AtomicBool::new(false);
+static HOST_CHANGED_ALL: AtomicBool = AtomicBool::new(false);
+const HOST_CHANGED_MAX: usize = 256;
+
+/// The host said `what` changed (node and name), or that anything may
+/// have (None): what the kernel has of it is fetched again before it's
+/// next used, now or once the filesystem is free.
+pub fn host_changed(what: Option<(Ino, &str)>) {
+    {
+        let mut pending = HOST_CHANGED.lock();
+        match what {
+            Some((ino, name)) if pending.len() < HOST_CHANGED_MAX => {
+                if !pending.iter().any(|(i, n)| *i == ino && n == name) {
+                    pending.push((ino, name.into()));
+                }
+            }
+            _ => HOST_CHANGED_ALL.store(true, Ordering::Relaxed),
+        }
+        HOST_CHANGED_ANY.store(true, Ordering::Relaxed);
+    }
+    // What was read ahead may be the old bytes.
+    hostfs::forget_kept();
+    if let Some(mut fs) = try_lock() {
+        fs.apply_host_changes();
+    }
+}
+
 /// Make `fs` the filesystem. Done once, after exec resolved the program.
 pub fn install(fs: Fs) {
     *FS.lock() = Some(fs);
@@ -806,7 +838,11 @@ pub fn try_lock() -> Option<FsGuard> {
 pub fn lock() -> FsGuard {
     let g = FS.try_lock().expect("filesystem lock taken twice");
     assert!(g.is_some(), "fs not initialised");
-    FsGuard(g)
+    let mut g = FsGuard(g);
+    if HOST_CHANGED_ANY.load(Ordering::Relaxed) {
+        g.apply_host_changes();
+    }
+    g
 }
 
 /// A TZif (version 2) file for UTC, the same 114 bytes as zoneinfo's `UTC`:
@@ -1416,6 +1452,15 @@ impl Fs {
         }
     }
 
+    /// The host's id for `ino` if the host can watch it for inotify: a
+    /// live mount's file or directory, but not a lazy import's (which
+    /// never changes for the guest).
+    pub fn watchable_remote(&self, ino: Ino) -> Option<u64> {
+        let n = &self.nodes[ino];
+        let r = n.remote.as_deref().filter(|r| !self.lazy[r.mount])?;
+        matches!(n.kind, Kind::Dir(_) | Kind::File(_)).then_some(r.id)
+    }
+
     /// The host id of a live mount's node.
     pub fn remote_id(&self, ino: Ino) -> Option<u64> {
         self.nodes[ino].remote.as_ref().map(|r| r.id)
@@ -1916,6 +1961,34 @@ impl Fs {
         }
         self.page = None;
         hostfs::forget_kept();
+    }
+
+    /// What the host said changed (`host_changed`) is fetched again when
+    /// next used: a watched directory's entries, and the entry named.
+    fn apply_host_changes(&mut self) {
+        let pending = core::mem::take(&mut *HOST_CHANGED.lock());
+        HOST_CHANGED_ANY.store(false, Ordering::Relaxed);
+        if HOST_CHANGED_ALL.swap(false, Ordering::Relaxed) {
+            self.forget_live();
+            return;
+        }
+        for (ino, name) in pending {
+            let Some(n) = self.nodes.get(ino).filter(|n| n.remote.is_some()) else { continue };
+            let child = match &n.kind {
+                Kind::Dir(children) if !name.is_empty() => children.get(&name).copied(),
+                _ => None,
+            };
+            if self.page.as_ref().is_some_and(|p| p.dir == ino) {
+                self.page = None;
+            }
+            for i in [Some(ino), child].into_iter().flatten() {
+                if let Some(r) = self.nodes[i].remote.as_deref_mut()
+                    && !self.lazy[r.mount]
+                {
+                    (r.fetched, r.listed_at) = (0, 0);
+                }
+            }
+        }
     }
 
     /// Before using directory `dir`'s entries: for a live mount's, have

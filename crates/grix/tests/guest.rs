@@ -1000,6 +1000,70 @@ fn live_mount_works_on_the_host_directory() {
 }
 
 #[test]
+fn inotify_sees_changes_made_on_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = temp_dir("watch");
+    std::fs::create_dir_all(host.join("w/sub")).unwrap();
+    std::fs::create_dir(host.join("ctl")).unwrap();
+    std::fs::write(host.join("w/attr.txt"), "a\n").unwrap();
+    std::fs::set_permissions(host.join("w/attr.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let sb = with("watch").mount(&host, "/work").unwrap().build().unwrap();
+    // The host's side: each change once the program says it's ready for it.
+    let changes = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            let w = host.join("w");
+            let steps: [&dyn Fn(); 7] = [
+                &|| std::fs::write(w.join("new.txt"), "one\n").unwrap(),
+                &|| {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new().append(true).open(w.join("new.txt")).unwrap();
+                    f.write_all(b"two\n").unwrap();
+                },
+                &|| std::fs::write(w.join("new.txt"), "3\n").unwrap(),
+                &|| std::fs::rename(w.join("new.txt"), w.join("renamed.txt")).unwrap(),
+                &|| std::fs::set_permissions(w.join("attr.txt"), std::fs::Permissions::from_mode(0o600)).unwrap(),
+                &|| std::fs::remove_file(w.join("renamed.txt")).unwrap(),
+                &|| std::fs::remove_dir(w.join("sub")).unwrap(),
+            ];
+            for (i, step) in steps.iter().enumerate() {
+                // Patient: under emulation the guest takes a while.
+                let ready = host.join(format!("ctl/{}", i + 1));
+                for _ in 0..6000 {
+                    if ready.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !ready.exists() {
+                    return;
+                }
+                step();
+            }
+        })
+    };
+    let out = sb.run(&["/bin/watch", "/work/w", "/work/ctl"]).unwrap();
+    changes.join().unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(
+        out.stdout_str(),
+        "watching (0 bytes queued)\n\
+         IN_CREATE new.txt\n  new.txt: \"one|\" size 4 mode 644\n\
+         IN_MODIFY new.txt\n  new.txt: \"one|two|\" size 8 mode 644\n\
+         IN_MODIFY new.txt\n  new.txt: \"3|\" size 2 mode 644\n\
+         IN_MOVED_FROM new.txt, IN_MOVED_TO renamed.txt, cookies match\n  new.txt: errno 2\n  \
+         renamed.txt: \"3|\" size 2 mode 644\n\
+         IN_ATTRIB attr.txt\n  attr.txt: \"a|\" size 2 mode 600\n\
+         IN_DELETE renamed.txt\n  renamed.txt: errno 2\n\
+         sub: IN_DELETE_SELF, IN_IGNORED\n\
+         removed: IN_IGNORED\n\
+         done\n"
+    );
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    std::fs::remove_dir_all(&host).unwrap();
+}
+
+#[test]
 fn live_mount_walks_trees_larger_than_the_kernel_keeps() {
     // More nodes than the kernel's budget holds at once: 10 directories of
     // 1,000 files, which it forgets once it's done with them, and one of
@@ -2199,6 +2263,45 @@ fn snapshots_with_live_mounts() {
     assert_eq!(out.stdout_str(), "A2\nB\ndone\n");
     assert!(out.stderr_str().contains("Read-only"), "{}", out.stderr_str());
     assert_eq!(std::fs::read_to_string(work.join("out.txt")).unwrap(), "one\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshots_keep_inotify_watches_on_live_mounts() {
+    // Watched before the snapshot: each restored run asks its host to
+    // watch again (and says what happened meanwhile was missed).
+    let dir = temp_dir("watchsnap");
+    std::fs::create_dir_all(dir.join("work/w")).unwrap();
+    std::fs::create_dir_all(dir.join("work/ctl")).unwrap();
+    let b = with("watch").cpus(1).mount(dir.join("work"), "/work").unwrap().timeout(Duration::from_secs(60));
+    if b.vmm_path().is_none() {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let argv = ["/bin/watch", "--snap", "/work/w", "/work/ctl"];
+    let snap = b.build().unwrap().snapshot(&argv, dir.join("w.snap")).unwrap();
+    for run in 0..2 {
+        let _ = std::fs::remove_file(dir.join("work/ctl/1"));
+        let _ = std::fs::remove_file(dir.join("work/w/new.txt"));
+        let host = dir.join("work");
+        let changes = std::thread::spawn(move || {
+            for _ in 0..6000 {
+                if host.join("ctl/1").exists() {
+                    std::fs::write(host.join("w/new.txt"), format!("run {run}\n")).unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let out = snap.clone().mount(dir.join("work"), "/work").unwrap().run("go\n").unwrap();
+        changes.join().unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+        let size = format!("run {run}\n").len();
+        assert_eq!(
+            out.stdout_str(),
+            format!("then: IN_Q_OVERFLOW\nIN_CREATE new.txt\n  new.txt: \"run {run}|\" size {size} mode 644\n")
+        );
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

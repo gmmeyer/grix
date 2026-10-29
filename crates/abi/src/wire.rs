@@ -81,6 +81,9 @@ pub enum Input {
     /// Send a `Channel::Stats` frame now (no payload). Answered only if
     /// there's room in the console at once: the host asks again later.
     Stats = 7,
+    /// Live mounts: a change the host saw in a watched node, a
+    /// `hostfs::Notice` (one per frame, unasked for).
+    FsEvent = 8,
 }
 
 impl Input {
@@ -93,6 +96,7 @@ impl Input {
             5 => Some(Self::Signal),
             6 => Some(Self::Resize),
             7 => Some(Self::Stats),
+            8 => Some(Self::FsEvent),
             _ => None,
         }
     }
@@ -468,6 +472,18 @@ mod tests {
         assert_eq!(got[0], (Channel::Stdout, b"hello".to_vec()));
         assert_eq!(decode_exit(&got[1].1), Some((ExitKind::Exited, 3)));
         assert!(d.garbage >= 2);
+    }
+
+    #[test]
+    fn input_kinds_have_their_own_codes() {
+        use Input::*;
+        let all = [Stdin, StdinEof, Link, Fs, Signal, Resize, Stats, FsEvent];
+        for (i, k) in all.iter().enumerate() {
+            assert_eq!(Input::from_u8(*k as u8), Some(*k));
+            assert!(all[..i].iter().all(|o| *o as u8 != *k as u8), "{k:?}");
+        }
+        assert_eq!(Input::from_u8(0), None);
+        assert_eq!(Input::from_u8(all.len() as u8 + 1), None);
     }
 
     #[test]

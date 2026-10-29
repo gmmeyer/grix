@@ -24,6 +24,7 @@ mod fd;
 mod fs;
 mod hostfs;
 mod inet;
+mod inotify;
 mod ipc;
 mod kmem;
 mod locks;

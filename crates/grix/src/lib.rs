@@ -40,6 +40,7 @@ mod sandbox;
 pub mod snapshot;
 mod treecache;
 mod vmm;
+mod watch;
 
 pub use container::{Image, ImageConfig};
 pub use control::RunControl;

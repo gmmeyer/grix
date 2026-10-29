@@ -215,6 +215,27 @@ above it up to the mount), after which it's an ordinary node keeping its
 inode number (`Node::host_ino`); a file's bytes stay the host's until
 the first write or truncate reads them in (`FileData::adopt`,
 `make_local`).
+inotify (`inotify.rs`) gets its events from the host: the first watch
+on a live mount's node (`Fs::watchable_remote`: not a lazy import's)
+sends `Request::Watch`, the last one going `Unwatch` (`inotify::REMOTE`
+counts them). The host watches through descriptors walked down to like
+every other (`crates/grix/src/watch.rs`: inotify on Linux, via
+`/proc/self/fd/N`; kqueue on macOS, comparing a directory's entries to
+name what changed and pairing renames by inode), and sends each change
+as a `hostfs::Notice` on `Input::FsEvent`, unasked, one per frame, so
+it never mixes with an answer. The console hands them to
+`inotify::from_host` (at most `MAX_NOTICES` held; more lost become an
+IN_Q_OVERFLOW), which queues them on the matching watches (each event
+charged, `MAX_QUEUED` per instance) and marks what changed for fetching
+again (`fs::host_changed`, applied when the filesystem is next free).
+The host bounds what it keeps (`hostfs::MAX_WATCHES`; on macOS entries
+and descriptors) and a round of changes (`watch::MAX_BATCH`, then an
+overflow), and sends as the guest takes them, within a quarter of the
+outbox (`Outbox::send_notice`: stats requests and datagrams still fit),
+so its own kernel's queue holds the rest. A restored snapshot's host watches nothing:
+`inotify::rewatch` asks again for every node and queues an overflow,
+as what changed meanwhile was missed. The guest's changes elsewhere make
+no events yet.
 
 Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
 process is in `PROCESS`; every other one, and zombies, are in
@@ -494,7 +515,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     - File data counts pages (`fs::set_limit`), and nodes and names count
       against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
-      files, network receive windows, DNS answers) take a `kmem::Charge`.
+      files, network receive windows, DNS answers, inotify events) take a
+      `kmem::Charge`.
     - A live mount's nodes count against `META_LIMIT` like the program's
       own; when it's full, `Fs::evict` forgets idle ones (the host still
       has them) before anything fails.

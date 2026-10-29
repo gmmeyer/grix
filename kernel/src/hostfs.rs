@@ -102,7 +102,19 @@ pub fn lookup(dir: u64, name: &str) -> Result<Entry, Errno> {
     })
 }
 
-/// What was read ahead goes (a restored snapshot: it may be old).
+/// Ask the host to report changes to `id` (`grix_abi::hostfs::Notice`).
+pub fn watch(id: u64) -> Result<(), Errno> {
+    done(&Request::Watch { id })
+}
+
+/// The host can stop reporting changes to `id`.
+pub fn unwatch(id: u64) {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    console::host_send(&Request::Unwatch { id }.encode(seq));
+}
+
+/// What was read ahead goes (a restored snapshot, or the host said files
+/// changed: it may be old).
 pub fn forget_kept() {
     KEPT.lock().clear();
 }

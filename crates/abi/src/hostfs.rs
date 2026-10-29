@@ -13,6 +13,11 @@
 //! live mounts, in order; the host gives out the rest in listings and when
 //! the guest creates something. The host treats every request as untrusted:
 //! it never leaves a mount, never follows a link, and checks every name.
+//!
+//! Watches: for inotify, the guest asks the host to watch a node
+//! ([`Request::Watch`]) and the host tells it what changes there, unasked,
+//! as [`Notice`]s on `Input::FsEvent` (one per frame, so they never mix
+//! with an answer), until the guest lets go of it ([`Request::Unwatch`]).
 
 use alloc::vec::Vec;
 
@@ -25,6 +30,43 @@ pub const MAX_MESSAGE: usize = 256 * 1024;
 pub const IO_MAX: usize = 64 * 1024;
 /// Entries per `Listed` reply; the guest asks for more after the last.
 pub const LIST_MAX: usize = 256;
+/// The longest name a [`Notice`] carries (Linux's NAME_MAX).
+pub const NAME_MAX: usize = 255;
+/// Nodes the host watches for a run at most; it refuses more (ENOSPC).
+pub const MAX_WATCHES: usize = 8192;
+
+/// inotify's event bits, as Linux has them: what a [`Notice`] says.
+pub mod mask {
+    pub const IN_ACCESS: u32 = 0x1;
+    pub const IN_MODIFY: u32 = 0x2;
+    pub const IN_ATTRIB: u32 = 0x4;
+    pub const IN_CLOSE_WRITE: u32 = 0x8;
+    pub const IN_CLOSE_NOWRITE: u32 = 0x10;
+    pub const IN_OPEN: u32 = 0x20;
+    pub const IN_MOVED_FROM: u32 = 0x40;
+    pub const IN_MOVED_TO: u32 = 0x80;
+    pub const IN_CREATE: u32 = 0x100;
+    pub const IN_DELETE: u32 = 0x200;
+    pub const IN_DELETE_SELF: u32 = 0x400;
+    pub const IN_MOVE_SELF: u32 = 0x800;
+    pub const IN_UNMOUNT: u32 = 0x2000;
+    pub const IN_Q_OVERFLOW: u32 = 0x4000;
+    pub const IN_IGNORED: u32 = 0x8000;
+    pub const IN_ISDIR: u32 = 0x4000_0000;
+    /// The changes a host reports. Not opens, reads or closes: the host's
+    /// own file server makes those for every request.
+    pub const HOST_EVENTS: u32 = IN_MODIFY
+        | IN_ATTRIB
+        | IN_CLOSE_WRITE
+        | IN_MOVED_FROM
+        | IN_MOVED_TO
+        | IN_CREATE
+        | IN_DELETE
+        | IN_DELETE_SELF
+        | IN_MOVE_SELF;
+    /// What a notice may carry: those, and what Linux sends unasked.
+    pub const NOTICE: u32 = HOST_EVENTS | IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED | IN_ISDIR;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -149,6 +191,16 @@ pub enum Request<'a> {
     /// The guest is done with `id`, a file it removed while it had it
     /// open: the host can let go of it too. No answer.
     Forget {
+        id: u64,
+    },
+    /// Report changes to `id` (a file, or a directory and its entries) as
+    /// [`Notice`]s from now on. `Done`, or an errno (ENOSPC past
+    /// `MAX_WATCHES`).
+    Watch {
+        id: u64,
+    },
+    /// No more notices about `id`. No answer.
+    Unwatch {
         id: u64,
     },
 }
@@ -296,6 +348,14 @@ impl<'a> Request<'a> {
                 w.u8(12);
                 w.u64(id);
             }
+            Request::Watch { id } => {
+                w.u8(13);
+                w.u64(id);
+            }
+            Request::Unwatch { id } => {
+                w.u8(14);
+                w.u64(id);
+            }
         }
         w.buf
     }
@@ -336,6 +396,8 @@ impl<'a> Request<'a> {
             10 => Request::Fsync { id: r.u64()? },
             11 => Request::Lookup { dir: r.u64()?, name: get_str(&mut r)? },
             12 => Request::Forget { id: r.u64()? },
+            13 => Request::Watch { id: r.u64()? },
+            14 => Request::Unwatch { id: r.u64()? },
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -432,6 +494,42 @@ impl<'a> Reply<'a> {
     }
 }
 
+/// A change the host saw in watched node `id`: inotify's `mask` (only
+/// `mask::NOTICE` bits) and `cookie` (pairing a rename's two halves, or 0),
+/// and the entry's `name` for a directory's entry ("" for the node itself).
+/// Id 0 with `IN_Q_OVERFLOW`: the host lost track, notices were dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Notice<'a> {
+    pub id: u64,
+    pub mask: u32,
+    pub cookie: u32,
+    pub name: &'a str,
+}
+
+impl<'a> Notice<'a> {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u64(self.id);
+        w.u32(self.mask);
+        w.u32(self.cookie);
+        put_str(&mut w, self.name);
+        w.buf
+    }
+
+    /// Only what a host may say: known bits, and a plain name of at most
+    /// `NAME_MAX` bytes.
+    pub fn decode(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(buf);
+        let n = Notice { id: r.u64()?, mask: r.u32()?, cookie: r.u32()?, name: get_str(&mut r)? };
+        r.done()?;
+        let plain = n.name.is_empty() || (n.name != "." && n.name != ".." && !n.name.contains(['/', '\0']));
+        if n.mask & !mask::NOTICE != 0 || n.name.len() > NAME_MAX || !plain {
+            return Err(DecodeError);
+        }
+        Ok(n)
+    }
+}
+
 /// The frame payloads carrying `msg`: each starts with 1 if more of the
 /// message follows, 0 for the last.
 pub fn frames(msg: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
@@ -494,6 +592,8 @@ mod tests {
             Request::Fsync { id: 9 },
             Request::Lookup { dir: 1, name: "x" },
             Request::Forget { id: 9 },
+            Request::Watch { id: 9 },
+            Request::Unwatch { id: 9 },
         ];
         for r in reqs {
             assert_eq!(Request::decode(&r.encode(7)), Ok((7, r)));
@@ -513,6 +613,26 @@ mod tests {
         }
         assert!(Request::decode(&[0, 0, 0, 0, 99]).is_err());
         assert!(Reply::decode(&[0, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn notices_say_only_what_a_host_may() {
+        let n = Notice { id: 3, mask: mask::IN_CREATE | mask::IN_ISDIR, cookie: 0, name: "d" };
+        assert_eq!(Notice::decode(&n.encode()), Ok(n));
+        let n = Notice { id: 3, mask: mask::IN_DELETE_SELF, cookie: 0, name: "" };
+        assert_eq!(Notice::decode(&n.encode()), Ok(n));
+        let long = "x".repeat(NAME_MAX + 1);
+        for bad in [
+            Notice { id: 3, mask: mask::IN_OPEN, cookie: 0, name: "a" },
+            Notice { id: 3, mask: 1 << 20, cookie: 0, name: "a" },
+            Notice { id: 3, mask: mask::IN_CREATE, cookie: 0, name: ".." },
+            Notice { id: 3, mask: mask::IN_CREATE, cookie: 0, name: "a/b" },
+            Notice { id: 3, mask: mask::IN_CREATE, cookie: 0, name: "a\0" },
+            Notice { id: 3, mask: mask::IN_CREATE, cookie: 0, name: &long },
+        ] {
+            assert!(Notice::decode(&bad.encode()).is_err(), "{bad:?}");
+        }
+        assert!(Notice::decode(&[1, 2, 3]).is_err());
     }
 
     #[test]

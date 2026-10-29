@@ -311,10 +311,15 @@ pub(crate) fn run(
         }
     });
     let proxy = Proxy::start(cfg.net.clone(), to_guest.clone(), on_event)?;
-    let fs = match &cfg.fs_state {
+    let mut fs = match &cfg.fs_state {
         Some(state) => crate::hostfs::Server::restore(&cfg.live, state)?,
         None => crate::hostfs::Server::new(&cfg.live)?,
     };
+    // Watched nodes' changes queue for the guest, waiting for room (a
+    // quarter of the outbox, so stats requests and datagrams still fit):
+    // the host's own queue holds what comes meanwhile.
+    let outbox = to_guest.clone();
+    fs.notify(Arc::new(move |frame| outbox.send_notice(frame)));
     let uart_path = dir.file("uart");
     let listener =
         UnixListener::bind(&uart_path).with_context(|| format!("creating socket {}", uart_path.display()))?;

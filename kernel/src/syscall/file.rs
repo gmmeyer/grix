@@ -450,7 +450,10 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             }
         }
         FileKind::Stdout | FileKind::Stderr | FileKind::Epoll(_) => Err(EBADF),
-        FileKind::Inotify(_) => would_block(p, nonblock),
+        FileKind::Inotify(n) => match n.read(count as usize, |b| copy_out(&mut p.aspace, buf, b).map(|_| ())) {
+            Some(r) => r.map(|n| n as u64),
+            None => would_block(p, nonblock),
+        },
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
         FileKind::PidFd(_) => Err(EINVAL),
         FileKind::SignalFd(mask) => {
@@ -2019,6 +2022,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
                 FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
                 FileKind::Inet(s) => super::net::inet_available(s) as u32,
                 FileKind::Stdin => console::stdin_state().0 as u32,
+                FileKind::Inotify(n) => n.available() as u32,
                 _ => return Err(ENOTTY),
             };
             write_u32(&mut p.aspace, arg, avail).map(|_| 0)
@@ -2400,36 +2404,30 @@ pub fn inotify_init1(p: &mut Process, flags: u64) -> SysResult {
     if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
         return Err(EINVAL);
     }
-    let file = new_file(FileKind::Inotify(crate::fd::Inotify::default()), O_RDONLY | (flags & O_NONBLOCK));
+    let file = new_file(FileKind::Inotify(crate::inotify::Inotify::new()), O_RDONLY | (flags & O_NONBLOCK));
     p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
 }
 
 pub fn inotify_add_watch(p: &mut Process, fd: u64, pathp: u64, mask: u64) -> SysResult {
-    const IN_DONT_FOLLOW: u64 = 0x0200_0000;
+    let mask = mask as u32;
     let file = p.fds.get(fd)?;
+    if !matches!(file.lock().kind, FileKind::Inotify(_)) {
+        return Err(EINVAL);
+    }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
-    let ino = resolve(p, AT_FDCWD as u64, &path, mask & IN_DONT_FOLLOW == 0)?;
-    let mut f = file.lock();
-    let FileKind::Inotify(n) = &mut f.kind else { return Err(EINVAL) };
-    if let Some((&wd, _)) = n.watches.iter().find(|(_, w)| **w == ino) {
-        return Ok(wd as u64);
-    }
-    use core::sync::atomic::Ordering;
-    if crate::fd::WATCHES.load(Ordering::Relaxed) >= crate::fd::MAX_WATCHES {
-        crate::stats::hit(grix_abi::stats::Limit::InotifyWatches);
-        return Err(ENOSPC);
-    }
-    crate::fd::WATCHES.fetch_add(1, Ordering::Relaxed);
-    n.next_wd += 1;
-    n.watches.insert(n.next_wd, ino);
-    Ok(n.next_wd as u64)
+    let ino = resolve(p, AT_FDCWD as u64, &path, mask & crate::inotify::IN_DONT_FOLLOW == 0)?;
+    let (is_dir, remote, pin) = {
+        let fs = fs::lock();
+        (fs.is_dir(ino), fs.watchable_remote(ino), fs.pin(ino))
+    };
+    let f = file.lock();
+    let FileKind::Inotify(n) = &f.kind else { return Err(EINVAL) };
+    n.add_watch(ino, is_dir, remote, pin, mask).map(|wd| wd as u64)
 }
 
 pub fn inotify_rm_watch(p: &mut Process, fd: u64, wd: u64) -> SysResult {
     let file = p.fds.get(fd)?;
-    let mut f = file.lock();
-    let FileKind::Inotify(n) = &mut f.kind else { return Err(EINVAL) };
-    n.watches.remove(&(wd as i32)).ok_or(EINVAL)?;
-    crate::fd::WATCHES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    Ok(0)
+    let f = file.lock();
+    let FileKind::Inotify(n) = &f.kind else { return Err(EINVAL) };
+    n.rm_watch(wd as i32).map(|_| 0)
 }

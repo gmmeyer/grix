@@ -454,8 +454,20 @@ impl Outbox {
 
     /// Queue a frame, waiting for room. False once the guest is gone.
     pub fn send(&self, frame: Vec<u8>) -> bool {
+        self.send_within(frame, OUTBOX_BYTES)
+    }
+
+    /// Queue a frame that can wait (a live mount's notice), once the
+    /// outbox is under a quarter full: whatever the host's watcher sends,
+    /// there's room for answers, stats requests and datagrams
+    /// (`offer_lossy`'s half).
+    pub fn send_notice(&self, frame: Vec<u8>) -> bool {
+        self.send_within(frame, OUTBOX_BYTES / 4)
+    }
+
+    fn send_within(&self, frame: Vec<u8>, limit: usize) -> bool {
         let mut q = self.q.lock().unwrap();
-        while !q.closed && q.bytes > 0 && q.bytes + frame.len() > OUTBOX_BYTES {
+        while !q.closed && q.bytes > 0 && q.bytes + frame.len() > limit {
             q = self.room.wait(q).unwrap();
         }
         if q.closed {
@@ -1299,6 +1311,23 @@ fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A live mount's notices wait while the outbox is a quarter full, so
+    /// a stats request (`offer_lossy`, under half) still goes.
+    #[test]
+    fn notices_leave_room_for_stats_requests() {
+        let out = Outbox::new();
+        assert!(out.send(vec![0; OUTBOX_BYTES / 4]));
+        let o = out.clone();
+        let notice = std::thread::spawn(move || o.send_notice(vec![1; 16]));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!notice.is_finished());
+        assert!(out.offer_lossy(vec![2; 4]));
+        assert_eq!(out.next().unwrap().len(), OUTBOX_BYTES / 4);
+        assert!(notice.join().unwrap());
+        assert_eq!(out.next().unwrap(), [2; 4]);
+        assert_eq!(out.next().unwrap(), [1; 16]);
+    }
 
     fn policy(rules: &[&str]) -> NetPolicy {
         NetPolicy {

@@ -225,14 +225,17 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.
 - [ ] Live mounts: a file the host replaces while the program has it open can show the new contents once the host's descriptor for it ages out (it reopens by name). Pin descriptors for files the guest has open (Open/Close requests).
 - [ ] Live mounts: changes on a read-only mount without `fs_write` report "needs fs_write" (the syscall gate runs first) instead of EROFS.
-- [ ] Live mounts: inotify for host-side changes; hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
+- [x] Live mounts: inotify for host-side changes (the host watches what the guest watches: inotify on Linux, kqueue on macOS).
+- [ ] Live mounts: hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
 - [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
       Coreutils `ls -la` currently hits an "unknown" syscall.
 - [~] `inotify`. Node `fs.watch`, webpack, watchdog.
-      Watches can be added and removed but never fire, even now that files change.
+      Events for live mounts' changes, the host's and the program's (which
+      arrive just after the call that made them, not before it returns).
+      The sandbox's own files (imports, written files) make none yet.
 - [x] `flock` and `fcntl` record locks with real semantics (sqlite): see
       round 2, item 11.
 - [x] Real file timestamps from the host (make, build caches). Everything

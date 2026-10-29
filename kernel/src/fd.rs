@@ -40,7 +40,7 @@ pub enum FileKind {
     Epoll(Arc<Mutex<Epoll>>),
     /// A /proc or /sys file: contents generated at open.
     Generated(Vec<u8>),
-    Inotify(Inotify),
+    Inotify(crate::inotify::Inotify),
     TimerFd(Arc<Mutex<crate::timer::TimerFd>>),
     /// A NETLINK_ROUTE socket (netlink.rs).
     Netlink(crate::netlink::Netlink),
@@ -60,24 +60,6 @@ pub enum FileKind {
     PidFd(u32),
 }
 
-/// Watches are recorded but never fire (yet): the fd is never readable.
-#[derive(Default)]
-pub struct Inotify {
-    pub watches: BTreeMap<i32, Ino>,
-    pub next_wd: i32,
-}
-
-/// Watches across all inotify instances (Linux's max_user_watches): they
-/// take kernel memory.
-pub const MAX_WATCHES: u64 = 8192;
-pub static WATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-impl Drop for Inotify {
-    fn drop(&mut self) {
-        WATCHES.fetch_sub(self.watches.len() as u64, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 impl FileKind {
     /// Current readiness (EPOLL* bits) and a counter that changes whenever
     /// the readiness might have (for edge-triggered epoll).
@@ -94,7 +76,7 @@ impl FileKind {
                 (if writable { EPOLLOUT } else { 0 }, version)
             }
             FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
-            FileKind::Inotify(_) => (0, 0),
+            FileKind::Inotify(n) => n.poll(),
             FileKind::TimerFd(t) => {
                 let mut t = t.lock();
                 t.update(crate::time::monotonic_ns());

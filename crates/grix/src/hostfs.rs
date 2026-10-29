@@ -5,6 +5,10 @@
 //! is walked from the mount's directory with `openat` and `O_NOFOLLOW`, one
 //! checked name at a time, so no link (the program's or anyone's) can lead
 //! out of the mount. Read-only mounts refuse every change.
+//!
+//! Nodes the guest's inotify watches are watched on the host too
+//! (`watch.rs`), through descriptors opened the same way; lazy imports
+//! never change for the guest, so they aren't.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -59,7 +63,7 @@ const OPEN_FILES: usize = 32;
 const KEPT_OPEN: usize = 128;
 
 /// A host error as a Linux errno.
-fn linux_errno(e: &io::Error) -> u16 {
+pub(crate) fn linux_errno(e: &io::Error) -> u16 {
     let Some(raw) = e.raw_os_error() else { return EIO };
     if cfg!(target_os = "linux") {
         return raw as u16;
@@ -198,7 +202,14 @@ pub(crate) struct Server {
     kept: VecDeque<(u64, bool, OwnedFd)>,
     listing: Option<Listing>,
     assembler: Assembler,
+    /// Where notices of watched nodes' changes go (frames for the guest),
+    /// and the watcher, once something is watched.
+    notices: Option<NoticeSink>,
+    watcher: Option<crate::watch::Watcher>,
 }
+
+/// Sends a frame to the guest; false once it's gone.
+pub(crate) type NoticeSink = std::sync::Arc<dyn Fn(Vec<u8>) -> bool + Send + Sync>;
 
 impl Server {
     pub fn new(mounts: &[LiveMount]) -> Result<Server> {
@@ -224,7 +235,14 @@ impl Server {
             kept: VecDeque::new(),
             listing: None,
             assembler: Assembler::default(),
+            notices: None,
+            watcher: None,
         })
+    }
+
+    /// Changes to watched nodes go to the guest through `send`.
+    pub fn notify(&mut self, send: NoticeSink) {
+        self.notices = Some(send);
     }
 
     /// What a snapshot keeps of the server, for runs restored from it:
@@ -356,6 +374,12 @@ impl Server {
             // One way: the guest doesn't wait for an answer.
             Ok((_, Request::Forget { id })) => {
                 self.kept.retain(|k| k.0 != id);
+                return Vec::new();
+            }
+            Ok((_, Request::Unwatch { id })) => {
+                if let Some(w) = &self.watcher {
+                    w.remove(id);
+                }
                 return Vec::new();
             }
             Ok((seq, req)) => match self.serve(req) {
@@ -578,7 +602,17 @@ impl Server {
                 let id = self.id(dir, name)?;
                 ok(Reply::Found { id, attr, target: &target })
             }
-            Request::Forget { .. } => unreachable!("handled without an answer"),
+            Request::Watch { id } => {
+                // A lazy import stays as the guest first saw it: nothing
+                // there changes for it.
+                if self.is_lazy(id) {
+                    return Err(EINVAL);
+                }
+                let fd = self.open_node(id)?;
+                self.watcher()?.add(id, fd)?;
+                ok(Reply::Done)
+            }
+            Request::Forget { .. } | Request::Unwatch { .. } => unreachable!("handled without an answer"),
         }
     }
 
@@ -711,6 +745,20 @@ impl Server {
         }
         self.files.push((id, write, fd));
         Ok(self.files.last().unwrap().2.as_raw_fd())
+    }
+
+    /// The watcher, started the first time it's needed.
+    fn watcher(&mut self) -> Result<&crate::watch::Watcher, u16> {
+        if self.watcher.is_none() {
+            let send = self.notices.clone().ok_or(EOPNOTSUPP)?;
+            let sink = Box::new(move |notice: Vec<u8>| {
+                let mut f = wire::input_header(Input::FsEvent, notice.len()).to_vec();
+                f.extend_from_slice(&notice);
+                send(f)
+            });
+            self.watcher = Some(crate::watch::Watcher::new(sink).map_err(err)?);
+        }
+        Ok(self.watcher.as_ref().unwrap())
     }
 
     fn is_lazy(&self, id: u64) -> bool {

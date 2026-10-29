@@ -437,8 +437,9 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   part isn't saved. Live mounts are (the names the host gave ids, and what
   the guest first saw of lazy imports): each run gives them host
   directories again (`--mount HOST:GUEST[:ro]`, `Snapshot::mount`), and
-  what the guest knew of them is fetched again. Sandboxes with on-exit
-  mounts can't take one.
+  what the guest knew of them is fetched again. inotify watches on them
+  are set up again too, with an `IN_Q_OVERFLOW` for what changed while
+  the snapshot sat there. Sandboxes with on-exit mounts can't take one.
 - The file holds the program's memory, so it's created readable only by
   you, and written fully before it replaces the old one.
 - Snapshots need grix-vmm: Hypervisor.framework on macOS 15+, KVM on
@@ -755,8 +756,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Signal handlers: Linux arm64 frames with FP/SIMD state, `SA_SIGINFO`/`SA_RESTART`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`, `sigaltstack`, per-thread masks, queued real-time signals, `sigsuspend`/`sigtimedwait`, faults delivered to handlers, EINTR and restart of blocked calls | |
 | Signals from the host: `RunControl::signal` and the CLI's Ctrl-C reach the program's process group (SIGTSTP and SIGCONT stop and continue it); a timeout sends SIGTERM and a grace period first, so exports still come back | |
 | `read`/`write`/`readv`/`writev`/`pread`/`lseek`, `openat`, `stat*`, `getdents64`, `readlink`, `fcntl`, `dup*`, `ioctl`; the host's file times | |
-| Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`) | inotify events for host changes |
-| With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files, `MAP_SHARED` file mappings (the file's own pages, across fork too). `flock`, POSIX record locks and OFD locks, between processes (SQLite in WAL mode from several). Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` mappings of live-mounted files (reported); locks the host sees; `inotify` events; xattrs |
+| Live host directory mounts (`mount`, `mount_read_only`, `--mount`), of any size; or changes applied when the program ends (`mount_on_exit`). `inotify` events for changes there, the host's too (`fs.watch`, watchdog), with rename cookies | Events for a change the program makes arrive just after its call returns |
+| With `fs_write`: creating, writing, truncating, renaming and deleting files and directories, hard and symbolic links, `O_TMPFILE`, unlinked-but-open files, chmod/chown/utimensat with Unix permissions, `sendfile`/`copy_file_range`, mmap of written files, `MAP_SHARED` file mappings (the file's own pages, across fork too). `flock`, POSIX record locks and OFD locks, between processes (SQLite in WAL mode from several). Exporting directories back to the host when the program ends (`export`, `--export`) | Writable `MAP_SHARED` mappings of live-mounted files (reported); locks the host sees; `inotify` events for the sandbox's own files; xattrs |
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging), a stack as big as `RLIMIT_STACK` says; more CPUs (`--cpus`): threads and processes run in parallel | `MAP_GROWSDOWN`; finer locking than one kernel lock |
 | Clocks (including per-thread and per-process CPU time; a vDSO reads them without a system call), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | |
