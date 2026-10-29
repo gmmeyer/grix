@@ -156,3 +156,15 @@ td:first-child { font-family: var(--mono); font-size: .88rem; white-space: nowra
 .hero-demo .code { margin-bottom: 14px; }
 #blog h2 a { text-decoration: none; }
 #blog h2 a:hover { text-decoration: underline; }
+
+/* Install */
+.steps { list-style: none; counter-reset: step; padding: 0; margin: 1.6rem 0 0; display: grid; gap: 22px; }
+.steps > li { counter-increment: step; position: relative; padding-left: 46px; }
+.steps > li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 30px; height: 30px;
+  border-radius: 50%; background: var(--accent); color: var(--accent-fg); font: 700 .9rem/30px var(--mono); text-align: center; }
+.steps p { color: var(--muted); margin: .2rem 0 .7rem; }
+.steps .code pre { font-size: .8rem; }
+.platform-notes { margin-top: 1.8rem; border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 22px; background: var(--bg-alt); }
+.platform-notes ul { margin: .4rem 0 0; padding-left: 1.2rem; }
+.platform-notes li { margin: .45rem 0; font-size: .96rem; }
+@media (max-width: 520px) { .steps > li { padding-left: 0; padding-top: 40px; } }

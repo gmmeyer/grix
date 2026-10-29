@@ -130,11 +130,79 @@ socket: opened fd 3</pre></div>
 </section>
 
 <section id="install">
+  <div class="eyebrow">Install</div>
+  <h2>Get grix</h2>
+  <p class="lead">Every commit to <code>main</code> is a <a href="https://github.com/gmmeyer/grix/releases">release</a>: grix, its
+  VMM, its kernels and the Python package, in one archive for each platform. Nothing else to install.</p>
+
+  <ol class="steps">
+    <li>
+      <h3>Download and check it</h3>
+      <p>Pick your platform: <code>macos-arm64</code> (Apple silicon, macOS 15+), <code>linux-arm64</code> or
+      <code>linux-x86_64</code>.</p>
+      <div class="code"><pre>os=macos-arm64
+tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/gmmeyer/grix/releases/latest | sed 's|.*/tag/||')
+v=${tag#v}
+curl -fsSLO "https://github.com/gmmeyer/grix/releases/download/$tag/grix-$v-$os.tar.gz"
+curl -fsSLO "https://github.com/gmmeyer/grix/releases/download/$tag/SHA256SUMS"
+grep " grix-$v-$os.tar.gz" SHA256SUMS | shasum -a 256 -c   <span class="c"># or: sha256sum -c</span>
+tar xzf "grix-$v-$os.tar.gz"</pre></div>
+    </li>
+    <li>
+      <h3>Put it on your PATH</h3>
+      <p>grix finds its kernel and VMM beside itself, so keep the directory together.</p>
+      <div class="code"><pre>mkdir -p ~/.local && mv "grix-$v-$os" ~/.local/grix
+export PATH="$HOME/.local/grix:$PATH"   <span class="c"># and in your shell's profile</span>
+grix --version</pre></div>
+    </li>
+    <li>
+      <h3>Run something</h3>
+      <p>Turn Docker Hub's Alpine into a grix image, then run its shell. It can't start <code>cat</code>
+      until you grant <code>process</code>, and it can't reach the network until you grant <code>net</code>
+      for one host.</p>
+      <div class="code"><pre>grix build --from alpine:3.21 -o alpine.grix
+
+grix run --image alpine.grix -- /bin/sh -c 'cat /etc/alpine-release'
+<span class="c">/bin/sh: cat: Operation not permitted</span>
+<span class="deny">grix: denied execve: needs capability `process`</span>
+
+grix run --image alpine.grix -a process -- /bin/sh -c 'cat /etc/alpine-release'
+<span class="c">3.21.9</span>
+
+grix run --image alpine.grix -a process -a net --allow-host example.com:80 -- \
+    /bin/sh -c 'wget -qO- http://example.com | grep -o "&lt;title&gt;.*&lt;/title&gt;"'
+<span class="c">&lt;title&gt;Example Domain&lt;/title&gt;</span></pre></div>
+    </li>
+  </ol>
+
+  <div class="platform-notes">
+    <h3>Platform notes</h3>
+    <ul>
+      <li><strong>macOS:</strong> Apple silicon and macOS 15 or later. If you downloaded the archive in a
+      browser instead of with <code>curl</code>, clear the quarantine first:
+      <code>xattr -d com.apple.quarantine ~/.local/grix/grix ~/.local/grix/grix-vmm</code>.</li>
+      <li><strong>Linux:</strong> grix's own VMM needs <code>/dev/kvm</code>. Add yourself to the
+      <code>kvm</code> group (<code>sudo usermod -aG kvm $USER</code>, then log in again), or pass
+      <code>--device /dev/kvm</code> to a container. Without KVM, grix falls back to QEMU
+      (<code>qemu-system-aarch64</code> or <code>qemu-system-x86_64</code>), which emulates and is much
+      slower.</li>
+      <li><strong>x86_64 Linux:</strong> images built from Docker/OCI images are arm64 for now. Set
+      <code>GRIX_ARCH=aarch64</code> for <code>grix build</code> and <code>grix run</code>, and they run
+      emulated in <code>qemu-system-aarch64</code>. x86_64 programs you import yourself run natively on
+      KVM.</li>
+      <li><strong>From source:</strong> <code>git clone https://github.com/gmmeyer/grix &amp;&amp; cd grix &amp;&amp; make</code>
+      needs Rust, and zig and Go for the test programs. See the
+      <a href="https://github.com/gmmeyer/grix#quick-start">README</a>.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="use">
   <div class="eyebrow">Use it</div>
   <h2>From the command line, an agent, or your code</h2>
-  <p class="lead">Every commit to <code>main</code> is a <a href="https://github.com/gmmeyer/grix/releases">release</a>, for arm64
-  macOS 15+, arm64 Linux and x86_64 Linux. Unpack one and run <code>./grix</code>: it finds its kernel and
-  VMM beside itself. On arm64 macOS and on Linux with KVM, it runs its own VMM. Elsewhere it uses QEMU.</p>
+  <p class="lead">The same sandbox from the CLI, an MCP server for agents (<code>claude mcp add grix --
+  grix mcp --root "$PWD"</code> in Claude Code), Python (<code>PYTHONPATH=~/.local/grix/python</code>, Python
+  3.9+), or Rust.</p>
   <div class="code-grid">
     <div class="code"><div class="label">CLI</div><pre><span class="c"># Only /bin/net exists, and nothing is granted.</span>
 $ grix run -i ./net:/bin/net -- /bin/net
