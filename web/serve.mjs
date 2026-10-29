@@ -13,10 +13,18 @@ const types = {
 };
 
 http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://x');
-  let file = path.join(root, decodeURIComponent(url.pathname));
-  if (!file.startsWith(root)) return res.writeHead(403).end();
-  if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+  let file;
+  try {
+    file = path.join(root, decodeURIComponent(new URL(req.url, 'http://x').pathname));
+  } catch {
+    return res.writeHead(400).end(); // a lone %, say
+  }
+  // Inside root (not a sibling whose name starts with its), and a path fs
+  // takes (no NUL, which it throws on).
+  if ((file !== root && !file.startsWith(root + path.sep)) || file.includes('\0')) return res.writeHead(403).end();
+  try {
+    if (fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+  } catch {}
   fs.readFile(file, (err, data) => {
     if (err) return res.writeHead(404).end('not found');
     res.writeHead(200, {

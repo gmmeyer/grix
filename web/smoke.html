@@ -7,6 +7,13 @@ import { Grix } from './grix.js';
 import { fetchTar } from './tar.js';
 const out = document.getElementById('out');
 const log = (s) => { out.textContent += s; };
+// A test page: its URL picks the program, its capabilities and QEMU's
+// arguments, which a link from anywhere shouldn't get to. So it runs only
+// served from this machine (deploy.sh leaves it off grixos.dev, too).
+if (!['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) {
+  out.textContent = 'smoke.html is a test page: it runs only from localhost.';
+  throw new Error('smoke.html runs only from localhost');
+}
 const params = new URLSearchParams(location.search);
 const bin = params.get('bin') ?? 'hello';
 const argv = JSON.parse(params.get('argv') ?? '["/bin/hello","world"]');

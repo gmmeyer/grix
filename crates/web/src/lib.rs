@@ -103,16 +103,20 @@ fn guest_path(p: &str) -> Result<String, String> {
     Ok(norm)
 }
 
+/// Not setuid or setgid: nothing in the sandbox honours them (as for an
+/// OCI image's layers).
+const MODE_BITS: u32 = 0o1777;
+
 impl Builder {
     pub fn file(&mut self, path: &str, data: Vec<u8>, mode: u32) -> Result<(), String> {
-        self.files.insert(guest_path(path)?, Node::File { data, mode: mode & 0o7777 });
+        self.files.insert(guest_path(path)?, Node::File { data, mode: mode & MODE_BITS });
         Ok(())
     }
 
     pub fn dir(&mut self, path: &str, mode: u32) -> Result<(), String> {
         let path = guest_path(path)?;
         if path != "/" {
-            self.files.insert(path, Node::Dir { mode: mode & 0o7777 });
+            self.files.insert(path, Node::Dir { mode: mode & MODE_BITS });
         }
         Ok(())
     }
@@ -568,6 +572,17 @@ mod tests {
     }
 
     #[test]
+    fn modes_lose_setuid_and_setgid() {
+        let mut b = Builder::default();
+        b.file("/bin/su", b"ELF".to_vec(), 0o106755).unwrap();
+        b.dir("/tmp", 0o41777).unwrap();
+        let bytes = b.image(&spec(&["/bin/su"])).unwrap();
+        let img = Image::decode(&bytes).unwrap();
+        let modes: Vec<_> = img.entries.iter().map(|e| (e.path, e.mode)).collect();
+        assert_eq!(modes, [("/bin/su", 0o755), ("/tmp", 0o1777)]);
+    }
+
+    #[test]
     fn bad_specs_are_errors() {
         let b = Builder::default();
         assert!(b.image(&spec(&[])).is_err());
@@ -620,5 +635,18 @@ mod tests {
             end,
             [&wire::input_header(Input::Stdin, 6)[..], b"xxxxxx", &wire::input_header(Input::StdinEof, 0)].concat()
         );
+    }
+
+    /// A guest that gave more credit than a wasm32 usize holds: 2^32 read
+    /// 0 there, and `input` spun on empty frames.
+    #[test]
+    fn credit_past_u32_still_sends() {
+        let mut s = Session { credit: 1 << 32, ..Session::default() };
+        s.stdin(b"abc", true);
+        assert_eq!(
+            s.input(),
+            [&wire::input_header(Input::Stdin, 3)[..], b"abc", &wire::input_header(Input::StdinEof, 0)].concat()
+        );
+        assert_eq!(s.credit, (1 << 32) - 3);
     }
 }
