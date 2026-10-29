@@ -89,6 +89,19 @@ pub struct Wait {
     pub rerun: bool,
 }
 
+/// A blocking FIFO open waiting for the other side: its own end (which
+/// counts for the other side meanwhile), the FIFO, the other side's open
+/// count when it began, and the call it's in. It lasts until the thread
+/// enters a different call, or a signal handler interrupts it (as Linux's
+/// fifo_open drops its count then, and a restart begins afresh): not
+/// `restarting`, which an interrupt before the call runs again clears.
+pub struct FifoWait {
+    pub ino: crate::fs::Ino,
+    pub end: crate::ipc::PipeEnd,
+    pub since: u64,
+    pub call: (u64, u64),
+}
+
 pub struct Thread {
     pub tid: u32,
     /// User registers, valid while the thread is not running.
@@ -130,6 +143,11 @@ pub struct Thread {
     /// write), for finding deadlocks. Only meaningful while it's blocked
     /// there.
     pub lock_wait: Option<(usize, u64, u64, bool)>,
+    /// The end a blocking open of a FIFO holds while it waits for the other
+    /// side (`open_fifo`).
+    pub fifo_wait: Option<FifoWait>,
+    /// The syscall it's in: (pc, number) as it entered.
+    pub call: (u64, u64),
 }
 
 impl Thread {
@@ -152,6 +170,8 @@ impl Thread {
             io_done: 0,
             cpu_ns: 0,
             lock_wait: None,
+            fifo_wait: None,
+            call: (0, 0),
         }
     }
 }

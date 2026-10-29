@@ -285,6 +285,20 @@ fn file_writes_need_fs_write() {
 }
 
 #[test]
+fn named_pipes() {
+    let b = with("fifo").allow(Capability::FsWrite).allow(Capability::Threads).allow(Capability::Process);
+    let out = run(b, &["/bin/fifo"]);
+    assert_eq!(out.stdout_str(), "fifo ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // A device node is denied, not missing.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { syscall, detail, .. }] if syscall == "mknodat" && detail == "/tmp/null"),
+        "{:?}",
+        out.events
+    );
+}
+
+#[test]
 fn writable_filesystem() {
     let b = with("files").allow(Capability::FsWrite).file("/data/in.txt", "imported text\n", 0o644).unwrap();
     let out = run(b, &["/bin/files"]);

@@ -575,6 +575,8 @@ pub enum Kind {
     /// An AF_UNIX socket's name (`unix::node_id`): connect finds the
     /// socket bound to it.
     Socket(u64),
+    /// A named pipe (mkfifo).
+    Fifo(crate::ipc::Fifo),
 }
 
 pub struct Node {
@@ -1434,6 +1436,7 @@ impl Fs {
             }
             Kind::Proc(_) => (S_IFREG, 0, 1, 0),
             Kind::Socket(_) => (S_IFSOCK, 0, n.nlink, 0),
+            Kind::Fifo(_) => (S_IFIFO, 0, n.nlink, 0),
         };
         StatInfo {
             ino: self.ino_number(ino),
@@ -1505,6 +1508,7 @@ impl Fs {
             Kind::Symlink(_) => 10,
             Kind::Dev(_) => 2,
             Kind::Socket(_) => 12,
+            Kind::Fifo(_) => 1,
         }
     }
 

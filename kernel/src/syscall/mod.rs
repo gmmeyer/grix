@@ -34,6 +34,14 @@ pub fn handle(tf: &mut TrapFrame) {
     // A rewound call is running again: no longer something a signal must
     // decide for (see `signal::return_to_user`).
     p.cur().restarting = false;
+    // Any other call than the one it waited in: a FIFO open's wait (and
+    // its end) is over.
+    let call = (tf.pc(), n);
+    let t = p.cur();
+    t.call = call;
+    if t.fifo_wait.as_ref().is_some_and(|w| w.call != call) {
+        t.fifo_wait = None;
+    }
     let result = match u32::try_from(n) {
         Ok(n) => dispatch(p, tf, n, a),
         Err(_) => p.unimplemented(u32::MAX, "unknown", "", ENOSYS),
@@ -169,6 +177,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::fallocate => file::fallocate(p, a[0], a[1], a[2], a[3]),
         nr::fchmod => file::fchmod(p, a[0], a[1]),
         nr::fchmodat => file::fchmodat(p, a[0], a[1], a[2]),
+        nr::mknodat => file::mknodat(p, a[0], a[1], a[2]),
         nr::fchmodat2 => file::fchmodat2(p, a[0], a[1], a[2], a[3]),
         nr::fchown => file::fchown(p, a[0], a[1], a[2]),
         nr::fchownat => file::fchownat(p, a[0], a[1], a[2], a[3], a[4]),

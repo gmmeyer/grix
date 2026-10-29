@@ -682,6 +682,9 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         if core::mem::take(&mut t.restarting) {
             interrupt_syscall(&mut p.aspace, t, tf, &act);
         }
+        // A FIFO open it waited in is interrupted: its end goes (a
+        // restart opens afresh).
+        t.fifo_wait = None;
         if push_frame(p, tf, &info, &act).is_err() {
             // Linux's force_sigsegv: a signal that can't be delivered ends the program.
             let why = "no room for a signal frame (stack overflow or bad sigaltstack)";

@@ -11,6 +11,22 @@ use crate::fs::{Content, Dev, Ino};
 use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd, SocketEnd};
 
 pub const MAX_FDS: usize = 1024;
+
+/// A named pipe's node and the ends this open has: one, or both for
+/// O_RDWR (which Linux allows on a FIFO, and never waits).
+pub struct FifoFile {
+    pub ino: Ino,
+    pub read: Option<PipeEnd>,
+    pub write: Option<PipeEnd>,
+}
+
+impl FifoFile {
+    pub fn poll(&self) -> (u32, u64) {
+        let (r, w) = (self.read.as_ref().map(PipeEnd::poll), self.write.as_ref().map(PipeEnd::poll));
+        let (mask, version) = [r, w].into_iter().flatten().fold((0, 0), |(m, v), (m2, v2)| (m | m2, v.max(v2)));
+        (mask, version)
+    }
+}
 /// Open file descriptions in all processes together (Linux's file-max):
 /// each takes kernel memory, and descriptor limits are per process.
 pub const MAX_OPEN_FILES: usize = 4096;
@@ -39,6 +55,8 @@ pub enum FileKind {
     Node(Ino),
     Dev(Dev, Ino),
     Pipe(PipeEnd),
+    /// A named pipe opened by its path.
+    Fifo(FifoFile),
     /// AF_UNIX stream socket from socketpair().
     Socket(SocketEnd),
     EventFd(Arc<Mutex<EventFd>>),
@@ -88,6 +106,7 @@ impl FileKind {
                 (if t.expirations > 0 { EPOLLIN } else { 0 }, t.version)
             }
             FileKind::Pipe(end) => end.poll(),
+            FileKind::Fifo(f) => f.poll(),
             FileKind::Netlink(nl) => nl.poll(),
             FileKind::UnixUnbound(_) => (EPOLLOUT | crate::ipc::EPOLLHUP, 0),
             // Depend on the reader's pending signals, or on other

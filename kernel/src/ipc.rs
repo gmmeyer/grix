@@ -93,18 +93,62 @@ pub struct PipeEnd {
     pub write: bool,
 }
 
-pub fn pipe() -> (PipeEnd, PipeEnd) {
-    let p = Arc::new(Mutex::new(Pipe {
+fn new_pipe(readers: usize, writers: usize) -> Arc<Mutex<Pipe>> {
+    Arc::new(Mutex::new(Pipe {
         buf: VecDeque::new(),
         charge: crate::kmem::Charge::default(),
-        readers: 1,
-        writers: 1,
+        readers,
+        writers,
         version: 0,
         written: 0,
         read: 0,
         rights: VecDeque::new(),
-    }));
+    }))
+}
+
+pub fn pipe() -> (PipeEnd, PipeEnd) {
+    let p = new_pipe(1, 1);
     (PipeEnd { pipe: p.clone(), write: false }, PipeEnd { pipe: p, write: true })
+}
+
+/// A named pipe (FIFO): whatever has it open shares one pipe, which goes,
+/// with what's in it, when the last end closes, as on Linux.
+#[derive(Default)]
+pub struct Fifo {
+    pipe: alloc::sync::Weak<Mutex<Pipe>>,
+    /// How many times it was opened for reading and for writing: an open
+    /// waiting for the other side waits for its count to change (the other
+    /// side may have come and gone meanwhile).
+    pub opened: [u64; 2],
+}
+
+impl Fifo {
+    /// The ends open now: (readers, writers).
+    pub fn ends(&self) -> (usize, usize) {
+        self.pipe.upgrade().map_or((0, 0), |p| {
+            let p = p.lock();
+            (p.readers, p.writers)
+        })
+    }
+
+    /// Another end, for reading or writing.
+    pub fn open(&mut self, write: bool) -> PipeEnd {
+        let pipe = self.pipe.upgrade().unwrap_or_else(|| {
+            let p = new_pipe(0, 0);
+            self.pipe = Arc::downgrade(&p);
+            p
+        });
+        let mut p = pipe.lock();
+        if write {
+            p.writers += 1;
+        } else {
+            p.readers += 1;
+        }
+        self.opened[write as usize] += 1;
+        p.touch();
+        drop(p);
+        PipeEnd { pipe, write }
+    }
 }
 
 impl PipeEnd {

@@ -11,8 +11,8 @@ use super::{require, table::nr};
 use crate::console;
 use crate::errno::*;
 use crate::fd::{
-    Epoll, FdEntry, FileKind, O_ACCMODE, O_APPEND, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile, Registration,
-    new_file,
+    Epoll, FdEntry, FifoFile, FileKind, O_ACCMODE, O_APPEND, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile,
+    Registration, new_file,
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
 use crate::locks;
@@ -94,7 +94,7 @@ pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
         return Ok(p.cwd());
     }
     match p.fds.get(fd)?.lock().kind {
-        FileKind::Node(ino) | FileKind::Dev(_, ino) => Ok(ino),
+        FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(FifoFile { ino, .. }) => Ok(ino),
         _ => Err(EINVAL),
     }
 }
@@ -144,7 +144,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
     };
     Ok(match &f.kind {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => anon(0x1000_0000 + fd, S_IFIFO | 0o600, 0),
-        FileKind::Node(ino) | FileKind::Dev(_, ino) => fs::lock().stat(*ino),
+        FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(FifoFile { ino, .. }) => fs::lock().stat(*ino),
         FileKind::Pty(end) => fs::lock().stat(end.ino),
         FileKind::Pipe(end) => anon(Arc::as_ptr(&end.pipe) as u64, S_IFIFO | 0o600, 0),
         FileKind::Socket(_)
@@ -260,7 +260,8 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         let mut fs = fs::lock();
         let proc_pid = fs.proc_pid(ino).filter(|&pid| pid != p.pid);
         fs.revalidate(ino);
-        if writes && fs.read_only(ino) && !fs.is_dir(ino) {
+        // (A FIFO is written to, never changed.)
+        if writes && fs.read_only(ino) && !fs.is_dir(ino) && !matches!(fs.node(ino).kind, Kind::Fifo(_)) {
             return Err(EROFS);
         }
         match &fs.node(ino).kind {
@@ -279,6 +280,11 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
             Kind::Symlink(_) => return Err(ELOOP), // O_NOFOLLOW on a symlink
             // A socket is connected to, not opened.
             Kind::Socket(_) => return Err(ENXIO),
+            Kind::Fifo(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            Kind::Fifo(_) => {
+                drop(fs);
+                return open_fifo(p, ino, flags, cloexec);
+            }
             Kind::Dir(_) if writes => return Err(EISDIR),
             // Reading a directory needs read permission, as on Linux; a live
             // mount's must be one the host can list, too.
@@ -340,6 +346,59 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         }
     }
     open_node(p, ino, content, flags, cloexec)
+}
+
+/// Open a named pipe, as Linux's fifo_open: for reading it waits for a
+/// writer, and for writing for a reader, unless O_NONBLOCK (then a writer
+/// without a reader gets ENXIO) or O_RDWR. A waiting open's end already
+/// counts (`Thread::fifo_wait` keeps it across the re-runs), so two opens
+/// waiting for each other both go on.
+fn open_fifo(p: &mut Process, ino: Ino, flags: u32, cloexec: bool) -> SysResult {
+    let acc = flags & O_ACCMODE;
+    let want = match acc {
+        O_RDONLY => MAY_READ,
+        O_WRONLY => MAY_WRITE,
+        O_RDWR => MAY_READ | MAY_WRITE,
+        _ => return Err(EINVAL),
+    };
+    let mut fs = fs::lock();
+    if !fs.permits(ino, p.uid, p.gid, want) {
+        return Err(EACCES);
+    }
+    let pin = fs.pin(ino);
+    let Kind::Fifo(fifo) = &mut fs.node_mut(ino).kind else { return Err(ENOENT) };
+    let (read, write) = if acc == O_RDWR {
+        (Some(fifo.open(false)), Some(fifo.open(true)))
+    } else {
+        let write = acc == O_WRONLY;
+        let (readers, writers) = fifo.ends();
+        let others = if write { readers } else { writers };
+        let end = if flags & O_NONBLOCK != 0 {
+            if write && readers == 0 {
+                return Err(ENXIO);
+            }
+            fifo.open(write)
+        } else {
+            let other = !write as usize;
+            let (end, since) = match p.cur().fifo_wait.take() {
+                Some(w) if w.ino == ino && w.end.write == write => (w.end, w.since),
+                _ => (fifo.open(write), fifo.opened[other]),
+            };
+            if others == 0 && fifo.opened[other] == since {
+                let call = p.cur().call;
+                p.cur().fifo_wait = Some(crate::process::FifoWait { ino, end, since, call });
+                drop(fs);
+                return p.block_io(None, Err(EINTR));
+            }
+            end
+        };
+        if write { (None, Some(end)) } else { (Some(end), None) }
+    };
+    drop(fs);
+    let file =
+        new_file(FileKind::Fifo(FifoFile { ino, read, write }), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
+    file.lock().pin = Some(pin);
+    p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
 fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool) -> SysResult {
@@ -503,6 +562,10 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         }
         FileKind::Pipe(end) if end.write => Err(EBADF),
         FileKind::Pipe(end) => pipe_read(p, end, buf, count, nonblock, false),
+        FileKind::Fifo(f) => match &f.read {
+            Some(end) => pipe_read(p, end, buf, count, nonblock, false),
+            None => Err(EBADF),
+        },
         FileKind::Pty(end) => super::tty::read(p, end, buf, count, nonblock),
         FileKind::Unix(s) => super::unix::recv_msg(p, s, &[(buf, count)], 0, nonblock).map(|r| r.n),
         FileKind::Socket(s) => match &s.rx {
@@ -695,6 +758,12 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
         FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
+        FileKind::Fifo(f) => {
+            return match &f.write {
+                Some(end) => pipe_write(p, end, buf, count, nonblock, true),
+                None => Err(EBADF),
+            };
+        }
         FileKind::Pty(end) => return super::tty::write(p, end, buf, count, nonblock),
         FileKind::Unix(s) => return super::unix::send_msg(p, s, &[(buf, count)], 0, nonblock, None, None),
         FileKind::Socket(s) => {
@@ -1262,6 +1331,27 @@ pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
     fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
 }
 
+/// mknod: named pipes and regular files. Device nodes would reach
+/// devices the sandbox doesn't have, so they're denied whoever asks.
+pub fn mknodat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+    const S_IFSOCK: u32 = 0o140000;
+    let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    let perm = mode as u32 & 0o7777 & !p.umask();
+    let kind = match mode as u32 & S_IFMT {
+        S_IFIFO => Kind::Fifo(Default::default()),
+        0 | S_IFREG => Kind::File(FileData::new(&[])),
+        S_IFCHR | S_IFBLK => return p.deny(nr::mknodat, "mknodat", "privileged", &path),
+        S_IFSOCK => return p.unimplemented(nr::mknodat, "mknodat", "S_IFSOCK", EPERM),
+        _ => return Err(EINVAL),
+    };
+    let (dir, name) = parent_of(p, dirfd, &path)?;
+    fs::lock().create(dir, &name, kind, perm, p.uid, p.gid).map(|_| 0)
+}
+
 pub fn unlinkat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult {
     const AT_REMOVEDIR: u64 = 0x200;
     if flags & !AT_REMOVEDIR != 0 {
@@ -1386,7 +1476,7 @@ fn writable_file(p: &Process, fd: u64, not_file: Errno) -> Result<(Ino, Content)
     match (&f.kind, &f.content) {
         (FileKind::Node(ino), Some(c)) if f.flags & O_ACCMODE != O_RDONLY && !f.path_only => Ok((*ino, c.clone())),
         (FileKind::Node(_), Some(_)) => Err(EBADF),
-        (FileKind::Pipe(_) | FileKind::Socket(_) | FileKind::Inet(_), _) => Err(ESPIPE),
+        (FileKind::Pipe(_) | FileKind::Fifo(_) | FileKind::Socket(_) | FileKind::Inet(_), _) => Err(ESPIPE),
         _ => Err(not_file),
     }
 }
@@ -2042,6 +2132,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
         FIONREAD => {
             let avail = match &file.lock().kind {
                 FileKind::Pipe(end) if !end.write => end.pipe.lock().buf.len() as u32,
+                FileKind::Fifo(FifoFile { read: Some(end), .. }) => end.pipe.lock().buf.len() as u32,
                 FileKind::Socket(s) => s.rx.as_ref().map_or(0, |r| r.pipe.lock().buf.len() as u32),
                 FileKind::Inet(s) => super::net::inet_available(s) as u32,
                 FileKind::Stdin => console::stdin_state().0 as u32,
