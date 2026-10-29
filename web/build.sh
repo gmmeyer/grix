@@ -61,6 +61,25 @@ cp target/wasm32-unknown-unknown/release/grix_web.wasm "$DIST/"
 
 cp web/grix.js web/tar.js web/grix-example.js web/index.html web/smoke.html "$DIST/"
 
+# Cloudflare Pages (and Netlify) take headers from _headers: isolation for
+# a page served here, and CORS and CORP so pages elsewhere can use the files.
+cat > "$DIST/_headers" <<'END'
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: cross-origin
+  Access-Control-Allow-Origin: *
+END
+
+# Where headers can't be set (GitHub Pages), coi-serviceworker makes the
+# page cross-origin isolated. A page that already is, it leaves alone.
+if [ ! -f "$DIST/coi-serviceworker.js" ]; then
+    tmp=$(mktemp -d)
+    (cd "$tmp" && npm pack -q coi-serviceworker@0.1.7 >/dev/null && tar xzf coi-serviceworker-0.1.7.tgz)
+    cp "$tmp/package/coi-serviceworker.js" "$DIST/"
+    rm -rf "$tmp"
+fi
+
 # xterm.js, for the terminal example.
 if [ ! -f "$DIST/vendor/xterm.js" ]; then
     tmp=$(mktemp -d)
@@ -94,7 +113,7 @@ tar -C "$FIX/node" -czf "$DIST/rootfs/node.tar.gz" .
 sh_root="$CACHE/bash"
 rm -rf "$sh_root"
 python3 -I tools/alpine.py --out "$sh_root" bash busybox
-./target/release/grix run -i "$sh_root:/" -- /bin/busybox --list-full | while read -r applet; do
+./target/release/grix run --arch aarch64 -i "$sh_root:/" -- /bin/busybox --list-full | while read -r applet; do
     if [ ! -e "$sh_root/$applet" ] && [ ! -L "$sh_root/$applet" ]; then
         mkdir -p "$(dirname "$sh_root/$applet")"
         ln -s /bin/busybox "$sh_root/$applet"

@@ -192,12 +192,20 @@ export class Grix {
   static async load({ qemu, kernel, web }) {
     // QEMU's threads are Web Workers, which emscripten keeps no handle on
     // that a run could end: note each one for the run it's made for.
+    // A worker's script must be the page's own, so one from elsewhere (the
+    // files on a CDN, the page on another host) starts as a module of the
+    // page's that imports it, which may come from anywhere CORS allows.
     if (!Grix.workers) {
       Grix.workers = [];
       const Real = globalThis.Worker;
       globalThis.Worker = class extends Real {
-        constructor(...a) {
-          super(...a);
+        constructor(url, opts) {
+          const href = new URL(url, location.href);
+          if (href.origin !== location.origin && opts?.type === 'module') {
+            const shim = `import ${JSON.stringify(href.href)};`;
+            url = URL.createObjectURL(new Blob([shim], { type: 'text/javascript' }));
+          }
+          super(url, opts);
           Grix.workers.push(this);
         }
       };
