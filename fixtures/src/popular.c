@@ -51,10 +51,37 @@ static int auxv(void) {
     return 0;
 }
 
+// The official nginx and httpd images link their logs to /dev/stdout and
+// /dev/stderr, which nginx opens with O_APPEND (and O_CREAT): a
+// descriptor reached through a symlink, not by its own name.
+static int fdlink(void) {
+    CHECK(symlink("/dev/stderr", "/tmp/error.log") == 0);
+    int fd = open("/tmp/error.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    CHECK(fd >= 0);
+    CHECK(write(fd, "through a link\n", 15) == 15);
+    close(fd);
+    struct stat st;
+    CHECK(stat("/tmp/error.log", &st) == 0 && S_ISFIFO(st.st_mode));
+    CHECK(open("/tmp/error.log", O_WRONLY | O_CREAT | O_EXCL, 0644) == -1 && errno == EEXIST);
+    // A relative path in /proc/self/fd.
+    CHECK(chdir("/proc/self") == 0);
+    fd = open("fd/2", O_WRONLY);
+    CHECK(fd >= 0);
+    CHECK(write(fd, "relative\n", 9) == 9);
+    close(fd);
+    CHECK(fstatat(AT_FDCWD, "fd/2", &st, 0) == 0 && S_ISFIFO(st.st_mode));
+    CHECK(chdir("/") == 0);
+    // A descriptor that isn't open.
+    CHECK(symlink("/proc/self/fd/77", "/tmp/gone") == 0);
+    CHECK(open("/tmp/gone", O_RDONLY) == -1 && errno == ENOENT);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
         if (strcmp(argv[i], "auxv") == 0) r = auxv();
+        if (strcmp(argv[i], "fdlink") == 0) r = fdlink();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

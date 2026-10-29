@@ -74,6 +74,25 @@ fn resolve(p: &mut Process, dirfd: u64, path: &str, follow: bool) -> Result<Ino,
     r
 }
 
+/// What a path names: a node, or a process's descriptor (`Fs::fd_link`).
+enum Named {
+    Node(Ino),
+    Fd(u32, u64),
+}
+
+/// `resolve`, for calls that also take a descriptor's path.
+fn resolve_named(p: &mut Process, dirfd: u64, path: &str, follow: bool) -> Result<Named, Errno> {
+    let base = base_of(p, dirfd, path)?;
+    let r = fs::lock().lookup(base, path, follow);
+    if r == Err(ENOENT) {
+        if let Some((pid, fd)) = fs::lock().fd_link(base, path, follow) {
+            return Ok(Named::Fd(pid, fd));
+        }
+        p.missing_path(base, path);
+    }
+    r.map(Named::Node)
+}
+
 /// The directory and last component of a path that is being created or removed.
 fn parent_of(p: &mut Process, dirfd: u64, path: &str) -> Result<(Ino, String), Errno> {
     let base = base_of(p, dirfd, path)?;
@@ -118,7 +137,11 @@ fn at_node(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Ino, E
     if let Some(fd) = procfs::fd_path(&path) {
         return fd_node(p, fd);
     }
-    resolve(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
+    match resolve_named(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)? {
+        Named::Node(ino) => Ok(ino),
+        Named::Fd(pid, fd) if pid == p.pid => fd_node(p, fd),
+        Named::Fd(pid, fd) => with_other(p, pid, |q| fd_node(q, fd).map_err(|_| ENOENT)),
+    }
 }
 
 /// The node an fd refers to, for *at(fd, "", AT_EMPTY_PATH) and fstat.
@@ -177,8 +200,11 @@ fn path_stat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Stat
     if let Some((pid, fd)) = procfs::other_fd_path(&path) {
         return with_other(p, pid, |q| fd_stat(q, fd).map_err(|_| ENOENT));
     }
-    let ino = resolve(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    Ok(fs::lock().stat(ino))
+    match resolve_named(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)? {
+        Named::Node(ino) => Ok(fs::lock().stat(ino)),
+        Named::Fd(pid, fd) if pid == p.pid => fd_stat(p, fd),
+        Named::Fd(pid, fd) => with_other(p, pid, |q| fd_stat(q, fd).map_err(|_| ENOENT)),
+    }
 }
 
 // ---------------------------------------------------------------- open/close
@@ -220,7 +246,19 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
     }
     let creat = flags & O_CREAT != 0;
     let excl = creat && flags & O_EXCL != 0;
-    let found = fs::lock().lookup(base, &path, flags & O_NOFOLLOW == 0 && !excl);
+    let follow = flags & O_NOFOLLOW == 0 && !excl;
+    let found = fs::lock().lookup(base, &path, follow);
+    // A descriptor reached through a symlink or a relative path.
+    if found == Err(ENOENT)
+        && let Some((pid, fd)) = fs::lock().fd_link(base, &path, follow)
+        && pid == p.pid
+    {
+        if excl {
+            return Err(EEXIST);
+        }
+        let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+        return p.fds.alloc(FdEntry { file, cloexec }, 0);
+    }
     let (ino, created) = match found {
         Ok(_) if excl => return Err(EEXIST),
         Ok(ino) => (ino, false),

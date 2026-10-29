@@ -1751,6 +1751,17 @@ fn proc_self_auxv() {
 }
 
 #[test]
+fn descriptors_through_symlinks() {
+    // nginx's logs are links to /dev/stderr, which it opens with O_APPEND.
+    let b = with("popular").allow(Capability::FsWrite);
+    let out = run(b, &["/bin/popular", "fdlink"]);
+    assert_eq!(out.stdout_str(), "fdlink ok\n");
+    assert_eq!(out.stderr_str(), "through a link\nrelative\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

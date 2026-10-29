@@ -1169,6 +1169,31 @@ impl Fs {
         self.fd_dirs.get(&ino).copied()
     }
 
+    /// The descriptor (process and number) a path names when it ends in a
+    /// /proc/<pid>/fd directory, whose entries aren't nodes: reached by a
+    /// relative path, or through symlinks such as the nginx image's
+    /// `/var/log/nginx/error.log -> /dev/stderr`. Asked only once a lookup
+    /// found nothing.
+    pub fn fd_link(&mut self, start: Ino, path: &str, follow: bool) -> Option<(u32, u64)> {
+        let mut links = 0;
+        let (mut dir, mut path) = (start, String::from(path));
+        loop {
+            let (parent, name) = self.lookup_parent(dir, &path).ok()?;
+            if let Some(pid) = self.fd_dir_pid(parent) {
+                return Some((pid, name.parse().ok()?));
+            }
+            let child = self.find_child(parent, &name).ok()??;
+            if !follow || !matches!(self.nodes[child].kind, Kind::Symlink(_)) {
+                return None;
+            }
+            links += 1;
+            if links > MAX_SYMLINKS {
+                return None;
+            }
+            (dir, path) = (parent, self.link_target(child).ok()?);
+        }
+    }
+
     /// A symlink's target: `/proc/self` and `thread-self` lead to the
     /// running process's directory. EINVAL if it isn't one; ENOENT for a
     /// zombie's `exe`, `cwd` and `root`, as on Linux, where it has no
