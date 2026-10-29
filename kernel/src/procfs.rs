@@ -61,6 +61,8 @@ pub enum ProcFile {
     BootId,
     // /sys/fs/cgroup/...
     CgroupMemoryMax,
+    /// grix's own: what each CPU counts (`smp::stats`).
+    SmpStats,
 }
 
 /// Each process's directory, /proc/<pid> (made at fork, gone once it has
@@ -162,6 +164,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/sys/fs/cgroup/cpu.max", ProcFile::CgroupCpuMax),
     ("/sys/fs/cgroup/memory.max", ProcFile::CgroupMemoryMax),
     ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
+    ("/proc/grix/smp", ProcFile::SmpStats),
 ];
 
 /// ENOMEM if it would take more kernel memory than buffers may.
@@ -208,6 +211,7 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
             let _ = write!(s, "grix / tmpfs {m} 0 0\nproc /proc proc rw 0 0\ndev /dev devtmpfs rw 0 0\n");
         }
         ProcFile::Cpuinfo => arch::cpuinfo(&mut s, crate::smp::count()),
+        ProcFile::SmpStats => crate::smp::stats(&mut s),
         ProcFile::CpuList => {
             let n = crate::smp::count();
             let _ = if n == 1 { writeln!(s, "0") } else { writeln!(s, "0-{}", n - 1) };

@@ -8,7 +8,7 @@
 //! process (see `smp`).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::console;
@@ -17,6 +17,7 @@ use crate::procs::{self, PROCS, Procs};
 use crate::signal::SIGKILL;
 use crate::smp;
 use crate::time;
+use grix_abi::machine::MAX_CPUS;
 use grix_abi::wire::Event;
 
 pub const SLICE_NS: u64 = 10_000_000;
@@ -66,7 +67,11 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
         crate::ipc::changed();
     }
     procs::reap_others(p, &mut procs);
-    poll(p, &mut procs);
+    // A timer interrupt that brought an idle CPU here (`irq` takes its own).
+    let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
+    if !poll(p, &mut procs) && timer {
+        smp::note(smp::Stat::TimerIdle, 1);
+    }
     // Others may have ended just now too (a timer's signal, the host's).
     procs::reap_others(p, &mut procs);
     // The process may have ended just now (a timer's signal, the host's).
@@ -251,13 +256,22 @@ fn waiting_for_signal(p: &mut Process, procs: &mut Procs) -> bool {
     })
 }
 
+/// A timer interrupt came, and hasn't been looked at by `poll` yet (for
+/// `Stat::TimerIdle`).
+static TIMER_FIRED: [AtomicBool; MAX_CPUS as usize] = [const { AtomicBool::new(false) }; MAX_CPUS as usize];
+
 /// Handle an acknowledged interrupt and signal its end.
 pub fn handle_interrupt(id: u32) {
     match id {
-        irq::TIMER_INTID => irq::timer_off(),
+        irq::TIMER_INTID => {
+            smp::note(smp::Stat::Timer, 1);
+            TIMER_FIRED[smp::me()].store(true, Ordering::Relaxed);
+            irq::timer_off()
+        }
         // A kick: the CPU schedules on its way out.
-        irq::KICK_INTID => {}
+        irq::KICK_INTID => smp::note(smp::Stat::Kick, 1),
         _ => {
+            smp::note(smp::Stat::Device, 1);
             console::interrupt(id);
         }
     }
@@ -325,6 +339,7 @@ pub fn irq(tf: &mut TrapFrame) {
         return;
     }
     p.timer_dirty = true;
+    let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
     let (woke, others_runnable) = {
         let mut procs = PROCS.lock();
         procs::reap_others(p, &mut procs);
@@ -333,7 +348,11 @@ pub fn irq(tf: &mut TrapFrame) {
         (woke, others_wait(&procs))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
-    if p.resched || (runnable(p) || others_runnable) && (slice_over || woke) {
+    let preempt = p.resched || (runnable(p) || others_runnable) && (slice_over || woke);
+    if timer && !woke && !preempt {
+        smp::note(smp::Stat::TimerIdle, 1);
+    }
+    if preempt {
         schedule(p, tf);
     } else {
         update_timer(p);

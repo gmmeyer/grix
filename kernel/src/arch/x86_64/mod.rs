@@ -493,7 +493,11 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
             tf.rcx,
         );
     }
-    crate::smp::lock();
+    crate::smp::enter(match tf.vector {
+        SYSCALL => crate::smp::Stat::Syscall,
+        v if v < 32 => crate::smp::Stat::Fault,
+        _ => crate::smp::Stat::Irq,
+    });
     // The thread this CPU ran may have ended meanwhile (exit_group or
     // execve on another CPU): then there's nothing to handle for it.
     let has_thread = process::PROCESS.lock().as_ref().is_some_and(|p| p.running);
@@ -658,11 +662,12 @@ static FLUSHED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// with the empty root (idle): it caches no user translations, and any
 /// other root it loads, with the lock, comes without them.
 pub fn flush_tlb() {
+    let me = cpu_number() % MAX_CPUS;
+    crate::smp::note_on(me, crate::smp::Stat::Flush, 1);
     reload_cr3();
     if crate::smp::count() == 1 {
         return;
     }
-    let me = cpu_number() % MAX_CPUS;
     let want = FLUSH_WANTED.fetch_add(1, Ordering::SeqCst) + 1;
     FLUSHED[me].fetch_max(want, Ordering::Relaxed);
     let online = crate::smp::online().min(MAX_CPUS);
@@ -675,10 +680,16 @@ pub fn flush_tlb() {
             *sent = true;
         }
     }
+    let start = counter();
     for (cpu, _) in sent.iter().enumerate().filter(|(_, s)| **s) {
         while FLUSHED[cpu].load(Ordering::Acquire) < want && !crate::smp::in_kernel(cpu) {
             core::hint::spin_loop();
         }
+    }
+    let ipis = sent.iter().filter(|&&s| s).count() as u64;
+    if ipis > 0 {
+        crate::smp::note_on(me, crate::smp::Stat::FlushIpi, ipis);
+        crate::smp::note_on(me, crate::smp::Stat::FlushWait, counter() - start);
     }
 }
 

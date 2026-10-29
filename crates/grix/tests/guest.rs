@@ -2993,6 +2993,57 @@ fn threads_run_in_parallel_on_more_cpus() {
     assert!(Sandbox::builder().cpus(9).build().is_err());
 }
 
+/// The kernel's per-CPU counters (/proc/grix/smp), and the benchmark that
+/// reads them: every mode runs, and what's counted adds up. Nothing about
+/// speed is checked (`threads_run_in_parallel_on_more_cpus` does that).
+#[test]
+fn smp_counters_and_benchmark() {
+    let b = || with("smpbench").allow(Capability::Threads).allow(Capability::Process);
+    const MODES: [&str; 6] = ["compute", "syscall", "mmap", "futex", "procs", "sleeper"];
+    for cpus in [1, 4] {
+        let out = run(b().cpus(cpus), &["/bin/smpbench", "-t", "100"]);
+        let stdout = out.stdout_str();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}");
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
+        let runs: Vec<std::collections::HashMap<&str, &str>> = stdout
+            .lines()
+            .filter(|l| l.starts_with("smpbench mode="))
+            .map(|l| l.split_whitespace().skip(1).filter_map(|kv| kv.split_once('=')).collect())
+            .collect();
+        assert_eq!(runs.len(), MODES.len() * if cpus == 1 { 1 } else { 2 }, "{stdout}");
+        for r in &runs {
+            let n = |k: &str| -> u64 { r.get(k).unwrap_or_else(|| panic!("no {k}: {stdout}")).parse().unwrap() };
+            let ops = n("ops");
+            assert!(ops > 0, "{stdout}");
+            assert!(n("lock_held_us") > 0 && n("syscall") > 0, "{stdout}");
+            assert!(n("timer_idle") <= n("timer"), "{stdout}");
+            match r["mode"] {
+                "syscall" | "futex" => assert!(n("syscall") >= ops, "{stdout}"),
+                // Each touches 16 new pages, and frees them.
+                "mmap" | "procs" => assert!(n("fault") >= 16 * ops && n("flush") >= ops, "{stdout}"),
+                "sleeper" => assert!(n("wakeups") > 0 && n("timer") > 0, "{stdout}"),
+                _ => {}
+            }
+        }
+        for mode in MODES {
+            assert!(runs.iter().any(|r| r["mode"] == mode), "{mode}: {stdout}");
+        }
+    }
+    // A header, a line per CPU, and their sum.
+    let out = run(with("cat").cpus(2), &["/bin/cat", "/proc/grix/smp"]);
+    let stdout = out.stdout_str();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{stdout}");
+    assert!(lines[0].starts_with("cpu syscall fault irq timer "), "{stdout}");
+    let width = lines[0].split_whitespace().count();
+    for (line, first) in lines[1..].iter().zip(["0", "1", "all"]) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!((fields.len(), fields[0]), (width, first), "{stdout}");
+        assert!(fields[1..].iter().all(|f| f.parse::<u64>().is_ok()), "{stdout}");
+    }
+}
+
 /// x86_64 programs run through an x86_64 translator (here Alpine's static
 /// qemu-x86_64, user mode), the way binfmt_misc runs them on Linux.
 #[test]

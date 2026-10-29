@@ -332,7 +332,13 @@ updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
 a fixture that checks whole lines writes each with one `write`. Secondaries start with PSCI CPU_ON (`boot.S`
-`secondary_entry`) on arm64, INIT and SIPI on x86_64.
+`secondary_entry`) on arm64, INIT and SIPI on x86_64. What it all
+costs is counted per CPU (`smp::Stat`: entries by kind, time waiting
+for and holding the lock, TLB flushes and their IPIs, timer interrupts
+that found nothing due), shown in `/proc/grix/smp` and, after a run
+with more CPUs, in the kernel log (`grix run -v`); the `smpbench`
+fixture runs each kind of load on one CPU and on n and prints the
+counters' deltas: measure with it before and after a locking change.
 
 x86_64 programs (`Image::x86_64`, `SandboxBuilder::x86_64`, `--x86-64`):
 the guest stays arm64; an x86_64 ELF that execve meets is run by the

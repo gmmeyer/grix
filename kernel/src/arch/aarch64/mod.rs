@@ -274,7 +274,11 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             tf.sp_el0
         );
     }
-    crate::smp::lock();
+    crate::smp::enter(match kind {
+        8 if esr() >> 26 == EC_SVC64 => crate::smp::Stat::Syscall,
+        8 => crate::smp::Stat::Fault,
+        _ => crate::smp::Stat::Irq,
+    });
     // The thread this CPU ran may have ended meanwhile (exit_group or
     // execve on another CPU): then there's nothing to handle for it.
     let has_thread = process::PROCESS.lock().as_ref().is_some_and(|p| p.running);
@@ -474,6 +478,7 @@ pub fn pte_barrier() {
 /// Forget cached translations, on every CPU (they may run threads of this
 /// address space): before a page whose mapping changed is reused.
 pub fn flush_tlb() {
+    crate::smp::note(crate::smp::Stat::Flush, 1);
     unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
 

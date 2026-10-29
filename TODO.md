@@ -92,7 +92,8 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     4-core runner shared with other machines, 4 threads on x86_64's 4
     CPUs ran at 0.5 to 1.2 times one (2.0 alone), as vCPUs wait for the
     lock or a TLB flush on one the host descheduled (KVM's PV TLB flush
-    and spinlock hints would help).
+    and spinlock hints would help). The `smpbench` fixture measures
+    each kind of load, with the kernel's counters (/proc/grix/smp).
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
 19. [x] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
@@ -170,6 +171,11 @@ Left, in order of impact:
       `grix run` and `grix mcp`). For a server in a container: no time
       limit (`--timeout 0`), output streamed without a cap or a copy,
       events printed as they happen.
+- [ ] /proc/grix/smp's per-CPU counters (kernel entries by kind, the
+      kernel lock's waits and holds, TLB flushes and their IPIs, timer
+      interrupts) in `guest_stats` too, and `stats::syscall` and
+      `page_fault` as sums of per-CPU counts rather than one shared atomic
+      on every entry (a `grix_abi::stats` change: bump `ABI_VERSION`).
 
 ## Images
 

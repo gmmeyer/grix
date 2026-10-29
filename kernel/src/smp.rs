@@ -74,6 +74,101 @@ pub fn count() -> u32 {
 static ENTRIES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static IN_KERNEL: [AtomicBool; N] = [const { AtomicBool::new(false) }; N];
 
+/// What each CPU counts, for /proc/grix/smp: how often it enters the
+/// kernel and why, and what the kernel lock and TLB flushes cost it.
+#[derive(Clone, Copy)]
+pub enum Stat {
+    /// Entries: system calls, other exceptions (page faults mostly), and
+    /// interrupts from user mode.
+    Syscall,
+    Fault,
+    Irq,
+    /// Interrupts taken, from user mode or while idle: the timer's, and
+    /// of those the ones after which nothing woke or was preempted; kicks;
+    /// devices'.
+    Timer,
+    TimerIdle,
+    Kick,
+    Device,
+    /// Kicks this CPU sent.
+    KickSent,
+    /// Counter ticks spent waiting for the kernel lock, and holding it.
+    LockWait,
+    LockHeld,
+    /// TLB flushes this CPU asked for, the IPIs they sent (x86_64), and
+    /// counter ticks spent waiting for those to be acknowledged.
+    Flush,
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    FlushIpi,
+    FlushWait,
+}
+
+const STATS: usize = Stat::FlushWait as usize + 1;
+/// The names /proc/grix/smp shows, in `Stat`'s order (times in µs).
+const STAT_NAMES: [&str; STATS] = [
+    "syscall",
+    "fault",
+    "irq",
+    "timer",
+    "timer_idle",
+    "kick",
+    "device",
+    "kick_sent",
+    "lock_wait_us",
+    "lock_held_us",
+    "flush",
+    "flush_ipi",
+    "flush_wait_us",
+];
+static COUNTS: [[AtomicU64; STATS]; N] = [const { [const { AtomicU64::new(0) }; STATS] }; N];
+/// When this CPU took the kernel lock (`Stat::LockHeld`).
+static TAKEN: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+/// Count `n` of `stat` on CPU `cpu`.
+pub fn note_on(cpu: usize, stat: Stat, n: u64) {
+    COUNTS[cpu % N][stat as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Count `n` of `stat` on this CPU.
+pub fn note(stat: Stat, n: u64) {
+    note_on(me(), stat, n);
+}
+
+/// /proc/grix/smp: a header, a line per CPU, and their sum.
+pub fn stats(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let freq = arch::counter_freq().max(1);
+    let shown = |i: usize, v: u64| match i {
+        i if i == Stat::LockWait as usize || i == Stat::LockHeld as usize || i == Stat::FlushWait as usize => {
+            (v as u128 * 1_000_000 / freq as u128) as u64
+        }
+        _ => v,
+    };
+    let _ = writeln!(s, "cpu {}", STAT_NAMES.join(" "));
+    let mut all = [0u64; STATS];
+    for (cpu, counts) in COUNTS.iter().enumerate().take(count() as usize) {
+        let _ = write!(s, "{cpu}");
+        for (i, c) in counts.iter().enumerate() {
+            let v = c.load(Ordering::Relaxed);
+            all[i] += v;
+            let _ = write!(s, " {}", shown(i, v));
+        }
+        s.push('\n');
+    }
+    let _ = write!(s, "all");
+    for (i, &v) in all.iter().enumerate() {
+        let _ = write!(s, " {}", shown(i, v));
+    }
+    s.push('\n');
+}
+
+/// Take the kernel for an exception of kind `why` (`Stat::Syscall`,
+/// `Fault` or `Irq`).
+pub fn enter(why: Stat) {
+    note(why, 1);
+    lock();
+}
+
 /// Take the kernel, and make the process this CPU runs `PROCESS`, with
 /// this CPU's scheduling state in it. A CPU with no thread gets some
 /// process to schedule from.
@@ -81,10 +176,14 @@ pub fn lock() {
     let cpu = me();
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
     ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
+    let start = arch::counter();
     let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
     while SERVING.load(Ordering::Acquire) != ticket {
         core::hint::spin_loop();
     }
+    let taken = arch::counter();
+    note_on(cpu, Stat::LockWait, taken.wrapping_sub(start));
+    TAKEN[cpu].store(taken, Ordering::Relaxed);
     arch::tlb_sync();
     let me = me();
     let cpu = CPUS.lock()[me];
@@ -157,6 +256,7 @@ pub fn unlock() {
             }
         }
     }
+    note_on(me, Stat::LockHeld, arch::counter().wrapping_sub(TAKEN[me].load(Ordering::Relaxed)));
     IN_KERNEL[me].store(false, Ordering::SeqCst);
     SERVING.fetch_add(1, Ordering::Release);
 }
@@ -266,6 +366,7 @@ pub fn kick_thread(tid: u32) {
 
 /// Wake CPU `cpu`: from its wait in `finish`, or out of user code.
 fn kick(cpu: usize) {
+    note(Stat::KickSent, 1);
     WORK[cpu].store(true, Ordering::Release);
     irq::send_sgi(cpu as u32);
     arch::vmm_kick(cpu);

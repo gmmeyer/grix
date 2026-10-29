@@ -694,6 +694,12 @@ pub fn finish(kind: ExitKind, code: i32) -> ! {
     // do the final counts.
     crate::tty::flush_console();
     console::report_stats();
+    // What the kernel lock and TLB flushes cost (`grix run -v` shows it).
+    if crate::smp::count() > 1 {
+        let mut s = alloc::string::String::new();
+        crate::smp::stats(&mut s);
+        console::klog!("{s}");
+    }
     console::report_exit(kind, code);
     crate::export::send();
     console::power_off()
