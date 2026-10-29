@@ -1780,6 +1780,12 @@ fn connecting_to_the_unspecified_address() {
 }
 
 #[test]
+fn cache_maintenance_on_read_only_pages() {
+    // Erlang's JIT cleans the cache on its code's executable view.
+    popular(with("popular"), &["cacheflush"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

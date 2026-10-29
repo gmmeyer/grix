@@ -302,9 +302,13 @@ fn el0_sync(tf: &mut TrapFrame) {
         EC_IABT_LOWER | EC_DABT_LOWER => {
             let far = far();
             let dfsc = esr & 0x3f;
+            // WnR is also set for cache maintenance (CM), which only
+            // needs to read the page, as Linux's is_write_abort says:
+            // `dc cvau` on a JIT's executable view of its code (Erlang's
+            // __clear_cache) must fault it in, not fail.
             let access = if ec == EC_IABT_LOWER {
                 process::Access::Exec
-            } else if esr & (1 << 6) != 0 {
+            } else if esr & (1 << 6) != 0 && esr & (1 << 8) == 0 {
                 process::Access::Write
             } else {
                 process::Access::Read

@@ -142,6 +142,29 @@ static int anyaddr(void) {
     return 0;
 }
 
+// Erlang's JIT writes code through one mapping of a memfd and runs it
+// through another, read-only one, cleaning the data cache there to the
+// point of unification (`dc cvau`, in __clear_cache) before the pages
+// are ever touched: a fault that's not a write.
+static int cacheflush(void) {
+    int fd = memfd_create("jit", 0);
+    CHECK(fd >= 0 && ftruncate(fd, 8192) == 0);
+    char *rx = mmap(NULL, 8192, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+    char *rw = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(rx != MAP_FAILED && rw != MAP_FAILED);
+    rw[4096] = 7;
+    for (char *a = rx; a < rx + 8192; a += 64) {
+#ifdef __aarch64__
+        asm volatile("dc cvau, %0" ::"r"(a) : "memory");
+        asm volatile("ic ivau, %0" ::"r"(a) : "memory");
+#else
+        asm volatile("clflush (%0)" ::"r"(a) : "memory");
+#endif
+    }
+    CHECK(rx[4096] == 7 && rx[0] == 0);
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -195,6 +218,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "v6only") == 0) r = v6only();
         if (strcmp(argv[i], "smaps") == 0) r = smaps();
         if (strcmp(argv[i], "anyaddr") == 0) r = anyaddr();
+        if (strcmp(argv[i], "cacheflush") == 0) r = cacheflush();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
