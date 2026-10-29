@@ -40,6 +40,7 @@ impl GuestMemory {
 
     /// `size` bytes of `fd` from `offset`, copy-on-write: a snapshot's RAM,
     /// paged in as the guest touches it.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub fn map_file(fd: i32, offset: u64, base: u64, size: usize) -> std::io::Result<GuestMemory> {
         // SAFETY: a fresh private mapping of a file we hold.
         let host = unsafe {

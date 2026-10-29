@@ -1969,10 +1969,13 @@ fn the_default_vmm() {
         .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).split('.').next()?.trim().parse::<u32>().ok())
         .is_some_and(|v| v >= 15);
-    // grix-vmm runs arm64 guests (on arm64 hosts).
-    let native = cfg!(target_arch = "aarch64")
-        && !x86_64_guest()
-        && (cfg!(target_os = "macos") && macos_15 || cfg!(target_os = "linux") && kvm);
+    // grix-vmm runs the host's own architecture's guests: arm64 on macOS
+    // 15+ or KVM, x86_64 on KVM.
+    let native = if x86_64_guest() {
+        cfg!(target_arch = "x86_64") && cfg!(target_os = "linux") && kvm
+    } else {
+        cfg!(target_arch = "aarch64") && (cfg!(target_os = "macos") && macos_15 || cfg!(target_os = "linux") && kvm)
+    };
     if native && !qemu_asked {
         let vmm = Sandbox::builder().vmm_path().map(Path::to_path_buf);
         assert!(vmm.as_ref().is_some_and(|p| p.is_file()), "grix-vmm not found: run `make vmm`");
@@ -1986,6 +1989,10 @@ fn the_default_vmm() {
 /// there: each its own (stdin, randomness), at the right time of day.
 #[test]
 fn snapshots_in_tty_mode() {
+    // Not on x86_64 yet (`snapshots_resume_where_the_program_waited` checks it says so).
+    if x86_64_guest() {
+        return;
+    }
     // An interactive shell, saved at its prompt: each run types into its
     // terminal, whose size is the runner's.
     let b = Sandbox::builder()
@@ -2024,6 +2031,10 @@ fn snapshots_in_tty_mode() {
 
 #[test]
 fn snapshots_with_live_mounts() {
+    // Not on x86_64 yet (`snapshots_resume_where_the_program_waited` checks it says so).
+    if x86_64_guest() {
+        return;
+    }
     // A live mount and a lazy import, used before the snapshot and after:
     // each run gives their host directories again (read-only if it likes).
     let dir = temp_dir("mountsnap");
@@ -2069,6 +2080,13 @@ fn snapshots_with_live_mounts() {
 
 #[test]
 fn snapshots_resume_where_the_program_waited() {
+    if x86_64_guest() {
+        let sb = Sandbox::builder().import(fixture("alpine/bin/busybox.static"), "/bin/busybox").unwrap();
+        let err =
+            sb.build().unwrap().snapshot(&["/bin/busybox", "true"], temp_dir("nosnap-x86").join("s")).unwrap_err();
+        assert!(err.to_string().contains("x86_64"), "{err}");
+        return;
+    }
     // One CPU, whatever GRIX_CPUS says (`snapshots_with_more_cpus` has more).
     let b = Sandbox::builder()
         .cpus(1)
@@ -2151,6 +2169,10 @@ fn snapshots_resume_where_the_program_waited() {
 /// from the snapshot have them all, running threads in parallel again.
 #[test]
 fn snapshots_with_more_cpus() {
+    // Not on x86_64 yet (`snapshots_resume_where_the_program_waited` checks it says so).
+    if x86_64_guest() {
+        return;
+    }
     let b = with("smp")
         .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
         .unwrap()

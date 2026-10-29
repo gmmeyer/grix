@@ -1,7 +1,7 @@
 # The x86_64 kernel on x86 hardware: the end-to-end tests with
-# GRIX_ARCH=x86_64 on a GitHub x86 runner, with KVM (QEMU microvm, -accel
-# kvm; grix-vmm on x86 KVM when it's there). For every push to main, and to
-# ci/** branches, to try things without making a release.
+# GRIX_ARCH=x86_64 on a GitHub x86 runner, with KVM: in grix-vmm, and in
+# QEMU microvm (-accel kvm). For every push to main, and to ci/**
+# branches, to try things without making a release.
 name: x86
 
 on:
@@ -43,10 +43,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add x86_64-unknown-none
-      - name: The x86_64 kernel, and grix
+      - name: The x86_64 kernel, grix and grix-vmm
         run: |
           (cd kernel && cargo build --release --target x86_64-unknown-none)
-          cargo build --release -p grix
+          cargo build --release -p grix -p grix-vmm
       - name: Fixtures
         run: |
           ./fixtures/build.sh
@@ -55,5 +55,18 @@ jobs:
           python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/node-x86_64 nodejs
       - name: Unit tests
         run: cargo test -p grix --lib
-      - name: End-to-end tests on the x86_64 kernel, with KVM
+      - name: A first run in grix-vmm
+        run: |
+          printf 'fn main() { println!("hello from {}", std::env::args().nth(1).unwrap()); std::process::exit(7); }\n' > hello.rs
+          rustup target add x86_64-unknown-linux-musl
+          rustc --target x86_64-unknown-linux-musl -C linker=rust-lld -O hello.rs -o hello
+          set +e
+          out=$(./target/release/grix run -v --timeout 60 -i ./hello:/bin/hello -- /bin/hello grix-vmm 2>&1)
+          code=$?
+          set -e
+          echo "$out (exit $code)"
+          echo "$out" | grep -q "hello from grix-vmm" && [ "$code" = 7 ]
+      - name: End-to-end tests on the x86_64 kernel, in grix-vmm (KVM)
         run: GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes
+      - name: End-to-end tests on the x86_64 kernel, in QEMU (KVM)
+        run: GRIX_VMM=qemu GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes
