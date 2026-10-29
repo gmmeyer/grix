@@ -1050,7 +1050,11 @@ fn build_stack(
     if total > 1 << 20 {
         return Err(E2BIG);
     }
-    let mut sp = STACK_TOP;
+    // As Linux's exec, the strings start a pointer below the top: the
+    // stack ends with a zero word after the program's name (code that
+    // rewrites the argv and environment area, like Node's process.title,
+    // may reach it).
+    let mut sp = STACK_TOP - 8;
     let mut push = |a: &mut AddressSpace, bytes: &[u8]| -> Result<u64, Errno> {
         sp -= bytes.len() as u64;
         copy_out(a, sp, bytes)?;
@@ -1062,9 +1066,15 @@ fn build_stack(
         v.push(0);
         push(a, &v)
     };
+    // In Linux's order, from the top down: the program's name, then the
+    // environment's strings and the arguments', each array ascending and
+    // all of it contiguous. setproctitle code (libuv's, nginx's,
+    // PostgreSQL's) measures the area it may rewrite by that.
     let execfn_ptr = cstr(a, execfn)?;
-    let env_ptrs = envp.iter().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
-    let arg_ptrs = argv.iter().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
+    let mut env_ptrs = envp.iter().rev().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
+    env_ptrs.reverse();
+    let mut arg_ptrs = argv.iter().rev().map(|s| cstr(a, s)).collect::<Result<Vec<_>, _>>()?;
+    arg_ptrs.reverse();
     let platform_ptr = cstr(a, crate::arch::PLATFORM)?;
     let mut random = [0u8; 16];
     rng::fill(&mut random);

@@ -1845,6 +1845,14 @@ fn mkdir_of_an_existing_name_without_fs_write() {
 }
 
 #[test]
+fn arguments_and_environment_in_linux_order() {
+    // libuv's process title (mongosh) measures the area by it.
+    let out = run(with("popular").env("A", "1").env("BB", "22"), &["/bin/popular", "argvlayout", "x", "yy"]);
+    assert_eq!(out.stdout_str(), "argvlayout ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

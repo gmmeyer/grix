@@ -532,6 +532,31 @@ static int smaps(void) {
     return 0;
 }
 
+extern char **environ;
+
+// Linux lays out the strings at the top of the stack in order: the
+// arguments, then the environment, each ascending and contiguous, then
+// the program's name and a zero word. setproctitle code (libuv's, which
+// Node and mongosh use; nginx's; PostgreSQL's) rewrites that area,
+// measuring it by that order.
+static int argvlayout(int argc, char **argv) {
+    for (int i = 0; i + 1 < argc; i++) CHECK(argv[i] + strlen(argv[i]) + 1 == argv[i + 1]);
+    char *end = argv[argc - 1] + strlen(argv[argc - 1]) + 1;
+    int n = 0;
+    for (char **e = environ; *e; e++, n++) {
+        CHECK(*e == end);
+        end = *e + strlen(*e) + 1;
+    }
+    CHECK(n == 2);
+    char *name = (char *)getauxval(AT_EXECFN);
+    CHECK(name == end && strcmp(name, "/bin/popular") == 0);
+    end = name + strlen(name) + 1;
+    unsigned long zero;
+    memcpy(&zero, end, sizeof zero);
+    CHECK(zero == 0 && ((unsigned long)end + 8) % 4096 == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -549,6 +574,12 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "rwv2") == 0) r = rwv2();
         if (strcmp(argv[i], "sysvshm") == 0) r = sysvshm();
         if (strcmp(argv[i], "mkdirexist") == 0) r = mkdirexist();
+        // The arguments after it are only there to be laid out.
+        if (strcmp(argv[i], "argvlayout") == 0) {
+            r = argvlayout(argc, argv);
+            printf("%s %s\n", argv[i], r ? "failed" : "ok");
+            return r;
+        }
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
