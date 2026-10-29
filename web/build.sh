@@ -61,7 +61,7 @@ cp target/wasm32-unknown-unknown/release/grix_web.wasm "$DIST/"
 
 # The site: grixos.dev's pages (the project, the demos, the blog) and the
 # runner they use.
-cp web/grix.js web/tar.js web/grix-example.js web/palettes.css web/site.css web/index.html web/smoke.html "$DIST/"
+cp web/grix.js web/tar.js web/grix-example.js web/site.css web/index.html web/smoke.html "$DIST/"
 rm -rf "$DIST/demos" "$DIST/blog"
 cp -r web/demos web/blog "$DIST/"
 

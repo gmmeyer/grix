@@ -1,7 +1,34 @@
 /* grixos.dev: the landing page, the demos and the blog. */
 
+/* Colours: GitHub's (Primer), light and dark as the system says. The
+   terminals and code samples are dark in both. Tokens: bg, bg-alt
+   (cards), fg, muted, border, code-bg (inline code), accent, accent-fg
+   (text on accent), ok, deny; and the terminal's: term, term-fg,
+   term-muted, term-border, term-err (stderr), term-event (grix's events),
+   term-ok, term-bad. */
 :root {
-  /* Colours are in palettes.css. */
+  --bg: #ffffff; --bg-alt: #f6f8fa; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --code-bg: #eff2f5;
+  --accent: #0969da; --accent-fg: #ffffff; --ok: #1a7f37; --deny: #cf222e;
+  --term: #0d1117; --term-fg: #f0f6fc; --term-muted: #9198a1; --term-border: #3d444d;
+  --term-err: #ffa657; --term-event: #79c0ff; --term-ok: #3fb950; --term-bad: #ff7b72;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --bg-alt: #151b23; --fg: #f0f6fc; --muted: #9198a1; --border: #3d444d; --code-bg: #262c36;
+    --accent: #4493f8; --accent-fg: #0d1117; --ok: #3fb950; --deny: #ff7b72;
+    --term: #010409;
+  }
+}
+/* The demos' colours, from the site's. */
+:root {
+  --grix-bg: var(--bg); --grix-fg: var(--fg); --grix-muted: var(--muted); --grix-border: var(--border);
+  --grix-panel: var(--bg-alt); --grix-term: var(--term); --grix-term-fg: var(--term-fg);
+  --grix-err: var(--term-err); --grix-event: var(--term-event); --grix-ok: var(--term-ok);
+  --grix-bad: var(--term-bad); --grix-accent: var(--accent); --grix-accent-fg: var(--accent-fg);
+}
+
+:root {
   --radius: 10px;
   --wide: 1080px;
   --prose: 760px;
