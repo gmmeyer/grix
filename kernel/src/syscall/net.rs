@@ -763,6 +763,7 @@ pub fn getname(p: &mut Process, fd: u64, addr: u64, addrlen: u64, peer: bool) ->
 
 // ---------------------------------------------------------------- AF_INET / AF_INET6 (inet.rs)
 
+const AF_UNSPEC: u16 = 0;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const IPPROTO_IP: u64 = 0;
@@ -828,6 +829,7 @@ fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
         // Only once it has the port (a failed bind leaves it unbound).
         let local = Udp::bind(&u, a)?;
         s.bound = Some(local);
+        s.addr_bound = !a.is_unspecified();
         return Ok(0);
     }
     if a.port != 0 && Listener::conflicts(a.addr, a.port, s.v6only) {
@@ -916,17 +918,41 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
 }
 
 fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u64) -> SysResult {
+    if s.dgram && len >= 2 {
+        let mut family = [0u8; 2];
+        copy_in(&mut p.aspace, addr, &mut family)?;
+        if u16::from_le_bytes(family) == AF_UNSPEC {
+            // Disconnect, forgetting the address connect chose (glibc's
+            // getaddrinfo sorts its answers this way with one socket).
+            s.peer = None;
+            let u = udp_of(s);
+            let mut u = u.lock();
+            u.peer = None;
+            if !s.addr_bound {
+                let any = if s.v6 { Addr::V6([0; 16]) } else { Addr::V4([0; 4]) };
+                for a in [s.bound.as_mut(), u.local.as_mut()].into_iter().flatten() {
+                    a.addr = any;
+                }
+            }
+            return Ok(0);
+        }
+    }
     let to = read_sockaddr(p, addr, len)?.or_loopback();
     if s.dgram {
         // Nothing is sent: resolvers and "what's my address" code connect a
         // UDP socket just to see the route. From now on datagrams come only
-        // from there.
+        // from there, to the address that route has (a v6 socket's v4
+        // one shows as ::ffff:a.b.c.d), unless bind named one.
         let ours = if to.is_loopback() { to.addr } else { Addr::V4(link::GUEST_V4) };
-        if s.bound.is_none() {
-            s.bound = Some(SockAddr { addr: ours, port: 0 });
+        let u = udp_of(s);
+        if !s.addr_bound {
+            let port = s.bound.map_or(0, |b| b.port);
+            s.bound = Some(SockAddr { addr: ours, port });
+            if let Some(l) = u.lock().local.as_mut() {
+                l.addr = ours;
+            }
         }
         s.peer = Some(to);
-        let u = udp_of(s);
         u.lock().peer = Some(to);
         udp_bind(s)?;
         return Ok(0);

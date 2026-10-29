@@ -963,6 +963,8 @@ pub struct Inet {
     pub sndtimeo: Option<u64>,
     /// IPV6_V6ONLY.
     pub v6only: bool,
+    /// UDP: bind named an address, so connect doesn't choose one.
+    pub addr_bound: bool,
 }
 
 impl Inet {
@@ -977,6 +979,7 @@ impl Inet {
             rcvtimeo: None,
             sndtimeo: None,
             v6only: false,
+            addr_bound: false,
         }
     }
 

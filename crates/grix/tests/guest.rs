@@ -1786,6 +1786,12 @@ fn cache_maintenance_on_read_only_pages() {
 }
 
 #[test]
+fn udp_reconnect_chooses_the_source_again() {
+    // glibc 2.31's getaddrinfo sorts its answers with one UDP socket.
+    popular(with("popular").allow(Capability::Net), &["udproute"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

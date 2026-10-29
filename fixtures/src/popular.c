@@ -142,6 +142,43 @@ static int anyaddr(void) {
     return 0;
 }
 
+/// getsockname's address, as text.
+static const char *sockname(int s) {
+    static char out[64];
+    struct sockaddr_storage a;
+    socklen_t len = sizeof a;
+    if (getsockname(s, (struct sockaddr *)&a, &len) != 0) return "?";
+    if (a.ss_family == AF_INET) return inet_ntop(AF_INET, &((struct sockaddr_in *)&a)->sin_addr, out, sizeof out);
+    return inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&a)->sin6_addr, out, sizeof out);
+}
+
+// glibc's getaddrinfo (2.31, Ubuntu 20.04's: curl in the Elasticsearch
+// image) sorts its answers by connecting one UDP socket to each in turn,
+// disconnecting it in between with AF_UNSPEC, and asserts that a v6
+// socket connected to a v4 address has a v4-mapped one.
+static int udproute(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 a6 = {.sin6_family = AF_INET6, .sin6_port = htons(9200), .sin6_addr = in6addr_loopback};
+    CHECK(connect(s, (struct sockaddr *)&a6, sizeof a6) == 0 && strcmp(sockname(s), "::1") == 0);
+    struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+    CHECK(connect(s, &unspec, sizeof unspec) == 0 && strcmp(sockname(s), "::") == 0);
+    struct sockaddr_in a4 = {.sin_family = AF_INET, .sin_port = htons(9200), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CHECK(connect(s, (struct sockaddr *)&a4, sizeof a4) == 0 && strcmp(sockname(s), "::ffff:127.0.0.1") == 0);
+    CHECK(connect(s, &unspec, sizeof unspec) == 0);
+    inet_pton(AF_INET6, "::ffff:1.2.3.4", &a6.sin6_addr);
+    CHECK(connect(s, (struct sockaddr *)&a6, sizeof a6) == 0 && strcmp(sockname(s), "::ffff:10.0.2.15") == 0);
+    // Connecting again chooses again, without a disconnect too.
+    CHECK(connect(s, (struct sockaddr *)&a4, sizeof a4) == 0 && strcmp(sockname(s), "::ffff:127.0.0.1") == 0);
+    // An address bind named stays.
+    int b = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in here = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CHECK(bind(b, (struct sockaddr *)&here, sizeof here) == 0);
+    a4.sin_addr.s_addr = inet_addr("1.2.3.4");
+    CHECK(connect(b, (struct sockaddr *)&a4, sizeof a4) == 0 && strcmp(sockname(b), "127.0.0.1") == 0);
+    CHECK(connect(b, &unspec, sizeof unspec) == 0 && strcmp(sockname(b), "127.0.0.1") == 0);
+    return 0;
+}
+
 // Erlang's JIT writes code through one mapping of a memfd and runs it
 // through another, read-only one, cleaning the data cache there to the
 // point of unification (`dc cvau`, in __clear_cache) before the pages
@@ -219,6 +256,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "smaps") == 0) r = smaps();
         if (strcmp(argv[i], "anyaddr") == 0) r = anyaddr();
         if (strcmp(argv[i], "cacheflush") == 0) r = cacheflush();
+        if (strcmp(argv[i], "udproute") == 0) r = udproute();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
