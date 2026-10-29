@@ -597,7 +597,9 @@ grix run --image alpine-x86_64.grix -a process -- uname -m    # x86_64
   architecture and the network rules). A step whose inputs haven't changed doesn't run
   again; `grix build --no-cache` runs them all.
 - Build steps (`run`) run in grix itself, with `fs_write`, `process`,
-  `threads` and `net`. A string runs with `/bin/sh -c`; a list such as
+  `threads` and `net`, and three times the image's size plus 512 MiB of
+  memory, or `memory_mb` if that's more (up to 3000 MiB; files written
+  take at most half). A string runs with `/bin/sh -c`; a list such as
   `["/bin/setup", "--fast"]` runs as it is, without a shell. The file tree
   a step leaves is the image's, minus what the kernel makes at boot
   (`/etc/passwd`, `/tmp`, ...). `apt-get install` works in a Debian or

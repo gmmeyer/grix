@@ -376,6 +376,14 @@ fn target(arch: Option<Arch>, kernel: Option<&Path>) -> Result<(Arch, PathBuf)> 
     Ok((arch, kernel))
 }
 
+/// A build step's guest memory: room for the tree, what the step adds,
+/// and the export of it all, or the image's `memory_mb` if that's more
+/// (installing a toolchain adds more than a small base's own size, and
+/// files take at most half of it), within the policy's limit.
+fn step_memory_mb(image_bytes: u64, asked: Option<u64>, limit: u64) -> u64 {
+    (image_bytes * 3 / (1 << 20) + 512).max(asked.unwrap_or(0)).min(limit)
+}
+
 /// What a step's result depends on: the files before it, the step, and
 /// how it runs.
 fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
@@ -422,8 +430,7 @@ fn run_step(
         return Ok(Image::new(files, image.config, kernel));
     }
     let (_, bytes) = image.size();
-    // Room for the tree, what the step adds, and the export of it all.
-    let memory_mb = (bytes * 3 / (1 << 20) + 512).min(policy.step_memory_mb);
+    let memory_mb = step_memory_mb(bytes, image.config.memory_mb, policy.step_memory_mb);
     // The image's own architecture, whatever GRIX_ARCH says.
     let mut b = Sandbox::builder()
         .arch(image.arch()?)
@@ -513,5 +520,15 @@ mod tests {
         let e = err(&Grixfile::default(), Arch::Aarch64);
         assert!(e.contains("is for x86_64, and this build is for aarch64"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn steps_get_the_memory_the_grixfile_asks_for() {
+        // A 100 MiB base: 812 MiB, unless memory_mb says more, up to the limit.
+        let base = 100 << 20;
+        assert_eq!(step_memory_mb(base, None, 3000), 812);
+        assert_eq!(step_memory_mb(base, Some(256), 3000), 812);
+        assert_eq!(step_memory_mb(base, Some(2048), 3000), 2048);
+        assert_eq!(step_memory_mb(base, Some(8192), 3000), 3000);
     }
 }
