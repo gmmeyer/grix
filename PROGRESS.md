@@ -618,6 +618,26 @@ Next, in TODO.md order:
   wrmsr(FS_BASE) faults on a non-canonical one (the `regs` fixture checks
   both).
 
+- **grix-vmm on x86 KVM, and x86_64 Linux releases** (round 2, item 19):
+  `crates/vmm/src/{kvm_x86,vm_x86}.rs` make microvm's machine on KVM:
+  KVM's own IOAPIC and local APICs (`KVM_CREATE_IRQCHIP`, with the TSS and
+  identity-map pages Intel needs), each vCPU's CPUID with its APIC ID and
+  the hypervisor timing leaf (`KVM_GET_TSC_KHZ`, so the kernel doesn't
+  measure the TSC), vCPU 0 at the kernel's PVH note in 32-bit protected
+  mode, COM1 by port I/O and the virtio console by MMIO on GSI 5. Its
+  seccomp filter has x86_64's numbers and kills x32 calls. It can't be
+  tested on this Mac (Apple silicon has no VT-x, and OrbStack's VM is arm64
+  without /dev/kvm), so `.github/workflows/x86.yml` runs the end-to-end
+  tests on a GitHub x86 runner with KVM, in grix-vmm and in QEMU: 82 guest
+  and 21 runtime tests pass in each. Two bugs it found, in both
+  architectures' filters: glibc registers `rseq` (and `set_robust_list`)
+  as a thread starts, which can be after the filter is on for a thread
+  made just before, and gives up if refused (now allowed: they register
+  the thread's own memory); and Rust writes a Unix socket with `sendto`,
+  which the filter refuses, so the serial port's socket is now written as
+  a plain file (write(2)). Releases add `grix-<v>-linux-x86_64`, smoke-
+  tested in grix-vmm on the runner's KVM.
+
 ### Notes for the next session
 
 - In this shell, `cp`, `rm` and `make` are aliased or broken. Use
