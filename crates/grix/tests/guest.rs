@@ -194,6 +194,31 @@ fn networking_through_the_host() {
 }
 
 #[test]
+fn image_placeholders_for_hosts_and_resolv_conf() {
+    // Docker images carry empty /etc/hosts and /etc/resolv.conf for Docker
+    // to replace: the kernel fills them in, the sandbox's own name too.
+    let b = || {
+        with("inet")
+            .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+            .unwrap()
+            .file("/etc/hosts", "", 0o644)
+            .unwrap()
+            .file("/etc/resolv.conf", "", 0o644)
+            .unwrap()
+    };
+    let out = run(b(), &["/bin/inet", "resolve", "grix"]);
+    assert_eq!(out.stdout_str(), "grix is 10.0.2.15\n");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let out = run(b(), &["/bin/busybox", "cat", "/etc/resolv.conf"]);
+    assert_eq!(out.stdout_str(), "nameserver 10.0.2.3\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // One with something in it is the program's.
+    let b = with("inet").file("/etc/hosts", "10.9.9.9 grix\n", 0o644).unwrap();
+    let out = run(b, &["/bin/inet", "resolve", "grix"]);
+    assert_eq!(out.stdout_str(), "grix is 10.9.9.9\n");
+}
+
+#[test]
 fn serving_through_a_forwarded_port() {
     use std::io::{BufRead, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

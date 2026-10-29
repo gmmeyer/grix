@@ -999,21 +999,31 @@ impl Fs {
         }
         // Name resolution: the virtual nameserver (whatever server a
         // program asks, the host answers: see inet.rs), and the usual
-        // local names plus the host's.
-        if !mounted("/etc/resolv.conf") && fs.lookup(ROOT, "/etc/resolv.conf", false).is_err() {
+        // local names plus the host's. Docker images carry these two as
+        // empty files, which Docker replaces at run time: an empty one is
+        // as good as none.
+        if !mounted("/etc/resolv.conf") && fs.placeholder("/etc/resolv.conf") {
             let etc = fs.mkdir_p("/etc");
             let [a, b, c, d] = grix_abi::link::DNS_V4;
             let text = alloc::format!("nameserver {a}.{b}.{c}.{d}\n");
-            fs.insert(etc, "resolv.conf", Kind::File(FileData::new(leak(text))), 0o644);
+            let ino = fs.insert(etc, "resolv.conf", Kind::File(FileData::new(leak(text))), 0o644);
+            fs.nodes[ino].generated = true;
         }
-        if !mounted("/etc/hosts") && fs.lookup(ROOT, "/etc/hosts", false).is_err() {
+        if !mounted("/etc/hosts") && fs.placeholder("/etc/hosts") {
             let etc = fs.mkdir_p("/etc");
+            // The sandbox's own name too, as Docker writes it: programs
+            // look up their hostname (Java, Python's getfqdn, the Datadog
+            // Agent), and it shouldn't go to the host's resolver.
             let [a, b, c, d] = grix_abi::link::HOST_V4;
+            let [e, f, g, h] = grix_abi::link::GUEST_V4;
             let text = alloc::format!(
-                "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{a}.{b}.{c}.{d}\t{}\n",
-                grix_abi::link::HOST_NAME
+                "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{a}.{b}.{c}.{d}\t{}\n\
+                 {e}.{f}.{g}.{h}\t{}\n",
+                grix_abi::link::HOST_NAME,
+                procfs::HOSTNAME
             );
-            fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
+            let ino = fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
+            fs.nodes[ino].generated = true;
         }
         if !mounted("/etc/mtab") && fs.lookup(ROOT, "/etc/mtab", false).is_err() {
             let etc = fs.mkdir_p("/etc");
@@ -1204,6 +1214,15 @@ impl Fs {
     /// Add or replace a node at build time (root-owned). Imports count
     /// against the metadata budget, since they use the same heap, but are
     /// never refused: the host chose them.
+    /// Is `path` missing, or an empty regular file (an image's
+    /// placeholder), so the kernel should supply it?
+    fn placeholder(&mut self, path: &str) -> bool {
+        match self.lookup(ROOT, path, false) {
+            Err(_) => true,
+            Ok(ino) => matches!(&self.nodes[ino].kind, Kind::File(c) if c.lock().image().is_some_and(<[u8]>::is_empty)),
+        }
+    }
+
     fn insert(&mut self, parent: Ino, name: &str, kind: Kind, perm: u32) -> Ino {
         if let Some(existing) = self.child(parent, name) {
             let node = &mut self.nodes[existing];
