@@ -101,6 +101,14 @@ impl PageTable {
         Some(())
     }
 
+    /// Call `f(pte)` for every valid leaf entry in `[start, end)`, only
+    /// reading them.
+    pub fn each_entry(&self, start: u64, end: u64, mut f: impl FnMut(u64)) {
+        if start < end {
+            visit(self.root, 0, 0, start, end, &mut |_, e| f(unsafe { *e }));
+        }
+    }
+
     /// Call `f(va, pte)` for every valid leaf entry in `[start, end)`,
     /// skipping unpopulated subtrees.
     pub fn for_each_mapped(&mut self, start: u64, end: u64, mut f: impl FnMut(u64, *mut u64)) {

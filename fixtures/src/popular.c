@@ -118,12 +118,58 @@ static int v6only(void) {
     return 0;
 }
 
+/// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
+static long smaps_field(void *addr, const char *field) {
+    if (slurp("/proc/self/smaps") <= 0) return -1;
+    char head[32];
+    snprintf(head, sizeof head, "%lx-", (unsigned long)addr);
+    for (char *line = buf; line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        if (strncmp(line, head, strlen(head)) != 0) continue;
+        for (char *f = strchr(line, '\n'); f; f = strchr(f + 1, '\n')) {
+            if (strncmp(f + 1, field, strlen(field)) == 0) return strtol(f + 1 + strlen(field), NULL, 10);
+            if (strncmp(f + 1, "VmFlags:", 8) == 0) return -1;
+        }
+    }
+    return -1;
+}
+
+// Redis checks for an arm64 kernel bug that loses data in a fork's
+// background save: a page written after MADV_FREE must show in the
+// forked child's /proc/self/smaps as Shared_Dirty. It refuses to start
+// if it can't tell.
+static int smaps(void) {
+    char *p = mmap(NULL, 2 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *q = p + 4096;
+    CHECK(p != MAP_FAILED && mprotect(q, 4096, PROT_READ | PROT_WRITE) == 0);
+    *(volatile char *)q = 1;
+    CHECK(madvise(q, 4096, MADV_FREE) == 0);
+    *(volatile char *)q = 2;
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        long kb = smaps_field(q, "Shared_Dirty:");
+        _exit(write(fds[1], &kb, sizeof kb) == sizeof kb ? 0 : 1);
+    }
+    long child = -1;
+    int status;
+    CHECK(read(fds[0], &child, sizeof child) == sizeof child && waitpid(pid, &status, 0) == pid);
+    CHECK(child == 4);
+    // The child is gone: the page is this process's alone again.
+    CHECK(smaps_field(q, "Private_Dirty:") == 4 && smaps_field(q, "Rss:") == 4 && smaps_field(q, "Size:") == 4);
+    CHECK(smaps_field(p, "Rss:") == 0 && smaps_field(p, "Size:") == 4);
+    CHECK(slurp("/proc/self/smaps_rollup") > 0 && strstr(buf, "[rollup]") && strstr(buf, "\nPss:"));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
         if (strcmp(argv[i], "auxv") == 0) r = auxv();
         if (strcmp(argv[i], "fdlink") == 0) r = fdlink();
         if (strcmp(argv[i], "v6only") == 0) r = v6only();
+        if (strcmp(argv[i], "smaps") == 0) r = smaps();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

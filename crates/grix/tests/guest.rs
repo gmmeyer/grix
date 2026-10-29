@@ -1768,6 +1768,12 @@ fn ipv6_only_listeners_beside_ipv4_ones() {
 }
 
 #[test]
+fn proc_self_smaps() {
+    // Redis's check for an arm64 copy-on-write bug, in a forked child.
+    popular(with("popular").allow(Capability::Process), &["smaps"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

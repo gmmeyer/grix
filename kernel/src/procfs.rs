@@ -7,10 +7,11 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::arch;
-use crate::errno::{EINVAL, ENOENT, Errno};
+use crate::errno::{EINVAL, ENOENT, ENOMEM, Errno};
 use crate::fd::FileKind;
 use crate::fs;
-use crate::mm::aspace::{Backing, STACK_TOP, VVAR};
+use crate::kmem::Charge;
+use crate::mm::aspace::{Backing, STACK_TOP, Usage, VVAR};
 use crate::mm::frame;
 use crate::process::{Ids, Process};
 use crate::procs::Zombie;
@@ -32,6 +33,8 @@ pub enum ProcFile {
     Cmdline,
     Environ,
     Auxv,
+    Smaps,
+    SmapsRollup,
     Comm,
     Limits,
     Mountinfo,
@@ -71,6 +74,8 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("cmdline", ProcFile::Cmdline),
     ("environ", ProcFile::Environ),
     ("auxv", ProcFile::Auxv),
+    ("smaps", ProcFile::Smaps),
+    ("smaps_rollup", ProcFile::SmapsRollup),
     ("comm", ProcFile::Comm),
     ("limits", ProcFile::Limits),
     ("mountinfo", ProcFile::Mountinfo),
@@ -84,6 +89,13 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
 /// auxv, which need ptrace_may_access(PTRACE_MODE_READ_FSCREDS).
 pub fn private(f: ProcFile) -> bool {
     matches!(f, ProcFile::Environ | ProcFile::Auxv)
+}
+
+/// Files of /proc/<pid> another process may open only if it may inspect
+/// this one: the private ones, and smaps (0444, but Linux checks
+/// ptrace_may_access(PTRACE_MODE_READ) on open, as for mem).
+pub fn inspected(f: ProcFile) -> bool {
+    private(f) || matches!(f, ProcFile::Smaps | ProcFile::SmapsRollup)
 }
 
 /// The other files to create, by path.
@@ -152,11 +164,14 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
 ];
 
-pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
+/// ENOMEM if it would take more kernel memory than buffers may.
+pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
     let mut s = String::new();
     match f {
         ProcFile::Text(t) => s.push_str(t),
         ProcFile::Maps => maps(p, &mut s),
+        ProcFile::Smaps => smaps(p, &mut s, false)?,
+        ProcFile::SmapsRollup => smaps(p, &mut s, true)?,
         ProcFile::Status => status(&shown(p), &mut s),
         ProcFile::Stat => stat(&shown(p), &mut s),
         ProcFile::Statm => {
@@ -170,11 +185,11 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
                 v.extend_from_slice(a.as_bytes());
                 v.push(0);
             }
-            return v;
+            return Ok(v);
         }
         // Go's golang.org/x/sys/cpu reads this when it can't get the
         // vector from its runtime, and otherwise reads the ID registers.
-        ProcFile::Auxv => return p.auxv.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        ProcFile::Auxv => return Ok(p.auxv.iter().flat_map(|w| w.to_le_bytes()).collect()),
         ProcFile::Comm => {
             let _ = writeln!(s, "{}", comm(p));
         }
@@ -275,7 +290,7 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
             let _ = writeln!(s, "{}", total * 4096);
         }
     }
-    s.into_bytes()
+    Ok(s.into_bytes())
 }
 
 /// What /proc/<pid> still shows of a process that has ended, until it's
@@ -351,7 +366,7 @@ pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> R
             if f == ProcFile::Status { status(&sh, &mut s) } else { stat(&sh, &mut s) }
         }
         // No memory: no mappings, arguments or environment (they read empty).
-        ProcFile::Maps | ProcFile::Cmdline | ProcFile::Environ => {}
+        ProcFile::Maps | ProcFile::Smaps | ProcFile::SmapsRollup | ProcFile::Cmdline | ProcFile::Environ => {}
         ProcFile::Statm => s.push_str("0 0 0 0 0 0 0\n"),
         ProcFile::Comm => {
             let _ = writeln!(s, "{}", r.comm);
@@ -396,29 +411,98 @@ fn root_mode(p: &Process) -> &'static str {
 fn maps(p: &Process, s: &mut String) {
     let fs = fs::lock();
     for v in p.aspace.vmas() {
-        let perms = [(v.prot.read || v.prot.write || v.prot.exec, 'r'), (v.prot.write, 'w'), (v.prot.exec, 'x')];
-        let mut flags = String::new();
-        for (on, c) in perms {
-            flags.push(if on { c } else { '-' });
-        }
-        let shared = matches!(v.backing, Backing::Shared { .. } | Backing::SharedFile { .. }) || v.is_shared_file();
-        flags.push(if shared { 's' } else { 'p' });
-        let (offset, inode, name) = match v.backing {
-            Backing::File { offset, ino, .. }
-            | Backing::Data { offset, ino, .. }
-            | Backing::SharedFile { offset, ino, .. } => (offset, fs.ino_number(ino), fs.path_of(ino)),
-            Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
-            Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
-            // What Linux calls the page holding the signal-return code on arm32.
-            Backing::Sigpage => (0, 0, "[sigpage]".into()),
-            Backing::KernelPage(_) if v.start == VVAR => (0, 0, "[vvar]".into()),
-            Backing::KernelPage(_) => (0, 0, "[vdso]".into()),
-            Backing::Anon => (0, 0, String::new()),
-            Backing::Shared { index, .. } => (index * 4096, 0, "/dev/zero (deleted)".into()),
-        };
-        let dev = if inode == 0 { "00:00" } else { "00:01" };
-        let _ = writeln!(s, "{:08x}-{:08x} {flags} {offset:08x} {dev} {inode:<10} {name}", v.start, v.end);
+        map_line(p, &fs, v, s);
     }
+}
+
+/// /proc/<pid>/smaps (or smaps_rollup: the sum, under one line). Every
+/// mapping takes a block of its own, so it's built within a charge, and
+/// a heap that can't grow is ENOMEM, not a panic.
+fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
+    let mut held = Charge::default();
+    let fs = fs::lock();
+    let mut total = Usage::default();
+    let mut block = String::new();
+    for v in p.aspace.vmas() {
+        let u = p.aspace.usage(v);
+        total.add(&u);
+        if rollup {
+            continue;
+        }
+        block.clear();
+        map_line(p, &fs, v, &mut block);
+        usage_lines(&mut block, v.end - v.start, &u);
+        let flags =
+            [(v.prot.read, "rd"), (v.prot.write, "wr"), (v.prot.exec, "ex"), (true, "mr"), (true, "mw"), (true, "me")];
+        let _ = write!(block, "VmFlags:");
+        for (_, f) in flags.iter().filter(|(on, _)| *on) {
+            let _ = write!(block, " {f}");
+        }
+        block.push('\n');
+        held.resize((s.len() + block.len()) as u64)?;
+        s.try_reserve(block.len()).map_err(|_| ENOMEM)?;
+        s.push_str(&block);
+    }
+    if rollup {
+        let (start, end) = (p.aspace.vmas().next().map_or(0, |v| v.start), p.aspace.vmas().last().map_or(0, |v| v.end));
+        let _ = writeln!(s, "{start:08x}-{end:08x} ---p 00000000 00:00 0                          [rollup]");
+        usage_lines(s, 0, &total);
+    }
+    Ok(())
+}
+
+/// smaps' sizes, in kB (`size` 0: none, as in smaps_rollup).
+fn usage_lines(s: &mut String, size: u64, u: &Usage) {
+    let kb = |b: u64| b / 1024;
+    if size != 0 {
+        let _ =
+            write!(s, "Size:           {:8} kB\nKernelPageSize:        4 kB\nMMUPageSize:           4 kB\n", kb(size));
+    }
+    let _ = write!(
+        s,
+        "Rss:            {:8} kB\nPss:            {:8} kB\nShared_Clean:   {:8} kB\nShared_Dirty:   {:8} kB\n\
+         Private_Clean:  {:8} kB\nPrivate_Dirty:  {:8} kB\nReferenced:     {:8} kB\nAnonymous:      {:8} kB\n\
+         LazyFree:              0 kB\nAnonHugePages:         0 kB\nShmemPmdMapped:        0 kB\n\
+         FilePmdMapped:         0 kB\nShared_Hugetlb:        0 kB\nPrivate_Hugetlb:       0 kB\n\
+         Swap:                  0 kB\nSwapPss:               0 kB\nLocked:                0 kB\n",
+        kb(u.rss),
+        kb(u.pss),
+        kb(u.shared_clean),
+        kb(u.shared_dirty),
+        kb(u.private_clean),
+        kb(u.private_dirty),
+        kb(u.rss),
+        kb(u.anonymous),
+    );
+    if size != 0 {
+        let _ = writeln!(s, "THPeligible:    0");
+    }
+}
+
+/// A mapping's line in /proc/<pid>/maps.
+fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String) {
+    let perms = [(v.prot.read || v.prot.write || v.prot.exec, 'r'), (v.prot.write, 'w'), (v.prot.exec, 'x')];
+    let mut flags = String::new();
+    for (on, c) in perms {
+        flags.push(if on { c } else { '-' });
+    }
+    let shared = matches!(v.backing, Backing::Shared { .. } | Backing::SharedFile { .. }) || v.is_shared_file();
+    flags.push(if shared { 's' } else { 'p' });
+    let (offset, inode, name) = match v.backing {
+        Backing::File { offset, ino, .. }
+        | Backing::Data { offset, ino, .. }
+        | Backing::SharedFile { offset, ino, .. } => (offset, fs.ino_number(ino), fs.path_of(ino)),
+        Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
+        Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
+        // What Linux calls the page holding the signal-return code on arm32.
+        Backing::Sigpage => (0, 0, "[sigpage]".into()),
+        Backing::KernelPage(_) if v.start == VVAR => (0, 0, "[vvar]".into()),
+        Backing::KernelPage(_) => (0, 0, "[vdso]".into()),
+        Backing::Anon => (0, 0, String::new()),
+        Backing::Shared { index, .. } => (index * 4096, 0, "/dev/zero (deleted)".into()),
+    };
+    let dev = if inode == 0 { "00:00" } else { "00:01" };
+    let _ = writeln!(s, "{:08x}-{:08x} {flags} {offset:08x} {dev} {inode:<10} {name}", v.start, v.end);
 }
 
 /// What status and stat show of a process, live or a zombie.

@@ -85,6 +85,30 @@ pub enum Backing {
     KernelPage(u64),
 }
 
+/// Bytes of a mapping in memory, by kind (`AddressSpace::usage`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub rss: u64,
+    pub pss: u64,
+    pub shared_clean: u64,
+    pub shared_dirty: u64,
+    pub private_clean: u64,
+    pub private_dirty: u64,
+    pub anonymous: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, o: &Usage) {
+        self.rss += o.rss;
+        self.pss += o.pss;
+        self.shared_clean += o.shared_clean;
+        self.shared_dirty += o.shared_dirty;
+        self.private_clean += o.private_clean;
+        self.private_dirty += o.private_dirty;
+        self.anonymous += o.anonymous;
+    }
+}
+
 /// The pages of a MAP_SHARED anonymous mapping, made as they're first
 /// touched. Holds a reference to each (every mapping holds its own).
 #[derive(Debug, Default)]
@@ -117,17 +141,25 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
-            Backing::Data { ref data, offset, end, ino, ref shared } => {
-                Backing::Data { data: data.clone(), offset: offset.saturating_add(skip), end, ino, shared: shared.clone() }
-            }
+            Backing::Data { ref data, offset, end, ino, ref shared } => Backing::Data {
+                data: data.clone(),
+                offset: offset.saturating_add(skip),
+                end,
+                ino,
+                shared: shared.clone(),
+            },
             Backing::Sigpage => Backing::Sigpage,
             Backing::KernelPage(pa) => Backing::KernelPage(pa),
             Backing::Shared { ref pages, index } => {
                 Backing::Shared { pages: pages.clone(), index: index + skip / PAGE_SIZE }
             }
-            Backing::SharedFile { ref data, offset, ino, may_write, ref token } => {
-                Backing::SharedFile { data: data.clone(), offset: offset.saturating_add(skip), ino, may_write, token: token.clone() }
-            }
+            Backing::SharedFile { ref data, offset, ino, may_write, ref token } => Backing::SharedFile {
+                data: data.clone(),
+                offset: offset.saturating_add(skip),
+                ino,
+                may_write,
+                token: token.clone(),
+            },
             Backing::File { data, offset, filesz, ino, ref shared } => Backing::File {
                 data,
                 offset: offset.saturating_add(skip),
@@ -305,6 +337,32 @@ impl AddressSpace {
 
     pub fn activate(&self) {
         arch::set_user_page_table(self.pt.root);
+    }
+
+    /// What a mapping's resident pages are (`/proc/<pid>/smaps`), from
+    /// its page table and each frame's reference count: a frame others map
+    /// too is shared, one of the kernel's or an imported file's is clean.
+    pub fn usage(&self, v: &Vma) -> Usage {
+        let mut u = Usage::default();
+        let kernel = matches!(v.backing, Backing::KernelPage(_) | Backing::Sigpage);
+        let shmem = matches!(v.backing, Backing::Shared { .. } | Backing::SharedFile { .. });
+        self.pt.each_entry(v.start, v.end, |pte| {
+            let refs = frame::mappings(pte & ADDR_MASK) as u64;
+            let dirty = refs != 0 && !kernel;
+            let shared = refs != 1;
+            u.rss += PAGE_SIZE;
+            u.pss += PAGE_SIZE / refs.max(1);
+            *match (shared, dirty) {
+                (true, false) => &mut u.shared_clean,
+                (true, true) => &mut u.shared_dirty,
+                (false, false) => &mut u.private_clean,
+                (false, true) => &mut u.private_dirty,
+            } += PAGE_SIZE;
+            if dirty && !shmem {
+                u.anonymous += PAGE_SIZE;
+            }
+        });
+        u
     }
 
     pub fn vmas(&self) -> impl Iterator<Item = &Vma> {

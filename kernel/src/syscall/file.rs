@@ -347,18 +347,18 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
             Some(pid) => {
                 let procs = crate::procs::PROCS.lock();
                 match (procs.others.get(&pid), procs.zombies.get(&pid)) {
-                    // Its environment and auxv only to those who may
-                    // inspect it, as Linux's ptrace_may_access.
-                    (Some(q), _) if procfs::private(f) && !crate::procs::may_inspect(p, q, false) => {
+                    // Its environment, auxv and smaps only to those who
+                    // may inspect it, as Linux's ptrace_may_access.
+                    (Some(q), _) if procfs::inspected(f) && !crate::procs::may_inspect(p, q, false) => {
                         return Err(EACCES);
                     }
-                    (Some(q), _) => procfs::generate(q, f),
+                    (Some(q), _) => procfs::generate(q, f)?,
                     (None, Some(z)) => procfs::generate_zombie(p, pid, z, f)?,
                     // Reaped just now: its directory is on its way out.
                     (None, None) => return Err(ENOENT),
                 }
             }
-            None => procfs::generate(p, f),
+            None => procfs::generate(p, f)?,
         };
         let held = crate::kmem::Charge::new(data.capacity() as u64)?;
         let file = new_file(FileKind::Generated(data), flags & !(O_CLOEXEC | O_CREAT | O_EXCL));

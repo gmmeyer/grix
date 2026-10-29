@@ -133,6 +133,15 @@ pub fn usage() -> (u64, u64) {
     (TOTAL.load(Ordering::Relaxed), IN_USE.load(Ordering::Relaxed))
 }
 
+/// How many mappings hold a frame: 0 for memory the allocator doesn't
+/// own (an imported file's bytes, mapped where they are).
+pub fn mappings(pa: u64) -> u16 {
+    let guard = FRAMES.lock();
+    let Some(f) = guard.as_ref() else { return 0 };
+    let i = pa.checked_sub(f.base).map(|o| (o / PAGE_SIZE) as usize);
+    i.and_then(|i| f.refs.get(i)).copied().unwrap_or(0)
+}
+
 /// (total frames, frames in use)
 pub fn stats() -> (u64, u64) {
     let guard = FRAMES.lock();
