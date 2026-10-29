@@ -217,6 +217,12 @@ pub fn timer_settime(p: &mut Process, id: u64, flags: u64, new: u64, old: u64) -
     t.timing = timing;
     t.overrun = 0;
     p.timer_dirty = true;
+    // A CPU-time timer set to a time already passed fires now, its signal
+    // delivered as this call returns (Linux's posix_cpu_timer_set), not
+    // at the next timer interrupt, which may come a little later.
+    if cpu.is_some() && timing.next.is_some_and(|next| next <= now) {
+        crate::timer::fire(p);
+    }
     if old != 0 {
         write_itimerspec(p, old, &prev, now)?;
     }
