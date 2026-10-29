@@ -1802,6 +1802,19 @@ fn the_sandbox_has_a_name() {
 }
 
 #[test]
+fn o_async_signals_the_owner() {
+    // nginx's master sets it on its channels to the workers.
+    popular(with("popular").allow(Capability::Process), &["sigio"]);
+}
+
+#[test]
+fn o_async_signals_cannot_reach_init() {
+    // A child making init (pid 1) the owner, as a process, its group or
+    // its thread, with SIGIO, SIGKILL or SIGSTOP: init goes on.
+    popular(with("popular").allow(Capability::Process), &["sigioinit"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

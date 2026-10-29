@@ -11,7 +11,7 @@ use super::{require, table::nr};
 use crate::console;
 use crate::errno::*;
 use crate::fd::{
-    Epoll, FdEntry, FifoFile, FileKind, O_ACCMODE, O_APPEND, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile,
+    Epoll, FdEntry, FifoFile, FileKind, O_ACCMODE, O_APPEND, O_ASYNC, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile,
     Registration, new_file,
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
@@ -39,7 +39,7 @@ const O_CLOEXEC: u32 = 0o2000000;
 const O_PATH: u32 = 0o10000000;
 const O_TMPFILE: u32 = 0o20000000;
 /// Status flags that F_SETFL may change.
-const SETFL_MASK: u32 = 0o2000 | 0o4000; // O_APPEND | O_NONBLOCK
+const SETFL_MASK: u32 = 0o2000 | 0o4000 | O_ASYNC; // O_APPEND | O_NONBLOCK | O_ASYNC
 
 /// Linux caps a single read/write at this many bytes.
 const MAX_RW: u64 = 0x7fff_f000;
@@ -2018,6 +2018,12 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETFL: u64 = 4;
     const F_GETLK: u64 = 5;
     const F_SETLK: u64 = 6;
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
+    const F_SETSIG: u64 = 10;
+    const F_GETSIG: u64 = 11;
+    const F_SETOWN_EX: u64 = 15;
+    const F_GETOWN_EX: u64 = 16;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     const F_ADD_SEALS: u64 = 1033;
     const F_GET_SEALS: u64 = 1034;
@@ -2032,9 +2038,16 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         F_SETFL => {
             let file = p.fds.get(fd)?;
             let mut f = file.lock();
+            let was = f.flags;
             f.flags = (f.flags & !SETFL_MASK) | (arg as u32 & SETFL_MASK);
+            let on = f.flags & !was & O_ASYNC != 0;
+            drop(f);
+            if on {
+                crate::fasync::watch(&file, fd);
+            }
             Ok(0)
         }
+        F_SETOWN | F_GETOWN | F_SETSIG | F_GETSIG | F_SETOWN_EX | F_GETOWN_EX => owner(p, fd, cmd, arg),
         F_GETLK | F_SETLK | F_SETLKW | 36..=38 => record_lock(p, fd, cmd, arg),
         // memfd seals: only sealable files (memfds) have them.
         F_ADD_SEALS | F_GET_SEALS => {
@@ -2127,11 +2140,82 @@ pub(super) fn poll_kind(p: &Process, kind: &FileKind) -> (u32, u64) {
     }
 }
 
+/// fcntl's O_ASYNC owner and signal (fasync.rs).
+fn owner(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
+    use crate::fasync::Owner;
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
+    const F_SETSIG: u64 = 10;
+    const F_GETSIG: u64 = 11;
+    const F_SETOWN_EX: u64 = 15;
+    const F_OWNER_TID: u32 = 0;
+    const F_OWNER_PID: u32 = 1;
+    const F_OWNER_PGRP: u32 = 2;
+    let file = p.fds.get(fd)?;
+    let fown = file.lock().fown;
+    let owner = match cmd {
+        F_GETOWN => {
+            // A group is negative, as it was set.
+            return Ok(match fown.owner {
+                Owner::Process(pid) | Owner::Thread(pid) => pid as u64,
+                Owner::Group(pgid) => (pgid as i32).wrapping_neg() as i64 as u64,
+                Owner::None => 0,
+            });
+        }
+        F_GETSIG => return Ok(fown.sig as u64),
+        F_SETSIG => {
+            if arg > 64 {
+                return Err(EINVAL);
+            }
+            file.lock().fown.sig = arg as u32;
+            return Ok(0);
+        }
+        F_SETOWN => match arg as i32 {
+            0 => Owner::None,
+            pid if pid > 0 => Owner::Process(pid as u32),
+            g => Owner::Group(g.unsigned_abs()),
+        },
+        F_SETOWN_EX => {
+            let ty = read_u32(&mut p.aspace, arg)?;
+            let pid = read_u32(&mut p.aspace, arg + 4)?;
+            match (ty, pid) {
+                (_, 0) => Owner::None,
+                (F_OWNER_TID, t) => Owner::Thread(t),
+                (F_OWNER_PID, pid) => Owner::Process(pid),
+                (F_OWNER_PGRP, g) => Owner::Group(g),
+                _ => return Err(EINVAL),
+            }
+        }
+        // F_GETOWN_EX
+        _ => {
+            let (ty, pid) = match fown.owner {
+                Owner::Thread(t) => (F_OWNER_TID, t),
+                Owner::Process(pid) => (F_OWNER_PID, pid),
+                Owner::Group(g) => (F_OWNER_PGRP, g),
+                Owner::None => (F_OWNER_PID, 0),
+            };
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&ty.to_le_bytes());
+            b[4..].copy_from_slice(&pid.to_le_bytes());
+            return copy_out(&mut p.aspace, arg, &b).map(|_| 0);
+        }
+    };
+    let mut f = file.lock();
+    f.fown.owner = owner;
+    (f.fown.sender, f.fown.sender_uid) = (p.pid, p.uid);
+    Ok(0)
+}
+
 pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     const FIONREAD: u64 = 0x541b;
     const FIONBIO: u64 = 0x5421;
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
+    const FIOASYNC: u64 = 0x5452;
+    const FIOSETOWN: u64 = 0x8901;
+    const SIOCSPGRP: u64 = 0x8902;
+    const FIOGETOWN: u64 = 0x8903;
+    const SIOCGPGRP: u64 = 0x8904;
     const SIOCGIFCONF: u64 = 0x8912;
     // The command is an unsigned int: C callers may pass it sign-extended.
     let req = req as u32 as u64;
@@ -2140,9 +2224,9 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
         FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
         _ => None,
     };
-    // FIONBIO and FIOCLEX are the descriptor's, as for any file.
+    // FIONBIO, FIOASYNC and FIOCLEX are the descriptor's, as for any file.
     if let Some((tty, master)) = pty
-        && !matches!(req, FIONBIO | FIONCLEX | FIOCLEX)
+        && !matches!(req, FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC)
     {
         return super::tty::ioctl(p, fd, tty, master, req, arg);
     }
@@ -2151,6 +2235,15 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
         file.lock().kind,
         FileKind::Socket(_) | FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_)
     );
+    // A socket's O_ASYNC owner, as F_SETOWN and F_GETOWN.
+    if socket && matches!(req, FIOSETOWN | SIOCSPGRP) {
+        let pid = read_u32(&mut p.aspace, arg)?;
+        return owner(p, fd, 8, pid as i32 as i64 as u64);
+    }
+    if socket && matches!(req, FIOGETOWN | SIOCGPGRP) {
+        let pid = owner(p, fd, 9, 0)?;
+        return write_u32(&mut p.aspace, arg, pid as u32).map(|_| 0);
+    }
     if socket && req == SIOCGIFCONF {
         // struct ifconf { int ifc_len; char *ifc_buf; }: one entry, for lo.
         let len = read_u32(&mut p.aspace, arg)? as usize;
@@ -2192,6 +2285,12 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             Ok(0)
         }
         FIOCLEX | FIONCLEX => p.fds.set_cloexec(fd, req == FIOCLEX).map(|_| 0),
+        // O_ASYNC, as F_SETFL sets it.
+        FIOASYNC => {
+            let on = read_u32(&mut p.aspace, arg)? != 0;
+            let flags = p.fds.get(fd)?.lock().flags;
+            fcntl(p, fd, 4, (if on { flags | O_ASYNC } else { flags & !O_ASYNC }) as u64)
+        }
         // stdio is not a terminal (TCGETS, TIOCGWINSZ, ...).
         _ => Err(ENOTTY),
     }

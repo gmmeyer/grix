@@ -5,6 +5,7 @@ mod mem;
 mod misc;
 mod net;
 mod proc;
+pub use proc::shields_init;
 mod signal;
 pub mod table;
 mod thread;

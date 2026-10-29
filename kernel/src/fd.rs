@@ -42,6 +42,8 @@ pub const O_RDONLY: u32 = 0o0;
 pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 pub const O_APPEND: u32 = 0o2000;
+/// FASYNC: signal the owner when I/O becomes possible (fasync.rs).
+pub const O_ASYNC: u32 = 0o20000;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 /// O_CREAT | O_EXCL | O_TRUNC: open's, not the file's.
@@ -146,6 +148,8 @@ pub struct OpenFile {
     pub held: Option<crate::kmem::Charge>,
     /// It has taken flock or OFD locks (which go when it closes).
     pub locked: bool,
+    /// O_ASYNC's owner and signal (F_SETOWN, F_SETSIG).
+    pub fown: crate::fasync::Fown,
 }
 
 impl Drop for OpenFile {
@@ -240,6 +244,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         dir_pos: None,
         held: None,
         locked: false,
+        fown: Default::default(),
     }))
 }
 

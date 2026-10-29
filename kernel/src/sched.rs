@@ -153,6 +153,7 @@ fn poll(p: &mut Process, procs: &mut Procs) -> bool {
             woke |= q.wake_io_waiters();
             woke |= wake_expired(q);
         }
+        crate::fasync::deliver(p, procs);
         if crate::ipc::generation() == generation {
             POLLED.store(generation, Ordering::Relaxed);
             return woke;
@@ -189,6 +190,7 @@ pub fn wake_io_everywhere(p: &mut Process) {
     p.wake_io_waiters();
     let mut procs = PROCS.lock();
     procs::reap_others(p, &mut procs);
+    crate::fasync::deliver(p, &mut procs);
     let mut woke = false;
     for q in procs.others.values_mut() {
         woke |= q.wake_io_waiters();

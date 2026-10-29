@@ -6,10 +6,13 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -217,6 +220,90 @@ static int cacheflush(void) {
     return 0;
 }
 
+static volatile sig_atomic_t io_count, io_fd, io_code, io_band;
+
+static void on_io(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)uc;
+    io_count++;
+    io_fd = si->si_fd;
+    io_code = si->si_code;
+    io_band = si->si_band;
+}
+
+// nginx's master sets O_ASYNC on its channel to each worker (FIOASYNC,
+// then F_SETOWN), and gives up on the worker if it can't.
+static int sigio(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct sigaction sa = {.sa_sigaction = on_io, .sa_flags = SA_SIGINFO};
+    CHECK(sigaction(SIGIO, &sa, NULL) == 0 && sigaction(SIGRTMIN, &sa, NULL) == 0);
+    int on = 1;
+    CHECK(ioctl(sv[0], FIOASYNC, &on) == 0 && fcntl(sv[0], F_SETOWN, getpid()) == 0);
+    CHECK((fcntl(sv[0], F_GETFL) & O_ASYNC) && fcntl(sv[0], F_GETOWN) == getpid());
+    CHECK(io_count == 0);
+    CHECK(write(sv[1], "x", 1) == 1);
+    CHECK(io_count == 1 && io_code == SI_KERNEL);
+    char c;
+    CHECK(read(sv[0], &c, 1) == 1 && io_count == 1);
+    // F_SETSIG: its signal, with the reason, the poll bits and the descriptor.
+    CHECK(fcntl(sv[0], F_SETSIG, SIGRTMIN) == 0 && fcntl(sv[0], F_GETSIG) == SIGRTMIN);
+    CHECK(write(sv[1], "y", 1) == 1 && read(sv[0], &c, 1) == 1);
+    CHECK(io_count == 2 && io_fd == sv[0] && io_code == POLL_IN && (io_band & POLLIN));
+    // Off again: nothing.
+    on = 0;
+    CHECK(ioctl(sv[0], FIOASYNC, &on) == 0 && !(fcntl(sv[0], F_GETFL) & O_ASYNC));
+    CHECK(write(sv[1], "z", 1) == 1 && read(sv[0], &c, 1) == 1 && io_count == 2);
+    // Another process's write: the worker's, to the master.
+    CHECK(fcntl(sv[0], F_SETSIG, 0) == 0 && fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_ASYNC) == 0);
+    sigset_t io, old;
+    sigemptyset(&io);
+    sigaddset(&io, SIGIO);
+    CHECK(sigprocmask(SIG_BLOCK, &io, &old) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) _exit(write(sv[1], "w", 1) == 1 ? 0 : 1);
+    while (io_count == 2) sigsuspend(&old);
+    int status;
+    CHECK(io_count == 3 && waitpid(pid, &status, 0) == pid && status == 0);
+    CHECK(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
+    // F_SETOWN_EX names a thread, a process or a group.
+    struct f_owner_ex ex = {.type = F_OWNER_PGRP, .pid = getpgrp()}, got;
+    CHECK(fcntl(sv[0], F_SETOWN_EX, &ex) == 0 && fcntl(sv[0], F_GETOWN_EX, &got) == 0);
+    CHECK(got.type == F_OWNER_PGRP && got.pid == getpgrp());
+    return 0;
+}
+
+// O_ASYNC's signals are the F_SETOWN caller's, as kill's would be: a
+// child can't end or stop init (pid 1, which handles none of them) by
+// making it the owner, as a process, its group or its thread.
+static int sigioinit(void) {
+    CHECK(getpid() == 1);
+    int sigs[] = {0, SIGKILL, SIGSTOP};
+    for (int how = 0; how < 3; how++) {
+        for (int i = 0; i < 3; i++) {
+            pid_t pid = fork();
+            CHECK(pid >= 0);
+            if (pid == 0) {
+                int sv[2], r;
+                if (setpgid(0, 0) || socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) _exit(2);
+                if (how == 0) {
+                    r = fcntl(sv[0], F_SETOWN, 1);
+                } else if (how == 1) {
+                    r = fcntl(sv[0], F_SETOWN, -getpgid(1));
+                } else {
+                    struct f_owner_ex ex = {.type = F_OWNER_TID, .pid = 1};
+                    r = fcntl(sv[0], F_SETOWN_EX, &ex);
+                }
+                if (r || fcntl(sv[0], F_SETSIG, sigs[i]) || fcntl(sv[0], F_SETFL, O_ASYNC)) _exit(3);
+                _exit(write(sv[1], "x", 1) == 1 ? 0 : 4);
+            }
+            int status;
+            CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -273,6 +360,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "cacheflush") == 0) r = cacheflush();
         if (strcmp(argv[i], "udproute") == 0) r = udproute();
         if (strcmp(argv[i], "hostname") == 0) r = hostname();
+        if (strcmp(argv[i], "sigio") == 0) r = sigio();
+        if (strcmp(argv[i], "sigioinit") == 0) r = sigioinit();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;
