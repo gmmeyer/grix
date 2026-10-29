@@ -620,7 +620,9 @@ does not make the mistake.
   land as #GP → SIGSEGV, never dispatched as a syscall or device
   interrupt (run live). `syscall`'s SFMASK (TF|IF|DF|IOPL|NT|RF|AC|ID) and
   `sigreturn`'s `FIX_EFLAGS|USER_RFLAGS` keep privileged rflags out (a
-  forged IOPL 3 / NT / VM frame comes back 0x202 — run live); `cs`/`ss`
+  forged IOPL 3 / NT / VM frame comes back with only the arithmetic
+  status flags it entered with — under TCG 0x202, on real KVM 0x202|PF,
+  as Linux preserves them too — run live); `cs`/`ss`
   are forced `USER_CS`/`USER_SS` on every return path, so no forged frame
   can name a kernel descriptor.
 - mmap/mprotect bounds (run live): `MAP_FIXED` in the kernel's half or

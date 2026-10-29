@@ -2267,7 +2267,17 @@ fn escape_attempts_are_contained() {
     assert!(matches!(esc(&["/bin/escape", "sigreturn-rsp2"]).status, ExitStatus::Signaled(11)));
     let out = esc(&["/bin/escape", "sigreturn-rflags"]);
     assert_eq!(out.status, ExitStatus::Exited(0));
-    assert_eq!(out.stdout_str(), "sigreturn-rflags: kill() = 0, rflags = 0x202 (IOPL 0)\n");
+    // What survives the forged frame: sigreturn keeps the arithmetic
+    // status flags (FIX_EFLAGS, sigframe.rs: CF, PF, AF, ZF, SF) — the
+    // program's own, whose value depends on its last flag-setting
+    // instruction, and real KVM leaves PF where TCG clears it — and
+    // forces USER_RFLAGS (IF and the fixed one). Everything else,
+    // including the forged IOPL 3, NT and VM, must be gone.
+    let line = out.stdout_str().to_owned();
+    let at = line.find("rflags = 0x").unwrap_or_else(|| panic!("{line}")) + "rflags = 0x".len();
+    let hex = line[at..].chars().take_while(char::is_ascii_hexdigit).collect::<String>();
+    let flags = u64::from_str_radix(&hex, 16).unwrap_or_else(|_| panic!("{line}"));
+    assert_eq!(flags & !0x50dd5, 0x202, "{line}");
     // The kernel's half is not mappable, by hint or by MAP_FIXED, and
     // neither is what wraps past the top of user addresses. (The hint's
     // address the kernel picks varies; it just has to stay below the top.)
