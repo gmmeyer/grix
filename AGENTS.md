@@ -302,7 +302,11 @@ kernel writes (`vdso::publish`); the kernel's clock uses the same
 More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
 is still the single-CPU kernel, made safe by a big kernel lock that every
 exception takes (`smp::lock` in `trap_handler`) and gives back on the way
-to EL0 (`smp::finish`). What runs in parallel is user code: each CPU runs
+to EL0 (`smp::finish`). It's a ticket lock whose turn a waiter skips
+when the lock has lain free and untaken for `SKIP_US` (that CPU's vCPU
+is likely descheduled; it takes a new ticket when it runs): FIFO hands
+off as a futex ping-pong wants, and a descheduled waiter doesn't stall
+everyone. What runs in parallel is user code: each CPU runs
 a thread of any process. Between kernel entries every process is in
 `procs::PROCS`; `smp::lock` moves the one this CPU runs into `PROCESS`
 and `smp::unlock` puts it back (a finished-off one goes then, out of

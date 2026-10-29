@@ -1,9 +1,12 @@
 // What more CPUs cost the kernel: each mode runs on one thread (or
 // process) and then on n (the CPUs, or -n), for a fixed time, and prints
 // its operations per second, the speedup, and what the kernel counted
-// meanwhile (the deltas of /proc/grix/smp's totals).
+// meanwhile (the deltas of /proc/grix/smp's totals; its maximums are
+// since boot).
 //
-//   smpbench [-t MS] [-n N] [MODE...]      (default: every mode, 300 ms)
+//   smpbench [-t MS] [-n N] [-s] [MODE...]  (default: every mode, 300 ms)
+//
+//   -s        only the run on n (to load the machine, say)
 //
 //   compute   arithmetic only
 //   syscall   getppid in a loop
@@ -234,7 +237,9 @@ static double run(const char *mode, int n, double one) {
     printf("smpbench mode=%s n=%d ops=%ld ops_s=%.0f speedup=%.2f", mode, n, ops, rate, one > 0 ? rate / one : 1.0);
     if (strcmp(mode, "sleeper") == 0) printf(" wakeups=%ld", atomic_load(&wakeups));
     if (counted && read_counters(after)) {
-        for (int i = 0; i < ncounters; i++) printf(" %s=%llu", names[i], after[i] - before[i]);
+        // A maximum is since boot, not a delta.
+        for (int i = 0; i < ncounters; i++)
+            printf(" %s=%llu", names[i], strstr(names[i], "_max") ? after[i] : after[i] - before[i]);
     } else {
         printf(" counters=none");
     }
@@ -247,10 +252,12 @@ int main(int argc, char **argv) {
     static const char *all[] = {"compute", "syscall", "mmap", "futex", "procs", "sleeper"};
     int n = sysconf(_SC_NPROCESSORS_ONLN);
     const char *modes[16];
-    int nmodes = 0;
+    int nmodes = 0, skip_one = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             run_ms = atol(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0) {
+            skip_one = 1;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             n = atoi(argv[++i]);
         } else if (nmodes < 16) {
@@ -263,8 +270,8 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < sizeof all / sizeof *all; i++) modes[nmodes++] = all[i];
     }
     for (int i = 0; i < nmodes; i++) {
-        double one = run(modes[i], 1, 0);
-        if (n > 1) run(modes[i], n, one);
+        double one = skip_one ? 0 : run(modes[i], 1, 0);
+        if (n > 1 || skip_one) run(modes[i], n, one);
     }
     printf("smpbench ok\n");
     return 0;

@@ -53,9 +53,16 @@ static CPUS: spin::Mutex<[Cpu; N]> = spin::Mutex::new([IDLE; N]);
 static ONLINE: AtomicU32 = AtomicU32::new(1);
 /// The machine's CPUs.
 static COUNT: AtomicU32 = AtomicU32::new(1);
-/// The big kernel lock: a ticket lock, so no CPU starves.
-static NEXT: AtomicU64 = AtomicU64::new(0);
-static SERVING: AtomicU64 = AtomicU64::new(0);
+/// The big kernel lock: a ticket lock whose turn can be skipped
+/// (`acquire`). Tickets come from `NEXT`; `LOCK` is the ticket served (low
+/// 32 bits) and whether its CPU has taken the lock (`HELD`), in one word
+/// so taking a turn and skipping it are one compare-and-swap.
+static NEXT: AtomicU32 = AtomicU32::new(0);
+static LOCK: AtomicU64 = AtomicU64::new(0);
+const HELD: u64 = 1 << 32;
+/// How long the lock may lie free with its turn untaken before a waiter
+/// moves the turn on, in µs.
+const SKIP_US: u64 = 20;
 /// Something may be runnable for this CPU (set before its kick).
 static WORK: [AtomicBool; N] = [const { AtomicBool::new(false) }; N];
 
@@ -95,6 +102,10 @@ pub enum Stat {
     /// Counter ticks spent waiting for the kernel lock, and holding it.
     LockWait,
     LockHeld,
+    /// The longest single wait for it (counter ticks).
+    LockWaitMax,
+    /// Turns this CPU skipped, their CPU not taking the lock (`acquire`).
+    LockSkip,
     /// TLB flushes this CPU asked for, the IPIs they sent (x86_64), and
     /// counter ticks spent waiting for those to be acknowledged.
     Flush,
@@ -116,6 +127,8 @@ const STAT_NAMES: [&str; STATS] = [
     "kick_sent",
     "lock_wait_us",
     "lock_held_us",
+    "lock_wait_max_us",
+    "lock_skip",
     "flush",
     "flush_ipi",
     "flush_wait_us",
@@ -139,7 +152,7 @@ pub fn stats(s: &mut alloc::string::String) {
     use core::fmt::Write;
     let freq = arch::counter_freq().max(1);
     let shown = |i: usize, v: u64| match i {
-        i if i == Stat::LockWait as usize || i == Stat::LockHeld as usize || i == Stat::FlushWait as usize => {
+        i if [Stat::LockWait, Stat::LockHeld, Stat::LockWaitMax, Stat::FlushWait].iter().any(|&t| t as usize == i) => {
             (v as u128 * 1_000_000 / freq as u128) as u64
         }
         _ => v,
@@ -150,7 +163,7 @@ pub fn stats(s: &mut alloc::string::String) {
         let _ = write!(s, "{cpu}");
         for (i, c) in counts.iter().enumerate() {
             let v = c.load(Ordering::Relaxed);
-            all[i] += v;
+            all[i] = if i == Stat::LockWaitMax as usize { all[i].max(v) } else { all[i] + v };
             let _ = write!(s, " {}", shown(i, v));
         }
         s.push('\n');
@@ -177,12 +190,11 @@ pub fn lock() {
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
     ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
     let start = arch::counter();
-    let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
-    while SERVING.load(Ordering::Acquire) != ticket {
-        core::hint::spin_loop();
-    }
+    acquire();
     let taken = arch::counter();
-    note_on(cpu, Stat::LockWait, taken.wrapping_sub(start));
+    let waited = taken.wrapping_sub(start);
+    note_on(cpu, Stat::LockWait, waited);
+    COUNTS[cpu][Stat::LockWaitMax as usize].fetch_max(waited, Ordering::Relaxed);
     TAKEN[cpu].store(taken, Ordering::Relaxed);
     arch::tlb_sync();
     let me = me();
@@ -258,7 +270,53 @@ pub fn unlock() {
     }
     note_on(me, Stat::LockHeld, arch::counter().wrapping_sub(TAKEN[me].load(Ordering::Relaxed)));
     IN_KERNEL[me].store(false, Ordering::SeqCst);
-    SERVING.fetch_add(1, Ordering::Release);
+    // Only the holder changes it while it's held: the next turn, free.
+    let served = LOCK.load(Ordering::Relaxed) as u32;
+    LOCK.store(served.wrapping_add(1) as u64, Ordering::Release);
+}
+
+/// Take the kernel lock, in turn. A plain ticket lock is fair, and
+/// hands the lock straight to the next waiter (which a futex ping-pong
+/// between CPUs wants: test-and-set let the CPU that just gave the lock
+/// back win it again, and ran that at a third of the speed). But in a VM
+/// the CPU whose turn is next may be a vCPU the host has descheduled, and
+/// then every CPU waits for it, the lock free all the while, for as long
+/// as the host keeps it off (Linux's virt_spin_lock gives up queueing in
+/// guests for this). So when the lock has lain free with its turn untaken
+/// for `SKIP_US`, a waiter moves the turn on, and the CPU whose turn it
+/// was takes a new ticket when it runs again.
+fn acquire() {
+    let skip = arch::counter_freq() * SKIP_US / 1_000_000;
+    let mut ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+    // The free, untaken turn last seen, and since when.
+    let mut stalled = (u64::MAX, 0);
+    loop {
+        let v = LOCK.load(Ordering::Acquire);
+        let serving = v as u32;
+        if v & HELD == 0 && serving == ticket {
+            if LOCK.compare_exchange_weak(v, v | HELD, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return;
+            }
+            continue;
+        }
+        if (serving.wrapping_sub(ticket) as i32) > 0 {
+            // Skipped while this CPU wasn't running: to the back.
+            ticket = NEXT.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if v & HELD == 0 {
+            let now = arch::counter();
+            if stalled.0 != v {
+                stalled = (v, now);
+            } else if now.wrapping_sub(stalled.1) > skip {
+                let next = serving.wrapping_add(1) as u64;
+                if LOCK.compare_exchange(v, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    note(Stat::LockSkip, 1);
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Is a thread of `pid` on any CPU (`cpus`: the CPUs, already locked)?

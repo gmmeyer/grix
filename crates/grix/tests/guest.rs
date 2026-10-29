@@ -2793,16 +2793,25 @@ fn snapshots_with_more_cpus() {
         assert_eq!(snap.cpus(), cpus);
         let mut randoms = Vec::new();
         for word in ["one", "two"] {
-            let out = snap.run(format!("{word}\n")).unwrap();
-            assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
-            let stdout = out.stdout_str();
-            let lines: Vec<&str> = stdout.lines().collect();
-            assert_eq!(lines[0], format!("got {word}"), "{stdout}");
-            assert!(lines[1].starts_with(&format!("smp ok cpus={cpus} ")), "{stdout}");
-            let used: u32 = lines[1].rsplit("cpus_used=").next().unwrap().trim().parse().unwrap();
-            assert!(used >= 2, "{stdout}");
-            randoms.push(lines[2].to_string());
-            assert!(out.events.is_empty(), "{:?}", out.events);
+            // Threads on more than one CPU, unless the host left a vCPU off
+            // for the whole of it (the kernel lock lets the others go on
+            // without one the host descheduled): then, as for
+            // `threads_run_in_parallel_on_more_cpus`, again.
+            for attempt in 1..=3 {
+                let out = snap.run(format!("{word}\n")).unwrap();
+                assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+                let stdout = out.stdout_str();
+                let lines: Vec<&str> = stdout.lines().collect();
+                assert_eq!(lines[0], format!("got {word}"), "{stdout}");
+                assert!(lines[1].starts_with(&format!("smp ok cpus={cpus} ")), "{stdout}");
+                assert!(out.events.is_empty(), "{:?}", out.events);
+                let used: u32 = lines[1].rsplit("cpus_used=").next().unwrap().trim().parse().unwrap();
+                if used >= 2 {
+                    randoms.push(lines[2].to_string());
+                    break;
+                }
+                assert!(attempt < 3, "{stdout}\n{}\n{}", out.stderr_str(), out.kernel_log);
+            }
         }
         assert_ne!(randoms[0], randoms[1]);
     }

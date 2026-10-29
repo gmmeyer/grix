@@ -224,7 +224,14 @@ int main(int argc, char **argv) {
     CHECK(atomic_load(&atomic_count) == 400000);
     CHECK(locked_count == 400000);
 
-    printf("smp ok cpus=%ld speedup=%.1f cpus_used=%d\n", cpus, n * one / all,
-           __builtin_popcount(atomic_load(&seen_cpus)));
+    int used = __builtin_popcount(atomic_load(&seen_cpus));
+    // What the kernel counted, for whoever wonders why they didn't spread.
+    if (cpus > 1 && used < 2) {
+        FILE *f = fopen("/proc/grix/smp", "r");
+        char line[512];
+        while (f && fgets(line, sizeof line, f)) fputs(line, stderr);
+        if (f) fclose(f);
+    }
+    printf("smp ok cpus=%ld speedup=%.1f cpus_used=%d\n", cpus, n * one / all, used);
     return 0;
 }

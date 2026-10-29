@@ -94,6 +94,11 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     lock or a TLB flush on one the host descheduled (KVM's PV TLB flush
     and spinlock hints would help). The `smpbench` fixture measures
     each kind of load, with the kernel's counters (/proc/grix/smp).
+    Done since: flushes only of the pages that changed and only to the
+    CPUs running that address space; a waiter skips the lock's turn of a
+    CPU that doesn't take it (twice the kernel-bound throughput with
+    80 other vCPUs on a 32-core host). Next: a timekeeper CPU; then a
+    per-CPU running process and a reader/writer lock (phase 2).
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
 19. [x] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
