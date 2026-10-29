@@ -141,6 +141,7 @@ pre.out { margin: 0; padding: 10px 12px; min-height: 3.2em; max-height: 360px; o
           background: var(--gx-term); color: var(--gx-term-fg);
           font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
 .term { background: var(--gx-term); padding: 6px; }
+.term .idle { color: var(--gx-muted); padding: 4px 6px; }
 .err { color: var(--gx-err); }
 .event { color: var(--gx-event); }
 .status { color: var(--gx-muted); }
@@ -169,7 +170,7 @@ class GrixExample extends HTMLElement {
           <button class="run">Run</button>
         </div>
         <div class="stdin" hidden><div class="stdin-label">stdin</div><textarea rows="3" spellcheck="false" aria-label="stdin"></textarea></div>
-        ${tty ? '<div class="term"></div><pre class="events" hidden></pre>' : '<pre class="out" aria-live="polite"></pre>'}
+        ${tty ? '<div class="term"><pre class="out idle">Press Run to start a terminal.</pre></div><pre class="events" hidden></pre>' : '<pre class="out" aria-live="polite"></pre>'}
         <details class="missing" hidden><summary></summary><pre></pre></details>
         <div class="note" hidden></div>
       </div>`;
@@ -236,6 +237,7 @@ class GrixExample extends HTMLElement {
     }
     this.term = new globalThis.Terminal({ rows: 20, cols: 80, convertEol: false, fontSize: 13,
       theme: { background: '#15171b' } });
+    this.$('.term .idle')?.remove();
     this.term.open(this.$('.term'));
     this.term.onData((d) => this.running?.write?.(new TextEncoder().encode(d)));
     return this.term;

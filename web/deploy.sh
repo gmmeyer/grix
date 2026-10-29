@@ -34,6 +34,8 @@ done
 rm -rf "$SITE"
 mkdir -p "$SITE"
 (cd "$DIST" && tar --exclude ./bin --exclude ./rootfs --exclude ./smoke.html -cf - .) | tar -C "$SITE" -xf -
-sed -i "s|<script src=\"coi-serviceworker.js\"></script>|<meta name=\"grix-files\" content=\"$FILES_URL\">\n&|" "$SITE/index.html"
-grep -q 'name="grix-files"' "$SITE/index.html"
+find "$SITE" -name '*.html' -print0 | while IFS= read -r -d '' page; do
+    sed -i "s|<script src=\"/coi-serviceworker.js\"></script>|<meta name=\"grix-files\" content=\"$FILES_URL\">\n&|" "$page"
+    grep -q 'name="grix-files"' "$page"
+done
 "${WRANGLER[@]}" pages deploy "$SITE" --project-name "$PROJECT" --branch main --commit-dirty=true

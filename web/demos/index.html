@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demos · grix</title>
+<meta name="description" content="grix demos, running in your browser.">
+<link rel="stylesheet" href="/site.css">
+<script src="/coi-serviceworker.js"></script>
+<script type="module" src="/grix-example.js"></script>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/">grix<span>_</span></a>
+  <nav class="site-nav"><a href="/#what" class="hide-sm">What is it</a><a href="/demos/" aria-current="page">Demos</a><a href="/blog/">Blog</a><a href="https://github.com/gmmeyer/grix">GitHub</a></nav>
+</div></header>
+<main class="prose">
+<h1>Demos</h1>
+<p class="byline">Real grix runs, in your browser. The grix kernel boots in QEMU compiled to WebAssembly,
+and grix's host side is its own Rust, compiled to WebAssembly too. Every run boots a fresh machine. Edit
+the command, tick a capability, and run it again.</p>
+<p class="isolation-warning" hidden>Your browser didn't give this page cross-origin isolation, so the demos can't run here. They need SharedArrayBuffer, for QEMU's threads.</p>
+
+<h2>Hello</h2>
+<p>A static C program gets its arguments and environment, writes to stdout and stderr, and exits with
+status 7.</p>
+<grix-example command="/bin/hello world"
+  env="GREETING=hi"
+  files='[{"src": "bin/hello", "path": "/bin/hello", "mode": 493}]'></grix-example>
+
+<h2>Least privilege</h2>
+<p>This program only opens a socket. Without <code>net</code> the kernel refuses, and says which
+capability would have allowed it. Tick <code>net</code> and run it again. (No traffic can leave a web page,
+so here <code>net</code> only lets the socket exist.)</p>
+<grix-example command="/bin/net"
+  caps="net"
+  files='[{"src": "bin/net", "path": "/bin/net", "mode": 493}]'></grix-example>
+
+<h2>Only what you import</h2>
+<p>The filesystem holds exactly the imports, plus a few files the kernel makes itself. Try
+<code>cat /etc/shadow</code>, or <code>ls /</code>.</p>
+<grix-example command="/bin/busybox wc -l /data/report.csv /etc/shadow"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"text": "region,total\nnorth,12\nsouth,7\n", "path": "/data/report.csv"}]'
+  download="660 KB"
+  show-missing></grix-example>
+
+<h2>stdin</h2>
+<grix-example command="/bin/busybox sort -u"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}]'
+  download="660 KB"
+  stdin="pear&#10;apple&#10;fig&#10;apple&#10;"></grix-example>
+
+<h2>Processes</h2>
+<p>A shell pipeline forks. Without <code>process</code> the shell can't fork, and the denial says why.</p>
+<grix-example command="sh -c &#x27;echo hello world | tr a-z A-Z; seq 1 5 | sort -r | head -3; uname -a&#x27;"
+  caps="process"
+  env="PATH=/bin"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"symlink": "busybox", "path": "/bin/sh"}, {"symlink": "busybox", "path": "/bin/cat"}, {"symlink": "busybox", "path": "/bin/ls"}, {"symlink": "busybox", "path": "/bin/tr"}, {"symlink": "busybox", "path": "/bin/sort"}, {"symlink": "busybox", "path": "/bin/uniq"}, {"symlink": "busybox", "path": "/bin/wc"}, {"symlink": "busybox", "path": "/bin/grep"}, {"symlink": "busybox", "path": "/bin/head"}, {"symlink": "busybox", "path": "/bin/seq"}, {"symlink": "busybox", "path": "/bin/sleep"}, {"symlink": "busybox", "path": "/bin/uname"}, {"symlink": "busybox", "path": "/bin/id"}, {"symlink": "busybox", "path": "/bin/ps"}, {"symlink": "busybox", "path": "/bin/yes"}, {"symlink": "busybox", "path": "/bin/env"}, {"symlink": "busybox", "path": "/bin/mkdir"}, {"symlink": "busybox", "path": "/bin/rm"}, {"symlink": "busybox", "path": "/bin/touch"}, {"symlink": "busybox", "path": "/bin/echo"}]'
+  download="660 KB"></grix-example>
+
+<h2>A shell</h2>
+<p>bash, with busybox for the rest, in a terminal: line editing, job control and Ctrl-C. Try
+<code>ls -l / | head</code>, <code>sleep 100</code> then Ctrl-C, or <code>echo hi &gt; /tmp/x</code> (that
+needs <code>fs_write</code>: stop, tick it and start again).</p>
+<grix-example command="bash"
+  caps="process fs_write"
+  allow="process"
+  env='["PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/tmp", "TERM=xterm-256color", "PS1=grix:\\w\\$ "]'
+  files='[{"tar": "rootfs/bash.tar.gz", "path": "/"}]'
+  download="1.8 MB"
+  tty></grix-example>
+
+<h2>A Python REPL</h2>
+<p>Try <code>import os; os.listdir('/')</code>, or <code>open('/tmp/x', 'w')</code> without
+<code>fs_write</code>.</p>
+<grix-example command="python3"
+  caps="threads fs_write process net"
+  allow="threads"
+  env='["TERM=xterm-256color", "HOME=/tmp"]'
+  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]'
+  download="15 MB"
+  tty memory="512"></grix-example>
+
+<h2>Threads and Go</h2>
+<p>Unmodified Go: its runtime starts threads, and <code>os/exec</code> forks, pipes and kills children.</p>
+<grix-example command="/bin/goexec"
+  caps="threads process"
+  allow="threads process"
+  files='[{"src": "bin/goexec", "path": "/bin/goexec", "mode": 493}]'
+  download="790 KB"></grix-example>
+
+<h2>Python</h2>
+<p>Alpine's Python 3.12, with its standard library imported as a root filesystem.</p>
+<grix-example command="/usr/bin/python3 -c &#x27;import sys, platform; print(sys.version); print(platform.machine(), sum(range(10**5)))&#x27;"
+  caps="threads fs_write net"
+  allow="threads"
+  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]'
+  download="15 MB"
+  memory="512"></grix-example>
+
+<h2>Node.js</h2>
+<grix-example command="/usr/bin/node -e &#x27;console.log(process.version, [1,2,3].map(x =&gt; x * 7))&#x27;"
+  caps="threads fs_write net"
+  allow="threads"
+  files='[{"tar": "rootfs/node.tar.gz", "path": "/"}]'
+  download="28 MB"
+  memory="512"></grix-example>
+</main>
+<footer class="site-footer"><div class="wrap">
+  <span>grix is open source, under the MIT license.</span>
+  <a href="https://github.com/gmmeyer/grix">Source</a>
+  <a href="https://github.com/gmmeyer/grix/releases">Releases</a>
+  <a href="https://github.com/gmmeyer/grix#readme">Documentation</a>
+  <a href="/blog/">Blog</a>
+</div></footer>
+<script>
+  // The demos need SharedArrayBuffer (QEMU's threads); say so where the
+  // page couldn't get it.
+  if (!crossOriginIsolated) {
+    for (const el of document.querySelectorAll('.isolation-warning')) el.hidden = false;
+  }
+</script>
+</body>
+</html>

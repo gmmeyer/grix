@@ -3,91 +3,238 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>grix in the browser</title>
-<style>
-  :root { --bg: #fbfbfc; --fg: #1d1f23; --muted: #5f6570; --border: #d9dce1; --code: #eef0f3; --accent: #2f6fde; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #141619; --fg: #e6e8eb; --muted: #9aa0a9; --border: #33373e; --code: #22252a; --accent: #78a6ff; }
-  }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; }
-  main { max-width: 880px; margin: 0 auto; padding: 32px 16px 80px; }
-  h1 { font-size: 1.9rem; margin: 0 0 .25rem; }
-  h2 { font-size: 1.25rem; margin: 2.5rem 0 .25rem; }
-  p { margin: .5rem 0; }
-  .lede { color: var(--muted); }
-  code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code); padding: .1em .35em; border-radius: 4px; }
-  a { color: var(--accent); }
-  .warn { border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin: 1rem 0; }
-</style>
-<script src="coi-serviceworker.js"></script>
-<script type="module" src="grix-example.js"></script>
+<title>grix: a sandbox for the code your agents run</title>
+<meta name="description" content="grix: a sandbox for the code your agents run. A small Linux-compatible kernel in Rust that runs one program per microVM, with least privilege by default.">
+<link rel="stylesheet" href="/site.css">
+<script src="/coi-serviceworker.js"></script>
+<script type="module" src="/grix-example.js"></script>
 </head>
 <body>
-<main>
-<h1>grix in the browser</h1>
-<p class="lede">These are real grix runs. The grix kernel boots in QEMU compiled to WebAssembly, and grix's host side (the boot image, the console protocol, stdin flow control) is grix's own Rust compiled to wasm. Every run boots a fresh machine whose kernel runs exactly one Linux binary. The program sees only the files listed for it, and anything it tries without the matching capability is denied and reported. Edit the command, tick a capability, and run it again.</p>
-<p class="warn" id="isolation" hidden></p>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/">grix<span>_</span></a>
+  <nav class="site-nav"><a href="/#what" class="hide-sm">What is it</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="https://github.com/gmmeyer/grix">GitHub</a></nav>
+</div></header>
+<main class="wrap">
 
-<h2>Hello</h2>
-<p>A static C program gets its arguments and environment, writes to stdout and stderr, and exits with status 7.</p>
-<grix-example command="/bin/hello world" env="GREETING=hi"
-  files='[{"src": "bin/hello", "path": "/bin/hello", "mode": 493}]'></grix-example>
+<div class="hero">
+  <div>
+    <h1>A sandbox for the code your agents run.</h1>
+    <p class="lead">grix is a small Linux-compatible kernel, written in Rust. Every run boots a fresh
+    microVM that runs exactly one unmodified Linux program. The program sees only the files you hand it,
+    and can do only what you grant it. Anything else is denied, and grix tells your agent exactly what
+    was missing.</p>
+    <div class="buttons">
+      <a class="button primary" href="#try">Try it in your browser</a>
+      <a class="button secondary" href="#install">Install</a>
+      <a class="button secondary" href="https://github.com/gmmeyer/grix">GitHub</a>
+    </div>
+  </div>
+  <div class="hero-demo">
+    <div class="code"><div class="label">Terminal</div><pre><span class="c"># Only /bin/net exists, and nothing is granted.</span>
+$ grix run -i ./net:/bin/net -- /bin/net
+socket: Operation not permitted
+<span class="deny">grix: denied socket: needs capability `net`</span>
 
-<h2>Least privilege</h2>
-<p>This program only opens a socket. Without <code>net</code> the kernel refuses and tells the host which capability would have allowed it. Tick <code>net</code> and run it again. (No traffic can leave a page. Here <code>net</code> only lets the socket exist.)</p>
-<grix-example command="/bin/net" caps="net"
+<span class="c"># Grant it, and the program gets its socket.</span>
+$ grix run -a net -i ./net:/bin/net -- /bin/net
+socket: opened fd 3</pre></div>
+    <grix-example command="/bin/net"
+  caps="net"
   files='[{"src": "bin/net", "path": "/bin/net", "mode": 493}]'></grix-example>
+    <p class="caption">And this is that program, in grix, running in your browser. Run it, then tick <code>net</code> and run it
+    again.</p>
+  </div>
+</div>
+<p class="isolation-warning" hidden>Your browser didn't give this page cross-origin isolation, so the demos can't run here. They need SharedArrayBuffer, for QEMU's threads.</p>
 
-<h2>Only what you import</h2>
-<p>The filesystem holds exactly the imports plus a few synthetic files. Try <code>cat /etc/shadow</code>, or <code>ls /</code>.</p>
-<grix-example command="/bin/busybox wc -l /data/report.csv /etc/shadow" show-missing
-  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"text": "region,total\nnorth,12\nsouth,7\n", "path": "/data/report.csv"}]'
+<section id="what">
+  <div class="eyebrow">What is it</div>
+  <h2>One program, one VM, nothing it wasn't given</h2>
+  <p class="lead">grix (greg + unix) is an <em>agentbox</em>: a unikernel built to run Linux programs on
+  behalf of AI agents, with least privilege by default.</p>
+  <div class="cards">
+    <div class="card"><h3>A fresh microVM per run</h3>
+      <p>Each run boots grix's kernel in its own virtual machine, on Hypervisor.framework or KVM. Booting,
+      running a small program and exiting takes about a tenth of a second.</p></div>
+    <div class="card"><h3>Only what you import</h3>
+      <p>The filesystem is the files you list, and the environment is the variables you set. The VM has
+      no network card and no disk. The program can't reach anything you didn't give it.</p></div>
+    <div class="card"><h3>Denied, and reported</h3>
+      <p>Writing files, threads, processes and the network are capabilities you grant. Anything else fails
+      the way it would on Linux, and grix reports it: <code>denied socket: needs capability `net`</code>.</p></div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="eyebrow">Why should I care</div>
+  <h2>Agents run code. Something has to say no.</h2>
+  <p class="lead">An agent that writes or downloads a program has to run it somewhere. On your machine,
+  it can do anything you can. A container shares your kernel, and inside it everything is allowed. A full
+  VM is a whole operating system to boot and maintain. grix starts from nothing allowed, starts in a tenth
+  of a second, and answers in a form an agent can act on.</p>
+  <ul class="reasons">
+    <li><strong>Least privilege by default</strong>
+      <span>No files, no network, no processes, no threads until you grant them. Privileged calls (mount,
+      ptrace, bpf, modules) are never available.</span></li>
+    <li><strong>Every refusal is explained</strong>
+      <span>Denied calls, files the program looked for and syscalls grix doesn't implement yet all come back
+      as events. An agent can ask you for <code>net</code> and run it again.</span></li>
+    <li><strong>Real software, unmodified</strong>
+      <span>Python 3.12, Node 22, Go, busybox, and Debian's bash, coreutils and git. arm64 and x86_64
+      Linux binaries, musl or glibc, run as they are.</span></li>
+    <li><strong>Fast to start, small to run</strong>
+      <span>About 0.1 s to boot, run and exit. Snapshots resume a warmed-up Python in 0.13 s. You can import
+      a single static binary, with no OS image at all.</span></li>
+    <li><strong>Networking under an allow-list</strong>
+      <span>With <code>net</code>, the guest's sockets become messages to the host. The host makes each
+      connection only if your rules allow that host and port.</span></li>
+    <li><strong>Built for agents</strong>
+      <span>An MCP server, Python and Rust libraries, JSON output, and images built from Docker/OCI
+      images.</span></li>
+  </ul>
+</section>
+
+<section id="try">
+  <div class="eyebrow">Try it</div>
+  <h2>Run it here</h2>
+  <p class="lead">These demos run the real grix kernel in your browser, on QEMU compiled to WebAssembly.
+  Edit a command, grant a capability, and run it again.</p>
+  <p class="isolation-warning" hidden>Your browser didn't give this page cross-origin isolation, so the demos can't run here. They need SharedArrayBuffer, for QEMU's threads.</p>
+  <h3 style="margin-top:1.6rem">A shell pipeline, without and then with <code>process</code></h3>
+  <grix-example command="sh -c &#x27;echo hello world | tr a-z A-Z; seq 1 5 | sort -r | head -3; uname -a&#x27;"
+  caps="process"
+  env="PATH=/bin"
+  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"symlink": "busybox", "path": "/bin/sh"}, {"symlink": "busybox", "path": "/bin/cat"}, {"symlink": "busybox", "path": "/bin/ls"}, {"symlink": "busybox", "path": "/bin/tr"}, {"symlink": "busybox", "path": "/bin/sort"}, {"symlink": "busybox", "path": "/bin/uniq"}, {"symlink": "busybox", "path": "/bin/wc"}, {"symlink": "busybox", "path": "/bin/grep"}, {"symlink": "busybox", "path": "/bin/head"}, {"symlink": "busybox", "path": "/bin/seq"}, {"symlink": "busybox", "path": "/bin/sleep"}, {"symlink": "busybox", "path": "/bin/uname"}, {"symlink": "busybox", "path": "/bin/id"}, {"symlink": "busybox", "path": "/bin/ps"}, {"symlink": "busybox", "path": "/bin/yes"}, {"symlink": "busybox", "path": "/bin/env"}, {"symlink": "busybox", "path": "/bin/mkdir"}, {"symlink": "busybox", "path": "/bin/rm"}, {"symlink": "busybox", "path": "/bin/touch"}, {"symlink": "busybox", "path": "/bin/echo"}]'
   download="660 KB"></grix-example>
-
-<h2>stdin</h2>
-<grix-example command="/bin/busybox sort -u" stdin="pear&#10;apple&#10;fig&#10;apple&#10;"
-  files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}]'
-  download="660 KB"></grix-example>
-
-<h2>Processes</h2>
-<p>A shell pipeline forks. Without <code>process</code> the shell can't fork, and the denial says why.</p>
-<grix-example command="sh -c 'echo hello world | tr a-z A-Z; seq 1 5 | sort -r | head -3; uname -a'" caps="process"
-  env="PATH=/bin" files='[{"src": "bin/busybox", "path": "/bin/busybox", "mode": 493}, {"symlink": "busybox", "path": "/bin/sh"}, {"symlink": "busybox", "path": "/bin/cat"}, {"symlink": "busybox", "path": "/bin/ls"}, {"symlink": "busybox", "path": "/bin/tr"}, {"symlink": "busybox", "path": "/bin/sort"}, {"symlink": "busybox", "path": "/bin/uniq"}, {"symlink": "busybox", "path": "/bin/wc"}, {"symlink": "busybox", "path": "/bin/grep"}, {"symlink": "busybox", "path": "/bin/head"}, {"symlink": "busybox", "path": "/bin/seq"}, {"symlink": "busybox", "path": "/bin/sleep"}, {"symlink": "busybox", "path": "/bin/uname"}, {"symlink": "busybox", "path": "/bin/id"}, {"symlink": "busybox", "path": "/bin/ps"}, {"symlink": "busybox", "path": "/bin/yes"}, {"symlink": "busybox", "path": "/bin/env"}, {"symlink": "busybox", "path": "/bin/mkdir"}, {"symlink": "busybox", "path": "/bin/rm"}, {"symlink": "busybox", "path": "/bin/touch"}, {"symlink": "busybox", "path": "/bin/echo"}]' download="660 KB"></grix-example>
-
-<h2>A shell</h2>
-<p>bash, with busybox for the rest, in TTY mode: the program's stdio is a pseudo-terminal inside the sandbox, with line editing, job control and Ctrl-C. Try <code>ls -l / | head</code>, <code>sleep 100</code> then Ctrl-C, or <code>echo hi &gt; /tmp/x</code> (it needs <code>fs_write</code>: stop, tick it and start again). Without <code>process</code>, nothing outside bash runs.</p>
-<grix-example tty command="bash" caps="process fs_write" allow="process"
+  <h3 style="margin-top:1.6rem">bash, in a terminal</h3>
+  <p>Try <code>ls -l / | head</code>, <code>sleep 100</code> then Ctrl-C, or <code>echo hi &gt; /tmp/x</code>
+  (that needs <code>fs_write</code>).</p>
+  <grix-example command="bash"
+  caps="process fs_write"
+  allow="process"
   env='["PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/tmp", "TERM=xterm-256color", "PS1=grix:\\w\\$ "]'
-  files='[{"tar": "rootfs/bash.tar.gz", "path": "/"}]' download="1.8 MB"></grix-example>
-
-<h2>A Python REPL</h2>
-<p>Python's own interactive prompt, in the same kind of terminal. Try <code>import os; os.listdir('/')</code>, or <code>open('/tmp/x', 'w')</code> without <code>fs_write</code>.</p>
-<grix-example tty command="python3" caps="threads fs_write process net" allow="threads" memory="512"
+  files='[{"tar": "rootfs/bash.tar.gz", "path": "/"}]'
+  download="1.8 MB"
+  tty></grix-example>
+  <h3 style="margin-top:1.6rem">Python's own REPL</h3>
+  <p>Try <code>import os; os.listdir('/')</code>, or <code>open('/tmp/x', 'w')</code> without
+  <code>fs_write</code>.</p>
+  <grix-example command="python3"
+  caps="threads fs_write process net"
+  allow="threads"
   env='["TERM=xterm-256color", "HOME=/tmp"]'
-  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]' download="15 MB"></grix-example>
+  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]'
+  download="15 MB"
+  tty memory="512"></grix-example>
+  <p><a href="/demos/">All the demos</a>: Go, Node, stdin, missing files and more.</p>
+</section>
 
-<h2>Threads and Go</h2>
-<p>Unmodified Go: its runtime starts threads, and <code>os/exec</code> forks, pipes and kills children.</p>
-<grix-example command="/bin/goexec" caps="threads process" allow="threads process"
-  files='[{"src": "bin/goexec", "path": "/bin/goexec", "mode": 493}]' download="790 KB"></grix-example>
+<section id="install">
+  <div class="eyebrow">Use it</div>
+  <h2>From the command line, an agent, or your code</h2>
+  <p class="lead">Every commit to <code>main</code> is a <a href="https://github.com/gmmeyer/grix/releases">release</a>, for arm64
+  macOS 15+, arm64 Linux and x86_64 Linux. Unpack one and run <code>./grix</code>: it finds its kernel and
+  VMM beside itself. On arm64 macOS and on Linux with KVM, it runs its own VMM. Elsewhere it uses QEMU.</p>
+  <div class="code-grid">
+    <div class="code"><div class="label">CLI</div><pre><span class="c"># Only /bin/net exists, and nothing is granted.</span>
+$ grix run -i ./net:/bin/net -- /bin/net
+socket: Operation not permitted
+<span class="deny">grix: denied socket: needs capability `net`</span>
 
-<h2>Python</h2>
-<p>Alpine's Python 3.12, unmodified, with its standard library imported as a root filesystem. Try opening a socket or writing a file without the capability.</p>
-<grix-example command="/usr/bin/python3 -c 'import sys, platform; print(sys.version); print(platform.machine(), sum(range(10**5)))'"
-  caps="threads fs_write net" allow="threads" memory="512"
-  files='[{"tar": "rootfs/python.tar.gz", "path": "/"}]' download="15 MB"></grix-example>
+<span class="c"># Python, with threads, and the network only to example.com.</span>
+$ grix run -a threads -a net --allow-host example.com:443 \
+    -i ./python-rootfs:/ -- /usr/bin/python3 script.py</pre></div>
+    <div class="code"><div class="label">MCP</div><pre><span class="c">// Claude Code, or any MCP client: a `run` tool
+// that runs programs in fresh sandboxes.</span>
+{"mcpServers": {"grix": {
+  "command": "grix",
+  "args": ["mcp", "--root", "/path/to/project"]
+}}}</pre></div>
+    <div class="code"><div class="label">Python</div><pre>import grix
 
-<h2>Node.js</h2>
-<grix-example command="/usr/bin/node -e 'console.log(process.version, [1,2,3].map(x => x * 7))'"
-  caps="threads fs_write net" allow="threads" memory="512"
-  files='[{"tar": "rootfs/node.tar.gz", "path": "/"}]' download="28 MB"></grix-example>
+sb = grix.Sandbox(imports={"./busybox": "/bin/busybox"},
+                  files={"/data/in.txt": "b\na\n"},
+                  capabilities=["process"], timeout=30)
+r = sb.run(["/bin/busybox", "sort", "/data/in.txt"])
+print(r.exit_code, r.stdout, r.events, r.missing_capabilities)</pre></div>
+    <div class="code"><div class="label">Rust</div><pre>let sandbox = Sandbox::builder()
+    .import("./tools/busybox.static", "/bin/busybox")?
+    .file("/data/input.csv", csv_bytes, 0o644)?
+    .allow(Capability::FsWrite)
+    .export("/out")?
+    .build()?;
+let out = sandbox.run(&amp;[
+    "/bin/busybox", "sort", "-o", "/out/sorted.csv", "/data/input.csv",
+])?;
+let needed = out.missing_capabilities();</pre></div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="eyebrow">How it works</div>
+  <h2>A kernel for one program</h2>
+  <div class="diagram">
+    <div class="box"><h3>Your process (the host)</h3><ul>
+      <li>collects the imports, argv, env and policy into a boot image</li>
+      <li>starts the VMM: grix-vmm, or QEMU</li>
+      <li>reads output, events and the exit status</li>
+      <li>makes network connections the policy allows</li></ul></div>
+    <div class="arrows"><span><b>→</b>boot image</span><span><b>←</b>framed console</span></div>
+    <div class="box vm"><h3>microVM: the grix kernel</h3><ul>
+      <li>no_std Rust, booted fresh for every run</li>
+      <li>builds a filesystem from the imports, in memory</li>
+      <li>implements Linux's system calls itself, checking each against the policy</li>
+      <li>runs your program, unmodified</li></ul></div>
+  </div>
+  <div class="points">
+    <p><strong>The hypervisor is the wall.</strong> A program that took over the grix kernel would still be in
+    a VM with no network card, no disk, and only its imports in memory.</p>
+    <p><strong>A small, confined VMM.</strong> grix-vmm, on Hypervisor.framework or KVM, emulates only the few devices grix needs.
+    Once the VM is up it confines itself: no files, no network, no new processes.</p>
+    <p><strong>No network card.</strong> Sockets become messages on the console. The host checks each one
+    against your allow-list, makes the connection, and answers DNS.</p>
+    <p><strong>Host directories without a disk.</strong> Live mounts are served by the host over the console,
+    file by file, as the program asks.</p>
+  </div>
+</section>
+
+<section id="capabilities">
+  <div class="eyebrow">Capabilities</div>
+  <h2>What a program gets</h2>
+  <div class="table-wrap"><table>
+    <tr><th>Capability</th><th>Without it</th><th>With it</th></tr>
+    <tr><td>(always)</td><td colspan="2">Memory, time, randomness, stdout/stderr, pipes, epoll, local sockets, and read access to the imported files</td></tr>
+    <tr><td>fs_write</td><td>The filesystem is read-only</td><td>The whole tree is writable in guest memory, copy-on-write over the imports. The host's files never change.</td></tr>
+    <tr><td>threads</td><td>No new threads</td><td>Threads, with futexes and preemption</td></tr>
+    <tr><td>process</td><td>No fork, exec or wait</td><td>Processes, shell pipelines, subprocess, os/exec</td></tr>
+    <tr><td>net</td><td>No sockets, and the VM has no network device</td><td>TCP and DNS through the host, only where the allow-list says, and forwarded ports for servers</td></tr>
+    <tr><td>(never)</td><td colspan="2">Privileged calls: mount, ptrace, bpf, module loading, Linux capabilities</td></tr>
+  </table></div>
+  <p class="note"><strong>Status: early prototype.</strong> grix runs a lot of real software, but it isn't
+  hardened against a determined attacker yet. See the <a href="https://github.com/gmmeyer/grix#security-model">security model</a>
+  and what's <a href="https://github.com/gmmeyer/grix#compatibility">compatible</a>.</p>
+</section>
+
+<section id="blog">
+  <div class="eyebrow">Blog</div>
+  <h2><a href="/blog/unikernels/">The Future of Software Engineering</a></h2>
+  <p class="lead">Unikernels lost to containers because they asked too much of developers. What happens
+  when friction goes to zero? Why grix exists, with the demos running in the post.</p>
+</section>
 
 </main>
+<footer class="site-footer"><div class="wrap">
+  <span>grix is open source, under the MIT license.</span>
+  <a href="https://github.com/gmmeyer/grix">Source</a>
+  <a href="https://github.com/gmmeyer/grix/releases">Releases</a>
+  <a href="https://github.com/gmmeyer/grix#readme">Documentation</a>
+  <a href="/blog/">Blog</a>
+</div></footer>
 <script>
+  // The demos need SharedArrayBuffer (QEMU's threads); say so where the
+  // page couldn't get it.
   if (!crossOriginIsolated) {
-    const w = document.getElementById('isolation');
-    w.hidden = false;
-    w.textContent = 'This page is not cross-origin isolated, so the examples cannot run: QEMU in wasm needs SharedArrayBuffer, which needs the Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp headers.';
+    for (const el of document.querySelectorAll('.isolation-warning')) el.hidden = false;
   }
 </script>
 </body>

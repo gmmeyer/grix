@@ -6,6 +6,6 @@ default-members = ["crates/abi", "crates/grix", "crates/vmm"]
 exclude = ["kernel"]
 
 [workspace.package]
-version = "0.0.18"
+version = "0.0.19"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
