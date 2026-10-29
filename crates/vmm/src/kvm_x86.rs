@@ -405,7 +405,10 @@ impl Cpu {
         let r = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_RUN as _, 0) };
         if r < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
+            // EAGAIN: a CPU that waited for its startup IPI (Linux's
+            // KVM_MP_STATE_UNINITIALIZED) has it, and runs from the next
+            // KVM_RUN, as QEMU takes it.
+            if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(libc::EAGAIN) {
                 return Ok(Exit::Interrupted);
             }
             return Err(Error(format!("KVM_RUN: {e}")));

@@ -123,8 +123,11 @@ counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
 PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
 x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
 in Linux's signal frame layout, and `sigframe::read_fp` keeps a frame's
-XSAVE header to what xrstor accepts (invariant 12). One CPU
-and no snapshots for now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
+XSAVE header to what xrstor accepts (invariant 12). More CPUs start
+with INIT and a startup IPI at a real-mode trampoline (`boot.S`
+`ap_trampoline`, copied below 1 MiB), which comes into long mode as CPU
+0 did and finds its stack by its APIC ID (`ap_main`). No snapshots for
+now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
 `kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
 COM1 by port I/O, PVH's entry state, a CPUID with nothing of the host's
 but the CPU's model and features (`guest_cpuid`: made-up brand, caches
@@ -266,7 +269,11 @@ they leave at their next schedule (`exclusive_wanted`, `kick_others`), and
 a process killed while it runs elsewhere is finished off there
 (`smp::running_anywhere`, `procs::reap_others`). Signals for a thread on
 another CPU kick it (`kick_thread`).
-TLB flushes and instruction-cache invalidation are broadcast; free pages
+TLB flushes and instruction-cache invalidation are broadcast (on
+x86_64, which has no broadcast invalidation, `flush_tlb` IPIs the other
+CPUs and waits for each, except one in the kernel: IF is clear there and
+it may be waiting for the lock, so it catches up when it gets it,
+`tlb_sync`, before it touches user memory); free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
 (`publish_barrier`). User memory other threads use at the same time is
@@ -274,7 +281,7 @@ updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
 a fixture that checks whole lines writes each with one `write`. Secondaries start with PSCI CPU_ON (`boot.S`
-`secondary_entry`).
+`secondary_entry`) on arm64, INIT and SIPI on x86_64.
 
 x86_64 programs (`Image::x86_64`, `SandboxBuilder::x86_64`, `--x86-64`):
 the guest stays arm64; an x86_64 ELF that execve meets is run by the

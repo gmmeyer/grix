@@ -473,6 +473,10 @@ pub fn flush_tlb() {
     unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
 }
 
+/// Flushes another CPU asked for and this one missed: none (`flush_tlb`
+/// broadcasts).
+pub fn tlb_sync() {}
+
 /// Make freshly written instructions at kernel address `kva` visible to instruction fetch.
 pub fn sync_icache(kva: u64, len: u64) {
     let mut a = kva & !63;
