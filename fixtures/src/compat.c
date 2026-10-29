@@ -54,6 +54,9 @@ int main(int argc, char **argv) {
     CHECK(contains("/proc/sys/fs/file-max", "4096\n"));
     CHECK(contains("/proc/sys/fs/inode-nr", "\t0\n"));
     CHECK(contains("/sys/class/net/lo/mtu", "65536\n"));
+    CHECK(contains("/proc/sys/kernel/random/entropy_avail", "256\n"));
+    CHECK(contains("/proc/sys/crypto/fips_enabled", "0\n"));
+    CHECK(contains("/proc/interrupts", "CPU0"));
     CHECK(contains("/sys/devices/system/cpu/cpu0/topology/core_id", "0\n"));
     // file-nr counts open files, everywhere: one more while this one is open.
     unsigned long nr1, nr2, unused, max;

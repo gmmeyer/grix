@@ -48,6 +48,7 @@ pub enum ProcFile {
     FileNr,
     FileMax,
     InodeNr,
+    Interrupts,
     /// /sys/devices/system/cpu/cpuN/topology/core_id.
     CoreId(u32),
     Uptime,
@@ -106,6 +107,10 @@ pub const FILES: &[(&str, ProcFile)] = &[
     // capability packages read it).
     ("/proc/sys/kernel/cap_last_cap", ProcFile::Text("40\n")),
     ("/proc/vmstat", ProcFile::Vmstat),
+    ("/proc/interrupts", ProcFile::Interrupts),
+    // What Linux 5.18+ always says: the pool is a CSPRNG's.
+    ("/proc/sys/kernel/random/entropy_avail", ProcFile::Text("256\n")),
+    ("/proc/sys/crypto/fips_enabled", ProcFile::Text("0\n")),
     // No block devices.
     ("/proc/diskstats", ProcFile::Text("")),
     ("/proc/partitions", ProcFile::Text("major minor  #blocks  name\n\n")),
@@ -233,6 +238,15 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
         }
         ProcFile::InodeNr => {
             let _ = writeln!(s, "{}\t0", fs::lock().node_count());
+        }
+        // The CPUs, and no interrupt counts: the guest's devices aren't the
+        // program's business.
+        ProcFile::Interrupts => {
+            s.push_str("    ");
+            for cpu in 0..crate::smp::count() {
+                let _ = write!(s, "       CPU{cpu}");
+            }
+            s.push('\n');
         }
         ProcFile::CoreId(cpu) => {
             let _ = writeln!(s, "{cpu}");
