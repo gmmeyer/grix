@@ -543,10 +543,27 @@ grix run --image app.grix -- python3 -V   # or another command
 
 # Nothing but grix and one static program, without a Grixfile:
 grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
+
+# For the other architecture than this host's (it runs emulated):
+grix build --arch x86_64 --from alpine:3.21 -o alpine-x86_64.grix
+grix run --image alpine-x86_64.grix -a process -- uname -m    # x86_64
 ```
 
+- An image is for one architecture, arm64 or x86_64: its kernel's, and
+  its programs'. `grix build` builds for the host's (or `GRIX_ARCH`'s, or
+  `--arch aarch64|x86_64`), pulling the Docker/OCI image's `linux/arm64`
+  or `linux/amd64` variant and packing that architecture's kernel, so an
+  image built on an x86_64 Linux host runs there natively on KVM.
+  `grix run --image` runs an image on its own architecture whatever the
+  host is: in grix-vmm where that's the host's, in QEMU (emulated)
+  otherwise; `--arch` or `GRIX_ARCH` naming another is an error.
+  `grix inspect` shows it. A base (`image:FILE`) must be for the
+  build's architecture, and an image whose command or `/bin/sh` is
+  another architecture's than its kernel is refused (as older grix built
+  them on x86_64 hosts: build it again).
+
 - `from` takes a registry reference (`alpine:3.21`,
-  `ghcr.io/owner/repo:tag`; the linux/arm64 image), `oci:DIR` (an OCI image
+  `ghcr.io/owner/repo:tag`; the build's architecture's image), `oci:DIR` (an OCI image
   layout), `docker-archive:FILE` (`docker save` output), `docker:NAME`,
   `dir:DIR`, or `image:FILE` (another grix image: its files and settings,
   to build on). Layers (tar, gzip or zstd) are applied with their
@@ -555,7 +572,9 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   entrypoint, command, environment and working directory become the grix
   image's, and so does its user (root unless it names one, as in Docker).
   A command that's a bare name is looked up on the image's `PATH`. `grix
-  pull REF --oci DIR` saves an image for offline builds.
+  pull REF --oci DIR [--arch ARCH]` saves an image (the host's
+  architecture's by default) for offline builds. `docker:NAME` asks
+  Docker for the architecture's (`docker save --platform`).
 - Private images: `grix login ghcr.io -u NAME --password-stdin` (Docker
   Hub is `docker.io`, the default) saves a login in
   `~/.config/grix/auth.json`; Docker's and Podman's logins (and credential
@@ -571,8 +590,8 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
 - Builds are cached in `~/.cache/grix/trees` (at most 10 GiB, or
   `GRIX_TREE_CACHE_MB`): what an image's layers add up to, and what each
   build step left, by everything that went into it (the files before it,
-  the step, its environment, user and working directory, the kernel and
-  the network rules). A step whose inputs haven't changed doesn't run
+  the step, its environment, user and working directory, the kernel, the
+  architecture and the network rules). A step whose inputs haven't changed doesn't run
   again; `grix build --no-cache` runs them all.
 - Build steps (`run`) run in grix itself, with `fs_write`, `process`,
   `threads` and `net`. A string runs with `/bin/sh -c`; a list such as
@@ -584,7 +603,7 @@ grix build -o hello.grix --copy ./hello:/bin/hello -- /bin/hello
   image's user. Without one or the other, it's 1000:1000. Ids mean something only inside the sandbox:
   root may switch to any user (`setuid` and friends follow Linux's rules),
   and nothing honours setuid bits.
-- `grix build` flags (`--from`, `--copy`, `--env`, `--cwd`, `--allow`,
+- `grix build` flags (`--from`, `--arch`, `--copy`, `--env`, `--cwd`, `--allow`,
   `--run`, `--exec`, `--mem`, `-- COMMAND`) add to `./Grixfile`, or make the
   whole image without one. Like Docker's build context, a Grixfile reads
   host files only under its own directory; paths given as flags may be

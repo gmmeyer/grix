@@ -103,7 +103,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     x86 KVM; every end-to-end test passes on it, in CI on an x86 runner
     with KVM (`x86.yml`); x86_64 Linux releases; AVX and AVX-512 state
     (XSAVE, in Linux's signal frame); more CPUs (INIT/SIPI, TLB flushes
-    by IPI); snapshots of x86_64 machines (grix-vmm on KVM).
+    by IPI); snapshots of x86_64 machines (grix-vmm on KVM); images per
+    architecture (`grix build --arch`, linux/amd64 pulled for x86_64), so
+    images built on x86_64 Linux run there natively.
 20. **An outside security review** (after the above).
 
 ## Agent integrations
@@ -132,6 +134,13 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       OCI layout, `docker save`, the Docker daemon) or nothing, copies, files,
       build steps (shell or argv), settings, and the kernel, in a `.grix` file.
       `grix run --image`, `SandboxBuilder::image`, `grix inspect`, `grix pull`.
+- [x] Images per architecture: `grix build` and `grix pull` for the host's
+      (or `--arch`), linux/arm64 or linux/amd64 and that kernel; an image
+      runs on its own architecture anywhere (emulated in QEMU if it isn't
+      the host's), and mismatches (kernel, machine, programs, a base
+      image, `--arch`) are errors. The build cache is per architecture.
+- [ ] Multi-architecture images (one `.grix` with both kernels and trees),
+      if a use turns up: today it's one file per architecture.
 - [x] zstd-compressed layers (and multi-member gzip).
 - [x] Registries that need credentials: `grix login`, Docker's and Podman's
       logins and credential helpers, Bearer (with a login or an identity

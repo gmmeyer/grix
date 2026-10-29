@@ -142,15 +142,23 @@ file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),
 Docker/OCI image (`oci.rs` pulls from registries and reads OCI layouts and
 `docker save` archives, applying layers with whiteouts and checking
 digests; zstd too), copies, files, and build steps, or another grix
-image (`image:FILE`). Registry logins come from `auth.rs` (only when a
+image (`image:FILE`). An image is one architecture's: its kernel's ELF
+machine is what it is (`Image::arch`, nothing in `grix-image.json`).
+A build targets one (`BuildOptions::arch`: the host's, `GRIX_ARCH`'s or
+`--arch`), pulls that platform (`linux/arm64`, `linux/amd64`) and packs
+that kernel; `SandboxBuilder::image` switches the machine (VMM or QEMU,
+accelerator, image base) to the image's unless an architecture was
+chosen, which is then an error, as is a kernel for another machine
+(`vmm::check_machine`) or programs for another kernel
+(`container::check_programs`). Registry logins come from `auth.rs` (only when a
 registry asks, to its own site's token service; agents' builds only
 with `--registry-credentials`). Every connection a pull makes goes
 through `oci::Resolver`, which checks the addresses names resolve to
 against the build's network policy (`net::reachable`), as the proxy
 checks a program's.
 `treecache.rs` keeps applied layers and build steps' results, keyed by
-what went into them: anything new that changes a step's result belongs
-in `build::step_key`. Steps run in grix itself and
+what went into them (the architecture too): anything new that changes a
+step's result belongs in `build::step_key`. Steps run in grix itself and
 export `/`; nodes the kernel made at boot (`Node::generated`) stay out
 unless the step changed them. They run as the image's user
 (`ImageConfig::user`, an OCI image's `User`, root by default as in

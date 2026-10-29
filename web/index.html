@@ -191,10 +191,11 @@ grix run --image alpine.grix -a process -a net --allow-host example.com:80 -- \
       <code>--device /dev/kvm</code> to a container. Without KVM, grix falls back to QEMU
       (<code>qemu-system-aarch64</code> or <code>qemu-system-x86_64</code>), which emulates and is much
       slower.</li>
-      <li><strong>x86_64 Linux:</strong> images built from Docker/OCI images are arm64 for now. Set
-      <code>GRIX_ARCH=aarch64</code> for <code>grix build</code> and <code>grix run</code>, and they run
-      emulated in <code>qemu-system-aarch64</code>. x86_64 programs you import yourself run natively on
-      KVM.</li>
+      <li><strong>Architectures:</strong> <code>grix build</code> makes an image for the host's
+      architecture, from the Docker/OCI image's <code>linux/amd64</code> or <code>linux/arm64</code>
+      variant, so on x86_64 Linux with KVM and on Apple silicon it runs natively. An image runs on its own
+      architecture wherever it is: <code>grix build --arch aarch64</code> (or <code>x86_64</code>) makes one
+      for the other, which runs emulated in QEMU.</li>
       <li><strong>From source:</strong> <code>git clone https://github.com/gmmeyer/grix &amp;&amp; cd grix &amp;&amp; make</code>
       needs Rust, and zig and Go for the test programs. See the
       <a href="https://github.com/gmmeyer/grix#quick-start">README</a>.</li>

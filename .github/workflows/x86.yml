@@ -34,7 +34,7 @@ jobs:
       - name: Packages
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 golang-go
+          sudo apt-get install -y -q qemu-system-x86 qemu-system-arm golang-go
           curl -sSfL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" -o zig.tar.xz
           echo "$ZIG_SHA256  zig.tar.xz" | sha256sum -c
           mkdir -p "$HOME/zig" && tar xf zig.tar.xz -C "$HOME/zig" --strip-components=1
@@ -42,10 +42,11 @@ jobs:
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal
-          rustup target add x86_64-unknown-none
-      - name: The x86_64 kernel, grix, grix-vmm and the Python module
+          rustup target add x86_64-unknown-none aarch64-unknown-none-softfloat
+      # The arm64 kernel too: arm64 images run here, emulated.
+      - name: The kernels, grix, grix-vmm and the Python module
         run: |
-          (cd kernel && cargo build --release --target x86_64-unknown-none)
+          (cd kernel && cargo build --release --target x86_64-unknown-none && cargo build --release)
           cargo build --release -p grix -p grix-vmm
           make python
       - name: Fixtures
@@ -54,6 +55,9 @@ jobs:
           python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/alpine-x86_64 busybox-static busybox
           python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/python-x86_64 python3 ca-certificates-bundle
           python3 -I tools/alpine.py --arch x86_64 --out fixtures/build/node-x86_64 nodejs
+          ./target/release/grix pull alpine:3.21 --oci fixtures/build/oci-x86_64/alpine
+          ./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci-x86_64/debian
+          ./target/release/grix pull --arch aarch64 alpine:3.21 --oci fixtures/build/oci/alpine
       - name: Unit tests
         run: cargo test -p grix --lib
       - name: A first run in grix-vmm
@@ -67,6 +71,17 @@ jobs:
           set -e
           echo "$out (exit $code)"
           echo "$out" | grep -q "hello from grix-vmm" && [ "$code" = 7 ]
+      # What a user does first: an image from Docker Hub, with no
+      # architecture given. It's x86_64's, and runs natively in grix-vmm.
+      - name: An image from Docker Hub, natively in grix-vmm
+        run: |
+          ./target/release/grix build --from alpine:3.21 -o alpine.grix
+          ./target/release/grix inspect alpine.grix | tee /dev/stderr | grep -q '"arch": "x86_64"'
+          out=$(./target/release/grix run -v --image alpine.grix -a process -- /bin/sh -c 'uname -m; cat /etc/alpine-release' 2>&1)
+          echo "$out"
+          echo "$out" | grep -qx 'grix: an x86_64 machine in grix-vmm'
+          echo "$out" | grep -qx x86_64
+          echo "$out" | grep -q '^3\.21\.'
       # The MCP server's and Python's tests pick their fixtures by
       # GRIX_ARCH too, so they run on each architecture.
       - name: End-to-end tests on the x86_64 kernel, in grix-vmm (KVM)
