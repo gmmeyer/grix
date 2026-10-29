@@ -253,6 +253,11 @@ static int test_ids(void) {
     gid_t groups[4];
     CHECK(getgroups(0, 0) == 1 && getgroups(4, groups) == 1 && groups[0] == 1000);
     CHECK(setgroups(1, groups) == -1 && errno == EPERM);
+    // setfsuid/setfsgid return the old id whatever happens; -1 only reads it.
+    CHECK(syscall(SYS_setfsuid, -1) == 1000 && syscall(SYS_setfsuid, 1000) == 1000);
+    CHECK(syscall(SYS_setfsuid, 0) == 1000 && syscall(SYS_setfsuid, -1) == 1000);
+    CHECK(syscall(SYS_setfsgid, -1) == 1000 && syscall(SYS_setfsgid, 0) == 1000);
+    CHECK(syscall(SYS_setfsgid, -1) == 1000);
     return 0;
 }
 
