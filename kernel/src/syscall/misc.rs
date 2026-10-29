@@ -85,6 +85,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
         }
         nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
+        nr::setfsuid | nr::setfsgid => set_fs_id(p, n, name, a[0] as u32),
         nr::umask => {
             let old = p.umask;
             p.umask = a[0] as u32 & 0o777;
@@ -260,6 +261,22 @@ fn set_ids(p: &mut Process, n: u32, _name: &str, a: [u64; 6]) -> SysResult {
     }
     crate::fs::lock().proc_owner(p.pid, (p.uid, p.gid));
     Ok(0)
+}
+
+/// setfsuid and setfsgid. The file system ids here are always the
+/// effective ones, as on Linux until a program sets them apart, so asking
+/// for the effective id (or an invalid one, -1, which is how a program
+/// reads it) changes nothing. Linux returns the old id whatever happens,
+/// so a program sees a refused change only by asking again: one it may
+/// make but grix can't (an id apart from the effective one) is reported
+/// and refused the same way.
+fn set_fs_id(p: &mut Process, n: u32, name: &str, id: u32) -> SysResult {
+    let users = n == nr::setfsuid;
+    let (r, e, s) = if users { (p.ids.ruid, p.uid, p.ids.suid) } else { (p.ids.rgid, p.gid, p.ids.sgid) };
+    if id != u32::MAX && id != e && (p.uid == 0 || id == r || id == s) {
+        let _ = p.unimplemented(n, name, "file system ids apart from the effective ones", EINVAL);
+    }
+    Ok(e as u64)
 }
 
 fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {

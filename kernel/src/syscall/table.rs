@@ -167,6 +167,8 @@ syscalls! {
     148 getresuid Core;
     149 setresgid Core;
     150 getresgid Core;
+    151 setfsuid Core;
+    152 setfsgid Core;
     153 times Core;
     154 setpgid Cap(Process);
     155 getpgid Core;
@@ -378,6 +380,8 @@ syscalls! {
     119 setresgid Core;
     120 getresgid Core;
     121 getpgid Core;
+    122 setfsuid Core;
+    123 setfsgid Core;
     124 getsid Core;
     125 capget Core;
     126 capset Privileged;

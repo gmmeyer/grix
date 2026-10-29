@@ -150,21 +150,73 @@ impl TrapFrame {
     }
 }
 
-/// User x87/SSE state, as `fxsave` writes it.
-#[repr(C, align(16))]
+/// Room for the largest XSAVE area this kernel keeps (standard format):
+/// the legacy x87/SSE region, the header, AVX's upper halves, and
+/// AVX-512's opmasks and upper registers.
+pub const FP_AREA: usize = 2688;
+
+/// User x87/SSE state as `fxsave` writes it, or, once `init_xsave` has
+/// turned XSAVE on, every component in `XCR0` as `xsave` writes them.
+#[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct FpState {
-    pub area: [u8; 512],
+    pub area: [u8; FP_AREA],
 }
 
 impl Default for FpState {
     /// The state a new program starts with (as `fninit` and Linux leave
-    /// it): FCW 0x37f, MXCSR 0x1f80 (every exception masked).
+    /// it): FCW 0x37f, MXCSR 0x1f80 (every exception masked), and an
+    /// XSAVE header that has every other component in its initial state.
     fn default() -> Self {
-        let mut area = [0u8; 512];
+        let mut area = [0u8; FP_AREA];
         area[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
         area[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
         FpState { area }
+    }
+}
+
+/// The XSAVE components user code has (XCR0), or 0 for fxsave alone.
+static XCR0: AtomicU64 = AtomicU64::new(0);
+/// The size of their XSAVE area (standard format).
+static XSAVE_SIZE: AtomicU32 = AtomicU32::new(0);
+
+/// The XSAVE components user state has, or 0 without XSAVE.
+pub fn xsave_features() -> u64 {
+    XCR0.load(Ordering::Relaxed)
+}
+
+/// The size of user state's XSAVE area, or 0 without XSAVE (fxsave's 512).
+pub fn xsave_size() -> usize {
+    XSAVE_SIZE.load(Ordering::Relaxed) as usize
+}
+
+/// Turn XSAVE on for x87, SSE and AVX, and AVX-512 when the CPU has all of
+/// its three components, as Linux does (glibc, musl and compilers look
+/// for OSXSAVE and XCR0 before they use AVX). Not MPX, PKRU or AMX: their
+/// state isn't user code's to use here. Without XSAVE, fxsave alone.
+fn init_xsave() {
+    if cpuid(1, 0)[2] & (1 << 26) == 0 {
+        return;
+    }
+    // SAFETY: CR4.OSXSAVE, on a CPU that has XSAVE.
+    unsafe {
+        asm!("mov {t}, cr4", "or {t}, {set}", "mov cr4, {t}", t = out(reg) _, set = in(reg) 1u64 << 18,
+             options(nostack));
+    }
+    let d = cpuid(0xd, 0);
+    let have = (d[3] as u64) << 32 | d[0] as u64;
+    let avx = if have & 0b111 == 0b111 { 0b111 } else { 0b11 };
+    let avx512 = if avx == 0b111 && have & 0xe0 == 0xe0 { avx | 0xe0 } else { avx };
+    for mask in [avx512, avx, 0b11] {
+        // SAFETY: components the CPU supports, x87 and SSE among them.
+        unsafe { asm!("xsetbv", in("ecx") 0, in("eax") mask as u32, in("edx") (mask >> 32) as u32, options(nostack)) };
+        // CPUID 0xd's EBX: the area's size for what XCR0 has now.
+        let size = cpuid(0xd, 0)[1];
+        if size as usize <= FP_AREA {
+            XCR0.store(mask, Ordering::Relaxed);
+            XSAVE_SIZE.store(size, Ordering::Relaxed);
+            return;
+        }
     }
 }
 
@@ -207,14 +259,32 @@ pub unsafe fn return_to_frame(frame: *const TrapFrame) -> ! {
 }
 
 pub fn save_fp(state: &mut FpState) {
-    // SAFETY: a 512-byte, 16-byte aligned area.
-    unsafe { asm!("fxsave64 [{}]", in(reg) state.area.as_mut_ptr(), options(nostack)) };
+    let mask = xsave_features();
+    // SAFETY: a 64-byte aligned area, larger than XSAVE_SIZE. xsave writes
+    // only the header's first 8 bytes (XSTATE_BV): the rest stay zero.
+    unsafe {
+        if mask == 0 {
+            asm!("fxsave64 [{}]", in(reg) state.area.as_mut_ptr(), options(nostack));
+        } else {
+            asm!("xsave64 [{}]", in(reg) state.area.as_mut_ptr(), in("eax") mask as u32,
+                 in("edx") (mask >> 32) as u32, options(nostack));
+        }
+    }
 }
 
 pub fn restore_fp(state: &FpState) {
-    // SAFETY: as above. A frame from user memory may hold any MXCSR:
-    // `sigframe` clears its reserved bits first (they'd fault here).
-    unsafe { asm!("fxrstor64 [{}]", in(reg) state.area.as_ptr(), options(nostack)) };
+    let mask = xsave_features();
+    // SAFETY: as above. A frame from user memory may hold any MXCSR or
+    // XSAVE header: `sigframe` keeps only what these accept (anything else
+    // would fault here).
+    unsafe {
+        if mask == 0 {
+            asm!("fxrstor64 [{}]", in(reg) state.area.as_ptr(), options(nostack));
+        } else {
+            asm!("xrstor64 [{}]", in(reg) state.area.as_ptr(), in("eax") mask as u32,
+                 in("edx") (mask >> 32) as u32, options(nostack));
+        }
+    }
 }
 
 const MSR_EFER: u32 = 0xc000_0080;
@@ -572,8 +642,13 @@ pub fn cpuinfo(s: &mut alloc::string::String, cpus: u32) {
         }
     }
     for (i, n) in ECX.iter().enumerate() {
-        // No AVX: this kernel doesn't save its state (fxsave).
-        if f[2] & (1 << i) != 0 && !n.is_empty() && !matches!(*n, "xsave" | "avx" | "f16c" | "fma") {
+        // AVX only when this kernel keeps its state (XSAVE with AVX on).
+        let off = match *n {
+            "xsave" => xsave_features() == 0,
+            "avx" | "f16c" | "fma" => xsave_features() & 0b100 == 0,
+            _ => false,
+        };
+        if f[2] & (1 << i) != 0 && !n.is_empty() && !off {
             flags.push(*n);
         }
     }
@@ -646,7 +721,7 @@ extern "C" fn arch_init() {
         IDT.0[2 * n + 1].store(handler >> 32, Ordering::Relaxed);
     }
     init_cpu(0);
-    // x87 and SSE for user code: fxsave/fxrstor, SSE exceptions as #XM.
+    // x87 and SSE for user code, SSE exceptions as #XM; then XSAVE.
     // SAFETY: control register setup on this CPU.
     unsafe {
         asm!("mov {t}, cr0", "and {t}, {clear}", "or {t}, {set}", "mov cr0, {t}",
@@ -656,6 +731,7 @@ extern "C" fn arch_init() {
              set = in(reg) (1u64 << 9) | (1 << 10), options(nostack));
         asm!("fninit", options(nomem, nostack));
     }
+    init_xsave();
     TSC_HZ.store(irq::measure_tsc(), Ordering::Relaxed);
 }
 
