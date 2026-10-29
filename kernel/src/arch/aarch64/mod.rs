@@ -172,6 +172,8 @@ pub const ELF_DYN_BASE: u64 = 0x0000_aaaa_aaa0_0000;
 
 /// ELF's e_machine for the programs this kernel runs.
 pub const ELF_MACHINE: u16 = 183; // EM_AARCH64
+/// Why an ELF for another machine doesn't load.
+pub const ELF_OTHER_MACHINE: &str = "not an AArch64 binary";
 /// AT_PLATFORM and uname's machine.
 pub const PLATFORM: &str = "aarch64";
 /// Linux's MINSIGSTKSZ: room for a frame with the FP/SIMD record.

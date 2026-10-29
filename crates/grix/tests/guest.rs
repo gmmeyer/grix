@@ -446,6 +446,17 @@ fn non_executable_program() {
 }
 
 #[test]
+fn program_for_another_machine() {
+    // hello for this guest, with RISC-V's e_machine: the kernel names its own.
+    let mut elf = std::fs::read(fixture("hello")).unwrap();
+    elf[18..20].copy_from_slice(&243u16.to_le_bytes());
+    let out = run(Sandbox::builder().file("/bin/x", elf, 0o755).unwrap(), &["/bin/x"]);
+    assert_eq!(out.status, ExitStatus::Exited(126));
+    let want = if x86_64_guest() { "/bin/x: not an x86_64 binary" } else { "/bin/x: not an AArch64 binary" };
+    assert!(matches!(&out.events[..], [GuestEvent::ExecFailed { reason, .. }] if reason == want), "{:?}", out.events);
+}
+
+#[test]
 fn reserved_and_relative_guest_paths_are_rejected() {
     assert!(Sandbox::builder().file("/dev/x", "", 0o644).is_err());
     assert!(Sandbox::builder().file("relative", "", 0o644).is_err());

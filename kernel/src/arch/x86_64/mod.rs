@@ -348,6 +348,8 @@ pub const ELF_DYN_BASE: u64 = 0x0000_5555_5555_0000;
 
 /// ELF's e_machine for the programs this kernel runs.
 pub const ELF_MACHINE: u16 = 62; // EM_X86_64
+/// Why an ELF for another machine doesn't load.
+pub const ELF_OTHER_MACHINE: &str = "not an x86_64 binary";
 /// AT_PLATFORM and uname's machine.
 pub const PLATFORM: &str = "x86_64";
 /// Linux's MINSIGSTKSZ.
