@@ -64,6 +64,8 @@ cp target/wasm32-unknown-unknown/release/grix_web.wasm "$DIST/"
 cp web/grix.js web/tar.js web/grix-example.js web/site.css web/index.html web/smoke.html "$DIST/"
 rm -rf "$DIST/demos" "$DIST/blog"
 cp -r web/demos web/blog "$DIST/"
+# grix's icon (web/tools/icon.py draws it), at the root where browsers look.
+cp web/icons/* "$DIST/"
 
 # Cloudflare Pages (and Netlify) take headers from _headers: isolation for
 # a page served here, and CORS and CORP so pages elsewhere can use the files.
