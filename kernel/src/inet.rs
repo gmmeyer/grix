@@ -370,40 +370,76 @@ pub struct Listener {
     pub port: u16,
     /// What it bound: which loopback connections reach it.
     pub addr: Addr,
+    /// IPV6_V6ONLY: a v6 wildcard that leaves v4 to another listener.
+    v6only: bool,
     backlog: usize,
     pub queue: VecDeque<Pending>,
     pub version: u64,
 }
 
-static LISTENERS: Mutex<BTreeMap<u16, Weak<Mutex<Listener>>>> = Mutex::new(BTreeMap::new());
+/// Each port's listeners: one, or a v4 one and a v6 one with IPV6_V6ONLY
+/// (as servers that listen on both, like Redis, make them).
+static LISTENERS: Mutex<BTreeMap<u16, Vec<Weak<Mutex<Listener>>>>> = Mutex::new(BTreeMap::new());
+
+/// Which families a listener on `addr` takes: (v4, v6). A v6 wildcard
+/// takes v4 too unless it's IPV6_V6ONLY.
+fn families(addr: Addr, v6only: bool) -> (bool, bool) {
+    match addr {
+        Addr::V4(_) => (true, false),
+        Addr::V6(a) => (a == [0; 16] && !v6only, true),
+    }
+}
+
+/// The live listeners on `port`.
+fn listeners_on(port: u16) -> Vec<Arc<Mutex<Listener>>> {
+    LISTENERS.lock().get(&port).map_or(Vec::new(), |v| v.iter().filter_map(Weak::upgrade).collect())
+}
 
 impl Listener {
     /// Listen on `port` of `addr` (port 0: pick one). EADDRINUSE if
     /// someone already listens there.
-    pub fn listen(addr: Addr, port: u16, backlog: usize) -> Result<Arc<Mutex<Listener>>, Errno> {
-        let mut listeners = LISTENERS.lock();
-        listeners.retain(|_, w| w.strong_count() > 0);
+    pub fn listen(addr: Addr, port: u16, backlog: usize, v6only: bool) -> Result<Arc<Mutex<Listener>>, Errno> {
         let port = if port != 0 {
             port
         } else {
-            (0..1000).map(|_| ephemeral_port()).find(|p| !listeners.contains_key(p)).ok_or(Errno(98))?
+            (0..1000).map(|_| ephemeral_port()).find(|&p| !Listener::is_bound(p)).ok_or(Errno(98))?
         };
-        if listeners.contains_key(&port) {
+        if Listener::conflicts(addr, port, v6only) {
             return Err(Errno(98)); // EADDRINUSE
         }
         let l = Arc::new(Mutex::new(Listener {
             port,
             addr,
+            v6only,
             backlog: backlog.clamp(1, 4096),
             queue: VecDeque::new(),
             version: 0,
         }));
-        listeners.insert(port, Arc::downgrade(&l));
+        let mut listeners = LISTENERS.lock();
+        let on = listeners.entry(port).or_default();
+        on.retain(|w| w.strong_count() > 0);
+        on.push(Arc::downgrade(&l));
         Ok(l)
     }
 
     pub fn is_bound(port: u16) -> bool {
-        LISTENERS.lock().get(&port).is_some_and(|w| w.strong_count() > 0)
+        !listeners_on(port).is_empty()
+    }
+
+    /// Would a listener on `addr`, `port` take connections one there
+    /// already does?
+    pub fn conflicts(addr: Addr, port: u16, v6only: bool) -> bool {
+        let (v4, v6) = families(addr, v6only);
+        listeners_on(port).iter().any(|l| {
+            let l = l.lock();
+            let (lv4, lv6) = families(l.addr, l.v6only);
+            (v4 && lv4) || (v6 && lv6)
+        })
+    }
+
+    /// The listener a connection to `to` reaches.
+    fn find(to: SockAddr) -> Option<Arc<Mutex<Listener>>> {
+        listeners_on(to.port).into_iter().find(|l| l.lock().takes(to))
     }
 
     fn push(&mut self, p: Pending) -> Result<(), Pending> {
@@ -425,7 +461,8 @@ impl Listener {
     fn takes(&self, to: SockAddr) -> bool {
         let wildcard = SockAddr { addr: self.addr, port: 0 }.is_unspecified();
         match (self.addr, to.addr) {
-            (Addr::V6(_), _) if wildcard => true,
+            (Addr::V6(_), Addr::V4(_)) if wildcard => !self.v6only,
+            (Addr::V6(_), Addr::V6(_)) if wildcard => true,
             (Addr::V4(_), Addr::V4(_)) => wildcard || self.addr == to.addr,
             (Addr::V6(a), Addr::V6(b)) => a == b,
             _ => false,
@@ -436,8 +473,11 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         let mut listeners = LISTENERS.lock();
-        if listeners.get(&self.port).is_some_and(|w| w.strong_count() == 0) {
-            listeners.remove(&self.port);
+        if let Some(on) = listeners.get_mut(&self.port) {
+            on.retain(|w| w.strong_count() > 0);
+            if on.is_empty() {
+                listeners.remove(&self.port);
+            }
         }
     }
 }
@@ -445,10 +485,7 @@ impl Drop for Listener {
 /// connect() to the guest's own address: a socket pair, one end queued on
 /// the listener. ECONNREFUSED if nothing listens there (or its queue is full).
 pub fn connect_local(peer: SockAddr) -> Result<(SocketEnd, SockAddr), Errno> {
-    let listener = LISTENERS.lock().get(&peer.port).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?;
-    if !listener.lock().takes(peer) {
-        return Err(ECONNREFUSED);
-    }
+    let listener = Listener::find(peer).ok_or(ECONNREFUSED)?;
     let slot = Slot::take().ok_or(ECONNREFUSED)?;
     let local = SockAddr { addr: peer.addr, port: ephemeral_port() };
     let (ours, theirs) = ipc::socketpair();
@@ -842,8 +879,9 @@ pub fn from_host(payload: &[u8]) {
             }
         }
         ToGuest::Incoming { id, port, peer, peer_port } => {
-            let listener = LISTENERS.lock().get(&port).and_then(Weak::upgrade);
             let local = SockAddr::v4(link::GUEST_V4, port);
+            // Forwarded to the port, whatever address it listens on.
+            let listener = Listener::find(local).or_else(|| listeners_on(port).into_iter().next());
             let made = Conn::new(id, ConnState::Open, local, SockAddr { addr: peer, port: peer_port });
             match (listener, made.and_then(Conn::register), Slot::take()) {
                 // A refused Conn says Close as it's dropped.
@@ -923,6 +961,8 @@ pub struct Inet {
     /// SO_RCVTIMEO and SO_SNDTIMEO, in ns.
     pub rcvtimeo: Option<u64>,
     pub sndtimeo: Option<u64>,
+    /// IPV6_V6ONLY.
+    pub v6only: bool,
 }
 
 impl Inet {
@@ -936,6 +976,7 @@ impl Inet {
             peer: None,
             rcvtimeo: None,
             sndtimeo: None,
+            v6only: false,
         }
     }
 

@@ -77,11 +77,53 @@ static int fdlink(void) {
     return 0;
 }
 
+// Redis listens on 0.0.0.0 and on [::] with IPV6_V6ONLY, both on the
+// same port: one listener per family.
+static int v6only(void) {
+    int one = 1, v = 0;
+    socklen_t len = sizeof v;
+    struct sockaddr_in a4 = {.sin_family = AF_INET, .sin_port = htons(7000)};
+    struct sockaddr_in6 a6 = {.sin6_family = AF_INET6, .sin6_port = htons(7000)};
+    int s4 = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    CHECK(bind(s4, (struct sockaddr *)&a4, sizeof a4) == 0 && listen(s4, 8) == 0);
+    // Without IPV6_V6ONLY, [::] takes v4 too: that's in use.
+    int dual = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(bind(dual, (struct sockaddr *)&a6, sizeof a6) == -1 && errno == EADDRINUSE);
+    int s6 = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    CHECK(getsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &v, &len) == 0 && v == 0);
+    CHECK(setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == 0);
+    CHECK(getsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &v, &len) == 0 && v == 1);
+    CHECK(bind(s6, (struct sockaddr *)&a6, sizeof a6) == 0 && listen(s6, 8) == 0);
+    CHECK(setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == -1 && errno == EINVAL);
+    CHECK(setsockopt(s4, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == -1 && errno == ENOPROTOOPT);
+    // Each family's connections reach its own listener.
+    a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a6.sin6_addr = in6addr_loopback;
+    int c4 = socket(AF_INET, SOCK_STREAM, 0), c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(connect(c4, (struct sockaddr *)&a4, sizeof a4) == 0);
+    CHECK(connect(c6, (struct sockaddr *)&a6, sizeof a6) == 0);
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof peer;
+    int x4 = accept(s4, (struct sockaddr *)&peer, &plen);
+    CHECK(x4 >= 0 && peer.ss_family == AF_INET);
+    plen = sizeof peer;
+    int x6 = accept(s6, (struct sockaddr *)&peer, &plen);
+    CHECK(x6 >= 0 && peer.ss_family == AF_INET6);
+    CHECK(accept(s4, 0, 0) == -1 && errno == EAGAIN);
+    CHECK(accept(s6, 0, 0) == -1 && errno == EAGAIN);
+    // Once they're closed, a dual-stack [::] may have the port.
+    close(s4);
+    close(s6);
+    CHECK(bind(dual, (struct sockaddr *)&a6, sizeof a6) == 0 && listen(dual, 8) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
         if (strcmp(argv[i], "auxv") == 0) r = auxv();
         if (strcmp(argv[i], "fdlink") == 0) r = fdlink();
+        if (strcmp(argv[i], "v6only") == 0) r = v6only();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

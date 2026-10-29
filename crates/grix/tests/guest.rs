@@ -1762,6 +1762,12 @@ fn descriptors_through_symlinks() {
 }
 
 #[test]
+fn ipv6_only_listeners_beside_ipv4_ones() {
+    // Redis's 0.0.0.0:6379 and [::]:6379 (IPV6_V6ONLY).
+    popular(with("popular").allow(Capability::Net), &["v6only"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

@@ -666,6 +666,25 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
 /// membership) don't change what a socket that only knows `lo` says.
 pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
+    const IPV6_V6ONLY: u64 = 26;
+    // Which listener on a port takes v4 connections (Redis listens on
+    // 0.0.0.0 and on [::] with it).
+    if is_inet(&file) && (level, name) == (IPPROTO_IPV6, IPV6_V6ONLY) {
+        if len < 4 {
+            return Err(EINVAL);
+        }
+        let on = read_u32(&mut p.aspace, val)? != 0;
+        return with_inet(p, fd, |_, s, _| {
+            if !s.v6 {
+                return Err(ENOPROTOOPT);
+            }
+            if s.bound.is_some() {
+                return Err(EINVAL);
+            }
+            s.v6only = on;
+            Ok(0)
+        })?;
+    }
     // TCP and IP options don't change connections the host makes.
     if is_inet(&file) && matches!(level, IPPROTO_IP | IPPROTO_TCP | IPPROTO_IPV6 | IPPROTO_UDP) {
         return Ok(0);
@@ -811,7 +830,7 @@ fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
         s.bound = Some(local);
         return Ok(0);
     }
-    if a.port != 0 && Listener::is_bound(a.port) {
+    if a.port != 0 && Listener::conflicts(a.addr, a.port, s.v6only) {
         return Err(Errno(98)); // EADDRINUSE
     }
     // Port 0 means one is picked now, as Linux does at bind (getsockname
@@ -836,7 +855,7 @@ fn inet_listen(s: &mut Inet, backlog: u64) -> SysResult {
     }
     let unspecified = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
     let bound = s.bound.unwrap_or(unspecified);
-    let l = Listener::listen(bound.addr, bound.port, (backlog as i32).max(1) as usize)?;
+    let l = Listener::listen(bound.addr, bound.port, (backlog as i32).max(1) as usize, s.v6only)?;
     s.bound = Some(SockAddr { port: l.lock().port, ..bound });
     s.state = State::Listening(l);
     Ok(0)
@@ -1292,7 +1311,7 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
         (SOL_SOCKET, SO_PROTOCOL) => (if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP }) as u32,
         (SOL_SOCKET, SO_DOMAIN) => (if s.v6 { AF_INET6 } else { AF_INET }) as u32,
         (IPPROTO_TCP, TCP_NODELAY) => 1,
-        (IPPROTO_IPV6, IPV6_V6ONLY) => 0,
+        (IPPROTO_IPV6, IPV6_V6ONLY) if s.v6 => s.v6only as u32,
         (IPPROTO_TCP | IPPROTO_IP | IPPROTO_IPV6, _) => 0,
         _ => return Err(ENOPROTOOPT),
     })
