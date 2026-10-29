@@ -1189,7 +1189,9 @@ impl Fs {
             if let Some(pid) = self.fd_dir_pid(parent) {
                 return Some((pid, name.parse().ok()?));
             }
-            let child = self.find_child(parent, &name).ok()??;
+            // The lookup that found nothing has just been there: a link
+            // on the way is known without asking a live mount's host.
+            let child = self.child(parent, &name)?;
             if !follow || !matches!(self.nodes[child].kind, Kind::Symlink(_)) {
                 return None;
             }
