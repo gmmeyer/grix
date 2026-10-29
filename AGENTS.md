@@ -9,7 +9,7 @@ what the project is and how to use it, see [README.md](README.md).
 make kernel      # guest kernels -> kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel
                  #                  and kernel/target/x86_64-unknown-none/release/grix-kernel
 make host        # host CLI      -> target/release/grix
-make vmm         # our own VMM   -> target/release/grix-vmm (arm64 macOS 15+ / Linux KVM; codesigned on macOS)
+make vmm         # our own VMM   -> target/release/grix-vmm (arm64 macOS 15+ / arm64 and x86_64 Linux KVM; codesigned on macOS)
 make python      # grix's native Python module -> python/grix/_native.abi3.so (PyO3)
 make fixtures    # C (zig) and Go test programs + Alpine busybox, python3, nodejs (network, cached)
 make test        # everything; end-to-end tests boot the kernel in grix-vmm (or QEMU)
@@ -26,8 +26,9 @@ make check       # clippy for host and kernel
   `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
   built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
   are never skipped.
-- Which VMM: grix's own (`crates/vmm`) on arm64 macOS 15+ and arm64 Linux
-  with KVM, when it's built; QEMU otherwise. `GRIX_ACCEL=hvf|kvm|tcg` (or
+- Which VMM: grix's own (`crates/vmm`) for the host's own architecture's
+  guests, on arm64 macOS 15+ and on arm64 and x86_64 Linux with KVM, when
+  it's built; QEMU otherwise. `GRIX_ACCEL=hvf|kvm|tcg` (or
   `.accel(...)`) means QEMU with that accelerator; `GRIX_VMM=PATH|qemu`
   picks too. The machine layout is `grix_abi::machine`'s; the one thing
   that differs, where the GIC redistributors are, is in the boot image's
@@ -114,8 +115,14 @@ idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
 instruction), as a masked one waits in the GIC on arm64. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
-PIT; the APIC timer is one-shot. FP state is fxsave's (no AVX). One CPU,
-QEMU only (no grix-vmm, no snapshots) for now.
+PIT; the APIC timer is one-shot. FP state is fxsave's (no AVX). One CPU
+and no snapshots for now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
+`kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
+COM1 by port I/O, PVH's entry state, the hypervisor timing leaf filled
+in (`KVM_GET_TSC_KHZ`), and a seccomp filter of x86_64's numbers that
+kills the x32 ABI's. `.github/workflows/x86.yml` runs the end-to-end
+tests on a GitHub x86 runner with KVM, in grix-vmm and in QEMU (push to a
+`ci/**` branch to try something without a release).
 
 Images (`crates/grix/src/container.rs`, `build.rs`, `oci.rs`): a `.grix`
 file is a gzipped tar of `grix-image.json` (settings and `ABI_VERSION`),

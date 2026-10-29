@@ -74,6 +74,7 @@ struct State {
 }
 
 impl State {
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// The device as the driver set it up, for a snapshot.
     fn save(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -95,6 +96,7 @@ impl State {
         w.buf
     }
 
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     fn load(b: &[u8]) -> Option<State> {
         let mut r = Reader::new(b);
         let mut s = State {
@@ -149,6 +151,7 @@ impl Console {
         Self::start_with(mem, line, State::default())
     }
 
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// The device as `save` left it, for a run restored from a snapshot.
     pub fn restore(mem: Arc<GuestMemory>, line: Line, saved: &[u8]) -> Result<Arc<Console>, String> {
         let state = State::load(saved).ok_or("the snapshot's console state is malformed")?;
@@ -158,6 +161,7 @@ impl Console {
         Ok(console)
     }
 
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     /// Take a snapshot with `f`, given the device's state, while nothing
     /// moves through the device (the lock keeps the reader and writer from
     /// touching guest memory). `None` if something is on its way (output,

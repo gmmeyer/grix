@@ -257,7 +257,12 @@ fn macos_major() -> Option<u32> {
 /// source tree's build. `GRIX_VMM=qemu`, or choosing a QEMU accelerator,
 /// means QEMU.
 pub(crate) fn default_vmm() -> Option<PathBuf> {
-    vmm_in(home_dir("target/release/grix-vmm").as_deref())
+    default_vmm_for(Arch::from_env())
+}
+
+/// grix-vmm for `arch`'s guests, where it runs them.
+fn default_vmm_for(arch: Arch) -> Option<PathBuf> {
+    vmm_for(home_dir("target/release/grix-vmm").as_deref(), arch)
 }
 
 /// Where an installation's `file` is: beside the running program (a
@@ -285,7 +290,11 @@ const SOURCE_TREE: Option<&str> = if option_env!("GRIX_RELEASE_BUILD").is_some()
 /// grix-vmm in `dir` (an installation), or this source tree's build, unless
 /// `GRIX_VMM` says otherwise. None where it doesn't run.
 pub(crate) fn vmm_in(dir: Option<&Path>) -> Option<PathBuf> {
-    if !vmm_runs_here() {
+    vmm_for(dir, Arch::from_env())
+}
+
+fn vmm_for(dir: Option<&Path>, arch: Arch) -> Option<PathBuf> {
+    if !vmm_runs_for(arch) {
         return None;
     }
     match std::env::var_os("GRIX_VMM") {
@@ -317,16 +326,18 @@ fn default_kernel(arch: Arch) -> PathBuf {
 }
 
 /// Does grix-vmm run here, unless told otherwise (`GRIX_ACCEL`)?
-fn vmm_runs_here() -> bool {
+/// Does grix-vmm run `arch`'s guests here, unless told otherwise
+/// (`GRIX_ACCEL`)? Only the host's own architecture's, with hardware
+/// virtualization: Hypervisor.framework on arm64 macOS, KVM on Linux.
+fn vmm_runs_for(arch: Arch) -> bool {
     if std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
         return false;
     }
-    // grix-vmm runs arm64 guests only (yet).
-    if Arch::from_env() != Arch::Aarch64 {
+    if arch != Arch::host() || arch == Arch::X86_64 && !cfg!(target_os = "linux") {
         return false;
     }
     // Hypervisor.framework has the GIC grix-vmm needs from macOS 15.
-    match default_accel() {
+    match default_accel_for(arch) {
         "hvf" => macos_major().is_none_or(|v| v >= 15),
         "kvm" => true,
         _ => false,
@@ -729,7 +740,7 @@ impl SandboxBuilder {
     pub fn install_dir(mut self, dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref();
         self.kernel = kernel_in(Some(dir), self.arch);
-        self.vmm = vmm_in(Some(dir));
+        self.vmm = vmm_for(Some(dir), self.arch);
         self
     }
 
@@ -812,10 +823,7 @@ impl SandboxBuilder {
             self.kernel = default_kernel(arch);
             self.qemu = arch.default_qemu();
             self.accel = default_accel_for(arch).into();
-            // grix-vmm runs arm64 guests only (yet).
-            if arch != Arch::Aarch64 {
-                self.vmm = None;
-            }
+            self.vmm = default_vmm_for(arch);
         }
         self
     }
@@ -1061,6 +1069,9 @@ impl Sandbox {
     pub fn snapshot<S: AsRef<str>>(&self, argv: &[S], path: impl AsRef<Path>) -> Result<crate::Snapshot> {
         let cfg = &self.cfg;
         let path = path.as_ref();
+        if cfg.arch == Arch::X86_64 {
+            bail!("snapshots of x86_64 machines aren't there yet (arm64's are)");
+        }
         if cfg.vmm.is_none() {
             bail!(
                 "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU"

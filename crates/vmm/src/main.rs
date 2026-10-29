@@ -27,20 +27,24 @@
 mod console;
 #[cfg(all(supported, target_os = "macos"))]
 mod hvf;
-#[cfg(all(supported, target_os = "linux"))]
+#[cfg(all(supported, target_os = "linux", target_arch = "aarch64"))]
 mod kvm;
+#[cfg(all(supported, target_arch = "x86_64"))]
+mod kvm_x86;
 #[cfg(supported)]
 mod mem;
-#[cfg(supported)]
+#[cfg(all(supported, target_arch = "aarch64"))]
 mod pause;
-#[cfg(supported)]
+#[cfg(all(supported, target_arch = "aarch64"))]
 mod snapshot;
 #[cfg(all(supported, target_os = "macos"))]
 mod snapshot_hvf;
-#[cfg(all(supported, target_os = "linux"))]
+#[cfg(all(supported, target_os = "linux", target_arch = "aarch64"))]
 mod snapshot_kvm;
-#[cfg(supported)]
+#[cfg(all(supported, target_arch = "aarch64"))]
 mod vm;
+#[cfg(all(supported, target_arch = "x86_64"))]
+mod vm_x86;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -122,12 +126,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    #[cfg(supported)]
+    #[cfg(all(supported, target_arch = "aarch64"))]
     let result = vm::run(&args);
+    #[cfg(all(supported, target_arch = "x86_64"))]
+    let result = vm_x86::run(&args);
     #[cfg(not(supported))]
     let result: Result<(), String> = {
         let _ = args;
-        Err("grix-vmm runs on arm64 macOS (Hypervisor.framework) and arm64 Linux (KVM)".into())
+        Err("grix-vmm runs on arm64 macOS (Hypervisor.framework) and arm64 and x86_64 Linux (KVM)".into())
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

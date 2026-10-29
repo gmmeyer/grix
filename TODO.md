@@ -94,10 +94,10 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     Done: the kernel's arm64 code under `arch/aarch64`, and `arch/x86_64`
     (PVH boot, traps and `syscall`, paging, LAPIC/IOAPIC, the 16550, the
     signal frame, the vDSO), the x86_64 syscall table, its older calls
-    and structure layouts; QEMU microvm (`--arch x86_64`); every
-    end-to-end test passes on it. Left: SMP (INIT/SIPI), AVX state
-    (xsave), grix-vmm on x86 KVM (and snapshots there), x86 hosts'
-    releases and CI with KVM.
+    and structure layouts; QEMU microvm (`--arch x86_64`); grix-vmm on
+    x86 KVM; every end-to-end test passes on it, in CI on an x86 runner
+    with KVM (`x86.yml`); x86_64 Linux releases. Left: SMP (INIT/SIPI),
+    AVX state (xsave), and snapshots of x86_64 machines.
 20. **An outside security review** (after the above).
 
 ## Agent integrations

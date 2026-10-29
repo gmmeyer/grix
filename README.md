@@ -85,9 +85,10 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
     /usr/bin/python3 -m http.server 8000
 ```
 
-On arm64 macOS 15+ and arm64 Linux with KVM, grix runs its kernel in its
-own VMM, `grix-vmm` (Hypervisor.framework or KVM, about 1,300 lines of
-Rust, no QEMU needed). A run that boots, runs a program and exits takes
+On arm64 macOS 15+ and on arm64 or x86_64 Linux with KVM, grix runs its
+kernel in its own VMM, `grix-vmm` (Hypervisor.framework or KVM, no QEMU
+needed): an arm64 guest on an arm64 host, an x86_64 guest on an x86
+host. A run that boots, runs a program and exits takes
 about 0.1 s. Elsewhere it uses QEMU, with its emulator if the host can't
 virtualize arm64. `GRIX_ACCEL=tcg|hvf|kvm` chooses QEMU with that
 accelerator, and `GRIX_VMM=PATH|qemu` picks the VMM. A Node script that
@@ -662,7 +663,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging), a stack as big as `RLIMIT_STACK` says; more CPUs (`--cpus`): threads and processes run in parallel | `MAP_GROWSDOWN`; finer locking than one kernel lock |
 | Clocks (including per-thread and per-process CPU time; a vDSO reads them without a system call), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | |
-| x86_64 guests (`--arch x86_64`, `GRIX_ARCH`, `SandboxBuilder::arch`): the same kernel built for x86_64, in QEMU microvm, with x86_64's system calls (the older ones too) and structures; every end-to-end test passes on it, CPython and Node included | More than one CPU, snapshots and grix-vmm on x86_64; AVX state (x87/SSE only); the old `getdents` and `utime*` calls |
+| x86_64 guests (`--arch x86_64`, `GRIX_ARCH`, `SandboxBuilder::arch`): the same kernel built for x86_64, in grix-vmm on x86 KVM or in QEMU microvm, with x86_64's system calls (the older ones too) and structures; every end-to-end test passes on it, CPython and Node included | More than one CPU and snapshots on x86_64; AVX state (x87/SSE only); the old `getdents` and `utime*` calls |
 
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
 and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
@@ -692,9 +693,9 @@ subshells.
 6. ~~**SMP and x86_64 guests**~~: more CPUs (`--cpus N`, threads of a
    process run in parallel) and x86_64 programs, through a user-mode
    translator in the arm64 sandbox (`--x86-64 qemu-x86_64`: x86_64 Alpine
-   and CPython run). A native x86_64 kernel runs in QEMU microvm
-   (`--arch x86_64`). Next: its SMP, grix-vmm on x86 KVM, and x86 hosts'
-   releases.
+   and CPython run). A native x86_64 kernel runs in grix-vmm on x86 KVM
+   or in QEMU microvm (`--arch x86_64`), and releases include x86_64
+   Linux. Next: its SMP, AVX state and snapshots.
 
 ## Repository layout
 

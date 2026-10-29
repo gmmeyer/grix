@@ -2,6 +2,7 @@
 //! hypervisor (Hypervisor.framework on macOS, KVM on Linux).
 
 use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +19,9 @@ const CONSOLE_IRQ: u32 = VIRTIO_IRQ;
 /// The PL011: transmit only, to the socket. Each byte costs an exit, so the
 /// kernel uses it only before the console is up and for panics.
 struct Uart {
-    out: Option<UnixStream>,
+    /// The connected socket, as a plain file: written with write(2), which
+    /// the seccomp filter allows (a socket's own writes are sendto).
+    out: Option<std::fs::File>,
 }
 
 impl Uart {
@@ -40,8 +43,9 @@ impl Uart {
     fn write(&mut self, off: u64, v: u32) {
         if off == 0
             && let Some(s) = &mut self.out
-            && s.write_all(&[v as u8]).is_err()
+            && let Err(e) = s.write_all(&[v as u8])
         {
+            eprintln!("grix-vmm: the serial port's socket: {e}");
             self.out = None;
         }
     }
@@ -57,7 +61,10 @@ struct Machine {
 
 fn connect_uart(args: &Args) -> Result<Mutex<Uart>, String> {
     let out = match &args.uart {
-        Some(p) => Some(UnixStream::connect(p).map_err(|e| format!("connecting to {}: {e}", p.display()))?),
+        Some(p) => {
+            let s = UnixStream::connect(p).map_err(|e| format!("connecting to {}: {e}", p.display()))?;
+            Some(std::fs::File::from(OwnedFd::from(s)))
+        }
         None => None,
     };
     Ok(Mutex::new(Uart { out }))

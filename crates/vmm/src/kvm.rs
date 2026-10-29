@@ -495,6 +495,11 @@ pub fn confine(snapshot: bool) -> Result<(), String> {
         226, // mprotect
         233, // madvise
         278, // getrandom
+        // A new thread's own: glibc registers them as the thread starts
+        // (which may be after the filter is on, for threads made just
+        // before), and gives up if rseq is refused.
+        99,  // set_robust_list
+        293, // rseq
     ];
     const SNAPSHOT_ALLOWED: &[u32] = &[
         46, // ftruncate
