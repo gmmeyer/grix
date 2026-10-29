@@ -22,13 +22,29 @@ node web/serve.mjs web/dist    # http://localhost:8080/
 
 ## Hosting
 
-QEMU's threads are Web Workers sharing memory, so the page must be
-**cross-origin isolated**. It must be served with
-`Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp` (`serve.mjs` does this). GitHub
-Pages can't set headers. There, a service worker such as
-[coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) adds
-them. A page that embeds the examples in an iframe needs the same headers.
+QEMU's threads are Web Workers sharing memory, so the page that shows the
+examples must be **cross-origin isolated**:
+
+- **Headers**, where the host can set them:
+  `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp`. `serve.mjs` sends them, and
+  so does Cloudflare Pages (or Netlify) from the `_headers` file `build.sh`
+  writes into `web/dist`.
+- **GitHub Pages** can't set headers. There, the page loads
+  [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker)
+  (`build.sh` puts it in `web/dist`) before anything else. On the first
+  visit it installs a service worker and reloads the page once, after which
+  the worker adds the headers. The script has to be served from the page's
+  own site.
+
+The files can live somewhere other than the page, for instance a blog on
+GitHub Pages with the files on Cloudflare: load `grix-example.js` by its
+full URL, and the rest comes from beside it. They need
+`Access-Control-Allow-Origin` and `Cross-Origin-Resource-Policy:
+cross-origin` (the `_headers` file has both). A browser won't start a Worker
+from another site's script, so `grix.js` starts each of QEMU's workers as a
+small module of the page's own that imports the real one. Cloudflare Pages
+takes files up to 25 MiB, which the Node root filesystem (28 MB) is over.
 
 Each run reserves 1.5 GiB of wasm memory (guest RAM, QEMU and its
 translation cache) and only one machine runs at a time: starting an
