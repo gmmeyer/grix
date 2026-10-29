@@ -56,15 +56,18 @@ function exclusive(f) {
   return next;
 }
 
+// Programs are kept for the next run. Root filesystems aren't: unpacked
+// they're tens of megabytes each, which a phone can't spare, and the
+// browser has the archive cached.
 const fileCache = new Map();
 function loadFiles(specs) {
   return Promise.all(specs.map((f) => {
     if (f.symlink !== undefined) return [{ path: f.path, symlink: f.symlink }];
     if (f.text !== undefined) return [{ path: f.path, data: new TextEncoder().encode(f.text), mode: f.mode ?? 0o644 }];
-    const key = f.tar ?? f.src;
+    if (f.tar) return fetchTar(exampleFile(f.tar), f.path ?? '/');
+    const key = f.src;
     if (!fileCache.has(key)) {
-      const p = f.tar ? fetchTar(exampleFile(f.tar), f.path ?? '/')
-        : fetch(exampleFile(f.src)).then((r) => {
+      const p = fetch(exampleFile(f.src)).then((r) => {
           if (!r.ok) throw new Error(`${f.src}: ${r.status}`);
           return r.arrayBuffer();
         }).then((b) => [{ path: f.path, data: new Uint8Array(b), mode: f.mode ?? 0o755 }]);
