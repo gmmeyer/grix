@@ -120,15 +120,48 @@ pub struct Sysv {
     pub pages: u64,
 }
 
-/// The pages of a MAP_SHARED anonymous mapping, made as they're first
-/// touched. Holds a reference to each (every mapping holds its own).
+/// The pages of a MAP_SHARED anonymous mapping (or a System V segment),
+/// made as they're first touched. Holds a reference to each (every
+/// mapping holds its own). Their addresses are kept in chunks of
+/// `SHARED_CHUNK` (2 MiB of the mapping each), charged to the kernel
+/// memory budget: a program can touch a lot of shared memory.
 #[derive(Debug, Default)]
-pub struct SharedPages(Mutex<BTreeMap<u64, u64>>);
+pub struct SharedPages(Mutex<SharedChunks>);
+
+const SHARED_CHUNK: usize = 512;
+/// A chunk's page that has no frame yet.
+const NO_FRAME: u64 = u64::MAX;
+
+#[derive(Debug, Default)]
+struct SharedChunks {
+    chunks: BTreeMap<u64, alloc::boxed::Box<[u64; SHARED_CHUNK]>>,
+    charge: crate::kmem::Charge,
+}
+
+impl SharedPages {
+    /// Page `idx`'s frame, made if it has none.
+    fn frame(&self, idx: u64) -> Result<u64, FaultError> {
+        let mut s = self.0.lock();
+        let (chunk, i) = (idx / SHARED_CHUNK as u64, (idx % SHARED_CHUNK as u64) as usize);
+        if !s.chunks.contains_key(&chunk) {
+            let bytes = s.charge.bytes() + (SHARED_CHUNK * 8) as u64;
+            s.charge.resize(bytes).map_err(|_| FaultError::OutOfMemory)?;
+            s.chunks.insert(chunk, alloc::boxed::Box::new([NO_FRAME; SHARED_CHUNK]));
+        }
+        let slot = &mut s.chunks.get_mut(&chunk).unwrap()[i];
+        if *slot == NO_FRAME {
+            *slot = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+        }
+        Ok(*slot)
+    }
+}
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
-        for &pa in self.0.get_mut().values() {
-            frame::free(pa);
+        for chunk in self.0.get_mut().chunks.values() {
+            for &pa in chunk.iter().filter(|&&pa| pa != NO_FRAME) {
+                frame::free(pa);
+            }
         }
     }
 }
@@ -704,15 +737,7 @@ impl AddressSpace {
             if sysv.is_some_and(|s| idx >= s.pages) {
                 return Err(FaultError::PastEnd);
             }
-            let mut pages = pages.0.lock();
-            let pa = match pages.get(&idx) {
-                Some(&pa) => pa,
-                None => {
-                    let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
-                    pages.insert(idx, pa);
-                    pa
-                }
-            };
+            let pa = pages.frame(idx)?;
             if vma.prot.exec {
                 arch::sync_icache(p2v(pa), PAGE_SIZE);
             }
