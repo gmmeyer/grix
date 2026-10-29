@@ -25,7 +25,12 @@ pub const STDIN_WINDOW: u32 = 64 * 1024;
 /// The most data one `Data` message carries.
 pub const MAX_DATA: usize = MAX_FRAME - 8;
 /// The largest UDP datagram that goes through the host (one frame).
+/// Bigger ones aren't carried: the guest's sends fail with EMSGSIZE, and
+/// the host drops what comes in, as a network that can't fragment would.
 pub const MAX_UDP: usize = MAX_FRAME - 32;
+/// Peers each UDP port forwarded from the host remembers (the most recent
+/// senders), the only ones the guest may reply to through it.
+pub const MAX_FORWARD_PEERS: usize = 256;
 
 /// `UdpVerdict`s: the policy refuses the destination; allows it; or the
 /// host can't take it now (out of sockets or threads: ask again later).
@@ -97,6 +102,10 @@ pub enum ToHost<'a> {
     UdpAllow { id: u32, addr: Addr, port: u16 },
     /// A datagram from socket `id` to a destination the host allowed.
     UdpSend { id: u32, addr: Addr, port: u16, data: &'a [u8] },
+    /// A reply from guest port `port`, forwarded from the host, to
+    /// `addr:peer_port`, which sent to it (`ToGuest::UdpIncoming`): it goes
+    /// out from the forwarded port, and only to such a peer.
+    UdpReply { port: u16, addr: Addr, peer_port: u16, data: &'a [u8] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +157,15 @@ pub enum ToGuest<'a> {
         id: u32,
         addr: Addr,
         port: u16,
+        data: &'a [u8],
+    },
+    /// A datagram to a UDP port forwarded from the host, for the guest
+    /// socket bound at `port`, from `peer:peer_port` (as the guest sees
+    /// it: the host's own loopback is `HOST_V4`).
+    UdpIncoming {
+        port: u16,
+        peer: Addr,
+        peer_port: u16,
         data: &'a [u8],
     },
 }
@@ -202,6 +220,13 @@ impl<'a> ToHost<'a> {
                 w.raw(&port.to_le_bytes());
                 w.raw(data);
             }
+            ToHost::UdpReply { port, addr, peer_port, data } => {
+                w.u8(10);
+                w.raw(&port.to_le_bytes());
+                addr.put(&mut w);
+                w.raw(&peer_port.to_le_bytes());
+                w.raw(data);
+            }
         }
         w.buf
     }
@@ -230,6 +255,12 @@ impl<'a> ToHost<'a> {
                 let addr = Addr::get(&mut r)?;
                 let port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
                 ToHost::UdpSend { id, addr, port, data: r.rest() }
+            }
+            10 => {
+                let port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+                let addr = Addr::get(&mut r)?;
+                let peer_port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
+                ToHost::UdpReply { port, addr, peer_port, data: r.rest() }
             }
             _ => return Err(DecodeError),
         };
@@ -291,6 +322,13 @@ impl<'a> ToGuest<'a> {
                 peer.put(&mut w);
                 w.raw(&peer_port.to_le_bytes());
             }
+            ToGuest::UdpIncoming { port, peer, peer_port, data } => {
+                w.u8(10);
+                w.raw(&port.to_le_bytes());
+                peer.put(&mut w);
+                w.raw(&peer_port.to_le_bytes());
+                w.raw(data);
+            }
         }
         w.buf
     }
@@ -324,6 +362,12 @@ impl<'a> ToGuest<'a> {
                 let port = u16_at(&mut r)?;
                 ToGuest::UdpRecv { id, addr, port, data: r.rest() }
             }
+            10 => {
+                let port = u16_at(&mut r)?;
+                let peer = Addr::get(&mut r)?;
+                let peer_port = u16_at(&mut r)?;
+                ToGuest::UdpIncoming { port, peer, peer_port, data: r.rest() }
+            }
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -347,6 +391,8 @@ mod tests {
             ToHost::StdinCredit { bytes: 5 },
             ToHost::UdpAllow { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123 },
             ToHost::UdpSend { id: 4, addr: Addr::V6([1; 16]), port: 9, data: b"ntp" },
+            ToHost::UdpReply { port: 53, addr: Addr::V4(HOST_V4), peer_port: 40000, data: b"answer" },
+            ToHost::UdpReply { port: 53, addr: Addr::V6([2; 16]), peer_port: 1, data: b"" },
         ];
         for m in to_host {
             assert_eq!(ToHost::decode(&m.encode()), Ok(m));
@@ -361,6 +407,8 @@ mod tests {
             ToGuest::Incoming { id: HOST_ID | 1, port: 8000, peer: Addr::V4([127, 0, 0, 1]), peer_port: 5555 },
             ToGuest::UdpVerdict { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, verdict: UDP_ALLOWED },
             ToGuest::UdpRecv { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, data: b"time" },
+            ToGuest::UdpIncoming { port: 53, peer: Addr::V4(HOST_V4), peer_port: 40000, data: b"query" },
+            ToGuest::UdpIncoming { port: 53, peer: Addr::V6([3; 16]), peer_port: 2, data: b"" },
         ];
         for m in to_guest {
             assert_eq!(ToGuest::decode(&m.encode()), Ok(m));
@@ -369,5 +417,8 @@ mod tests {
             assert!(ToHost::decode(bad).is_err(), "{bad:?}");
         }
         assert!(ToGuest::decode(&[7, 1, 0, 0, 0, 1, 0, 4, 1]).is_err());
+        // A forwarded datagram needs a whole address and port.
+        assert!(ToGuest::decode(&[10, 53, 0, 4, 10, 0, 2]).is_err());
+        assert!(ToHost::decode(&[10, 53, 0, 5, 0]).is_err());
     }
 }

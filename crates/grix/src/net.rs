@@ -3,8 +3,10 @@
 //! sandbox's policy says yes; connections to forwarded ports are handed to
 //! it; its DNS questions are answered with the host's resolver; its UDP
 //! datagrams go out from a socket here per guest socket, to destinations
-//! the policy allows, and only those destinations' replies come back; and
-//! its stdin credit lets more stdin through.
+//! the policy allows, and only those destinations' replies come back;
+//! datagrams to forwarded UDP ports are handed to it, and its replies go
+//! back out of those ports, only to peers that sent there; and its stdin
+//! credit lets more stdin through.
 //!
 //! What the guest says is untrusted: every message is checked, sizes stay
 //! within the credit given, and nothing it sends can make the host buffer
@@ -13,7 +15,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -44,6 +46,32 @@ const MAX_UDP_DESTS: usize = 256;
 /// Threads taking UDP replies in, all sockets together (a closed socket's
 /// lives on until its next read times out).
 const MAX_UDP_THREADS: u32 = 128;
+/// How often a forwarded UDP port's thread looks up to see if the run is over.
+const UDP_FORWARD_TICK: Duration = Duration::from_millis(100);
+
+/// A UDP port forwarded from the host to `guest`.
+struct UdpForward {
+    guest: u16,
+    sock: UdpSocket,
+    /// Who sent to it, as the guest sees them, to where they really are,
+    /// and when they were last heard (a count): the only peers the guest's
+    /// replies may go to, at most `link::MAX_FORWARD_PEERS`.
+    peers: Mutex<HashMap<(Addr, u16), (SocketAddr, u64)>>,
+    heard: AtomicU64,
+}
+
+impl UdpForward {
+    fn heard_from(&self, seen: (Addr, u16), real: SocketAddr) {
+        let mut peers = self.peers.lock().unwrap();
+        if !peers.contains_key(&seen) && peers.len() >= link::MAX_FORWARD_PEERS {
+            let oldest = peers.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                peers.remove(&k);
+            }
+        }
+        peers.insert(seen, (real, self.heard.fetch_add(1, Ordering::Relaxed)));
+    }
+}
 
 /// A guest UDP socket's host side.
 struct Udp {
@@ -190,6 +218,8 @@ pub(crate) struct NetPolicy {
     pub allow: Option<Vec<HostRule>>,
     /// Where the host listens, and the guest port it forwards to.
     pub forwards: Vec<(ForwardFrom, u16)>,
+    /// The same for UDP.
+    pub udp_forwards: Vec<(UdpFrom, u16)>,
 }
 
 /// The host side of a forwarded port.
@@ -199,6 +229,69 @@ pub(crate) enum ForwardFrom {
     Addr(SocketAddr),
     /// Bound once by the caller (so it knows the port), shared by every run.
     Listener(Arc<TcpListener>),
+}
+
+/// The host side of a forwarded UDP port.
+#[derive(Clone, Debug)]
+pub(crate) enum UdpFrom {
+    /// Bound for each run.
+    Addr(SocketAddr),
+    /// Bound once by the caller, shared by every run.
+    Socket(Arc<UdpSocket>),
+}
+
+/// The host side of a forward to `guest_port`: `host` resolved.
+pub(crate) fn forward_addr(host: &str, guest_port: u16) -> Result<SocketAddr> {
+    let addr = host
+        .to_socket_addrs()
+        .with_context(|| format!("forward address {host:?}"))?
+        .next()
+        .with_context(|| format!("forward address {host:?} resolves to nothing"))?;
+    if guest_port == 0 {
+        bail!("forwarding {host} needs a guest port");
+    }
+    Ok(addr)
+}
+
+/// What `grix run -p` takes: `[ADDR:]HOSTPORT:GUESTPORT`, with Docker's
+/// `/udp` (or `/tcp`, the default) after it. The address is 127.0.0.1
+/// unless given (`[::1]:53:53/udp` for IPv6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Publish {
+    /// Where the host listens, `ADDR:PORT`.
+    pub host: String,
+    pub guest: u16,
+    pub udp: bool,
+}
+
+impl Publish {
+    pub fn parse(spec: &str) -> Result<Publish> {
+        let (ports, udp) = match spec.rsplit_once('/') {
+            Some((p, "udp")) => (p, true),
+            Some((p, "tcp")) => (p, false),
+            Some((_, proto)) => bail!("publish {spec:?}: {proto:?} isn't tcp or udp"),
+            None => (spec, false),
+        };
+        let (host, guest) =
+            ports.rsplit_once(':').with_context(|| format!("publish {spec:?} must be [ADDR:]HOSTPORT:GUESTPORT"))?;
+        let guest: u16 = guest.parse().with_context(|| format!("publish {spec:?}: bad guest port"))?;
+        if guest == 0 {
+            bail!("publish {spec:?} needs a guest port");
+        }
+        let host = if host.contains(':') {
+            host.to_string()
+        } else {
+            host.parse::<u16>().with_context(|| format!("publish {spec:?}: bad host port"))?;
+            format!("127.0.0.1:{host}")
+        };
+        Ok(Publish { host, guest, udp })
+    }
+}
+
+impl std::fmt::Display for Publish {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:{}{}", self.host, self.guest, if self.udp { "/udp" } else { "" })
+    }
 }
 
 fn host_v4() -> IpAddr {
@@ -219,6 +312,22 @@ fn addr_of(ip: IpAddr) -> Addr {
         IpAddr::V4(a) => Addr::V4(a.octets()),
         IpAddr::V6(a) => Addr::V6(a.octets()),
     }
+}
+
+/// What the guest sees as the source of a datagram to a forwarded UDP port,
+/// one its reply can name: the host's own loopback is `link::HOST_V4`, as
+/// everywhere in the guest (127.0.0.1 there is the guest's own). None for
+/// what the guest would take for one of its network's own addresses.
+fn guest_view(peer: SocketAddr) -> Option<(Addr, u16)> {
+    let ip = peer.ip().to_canonical();
+    if ip.is_loopback() {
+        return Some((Addr::V4(link::HOST_V4), peer.port()));
+    }
+    let own = [link::GUEST_V4, link::HOST_V4, link::DNS_V4].map(|a| IpAddr::V4(Ipv4Addr::from(a)));
+    if ip.is_unspecified() || own.contains(&ip) || peer.port() == 0 {
+        return None;
+    }
+    Some((addr_of(ip), peer.port()))
 }
 
 /// Addresses that only a rule for them (or their range) reaches, and the
@@ -393,11 +502,14 @@ impl Outbox {
 
     /// Queue a frame that may be lost (a datagram) only while the outbox is
     /// under half full, so replies to the guest's own messages always fit.
-    fn offer_lossy(&self, frame: Vec<u8>) {
+    /// Whether it was.
+    fn offer_lossy(&self, frame: Vec<u8>) -> bool {
         let q = self.q.lock().unwrap();
         if !q.closed && q.bytes + frame.len() <= OUTBOX_BYTES / 2 {
             self.push(q, frame);
+            return true;
         }
+        false
     }
 
     /// The next frame to write; None once closed.
@@ -482,6 +594,7 @@ struct Shared {
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
     udps: Mutex<HashMap<u32, Arc<Udp>>>,
     udp_threads: AtomicU32,
+    udp_forwards: Vec<Arc<UdpForward>>,
     /// What DNS answered each address for, so name rules cover connections.
     names: Mutex<HashMap<IpAddr, String>>,
     name_rules: bool,
@@ -587,6 +700,22 @@ impl Proxy {
             l.set_nonblocking(true)?;
             listeners.push((l, *guest));
         }
+        let mut udp_forwards = Vec::new();
+        for (from, guest) in &policy.udp_forwards {
+            let sock = match from {
+                UdpFrom::Addr(host) => {
+                    UdpSocket::bind(host).with_context(|| format!("forwarding UDP {host} to guest port {guest}"))?
+                }
+                UdpFrom::Socket(s) => s.try_clone().context("forwarding a UDP socket")?,
+            };
+            sock.set_read_timeout(Some(UDP_FORWARD_TICK))?;
+            udp_forwards.push(Arc::new(UdpForward {
+                guest: *guest,
+                sock,
+                peers: Mutex::new(HashMap::new()),
+                heard: AtomicU64::new(0),
+            }));
+        }
         let shared = Arc::new(Shared {
             name_rules: policy.has_name_rules(),
             policy,
@@ -594,6 +723,7 @@ impl Proxy {
             conns: Mutex::new(HashMap::new()),
             udps: Mutex::new(HashMap::new()),
             udp_threads: AtomicU32::new(0),
+            udp_forwards,
             names: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
             reported: Mutex::new(HashSet::new()),
@@ -610,6 +740,13 @@ impl Proxy {
             let t = thread::Builder::new()
                 .spawn(move || accept_loop(&shared, l, guest, &next))
                 .context("starting a port forward")?;
+            proxy.accepting.lock().unwrap().push(t);
+        }
+        for f in proxy.shared.udp_forwards.clone() {
+            let shared = proxy.shared.clone();
+            let t = thread::Builder::new()
+                .spawn(move || udp_forward_loop(&shared, &f))
+                .context("starting a UDP port forward")?;
             proxy.accepting.lock().unwrap().push(t);
         }
         Ok(proxy)
@@ -670,6 +807,7 @@ impl Proxy {
                     let _ = sock.send_to(data, to);
                 }
             }
+            ToHost::UdpReply { port, addr, peer_port, data } => self.udp_reply(port, addr, peer_port, data),
             ToHost::StdinCredit { bytes } => {
                 let mut credit = s.stdin_credit.lock().unwrap();
                 *credit = (*credit + bytes as u64).min(link::STDIN_WINDOW as u64);
@@ -749,6 +887,28 @@ impl Proxy {
         reverse.insert(to, (addr, port));
         drop((allowed, reverse));
         s.reply(verdict(link::UDP_ALLOWED));
+    }
+
+    /// A reply from guest port `port` to `addr:peer_port`: out of the
+    /// forwarded port it came in on, if that peer sent there, and nowhere
+    /// else (the guest checked too, but an image may bring its own kernel).
+    fn udp_reply(&self, port: u16, addr: Addr, peer_port: u16, data: &[u8]) {
+        let s = &self.shared;
+        if !s.policy.enabled {
+            return s.deny_capability("sendto");
+        }
+        let to = s.udp_forwards.iter().filter(|f| f.guest == port).find_map(|f| {
+            let real = f.peers.lock().unwrap().get(&(addr, peer_port)).map(|&(real, _)| real)?;
+            Some((f, real))
+        });
+        match to {
+            // UDP: lost if it can't go now.
+            Some((f, real)) => drop(f.sock.send_to(data, real)),
+            None => s.deny(
+                "sendto",
+                format!("{}:{peer_port} hasn't sent to forwarded UDP port {port} (lately)", ip_of(addr)),
+            ),
+        }
     }
 
     fn connect(&self, id: u32, ip: IpAddr, port: u16) {
@@ -960,6 +1120,35 @@ fn udp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> Option<Arc<Ud
     Some(sock)
 }
 
+/// Hand datagrams to a forwarded UDP port to the guest, as long as there's
+/// room for them (dropped otherwise, as UDP may), remembering who sent
+/// them so the guest can reply.
+fn udp_forward_loop(s: &Shared, f: &UdpForward) {
+    // One more than a frame holds: anything that fills it is too big.
+    let mut buf = vec![0u8; link::MAX_UDP + 1];
+    while !s.stop.load(Ordering::Relaxed) {
+        match f.sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if !s.policy.enabled {
+                    s.deny_capability("UDP port forward");
+                    continue;
+                }
+                // Too big for a frame: dropped, as a network that can't
+                // fragment it would.
+                let Some(seen) = guest_view(from).filter(|_| n <= link::MAX_UDP) else { continue };
+                let msg = ToGuest::UdpIncoming { port: f.guest, peer: seen.0, peer_port: seen.1, data: &buf[..n] };
+                if s.outbox.offer_lossy(frame(msg)) {
+                    f.heard_from(seen, from);
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+            // (An ICMP error for an earlier reply, on some systems.)
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+            Err(_) => thread::sleep(UDP_FORWARD_TICK),
+        }
+    }
+}
+
 fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &AtomicU32) {
     while !s.stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -1102,6 +1291,7 @@ mod tests {
             enabled: true,
             allow: Some(rules.iter().map(|r| HostRule::parse(r).unwrap()).collect()),
             forwards: vec![],
+            udp_forwards: vec![],
         }
     }
 
@@ -1193,6 +1383,137 @@ mod tests {
         proxy.handle(&ToHost::Data { id: 1, data: b"more" }.encode());
         assert!(conn.to_peer.lock().unwrap().data.is_empty());
         proxy.stop();
+    }
+
+    #[test]
+    fn publish_specs() {
+        let p = |spec: &str| Publish::parse(spec).map(|p| (p.host, p.guest, p.udp)).ok();
+        assert_eq!(p("8080:80"), Some(("127.0.0.1:8080".into(), 80, false)));
+        assert_eq!(p("8080:80/tcp"), Some(("127.0.0.1:8080".into(), 80, false)));
+        assert_eq!(p("5353:53/udp"), Some(("127.0.0.1:5353".into(), 53, true)));
+        assert_eq!(p("0.0.0.0:5353:53/udp"), Some(("0.0.0.0:5353".into(), 53, true)));
+        assert_eq!(p("[::1]:5353:53/udp"), Some(("[::1]:5353".into(), 53, true)));
+        for bad in ["80", "8080:80/sctp", "8080:http", "x:80", "8080:0/udp", "8080:80/", "8080:70000"] {
+            assert!(Publish::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(Publish::parse("5353:53/udp").unwrap().to_string(), "127.0.0.1:5353:53/udp");
+    }
+
+    /// The `ToGuest` messages in the outbox's frames.
+    fn drain(o: &Outbox) -> Vec<Vec<u8>> {
+        let mut q = o.q.lock().unwrap();
+        q.bytes = 0;
+        q.frames.drain(..).map(|f| f[wire::FRAME_HEADER..].to_vec()).collect()
+    }
+
+    fn forwarding(enabled: bool) -> (Proxy, Arc<Outbox>, SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host = sock.local_addr().unwrap();
+        let policy =
+            NetPolicy { enabled, udp_forwards: vec![(UdpFrom::Socket(Arc::new(sock)), 53)], ..NetPolicy::default() };
+        let outbox = Outbox::new();
+        (Proxy::start(policy, outbox.clone()).unwrap(), outbox, host)
+    }
+
+    fn wait_for(mut f: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !f() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Datagrams to a forwarded UDP port go to the guest from where they
+    /// came (the host's loopback as the guest knows it), up to a frame's
+    /// worth; replies go back from the forwarded port, and only to peers
+    /// that sent there, the most recent `MAX_FORWARD_PEERS` of them.
+    #[test]
+    fn forwarded_udp_and_its_replies() {
+        let (proxy, outbox, host) = forwarding(true);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let port = peer.local_addr().unwrap().port();
+        peer.send_to(&[0; link::MAX_UDP + 1], host).unwrap();
+        peer.send_to(b"query", host).unwrap();
+        let mut got = Vec::new();
+        wait_for(|| {
+            got.extend(drain(&outbox));
+            !got.is_empty()
+        });
+        let seen = Addr::V4(link::HOST_V4);
+        assert_eq!(
+            ToGuest::decode(&got[0]),
+            Ok(ToGuest::UdpIncoming { port: 53, peer: seen, peer_port: port, data: b"query" })
+        );
+        assert_eq!(got.len(), 1, "the oversized one isn't carried");
+        // A reply to it comes from the forwarded port.
+        proxy.handle(&ToHost::UdpReply { port: 53, addr: seen, peer_port: port, data: b"answer" }.encode());
+        let mut buf = [0u8; 64];
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!((&buf[..n], from), (&b"answer"[..], host));
+        // Not to a peer that never sent, nor from another guest port.
+        for (guest, to) in [(53, port ^ 1), (54, port)] {
+            proxy.handle(&ToHost::UdpReply { port: guest, addr: seen, peer_port: to, data: b"no" }.encode());
+        }
+        peer.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        assert!(peer.recv_from(&mut buf).is_err());
+        let events = proxy.stop();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events.iter().all(|e| matches!(e, GuestEvent::Denied { capability, .. } if capability == "allow_host"))
+        );
+    }
+
+    #[test]
+    fn forwarded_udp_peers_are_capped() {
+        let (proxy, outbox, host) = forwarding(true);
+        let peers: Vec<_> =
+            (0..link::MAX_FORWARD_PEERS + 10).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+        for p in &peers {
+            p.send_to(b"hi", host).unwrap();
+            // One at a time, so which are the oldest is known.
+            let mut n = 0;
+            wait_for(|| {
+                n += drain(&outbox).len();
+                n == 1
+            });
+        }
+        let f = &proxy.shared.udp_forwards[0];
+        let remembered = f.peers.lock().unwrap().values().map(|(real, _)| *real).collect::<HashSet<_>>();
+        assert_eq!(remembered.len(), link::MAX_FORWARD_PEERS);
+        assert!(!remembered.contains(&peers[0].local_addr().unwrap()));
+        assert!(remembered.contains(&peers.last().unwrap().local_addr().unwrap()));
+        proxy.stop();
+    }
+
+    /// Without `net`, the proxy neither hands datagrams in nor sends replies.
+    #[test]
+    fn forwarded_udp_needs_net() {
+        let (proxy, outbox, host) = forwarding(false);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.send_to(b"query", host).unwrap();
+        wait_for(|| !proxy.shared.events.lock().unwrap().is_empty());
+        assert!(drain(&outbox).is_empty());
+        let port = peer.local_addr().unwrap().port();
+        proxy.handle(
+            &ToHost::UdpReply { port: 53, addr: Addr::V4(link::HOST_V4), peer_port: port, data: b"answer" }.encode(),
+        );
+        let events = proxy.stop();
+        assert!(events.iter().all(|e| matches!(e, GuestEvent::Denied { capability, .. } if capability == "net")));
+        assert!(proxy.shared.udp_forwards[0].peers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn what_the_guest_sees_of_a_peer() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let host = Addr::V4(link::HOST_V4);
+        assert_eq!(guest_view(a("127.0.0.1:5000")), Some((host, 5000)));
+        assert_eq!(guest_view(a("[::1]:5000")), Some((host, 5000)));
+        assert_eq!(guest_view(a("192.168.1.9:5000")), Some((Addr::V4([192, 168, 1, 9]), 5000)));
+        assert_eq!(guest_view(a("[::ffff:192.168.1.9]:5000")), Some((Addr::V4([192, 168, 1, 9]), 5000)));
+        for own in ["10.0.2.15:5000", "10.0.2.2:5000", "10.0.2.3:53", "0.0.0.0:1", "192.168.1.9:0"] {
+            assert_eq!(guest_view(a(own)), None, "{own}");
+        }
     }
 
     #[test]

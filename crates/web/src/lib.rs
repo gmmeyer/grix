@@ -173,6 +173,7 @@ impl Builder {
             mounts: Vec::new(),
             live_mounts: Vec::new(),
             forwards: Vec::new(),
+            udp_forwards: Vec::new(),
             snapshot: false,
             cpus: spec.cpus,
             x86_64: "",

@@ -97,6 +97,37 @@ class Common:
         with self.assertRaises(grix.GrixError):
             grix.Sandbox(imports={"/no/such/file": "/x"}).run(["/x"])
 
+    def test_udp_port_forwarding(self):
+        import socket
+        import threading
+        import time
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        udp = FIXTURES / ("amd64/udp" if X86_64 else "udp")
+        sb = grix.Sandbox(imports={udp: "/bin/udp"}, capabilities=["net"], publish=[f"{port}:5300/udp"], timeout=60)
+        result = {}
+        guest = threading.Thread(target=lambda: result.update(out=sb.run(["/bin/udp", "serve", "5300"])))
+        guest.start()
+        peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        peer.settimeout(0.5)
+        started = time.monotonic()
+        while True:
+            self.assertLess(time.monotonic() - started, 60, "the server never answered")
+            peer.sendto(b"quit", ("127.0.0.1", port))
+            try:
+                reply, frm = peer.recvfrom(64)
+                break
+            except socket.timeout:
+                pass
+        self.assertEqual((reply, frm), (b"echo 4: quit", ("127.0.0.1", port)))
+        guest.join()
+        peer.close()
+        self.assertEqual(result["out"].stdout, "udp serve ok\n")
+        self.assertEqual(result["out"].exit_code, 0)
+
     def test_exports_where_mounts_could_lead_them(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "work"

@@ -180,7 +180,16 @@ resolver; a datagram to the guest's own address to the socket bound there
 (`deliver_local`); any other through the host (`ToHost::UdpSend`), to
 destinations the host allowed (`UdpAllow`, asked once per destination:
 the send waits for the `UdpVerdict`, EPERM if refused), and the host
-passes back only those destinations' replies. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
+passes back only those destinations' replies. Forwarded UDP ports
+(`NetPolicy::udp_forwards`, `Image::udp_forwards` for deadlock
+detection): the host binds them and sends each datagram as
+`UdpIncoming` (lossy, under the outbox's half; over one frame dropped),
+with the host's loopback as 10.0.2.2 (`guest_view`), to the socket
+bound at that port. Both sides remember the last
+`link::MAX_FORWARD_PEERS` senders (`inet::forward_peer`, `UdpForward`):
+a send to one is a `UdpReply` out of the forwarded port, which the host
+checks again; anything else goes through `UdpAllow` like any socket's.
+Restoring a snapshot forgets them. The guest is 10.0.2.15, the host's own loopback is 10.0.2.2
 (`host.grix.internal`, only with an explicit rule), and the nameserver is
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.

@@ -1759,6 +1759,63 @@ fn udp_beyond_dns() {
     );
 }
 
+/// Datagrams to a UDP port forwarded from the host reach the socket bound
+/// there, from their senders (the host's loopback is 10.0.2.2), and its
+/// replies go back out of the forwarded port; but only to those senders.
+#[test]
+fn serving_udp_through_a_forwarded_port() {
+    use std::net::UdpSocket;
+    let forwarded = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let host = forwarded.local_addr().unwrap();
+    let sb = with("udp").allow(Capability::Net).forward_udp_socket(forwarded, 5300).unwrap().build().unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/bin/udp", "serve", "5300"]).unwrap());
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // The next reply that isn't to one of the hellos sent while waiting.
+    let reply = |s: &UdpSocket| loop {
+        let mut buf = [0u8; 8192];
+        let (n, from) = s.recv_from(&mut buf).expect("no reply");
+        assert_eq!(from, host, "replies come from the forwarded port");
+        let r = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if r != "echo 5: hello" {
+            return r;
+        }
+    };
+    // Until the program binds, the guest drops what the host forwards.
+    peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(60), "the server never answered");
+        peer.send_to(b"hello", host).unwrap();
+        let mut buf = [0u8; 64];
+        if let Ok((n, from)) = peer.recv_from(&mut buf) {
+            assert_eq!((&buf[..n], from), (&b"echo 5: hello"[..], host));
+            break;
+        }
+    }
+    peer.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // Too big for one frame: dropped on the way in.
+    peer.send_to(&[b'x'; 5000], host).unwrap();
+    peer.send_to(b"after", host).unwrap();
+    assert_eq!(reply(&peer), "echo 5: after");
+    // Another sender gets its own replies.
+    let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+    other.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    other.send_to(b"two", host).unwrap();
+    assert_eq!(reply(&other), "echo 3: two");
+    peer.send_to(b"quit", host).unwrap();
+    assert_eq!(reply(&peer), "echo 4: quit");
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "udp serve ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // The send to a port that never sent went to the policy, which refused it.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { syscall, capability, .. }]
+            if syscall == "sendto" && capability == "allow_host"),
+        "{:?}",
+        out.events
+    );
+}
+
 #[test]
 fn shebang_scripts() {
     let b = Sandbox::builder()

@@ -155,6 +155,7 @@ class Sandbox:
     timeout: Optional[float] = None
     grace: Optional[float] = None
     allow_hosts: Sequence[str] = ()
+    #: Forwarded ports as ``grix run -p`` takes them: ``"8080:80"``, ``"5353:53/udp"``.
     publish: Sequence[str] = ()
     mounts: Sequence[tuple] = ()
     exports: Mapping[str, PathLike] = field(default_factory=dict)

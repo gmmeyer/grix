@@ -643,7 +643,7 @@ pub fn start(img: Image<'static>) -> ! {
     // Kept for good (this never returns), for comparing mounts at the end.
     let entries: &'static [grix_abi::image::Entry<'static>] = img.entries.leak();
     crate::export::init(&img.exports, &img.mounts, entries, img.export_budget);
-    crate::inet::init(img.forwards.clone());
+    crate::inet::init(img.forwards.clone(), img.udp_forwards.clone());
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);

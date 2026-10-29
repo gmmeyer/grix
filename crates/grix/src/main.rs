@@ -180,8 +180,9 @@ struct RunArgs {
     #[arg(long = "allow-host", value_name = "RULE")]
     allow_hosts: Vec<String>,
     /// Forward [ADDR:]HOSTPORT on the host (127.0.0.1 by default) to
-    /// GUESTPORT in the sandbox. Repeatable.
-    #[arg(short = 'p', long = "publish", value_name = "[ADDR:]HOSTPORT:GUESTPORT")]
+    /// GUESTPORT in the sandbox: TCP, or UDP with /udp after it.
+    /// Repeatable.
+    #[arg(short = 'p', long = "publish", value_name = "[ADDR:]HOSTPORT:GUESTPORT[/udp]")]
     publish: Vec<String>,
     /// Grant a capability (fs_write, threads, process, net). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
@@ -342,8 +343,7 @@ fn run(args: RunArgs) -> Result<i32> {
             eprintln!("grix: the snapshot asks for net; grant it with `-a net` (and limit it with --allow-host)");
         }
         for spec in &args.publish {
-            let (host, guest) = publish_spec(spec)?;
-            snap = snap.forward(&host, guest)?;
+            snap = snap.publish(spec)?;
         }
         if let Some(mb) = args.max_output {
             snap = snap.max_output(mb << 20);
@@ -523,15 +523,6 @@ fn write_stream(stream: Stream, data: &[u8]) {
     };
 }
 
-/// `--publish [ADDR:]HOSTPORT:GUESTPORT`: (host address, guest port).
-fn publish_spec(spec: &str) -> Result<(String, u16)> {
-    let (host, guest) =
-        spec.rsplit_once(':').with_context(|| format!("--publish {spec:?} must be HOSTPORT:GUESTPORT"))?;
-    let guest: u16 = guest.parse().with_context(|| format!("--publish {spec:?}: bad guest port"))?;
-    let host = if host.contains(':') { host.to_string() } else { format!("127.0.0.1:{host}") };
-    Ok((host, guest))
-}
-
 fn prepare(args: &RunArgs) -> Result<Prepared> {
     let manifest = match &args.manifest {
         Some(p) => Manifest::load(p)?,
@@ -594,10 +585,11 @@ fn prepare(args: &RunArgs) -> Result<Prepared> {
         b = b.allow_host(rule)?;
     }
     for spec in &args.publish {
-        let (host, guest) = publish_spec(spec)?;
-        b = b.forward(&host, guest)?;
+        let p = grix::Publish::parse(spec)?;
+        b = b.publish(spec)?;
         if !args.quiet {
-            eprintln!("grix: forwarding {host} to port {guest} in the sandbox");
+            let udp = if p.udp { "UDP " } else { "" };
+            eprintln!("grix: forwarding {udp}{} to port {} in the sandbox", p.host, p.guest);
         }
     }
     for name in &args.allow {

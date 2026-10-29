@@ -1127,7 +1127,8 @@ fn udp_bind(s: &mut Inet) -> Result<SockAddr, Errno> {
     Ok(local)
 }
 
-/// Send one UDP datagram to `to`: to a socket of the guest's own, to the
+/// Send one UDP datagram to `to`: back to a peer that sent to it through
+/// a port forwarded from the host, to a socket of the guest's own, to the
 /// host's resolver (DNS), or through the host if it allows `to` (asked the
 /// first time; a refusal is EPERM, as a firewall's is).
 fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: bool) -> SysResult {
@@ -1137,6 +1138,13 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
     let local = udp_bind(s)?;
     let u = udp_of(s);
     let len = data.len() as u64;
+    // A reply out of the forwarded port (even to port 53: it's no query).
+    // Anywhere else, a forwarded socket is like any other.
+    let id = u.lock().id;
+    if inet::forward_peer(id, to) {
+        u.lock().reply(to, data);
+        return Ok(len);
+    }
     // (The unspecified address is this host, as on Linux.)
     if to.is_local() || to.is_unspecified() {
         let addr = match to {

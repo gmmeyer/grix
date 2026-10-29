@@ -65,8 +65,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
 13. [x] **Networking**: UDP beyond DNS (through the host, policed per
     destination; between the guest's own sockets in it), AF_UNIX sockets
     bound to paths, abstract names, datagrams, seqpackets and SCM_RIGHTS.
-    Left: UDP port forwarding, datagrams over one frame (~4 KiB),
-    SO_PASSCRED.
+    UDP port forwarding (`forward_udp`, `-p 5353:53/udp`): replies leave
+    from the forwarded port, only to its recent senders. Left: datagrams
+    over one frame (~4 KiB), SO_PASSCRED.
 14. [x] **Smaller syscalls**: `/proc/<pid>` for every process (`ps`),
     zombies included until they're reaped, pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
     `CLONE_PIDFD`, `waitid(P_PIDFD)`, polling), CPU-time timers
@@ -285,6 +286,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
       raw sockets and ICMP are reported as unsupported.
 - [x] Listening sockets with port forwarding to the host (bind/listen/accept4).
       `forward` / `-p` / `[[forward]]`. Node and Python servers work.
+      UDP too: `forward_udp` / `-p HOST:GUEST/udp` / `protocol = "udp"`.
 - [~] Host-side policy: allow-list for outbound connections
       (hosts/ports/CIDRs), DNS policy, bandwidth limits.
       `allow_host` rules (names, wildcards, IPs, CIDRs, ports); DNS only for names

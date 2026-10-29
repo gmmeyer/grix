@@ -283,6 +283,7 @@ let sandbox = Sandbox::builder()
     .allow_host("*.pythonhosted.org:443")?
     .allow_host("host.grix.internal:5432")? // the host's own 127.0.0.1:5432
     .forward("127.0.0.1:8080", 8000)?      // host 8080 -> sandbox port 8000
+    .forward_udp("127.0.0.1:5353", 53)?    // UDP: host 5353 -> sandbox port 53
     .build()?;
 ```
 
@@ -305,16 +306,28 @@ let sandbox = Sandbox::builder()
   or curl, add Alpine's `ca-certificates-bundle` to the runtime (the test
   fixture has it).
 - `forward_listener` takes a `TcpListener` you bound (port 0 to let the OS
-  pick), for tests.
+  pick), for tests; `forward_udp_socket` a `UdpSocket`.
+- A forwarded UDP port's datagrams go to the socket bound at the guest
+  port (on any address or 10.0.2.15). `recvfrom` shows each sender's own
+  address, except the host's loopback (127.0.0.1, `::1`), which is
+  10.0.2.2 (`host.grix.internal`) as everywhere in the sandbox; senders
+  the sandbox would take for its own addresses are dropped. Replies to a
+  sender leave from the forwarded port, but only to senders (the most
+  recent 256 of each port): anything else the socket sends goes through
+  the policy as any socket's does, so a forward doesn't open the host or
+  anywhere else. Datagrams over one frame (about 4 KiB) are dropped on the
+  way in.
 
-The CLI has `--allow-host RULE` and `-p/--publish [ADDR:]HOSTPORT:GUESTPORT`;
-manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host` and
-`guest`. TCP and UDP are supported (raw sockets and ICMP are reported as
-unsupported). A UDP socket's first datagram to a destination waits for the
-host's say; a refused one gets EPERM, as from a firewall, and only the
-destinations it sent to can answer it. Datagrams between the sandbox's own
-sockets stay in it; ones larger than about 4 KiB get EMSGSIZE (they'd be
-fragments on a real network), and forwarded ports are TCP only.
+The CLI has `--allow-host RULE` and `-p/--publish
+[ADDR:]HOSTPORT:GUESTPORT[/udp]` (Docker's spelling: `-p 5353:53/udp`);
+manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host`,
+`guest` and `protocol` (`"tcp"`, the default, or `"udp"`); Python's
+`publish` takes the CLI's specs. TCP and UDP are supported (raw sockets and
+ICMP are reported as unsupported). A UDP socket's first datagram to a
+destination waits for the host's say; a refused one gets EPERM, as from a
+firewall, and only the destinations it sent to can answer it. Datagrams
+between the sandbox's own sockets stay in it; ones larger than about 4 KiB
+get EMSGSIZE (they'd be fragments on a real network).
 
 ## MCP server and Python
 
@@ -431,8 +444,8 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   snapshot runs only on the kind of host that took it. A file may be
   anyone's, so runs from it get the network only as an image's program
   does: with `-a net` (and `--allow-host`, `--publish` as for any run;
-  `Snapshot::allow_net`, `forward`), never the file's own rules or
-  forwarded ports. Over MCP they get the server's. Output, export and
+  `Snapshot::allow_net`, `forward`, `forward_udp`), never the file's own
+  rules or forwarded ports (TCP or UDP). Over MCP they get the server's. Output, export and
   grace limits are a sandbox's defaults (or the file's, if lower) unless
   set, and never more than the file's; the time limit is the file's or
   the default's, whichever is shorter, unless `--timeout` says.
@@ -548,6 +561,7 @@ host = "results"         # relative to the manifest; must not exist yet, or be e
 # [[forward]]            # with net: host 127.0.0.1:8080 -> port 8000 in the sandbox
 # host = "127.0.0.1:8080"
 # guest = 8000
+# protocol = "udp"       # UDP datagrams instead ("tcp" by default)
 ```
 
 ## What you can import
@@ -582,7 +596,7 @@ bounded by `memory_mb` (Python's root is 40 MB, Node's 73 MB).
 | `fs_write` | Denied: the filesystem is read-only | `allow(Capability::FsWrite)`: the whole tree becomes writable in guest memory (copy-on-write over the imports, up to half of RAM). The host's files never change. |
 | `threads` | Denied | `allow(Capability::Threads)` |
 | `process` (fork/exec/wait) | Denied | `allow(Capability::Process)` |
-| `net` | Denied, and the VM has no network device | `allow(Capability::Net)`: TCP and DNS through the host, which checks `allow_host` rules; `forward` for servers |
+| `net` | Denied, and the VM has no network device | `allow(Capability::Net)`: TCP, UDP and DNS through the host, which checks `allow_host` rules; `forward` and `forward_udp` for servers |
 | Privileged (mount, ptrace, bpf, module loading, capabilities, …) | Always denied | — |
 
 A program can't get around the policy by making the call itself (with
@@ -637,7 +651,7 @@ Events tell you what happened:
   program needs them, and sends its changes as it makes them.
 - **Networking without a network card.** The guest kernel turns sockets
   into messages on the console. The host makes the connections (after the
-  policy check), forwards ports, and answers DNS. Flow control is by credit
+  policy check), forwards TCP and UDP ports, and answers DNS. Flow control is by credit
   in both directions, so a slow connection never stalls the console.
 
 ### Security model
@@ -663,8 +677,8 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 |---|---|
 | Static, static-PIE and dynamic executables, musl and glibc (Debian's bash, coreutils, perl, apt, git, curl; the official `python` and `node` images) | |
 | Terminals: pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`, Python's `pty`), termios, controlling terminals and `/dev/tty`, TTY mode (`grix run -t`, `tty`) with an interactive shell's job control | Packet mode (`TIOCPKT`), `TIOCSTI`; `VMIN` and `VTIME` together return at the first byte; orphaned process groups aren't treated specially |
-| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Raw sockets, ICMP (`ping`); UDP port forwarding |
-| With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), DNS through the host, loopback inside the sandbox, ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
+| argv/envp/auxv, HWCAP, AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Raw sockets, ICMP (`ping`); UDP datagrams over about 4 KiB |
+| With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), UDP (each destination asked of the host once), DNS through the host, loopback inside the sandbox, TCP and UDP ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
 | Interface listing without `net`: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls and `/proc/net/dev` all report just `lo` | |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | |
 | With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec`. Job control: stopping and continuing, `WUNTRACED`/`WCONTINUED`, `CLD_STOPPED`. pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `CLONE_PIDFD`, `waitid(P_PIDFD)`). `/proc/<pid>` for every process (`ps`), zombies included until they're reaped | |

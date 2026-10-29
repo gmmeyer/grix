@@ -93,13 +93,9 @@ impl Config {
         for rule in &self.allow_hosts {
             b = b.allow_host(rule)?;
         }
-        // [ADDR:]HOSTPORT:GUESTPORT, as `grix run -p` takes it.
+        // [ADDR:]HOSTPORT:GUESTPORT[/udp], as `grix run -p` takes it.
         for spec in &self.publish {
-            let (host, guest) =
-                spec.rsplit_once(':').with_context(|| format!("publish {spec:?}: HOSTPORT:GUESTPORT"))?;
-            let guest: u16 = guest.parse().with_context(|| format!("publish {spec:?}: bad guest port"))?;
-            let host = if host.contains(':') { host.to_string() } else { format!("127.0.0.1:{host}") };
-            b = b.forward(&host, guest)?;
+            b = b.publish(spec)?;
         }
         for (host, guest, mode) in &self.mounts {
             let mode = match mode.as_str() {

@@ -2,6 +2,10 @@
 //   udp local        between two of the guest's own sockets (no host)
 //   udp echo PORT    to an echo server on the host (host.grix.internal:PORT)
 //   udp denied PORT  to a port the policy doesn't allow: EPERM
+//   udp serve PORT   an echo server on PORT, forwarded from the host: echoes
+//                    each datagram to its sender (seen as 10.0.2.2, the
+//                    host's loopback) until "quit"; a send to a peer that
+//                    never sent gets EPERM
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -77,10 +81,36 @@ static void denied(int port) {
     printf("udp denied ok\n");
 }
 
+static void serve(int port) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in any = {.sin_family = AF_INET, .sin_port = htons(port)};
+    CHECK(bind(s, (void *)&any, sizeof any) == 0);
+    struct sockaddr_in host = at("10.0.2.2", 0);
+    for (int first = 1;; first = 0) {
+        char buf[8192], reply[8200];
+        struct sockaddr_in from;
+        socklen_t len = sizeof from;
+        ssize_t n = recvfrom(s, buf, sizeof buf, 0, (void *)&from, &len);
+        CHECK(n >= 0 && from.sin_addr.s_addr == host.sin_addr.s_addr && from.sin_port != 0);
+        if (first) {
+            // Nobody at the next port sent here: no way out through the
+            // forward, and the policy doesn't allow the host itself.
+            struct sockaddr_in stranger = from;
+            stranger.sin_port = htons(ntohs(from.sin_port) ^ 1);
+            CHECK(sendto(s, "no", 2, 0, (void *)&stranger, sizeof stranger) == -1 && errno == EPERM);
+        }
+        int m = snprintf(reply, sizeof reply, "echo %zd: %.*s", n, (int)n, buf);
+        CHECK(sendto(s, reply, m, 0, (void *)&from, len) == m);
+        if (n == 4 && memcmp(buf, "quit", 4) == 0) break;
+    }
+    printf("udp serve ok\n");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "local") == 0) local();
     else if (argc > 2 && strcmp(argv[1], "echo") == 0) echo(atoi(argv[2]));
     else if (argc > 2 && strcmp(argv[1], "denied") == 0) denied(atoi(argv[2]));
+    else if (argc > 2 && strcmp(argv[1], "serve") == 0) serve(atoi(argv[2]));
     else return 2;
     return 0;
 }

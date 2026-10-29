@@ -21,6 +21,7 @@
 //! [[forward]]                # host 127.0.0.1:8080 -> port 8000 in the sandbox
 //! host = "127.0.0.1:8080"
 //! guest = 8000
+//! protocol = "tcp"           # or "udp"
 //!
 //! [[export]]                 # copied out when the program ends (CLI)
 //! guest = "/out"
@@ -90,12 +91,15 @@ pub struct Import {
     pub guest: String,
 }
 
-/// A host address whose connections go to a port in the sandbox.
+/// A host address whose connections (or UDP datagrams) go to a port in
+/// the sandbox.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Forward {
     pub host: String,
     pub guest: u16,
+    /// "tcp" (the default) or "udp".
+    pub protocol: Option<String>,
 }
 
 /// A guest directory to export, and where on the host to write it.
@@ -174,7 +178,11 @@ impl Manifest {
             b = b.allow_host(rule)?;
         }
         for f in &self.forwards {
-            b = b.forward(&f.host, f.guest)?;
+            b = match f.protocol.as_deref() {
+                None | Some("tcp") => b.forward(&f.host, f.guest)?,
+                Some("udp") => b.forward_udp(&f.host, f.guest)?,
+                Some(other) => bail!("forward protocol {other:?} isn't tcp or udp"),
+            };
         }
         for imp in &self.imports {
             b = b.import(&imp.host, &imp.guest)?;
@@ -229,6 +237,26 @@ mod tests {
     fn rejects_unknown_fields_and_capabilities() {
         assert!(Manifest::parse("comand = []").is_err());
         let m = Manifest::parse(r#"capabilities = ["root"]"#).unwrap();
+        assert!(m.apply(SandboxBuilder::default()).is_err());
+    }
+
+    #[test]
+    fn forwards_tcp_or_udp() {
+        let m = Manifest::parse(
+            r#"
+            [[forward]]
+            host = "127.0.0.1:0"
+            guest = 80
+            [[forward]]
+            host = "127.0.0.1:0"
+            guest = 53
+            protocol = "udp"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(m.forwards[1].protocol.as_deref(), Some("udp"));
+        assert!(m.apply(SandboxBuilder::default()).is_ok());
+        let m = Manifest::parse("[[forward]]\nhost = \"127.0.0.1:0\"\nguest = 1\nprotocol = \"sctp\"").unwrap();
         assert!(m.apply(SandboxBuilder::default()).is_err());
     }
 }

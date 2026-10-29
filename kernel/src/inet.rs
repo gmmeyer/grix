@@ -7,12 +7,14 @@
 //! - UDP: a query to port 53 goes to the host, which answers it with its
 //!   own resolver; a datagram to the guest's own address to the socket
 //!   bound there; any other through the host, to destinations its policy
-//!   allows (`Udp`).
+//!   allows (`Udp`). Datagrams to a port forwarded from the host come in
+//!   to the socket bound there, and its replies to their senders go back
+//!   out the way they came (`forward_peer`).
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use grix_abi::link::{self, Addr, ToGuest, ToHost, WINDOW};
 use spin::{Mutex, Once};
 
@@ -640,6 +642,13 @@ impl Udp {
         send(ToHost::UdpSend { id: self.id, addr: to.addr, port: to.port, data });
     }
 
+    /// A reply to `to`, which sent to this socket through a port forwarded
+    /// from the host (`forward_peer`): it leaves from the host's port.
+    pub fn reply(&self, to: SockAddr, data: &[u8]) {
+        let Some(local) = self.local else { return };
+        send(ToHost::UdpReply { port: local.port, addr: to.addr, peer_port: to.port, data });
+    }
+
     /// Writable unless it waits for the host's say (level-triggered loops
     /// would spin on EAGAIN meanwhile).
     pub fn poll(&self) -> (u32, u64) {
@@ -651,6 +660,7 @@ impl Udp {
 impl Drop for Udp {
     fn drop(&mut self) {
         UDPS.lock().remove(&self.id);
+        FORWARD_PEERS.lock().retain(|&(id, _), _| id != self.id);
         if let Some(local) = self.local {
             let mut ports = UDP_PORTS.lock();
             if ports.get(&local.port).is_some_and(|w| w.strong_count() == 0) {
@@ -678,11 +688,47 @@ pub fn deliver_local(from: SockAddr, to: SockAddr, data: &[u8]) -> bool {
 
 // ---------------------------------------------------------------- from the host
 
-/// Guest ports the host forwards connections to (from the boot image).
+/// Guest ports the host forwards connections to, and UDP datagrams (from
+/// the boot image).
 static FORWARDS: Once<Vec<u16>> = Once::new();
+static UDP_FORWARDS: Once<Vec<u16>> = Once::new();
 
-pub fn init(forwards: Vec<u16>) {
+pub fn init(forwards: Vec<u16>, udp_forwards: Vec<u16>) {
     FORWARDS.call_once(|| forwards);
+    UDP_FORWARDS.call_once(|| udp_forwards);
+}
+
+/// Who sent to each socket through a forwarded UDP port (socket id, peer),
+/// and when it was last heard (a count): the peers it may reply to through
+/// the host's port. The host keeps the same `link::MAX_FORWARD_PEERS`
+/// most recent per port, and checks again.
+static FORWARD_PEERS: Mutex<BTreeMap<(u32, SockAddr), u64>> = Mutex::new(BTreeMap::new());
+static HEARD: AtomicU64 = AtomicU64::new(0);
+
+fn heard_from(id: u32, peer: SockAddr) {
+    let mut peers = FORWARD_PEERS.lock();
+    let mine = || {
+        (id, SockAddr { addr: Addr::V4([0; 4]), port: 0 })
+            ..=(id, SockAddr { addr: Addr::V6([0xff; 16]), port: u16::MAX })
+    };
+    if !peers.contains_key(&(id, peer)) && peers.range(mine()).count() >= link::MAX_FORWARD_PEERS {
+        let oldest = peers.range(mine()).min_by_key(|(_, at)| **at).map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            peers.remove(&k);
+        }
+    }
+    peers.insert((id, peer), HEARD.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Did `to` send to UDP socket `id` through a port forwarded from the
+/// host (so a reply goes back that way)?
+pub fn forward_peer(id: u32, to: SockAddr) -> bool {
+    FORWARD_PEERS.lock().contains_key(&(id, to))
+}
+
+/// Restored from a snapshot: this run's host has heard from nobody.
+pub fn forget_forward_peers() {
+    FORWARD_PEERS.lock().clear();
 }
 
 /// A message from the host's network proxy.
@@ -771,6 +817,18 @@ pub fn from_host(payload: &[u8]) {
                 u.lock().push(SockAddr { addr, port }, data);
             }
         }
+        ToGuest::UdpIncoming { port, peer, peer_port, data } => {
+            // To the socket bound at that port on the guest's own address
+            // (or any), as a datagram from the network would be.
+            let Some(u) = UDP_PORTS.lock().get(&port).and_then(Weak::upgrade) else { return };
+            let mut u = u.lock();
+            let takes = u.local.is_some_and(|l| l.is_unspecified() || l.addr == Addr::V4(link::GUEST_V4));
+            if takes {
+                let from = SockAddr { addr: peer, port: peer_port };
+                heard_from(u.id, from);
+                u.push(from, data);
+            }
+        }
         ToGuest::Incoming { id, port, peer, peer_port } => {
             let listener = LISTENERS.lock().get(&port).and_then(Weak::upgrade);
             let local = SockAddr::v4(link::GUEST_V4, port);
@@ -790,7 +848,7 @@ pub fn from_host(payload: &[u8]) {
 
 /// Could the host still wake a thread waiting on the network: a
 /// connection still open or being made, a DNS query unanswered, or a
-/// listener on a forwarded port?
+/// listener (or UDP socket) on a forwarded port?
 pub fn host_pending() -> bool {
     let conns: Vec<_> = CONNS.lock().values().filter_map(Weak::upgrade).collect();
     if conns.iter().any(|c| {
@@ -814,7 +872,12 @@ pub fn host_pending() -> bool {
         return true;
     }
     let forwards = FORWARDS.get().map_or(&[][..], |f| &f[..]);
-    forwards.iter().any(|&p| Listener::is_bound(p))
+    if forwards.iter().any(|&p| Listener::is_bound(p)) {
+        return true;
+    }
+    let udp_forwards = UDP_FORWARDS.get().map_or(&[][..], |f| &f[..]);
+    let ports = UDP_PORTS.lock();
+    udp_forwards.iter().any(|p| ports.get(p).is_some_and(|w| w.strong_count() > 0))
 }
 
 // ---------------------------------------------------------------- sockets

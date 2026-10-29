@@ -89,6 +89,9 @@ pub struct Image<'a> {
     pub live_mounts: Vec<LiveMount<'a>>,
     /// Guest ports the host forwards connections to (`link::ToGuest::Incoming`).
     pub forwards: Vec<u16>,
+    /// Guest ports the host forwards UDP datagrams to
+    /// (`link::ToGuest::UdpIncoming`).
+    pub udp_forwards: Vec<u16>,
     /// Snapshot the machine when the program first waits for stdin (see
     /// [`SNAPSHOT_CALL`]).
     pub snapshot: bool,
@@ -192,6 +195,10 @@ impl<'a> Image<'a> {
         for port in &self.forwards {
             w.u32(*port as u32);
         }
+        w.u32(self.udp_forwards.len() as u32);
+        for port in &self.udp_forwards {
+            w.u32(*port as u32);
+        }
         w.u8(self.snapshot as u8);
         w.u32(self.cpus);
         w.str(self.x86_64);
@@ -252,6 +259,11 @@ impl<'a> Image<'a> {
             return Err(DecodeError);
         }
         let forwards = (0..n).map(|_| r.u32().map(|p| p as u16)).collect::<Result<_, _>>()?;
+        let n = r.u32()? as usize;
+        if n > r.remaining() / 4 {
+            return Err(DecodeError);
+        }
+        let udp_forwards = (0..n).map(|_| r.u32().map(|p| p as u16)).collect::<Result<_, _>>()?;
         let snapshot = r.u8()? != 0;
         let cpus = r.u32()?;
         if cpus == 0 || cpus > crate::machine::MAX_CPUS {
@@ -280,6 +292,7 @@ impl<'a> Image<'a> {
             mounts,
             live_mounts,
             forwards,
+            udp_forwards,
             snapshot,
             cpus,
             x86_64,
@@ -327,6 +340,7 @@ mod tests {
                 LiveMount { path: "/big", writable: false, lazy: true },
             ],
             forwards: vec![8000, 80],
+            udp_forwards: vec![53],
             snapshot: true,
             cpus: 4,
             x86_64: "/usr/bin/qemu-x86_64",
@@ -360,6 +374,7 @@ mod tests {
             mounts: vec![],
             live_mounts: vec![],
             forwards: vec![],
+            udp_forwards: vec![],
             snapshot: false,
             cpus: 1,
             x86_64: "",

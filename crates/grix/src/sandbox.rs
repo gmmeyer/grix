@@ -17,7 +17,7 @@ use crate::export::{Collector, Export};
 use crate::hostfs::LiveMount;
 use crate::image::{self, Node};
 use crate::mount::{Mount, MountChanges};
-use crate::net::{ForwardFrom, HostRule, NetPolicy};
+use crate::net::{ForwardFrom, HostRule, NetPolicy, Publish, UdpFrom, forward_addr};
 use crate::vmm::{self, SnapshotFile, VmConfig, VmEnd};
 
 /// Room the kernel needs below the boot image (kernel, heap, page tables).
@@ -727,15 +727,42 @@ impl SandboxBuilder {
     /// on, like `127.0.0.1:8080`) to `guest_port`, where a program in the
     /// sandbox listens (with [`Capability::Net`]).
     pub fn forward(mut self, host: &str, guest_port: u16) -> Result<Self> {
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
-            .with_context(|| format!("forward address {host:?}"))?
-            .next()
-            .with_context(|| format!("forward address {host:?} resolves to nothing"))?;
-        if guest_port == 0 {
-            bail!("forwarding {host} needs a guest port");
-        }
+        let addr = forward_addr(host, guest_port)?;
         self.net.forwards.push((ForwardFrom::Addr(addr), guest_port));
         Ok(self)
+    }
+
+    /// Forward UDP datagrams to `host` (an address and port the host binds,
+    /// like `127.0.0.1:5353`) to `guest_port`, where a program in the
+    /// sandbox has a UDP socket bound (with [`Capability::Net`]). It sees
+    /// each sender's address as the source (the host's own loopback as
+    /// `10.0.2.2`, `host.grix.internal`), and its replies to a sender go
+    /// back out from `host`. Only to senders, the most recent 256 of them:
+    /// anywhere else, its sends are under [`allow_host`](Self::allow_host)
+    /// as any socket's are. Datagrams over about 4 KiB are dropped.
+    pub fn forward_udp(mut self, host: &str, guest_port: u16) -> Result<Self> {
+        let addr = forward_addr(host, guest_port)?;
+        self.net.udp_forwards.push((UdpFrom::Addr(addr), guest_port));
+        Ok(self)
+    }
+
+    /// Like [`forward_udp`](SandboxBuilder::forward_udp), from a socket
+    /// the caller bound (to port 0, say, to know which it got). Every run
+    /// of the sandbox serves it.
+    pub fn forward_udp_socket(mut self, socket: std::net::UdpSocket, guest_port: u16) -> Result<Self> {
+        if guest_port == 0 {
+            bail!("forwarding a UDP socket needs a guest port");
+        }
+        self.net.udp_forwards.push((UdpFrom::Socket(std::sync::Arc::new(socket)), guest_port));
+        Ok(self)
+    }
+
+    /// [`forward`](Self::forward) or [`forward_udp`](Self::forward_udp) as
+    /// `grix run -p` spells it: `[ADDR:]HOSTPORT:GUESTPORT`, with `/udp`
+    /// after it for UDP (see [`Publish`]).
+    pub fn publish(self, spec: &str) -> Result<Self> {
+        let p = Publish::parse(spec)?;
+        if p.udp { self.forward_udp(&p.host, p.guest) } else { self.forward(&p.host, p.guest) }
     }
 
     /// Like [`forward`](SandboxBuilder::forward), from a listener the
@@ -1036,6 +1063,7 @@ impl Sandbox {
                 .map(|m| grix_abi::image::LiveMount { path: &m.guest, writable: m.writable, lazy: m.lazy })
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
+            udp_forwards: cfg.net.udp_forwards.iter().map(|&(_, port)| port).collect(),
             snapshot: take.is_some(),
             cpus: cfg.cpus,
             x86_64: cfg.x86_64.as_deref().unwrap_or(""),
@@ -1106,11 +1134,19 @@ impl Sandbox {
                 ForwardFrom::Listener(_) => bail!("a forwarded listener can't be saved in a snapshot (use forward)"),
             }
         }
+        let mut udp_forwards = Vec::new();
+        for (from, port) in &cfg.net.udp_forwards {
+            match from {
+                UdpFrom::Addr(a) => udp_forwards.push((a.to_string(), *port)),
+                UdpFrom::Socket(_) => bail!("a forwarded UDP socket can't be saved in a snapshot (use forward_udp)"),
+            }
+        }
         let settings = crate::snapshot::Settings {
             abi: grix_abi::ABI_VERSION,
             net: cfg.policy.allows(Capability::Net),
             allow_hosts: cfg.net.allow.as_ref().map(|rules| rules.iter().map(|r| r.to_string()).collect()),
             forwards,
+            udp_forwards,
             exports: cfg.exports.clone(),
             max_export: cfg.max_export,
             max_output: cfg.max_output,
@@ -1311,10 +1347,15 @@ pub(crate) fn run_snapshot(
             .map(|rules| rules.iter().map(|r| HostRule::parse(r)).collect::<Result<Vec<_>>>())
             .transpose()?,
         forwards: Vec::new(),
+        udp_forwards: Vec::new(),
     };
     for (addr, port) in &s.forwards {
         let a = addr.parse().with_context(|| format!("forward address {addr:?} in the snapshot"))?;
         net.forwards.push((ForwardFrom::Addr(a), *port));
+    }
+    for (addr, port) in &s.udp_forwards {
+        let a = addr.parse().with_context(|| format!("UDP forward address {addr:?} in the snapshot"))?;
+        net.udp_forwards.push((UdpFrom::Addr(a), *port));
     }
     let (live, fs_state) = snap.live_mounts()?;
     let vm = VmConfig {

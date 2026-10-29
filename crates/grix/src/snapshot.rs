@@ -53,6 +53,9 @@ pub(crate) struct Settings {
     pub allow_hosts: Option<Vec<String>>,
     /// Forwarded ports: host address, guest port.
     pub forwards: Vec<(String, u16)>,
+    /// Forwarded UDP ports, the same way.
+    #[serde(default)]
+    pub udp_forwards: Vec<(String, u16)>,
     pub exports: Vec<String>,
     pub max_export: usize,
     pub max_output: usize,
@@ -175,6 +178,7 @@ impl Snapshot {
         settings.net = false;
         settings.allow_hosts = None;
         settings.forwards.clear();
+        settings.udp_forwards.clear();
         let timeout = Duration::from_millis(settings.timeout_ms).min(crate::sandbox::DEFAULT_TIMEOUT);
         let snap = Snapshot {
             path,
@@ -236,15 +240,25 @@ impl Snapshot {
     /// [`SandboxBuilder::forward`](crate::SandboxBuilder::forward)); the
     /// file's forwarded ports aren't.
     pub fn forward(mut self, host: &str, guest_port: u16) -> Result<Self> {
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
-            .with_context(|| format!("forward address {host:?}"))?
-            .next()
-            .with_context(|| format!("forward address {host:?} resolves to nothing"))?;
-        if guest_port == 0 {
-            bail!("forwarding {host} needs a guest port");
-        }
+        let addr = crate::net::forward_addr(host, guest_port)?;
         self.settings.forwards.push((addr.to_string(), guest_port));
         Ok(self)
+    }
+
+    /// Forward UDP datagrams to `host` to `guest_port` in runs from here
+    /// (see [`SandboxBuilder::forward_udp`](crate::SandboxBuilder::forward_udp));
+    /// the file's forwarded ports aren't.
+    pub fn forward_udp(mut self, host: &str, guest_port: u16) -> Result<Self> {
+        let addr = crate::net::forward_addr(host, guest_port)?;
+        self.settings.udp_forwards.push((addr.to_string(), guest_port));
+        Ok(self)
+    }
+
+    /// [`forward`](Self::forward) or [`forward_udp`](Self::forward_udp) as
+    /// `grix run -p` spells it (see [`Publish`](crate::Publish)).
+    pub fn publish(self, spec: &str) -> Result<Self> {
+        let p = crate::net::Publish::parse(spec)?;
+        if p.udp { self.forward_udp(&p.host, p.guest) } else { self.forward(&p.host, p.guest) }
     }
 
     /// At most this much of each of stdout and stderr is kept, and at most
@@ -425,6 +439,7 @@ mod tests {
             net: true,
             allow_hosts: Some(vec!["host.grix.internal".into(), "127.0.0.0/8".into()]),
             forwards: vec![("0.0.0.0:8080".into(), 80)],
+            udp_forwards: vec![("0.0.0.0:5353".into(), 53)],
             exports: vec![],
             max_export: usize::MAX,
             max_output: usize::MAX,
@@ -454,6 +469,7 @@ mod tests {
         let s = crafted();
         assert!(s.asks_for_net());
         assert!(!s.settings.net && s.settings.allow_hosts.is_none() && s.settings.forwards.is_empty());
+        assert!(s.settings.udp_forwards.is_empty());
         assert_eq!(s.settings.max_output, crate::sandbox::DEFAULT_MAX_OUTPUT);
         assert_eq!(s.settings.max_export, crate::sandbox::DEFAULT_MAX_EXPORT);
         assert_eq!(s.settings.grace_ms, crate::sandbox::DEFAULT_GRACE.as_millis() as u64);
@@ -464,6 +480,10 @@ mod tests {
         let s = crafted().allow_net(&["pypi.org".into()]).unwrap().forward("127.0.0.1:0", 80).unwrap();
         assert_eq!(s.settings.allow_hosts, Some(vec!["pypi.org".to_string()]));
         assert_eq!(s.settings.forwards, [("127.0.0.1:0".to_string(), 80)]);
+        assert!(s.settings.udp_forwards.is_empty());
+        let s = crafted().allow_net(&[]).unwrap().publish("127.0.0.1:0:53/udp").unwrap();
+        assert_eq!(s.settings.udp_forwards, [("127.0.0.1:0".to_string(), 53)]);
+        assert!(s.settings.forwards.is_empty());
         // Limits are the caller's, up to the file's.
         let s = crafted().limits(10, 20, Duration::from_secs(1));
         assert_eq!((s.settings.max_output, s.settings.max_export, s.settings.grace_ms), (10, 20, 1000));
