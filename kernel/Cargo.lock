@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "grix-abi"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "grix-kernel"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "grix-abi",
  "spin",

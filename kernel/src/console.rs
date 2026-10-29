@@ -452,12 +452,15 @@ pub fn host_pending() -> bool {
     let net = crate::inet::host_pending();
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut() else { return false };
-    if c.dev.tx_interrupt() {
-        c.out_version += 1;
-        crate::ipc::changed();
-        return true;
+    match c.dev.output() {
+        virtio::Output::RoomBack => {
+            c.out_version += 1;
+            crate::ipc::changed();
+            true
+        }
+        virtio::Output::InFlight => true,
+        virtio::Output::Idle => net || !c.stdin.eof,
     }
-    net || !c.stdin.eof || c.dev.in_flight()
 }
 
 /// The kernel's final counts, for the host's metrics.

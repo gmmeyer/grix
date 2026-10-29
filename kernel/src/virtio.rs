@@ -196,6 +196,17 @@ impl Queue {
     }
 }
 
+/// What the host can still do for output: `Console::output`.
+pub enum Output {
+    /// Buffers someone waits for came back (as for `tx_interrupt`).
+    RoomBack,
+    /// Some are still on their way; the device interrupts as they get
+    /// through.
+    InFlight,
+    /// Every buffer is back, and nobody waits for room.
+    Idle,
+}
+
 pub struct Console {
     base: u64,
     pub irq: u32,
@@ -310,16 +321,37 @@ impl Console {
         self.tx_free.len() * BUF_SIZE >= len
     }
 
-    /// Is output still on its way to the host? Then the device interrupts
-    /// as it gets through.
-    pub fn in_flight(&mut self) -> bool {
-        !self.room_for(QSIZE as usize * BUF_SIZE)
+    /// What the host can still do for output (for finding deadlocks),
+    /// decided from one look at the ring. Asking whether room came back
+    /// and then, looking again, whether anything is still in flight would
+    /// miss every buffer the device returns in between (the vCPU's thread
+    /// preempted there, say): neither, and a writer waiting for them
+    /// looks deadlocked.
+    pub fn output(&mut self) -> Output {
+        let wanted = self.tx_irq;
+        // Looks again after asking for the interrupt, if it does.
+        let all_back = self.room_for(QSIZE as usize * BUF_SIZE);
+        if wanted && self.room_back() {
+            Output::RoomBack
+        } else if !all_back {
+            Output::InFlight
+        } else {
+            // Nobody waits for room (`room_for` may have asked for it).
+            self.tx_irq = false;
+            self.tx.set_avail_flags(AVAIL_F_NO_INTERRUPT);
+            Output::Idle
+        }
     }
 
     /// After an interrupt: did transmit buffers that someone waits for come
     /// back? Stops those interrupts until they're wanted again.
     pub fn tx_interrupt(&mut self) -> bool {
         self.reclaim_tx();
+        self.room_back()
+    }
+
+    /// `tx_interrupt` after its look at the ring.
+    fn room_back(&mut self) -> bool {
         if !self.tx_irq || self.tx_free.is_empty() {
             return false;
         }

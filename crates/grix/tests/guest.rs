@@ -1655,6 +1655,49 @@ fn stdout_backpressure_with_signals() {
 }
 
 #[test]
+fn a_writer_waiting_for_the_host_is_not_deadlocked() {
+    // Sandboxes side by side, each writing megabytes to a host that reads
+    // in bursts: it stalls until every buffer is with the device, then
+    // takes them all back at once. The deadlock check once looked at the
+    // ring twice (no room came back; then nothing in flight), and buffers
+    // returned in between made a writer waiting for them look deadlocked:
+    // busybox head was killed short of its output. That window is a few
+    // instructions wide, so this seldom hits it: GRIX_STRESS=N runs N
+    // rounds.
+    let rounds = std::env::var("GRIX_STRESS").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
+    const BYTES: usize = 3_000_000;
+    for _ in 0..rounds {
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let sb = Sandbox::builder()
+                        .timeout(Duration::from_secs(120))
+                        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+                        .unwrap()
+                        .build()
+                        .unwrap();
+                    let mut seen = 0;
+                    let argv = ["/bin/busybox", "head", "-c", "3000000", "/dev/zero"];
+                    let out = sb
+                        .run_streaming(&argv, |_, bytes| {
+                            // About what the device's buffers hold.
+                            if (seen + bytes.len()) >> 17 != seen >> 17 {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            seen += bytes.len();
+                        })
+                        .unwrap();
+                    assert!(out.events.is_empty(), "{:?}\n{}", out.events, out.kernel_log);
+                    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.kernel_log);
+                    assert_eq!(out.stdout.len(), BYTES);
+                    assert!(out.stdout.iter().all(|&b| b == 0));
+                });
+            }
+        });
+    }
+}
+
+#[test]
 fn large_transfers_are_lossless() {
     // Megabytes each way, with a reader that keeps stalling: the guest is
     // held back, and nothing is dropped or reordered.
