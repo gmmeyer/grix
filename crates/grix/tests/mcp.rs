@@ -10,6 +10,15 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/build").canonicalize().unwrap()
 }
 
+fn x86_64_guest() -> bool {
+    grix::Arch::from_env() == grix::Arch::X86_64
+}
+
+/// Alpine's static busybox for the guest's architecture (`GRIX_ARCH`).
+fn busybox(fixtures: &Path) -> PathBuf {
+    fixtures.join(if x86_64_guest() { "alpine-x86_64" } else { "alpine" }).join("bin/busybox.static")
+}
+
 struct Server {
     child: Child,
     to: Option<ChildStdin>,
@@ -72,7 +81,7 @@ fn an_agent_runs_programs_over_mcp() {
     let init =
         call(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
     assert_eq!(init["result"]["capabilities"]["tools"], json!({}));
-    let busybox = fixtures.join("alpine/bin/busybox.static");
+    let busybox = busybox(&fixtures);
     let run = call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run", "arguments": {
         "imports": [{"host": busybox, "guest": "/bin/busybox"}],
         "files": [{"path": "/in.txt", "content": "pear\napple\n"}],
@@ -132,10 +141,10 @@ fn a_writable_server_builds_images_and_writes_mounts() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("work")).unwrap();
     std::fs::create_dir_all(dir.join("ctx")).unwrap();
-    std::fs::copy(fixtures.join("alpine/bin/busybox.static"), dir.join("ctx/busybox")).unwrap();
+    std::fs::copy(busybox(&fixtures), dir.join("ctx/busybox")).unwrap();
     let dir = dir.canonicalize().unwrap();
     let mut server = Server::start(&["--writable", "--max-mem", "1024"], &[&fixtures, &dir]);
-    let busybox = fixtures.join("alpine/bin/busybox.static");
+    let busybox = busybox(&fixtures);
 
     let r = server.tool(
         "run",
@@ -187,7 +196,9 @@ fn a_writable_server_builds_images_and_writes_mounts() {
             "output": dir.join("sh.snap"),
         }),
     );
-    if grix::Sandbox::builder().vmm_path().is_some() {
+    if x86_64_guest() {
+        assert!(text(&r).contains("snapshots of x86_64 machines"), "{}", text(&r));
+    } else if grix::Sandbox::builder().vmm_path().is_some() {
         assert_eq!(r["isError"], false, "{r}");
         for who in ["agent", "again"] {
             let r = server.tool("run", json!({"snapshot": dir.join("sh.snap"), "stdin": format!("{who}\n")}));
@@ -261,7 +272,7 @@ fn progress_and_cancellation() {
     // Two calls at once: one streams its output as progress, the other is
     // withdrawn mid-run and never answered.
     let fixtures = fixtures();
-    let busybox = fixtures.join("alpine/bin/busybox.static");
+    let busybox = busybox(&fixtures);
     let mut server = Server::start(&["--max-parallel", "2"], &[&fixtures]);
     let started = std::time::Instant::now();
     let call = |id: u64, token: Value, script: &str| {
