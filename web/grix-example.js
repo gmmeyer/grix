@@ -127,6 +127,8 @@ const STYLE = `
 input.command { flex: 1; min-width: 0; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
        padding: 5px 7px; border: 1px solid var(--gx-border); border-radius: 5px;
        background: var(--gx-bg); color: var(--gx-fg); }
+/* The capabilities and Run move as one: when the bar wraps, they share a row. */
+.actions { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 .caps { display: flex; gap: 10px; flex-wrap: wrap; font: 12px ui-monospace, monospace; }
 .caps label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; white-space: nowrap; }
 button { font: 600 13px system-ui, sans-serif; padding: 5px 14px; border-radius: 5px; cursor: pointer;
@@ -166,8 +168,7 @@ class GrixExample extends HTMLElement {
       <div class="box">
         <div class="bar">
           <div class="cmd"><span>$</span><input class="command" spellcheck="false" aria-label="Command"></div>
-          <div class="caps"></div>
-          <button class="run">Run</button>
+          <div class="actions"><div class="caps"></div><button class="run">Run</button></div>
         </div>
         <div class="stdin" hidden><div class="stdin-label">stdin</div><textarea rows="3" spellcheck="false" aria-label="stdin"></textarea></div>
         ${tty ? '<div class="term"><pre class="out idle">Press Run to start a terminal.</pre></div><pre class="events" hidden></pre>' : '<pre class="out" aria-live="polite"></pre>'}

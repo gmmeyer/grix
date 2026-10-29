@@ -15,7 +15,7 @@
   --deny: #c2410c;
   --radius: 10px;
   --wide: 1080px;
-  --prose: 700px;
+  --prose: 760px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color-scheme: light dark;
 }
@@ -133,6 +133,11 @@ td:first-child { font-family: var(--mono); font-size: .88rem; white-space: nowra
 .prose .byline { color: var(--muted); font-size: .95rem; margin-bottom: 2rem; }
 .prose p { margin: 1.05rem 0; }
 .prose figure { margin: 1.8rem 0; }
+/* Demos wider than the text, where there's room: their bar fits on one row. */
+@media (min-width: 1000px) {
+  .prose figure, .prose > grix-example { margin-left: -70px; margin-right: -70px; }
+  .prose figure figcaption { padding: 0 70px; }
+}
 .prose figcaption { font-size: .9rem; color: var(--muted); margin-top: .4rem; }
 .prose figure grix-example { margin: 0; }
 .post-list { list-style: none; padding: 0; margin: 1.5rem 0; }
