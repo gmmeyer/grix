@@ -1438,6 +1438,20 @@ pub fn fchmodat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult
     set_mode(p, ino, mode)
 }
 
+/// fchmodat with flags (Linux 6.6; glibc 2.39's fchmodat tries it first).
+/// Like Linux, a symlink's own mode can't be changed.
+pub fn fchmodat2(p: &mut Process, dirfd: u64, pathp: u64, mode: u64, flags: u64) -> SysResult {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let ino = at_node(p, dirfd, pathp, flags)?;
+    // (EINVAL: it isn't a symlink.)
+    if fs::lock().link_target(ino) != Err(EINVAL) {
+        return Err(EOPNOTSUPP);
+    }
+    set_mode(p, ino, mode)
+}
+
 /// chown: without privileges a program can only "change" a file it owns to
 /// its own uid and its own group, as on Linux. -1 leaves an id alone.
 fn set_owner(p: &mut Process, ino: Ino, uid: u64, gid: u64) -> SysResult {

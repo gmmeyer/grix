@@ -208,6 +208,20 @@ static int test_permissions(void) {
     CHECK(chmod("/proc/self", 0777) == -1 && errno == EPERM);
     CHECK(unlink("/dev/null") == -1 && errno == EACCES);
     CHECK(put("/dev/shm/sem", "ok") == 0);
+    // fchmodat2 (452 on both architectures): flags, and a symlink's own
+    // mode can't change.
+    CHECK(syscall(452, AT_FDCWD, "/tmp/mine", 0600, AT_SYMLINK_NOFOLLOW) == 0);
+    CHECK(stat("/tmp/mine", &st) == 0 && (st.st_mode & 07777) == 0600);
+    CHECK(symlink("/tmp/mine", "/tmp/mine-link") == 0);
+    CHECK(syscall(452, AT_FDCWD, "/tmp/mine-link", 0644, AT_SYMLINK_NOFOLLOW) == -1 && errno == EOPNOTSUPP);
+    CHECK(syscall(452, AT_FDCWD, "/tmp/mine-link", 0640, 0) == 0);
+    CHECK(stat("/tmp/mine", &st) == 0 && (st.st_mode & 07777) == 0640);
+    fd = open("/tmp/mine", O_RDONLY);
+    CHECK(syscall(452, fd, "", 0604, AT_EMPTY_PATH) == 0);
+    CHECK(fstat(fd, &st) == 0 && (st.st_mode & 07777) == 0604);
+    close(fd);
+    CHECK(syscall(452, AT_FDCWD, "/tmp/mine", 0600, 1) == -1 && errno == EINVAL);
+    CHECK(unlink("/tmp/mine-link") == 0);
     return 0;
 }
 

@@ -263,6 +263,7 @@ syscalls! {
     437 openat2 Core;
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    452 fchmodat2 Cap(FsWrite);
 }
 
 // Linux x86_64 (arch/x86/entry/syscalls/syscall_64.tbl): the same calls, and
@@ -544,4 +545,5 @@ syscalls! {
     438 pidfd_getfd Cap(Process);
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    452 fchmodat2 Cap(FsWrite);
 }
