@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Prepares a sandbox for grix: Rust (host + bare-metal aarch64 kernel target), QEMU for the
-# end-to-end tests, zig for the C fixtures, Go for the Go fixtures, then builds kernel, host CLI and fixtures so
-# `make test` works immediately. Safe to rerun: every step skips work that is already current.
+# Prepares a sandbox for grix: Rust (host + the bare-metal aarch64 and x86_64 kernel targets),
+# QEMU for the end-to-end tests, zig for the C fixtures, Go for the Go fixtures, then builds
+# kernels, host CLI, grix-vmm, the Python module and fixtures so `make test` works immediately.
+# Safe to rerun: every step skips work that is already current.
 #
-# Sandboxes are x86_64 without /dev/kvm, so grix falls back to QEMU's TCG emulator
-# (GRIX_ACCEL=tcg) automatically; end-to-end tests are slower than on HVF/KVM.
+# Sandboxes are x86_64 without /dev/kvm. The guest defaults to the host's architecture, so tests
+# boot the x86_64 kernel in qemu-system-x86_64 under TCG (no grix-vmm without KVM);
+# GRIX_ARCH=aarch64 runs them on the arm64 kernel in qemu-system-aarch64. Both are slower than
+# on HVF/KVM. crates/grix/tests/mcp.rs and python/tests import only the arm64 busybox, so they
+# pass only with GRIX_ARCH=aarch64 here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,9 +20,10 @@ GO_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
-# --- System packages: QEMU (qemu-system-aarch64) and tools for downloads.
+# --- System packages: QEMU (qemu-system-aarch64, qemu-system-x86_64) and tools for downloads.
 need=()
 command -v qemu-system-aarch64 >/dev/null || need+=(qemu-system-arm)
+command -v qemu-system-x86_64 >/dev/null || need+=(qemu-system-x86)
 command -v xz >/dev/null || need+=(xz-utils)
 command -v curl >/dev/null || need+=(curl)
 command -v cc >/dev/null || need+=(build-essential) # linker for host Rust builds
@@ -28,14 +33,15 @@ if [ ${#need[@]} -gt 0 ]; then
 fi
 
 # --- Rust via rustup (stable; repo uses edition 2024). The kernel is a separate workspace
-# built for aarch64-unknown-none-softfloat, so that target must be installed too.
+# built for aarch64-unknown-none-softfloat and x86_64-unknown-none (`make kernel` builds both),
+# so those targets must be installed too.
 export PATH="$HOME/.cargo/bin:$PATH"
 if ! command -v rustup >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
     --no-modify-path -c clippy -c rustfmt
 fi
 rustup toolchain install stable --profile minimal -c clippy -c rustfmt >/dev/null
-rustup target add --toolchain stable aarch64-unknown-none-softfloat >/dev/null
+rustup target add --toolchain stable aarch64-unknown-none-softfloat x86_64-unknown-none >/dev/null
 # Expose the rustup proxies on the default PATH so agent shells and services find them.
 for bin in cargo rustc rustup rustfmt cargo-fmt cargo-clippy clippy-driver rustdoc; do
   [ -e "$HOME/.cargo/bin/$bin" ] && $SUDO ln -sf "$HOME/.cargo/bin/$bin" "/usr/local/bin/$bin"
@@ -70,6 +76,8 @@ $SUDO ln -sf "$go_dir/bin/go" /usr/local/bin/go
 # small C programs (seconds) and tools/alpine.py caches downloads in ~/.cache/grix/alpine.
 make kernel
 make host
+make vmm
+make python
 make fixtures
 # Pre-build test binaries so the first `cargo test` doesn't pay for compilation.
 cargo test --workspace --no-run
