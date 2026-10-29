@@ -14,6 +14,7 @@
 #include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -304,6 +305,58 @@ static int sigioinit(void) {
     return 0;
 }
 
+/// Read exactly `n` bytes.
+static int read_all(int fd, char *out, size_t n) {
+    for (size_t got = 0; got < n;) {
+        ssize_t r = read(fd, out + got, n - got);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return 0;
+}
+
+// nginx serves static files with sendfile to the client's socket.
+static int sendfile_out(void) {
+    static char want[8192], got[8192];
+    int in = open("/proc/self/exe", O_RDONLY);
+    struct stat st;
+    CHECK(in >= 0 && fstat(in, &st) == 0 && st.st_size > 8192 && pread(in, want, 8192, 0) == 8192);
+    // To a socket pair.
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    off_t off = 0;
+    CHECK(sendfile(sv[0], in, &off, 4096) == 4096 && off == 4096);
+    CHECK(read_all(sv[1], got, 4096) == 0 && memcmp(got, want, 4096) == 0);
+    // To a pipe, from the file's offset, which moves.
+    int pf[2];
+    CHECK(pipe(pf) == 0 && lseek(in, 100, SEEK_SET) == 100);
+    CHECK(sendfile(pf[1], in, NULL, 50) == 50 && lseek(in, 0, SEEK_CUR) == 150);
+    CHECK(read_all(pf[0], got, 50) == 0 && memcmp(got, want + 100, 50) == 0);
+    // To a TCP connection.
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(7002), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0), c = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 1) == 0);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+    int x = accept(l, NULL, NULL);
+    off = 0;
+    CHECK(x >= 0 && sendfile(x, in, &off, 8192) == 8192);
+    CHECK(read_all(c, got, 8192) == 0 && memcmp(got, want, 8192) == 0);
+    // At the end of the file: nothing.
+    off = st.st_size;
+    CHECK(sendfile(x, in, &off, 100) == 0);
+    // To a named pipe.
+    CHECK(mkfifo("/tmp/fifo", 0600) == 0);
+    int fr = open("/tmp/fifo", O_RDONLY | O_NONBLOCK), fw = open("/tmp/fifo", O_WRONLY);
+    off = 0;
+    CHECK(fr >= 0 && fw >= 0 && sendfile(fw, in, &off, 1000) == 1000);
+    CHECK(read_all(fr, got, 1000) == 0 && memcmp(got, want, 1000) == 0);
+    // Nobody to read it.
+    signal(SIGPIPE, SIG_IGN);
+    close(pf[0]);
+    CHECK(sendfile(pf[1], in, NULL, 10) == -1 && errno == EPIPE);
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -362,6 +415,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "hostname") == 0) r = hostname();
         if (strcmp(argv[i], "sigio") == 0) r = sigio();
         if (strcmp(argv[i], "sigioinit") == 0) r = sigioinit();
+        if (strcmp(argv[i], "sendfile") == 0) r = sendfile_out();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

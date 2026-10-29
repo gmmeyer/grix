@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
 
-use super::file::{pipe_read, pipe_write};
+use super::file::{Src, pipe_read, pipe_write};
 use super::{require, table::nr};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, FileRef, O_NONBLOCK, O_RDWR, new_file};
@@ -295,7 +295,7 @@ fn send(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
     match &s.tx {
-        Some(tx) => pipe_write(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0),
+        Some(tx) => pipe_write(p, tx, Src::User(buf), len, nonblock, flags & MSG_NOSIGNAL == 0),
         None => {
             if flags & MSG_NOSIGNAL == 0 {
                 crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: wrote to a socket that was shut down");
@@ -1077,7 +1077,7 @@ pub(super) fn inet_read(
 pub(super) fn inet_write(
     p: &mut Process,
     s: &mut Inet,
-    buf: u64,
+    src: Src,
     count: u64,
     nonblock: bool,
     sigpipe: bool,
@@ -1095,7 +1095,7 @@ pub(super) fn inet_write(
             return Err(EMSGSIZE);
         }
         let mut q = alloc::vec![0u8; count as usize];
-        copy_in(&mut p.aspace, buf, &mut q)?;
+        src.read(p, 0, &mut q)?;
         return udp_send(p, s, &q, to, nonblock);
     }
     match &s.state {
@@ -1121,7 +1121,7 @@ pub(super) fn inet_write(
                 if n == 0 {
                     break;
                 }
-                copy_in(&mut p.aspace, buf + done, &mut chunk[..n])?;
+                src.read(p, done, &mut chunk[..n])?;
                 let msg = link::ToHost::Data { id, data: &chunk[..n] }.encode();
                 if !crate::console::try_write(grix_abi::wire::Channel::Link, &msg) {
                     break;
@@ -1132,7 +1132,7 @@ pub(super) fn inet_write(
             if done > 0 || count == 0 { Ok(done) } else { wait(p, nonblock, s.sndtimeo, EAGAIN) }
         }
         State::Local { end, .. } => match &end.tx {
-            Some(tx) => local_io(p, nonblock, s.sndtimeo, |p| pipe_write(p, tx, buf, count, true, sigpipe)),
+            Some(tx) => local_io(p, nonblock, s.sndtimeo, |p| pipe_write(p, tx, src, count, true, sigpipe)),
             None => epipe(p),
         },
         _ => Err(ENOTCONN),
@@ -1263,7 +1263,7 @@ fn inet_send(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64, to: Opti
     let mut total = 0;
     for (i, &(base, len)) in bufs.iter().enumerate() {
         let nonblock = nonblock || i > 0;
-        match inet_write(p, s, base, len, nonblock, flags & MSG_NOSIGNAL == 0, None) {
+        match inet_write(p, s, Src::User(base), len, nonblock, flags & MSG_NOSIGNAL == 0, None) {
             Ok(n) => {
                 total += n;
                 if n < len {

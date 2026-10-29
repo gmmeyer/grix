@@ -1815,6 +1815,12 @@ fn o_async_signals_cannot_reach_init() {
 }
 
 #[test]
+fn sendfile_to_sockets_and_pipes() {
+    // nginx serves static files this way.
+    popular(with("popular").allow(Capability::Net).allow(Capability::FsWrite), &["sendfile"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

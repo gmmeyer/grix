@@ -542,7 +542,7 @@ pub fn send_stream(
         return Err(Errno(109)); // ETOOMANYREFS: it would hold itself open
     }
     let at = tx.pipe.lock().written;
-    let n = pipe_write(p, tx, buf, len, nonblock, sigpipe)?;
+    let n = pipe_write(p, tx, super::file::Src::User(buf), len, nonblock, sigpipe)?;
     if let Some(r) = rights
         && n > 0
     {

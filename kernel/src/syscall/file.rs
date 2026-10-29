@@ -800,10 +800,10 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             return super::net::netlink_request(p, nl, &[(buf, count)]);
         }
         FileKind::Pipe(end) if !end.write => return Err(EBADF),
-        FileKind::Pipe(end) => return pipe_write(p, end, buf, count, nonblock, true),
+        FileKind::Pipe(end) => return pipe_write(p, end, Src::User(buf), count, nonblock, true),
         FileKind::Fifo(f) => {
             return match &f.write {
-                Some(end) => pipe_write(p, end, buf, count, nonblock, true),
+                Some(end) => pipe_write(p, end, Src::User(buf), count, nonblock, true),
                 None => Err(EBADF),
             };
         }
@@ -811,7 +811,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         FileKind::Unix(s) => return super::unix::send_msg(p, s, &[(buf, count)], 0, nonblock, None, None),
         FileKind::Socket(s) => {
             return match &s.tx {
-                Some(tx) => pipe_write(p, tx, buf, count, nonblock, true),
+                Some(tx) => pipe_write(p, tx, Src::User(buf), count, nonblock, true),
                 None => {
                     crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: wrote to a socket that was shut down");
                     Err(EPIPE)
@@ -820,7 +820,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::Inet(_) => {
             let FileKind::Inet(s) = &mut f.kind else { unreachable!() };
-            return super::net::inet_write(p, s, buf, count, nonblock, true, None);
+            return super::net::inet_write(p, s, Src::User(buf), count, nonblock, true, None);
         }
         FileKind::EventFd(e) => {
             if count < 8 {
@@ -941,11 +941,33 @@ pub(super) fn pipe_read_rights(
     Ok(n as u64)
 }
 
+/// Where written bytes come from: the program's memory, or the kernel's
+/// (sendfile's, read from a file).
+#[derive(Clone, Copy)]
+pub(super) enum Src<'a> {
+    User(u64),
+    Kernel(&'a [u8]),
+}
+
+impl Src<'_> {
+    /// Bytes `off..off + out.len()` of it.
+    pub(super) fn read(self, p: &mut Process, off: u64, out: &mut [u8]) -> Result<(), Errno> {
+        match self {
+            Src::User(buf) => copy_in(&mut p.aspace, buf + off, out),
+            Src::Kernel(b) => {
+                let b = b.get(off as usize..off as usize + out.len()).ok_or(EFAULT)?;
+                out.copy_from_slice(b);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Write to a pipe (or one direction of a socket).
 pub(super) fn pipe_write(
     p: &mut Process,
     end: &PipeEnd,
-    buf: u64,
+    src: Src,
     count: u64,
     nonblock: bool,
     sigpipe: bool,
@@ -969,7 +991,7 @@ pub(super) fn pipe_write(
     }
     let n = pipe.reserve(count as usize);
     let mut tmp = alloc::vec![0u8; n];
-    copy_in(&mut p.aspace, buf, &mut tmp)?;
+    src.read(p, 0, &mut tmp)?;
     pipe.buf.extend(tmp);
     pipe.written += n as u64;
     pipe.touch();
@@ -1731,9 +1753,12 @@ fn offset_arg(p: &mut Process, ptr: u64) -> Result<Option<u64>, Errno> {
     Ok(Some(off))
 }
 
-/// sendfile from a regular file to a regular file, stdout or stderr. Other
-/// destinations get EINVAL, which makes callers (Python's shutil, busybox)
-/// fall back to read and write.
+/// The most sendfile moves to a pipe or socket at once (a kernel buffer).
+const SENDFILE_CHUNK: u64 = 64 * 1024;
+
+/// sendfile from a regular file to a regular file, stdout or stderr, a
+/// pipe or FIFO, or a stream socket. Other destinations get EINVAL, which
+/// makes callers (Python's shutil, busybox) fall back to read and write.
 pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64) -> SysResult {
     let (in_file, src, _) = fd_content(p, in_fd, false)?;
     let start = match offset_arg(p, offp)? {
@@ -1778,6 +1803,33 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
                 done += n as u64;
             }
             done
+        }
+        // A pipe or a socket (nginx serves files this way): what a write
+        // of the next chunk would take.
+        (FileKind::Pipe(_) | FileKind::Fifo(_) | FileKind::Socket(_) | FileKind::Inet(_), _) => {
+            let mut data = alloc::vec![0u8; count.min(SENDFILE_CHUNK) as usize];
+            let got = src.lock().read_at(start, &mut data)?;
+            let data = Src::Kernel(&data[..got]);
+            match &mut o.kind {
+                _ if got == 0 => 0,
+                FileKind::Pipe(end) if end.write => pipe_write(p, end, data, got as u64, nonblock, true)?,
+                FileKind::Fifo(FifoFile { write: Some(end), .. }) => {
+                    pipe_write(p, end, data, got as u64, nonblock, true)?
+                }
+                FileKind::Socket(s) => match &s.tx {
+                    Some(tx) => pipe_write(p, tx, data, got as u64, nonblock, true)?,
+                    None => {
+                        crate::signal::raise(
+                            p,
+                            crate::signal::SIGPIPE,
+                            "SIGPIPE: wrote to a socket that was shut down",
+                        );
+                        return Err(EPIPE);
+                    }
+                },
+                FileKind::Inet(s) => super::net::inet_write(p, s, data, got as u64, nonblock, true, None)?,
+                _ => return Err(EBADF),
+            }
         }
         _ => return Err(EINVAL),
     };
