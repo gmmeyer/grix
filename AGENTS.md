@@ -115,7 +115,10 @@ idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
 instruction), as a masked one waits in the GIC on arm64. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
-PIT; the APIC timer is one-shot. FP state is fxsave's (no AVX). One CPU
+PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
+x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
+in Linux's signal frame layout, and `sigframe::read_fp` keeps a frame's
+XSAVE header to what xrstor accepts (invariant 12). One CPU
 and no snapshots for now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
 `kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
 COM1 by port I/O, PVH's entry state, the hypervisor timing leaf filled

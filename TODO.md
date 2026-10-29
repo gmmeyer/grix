@@ -96,8 +96,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     signal frame, the vDSO), the x86_64 syscall table, its older calls
     and structure layouts; QEMU microvm (`--arch x86_64`); grix-vmm on
     x86 KVM; every end-to-end test passes on it, in CI on an x86 runner
-    with KVM (`x86.yml`); x86_64 Linux releases. Left: SMP (INIT/SIPI),
-    AVX state (xsave), and snapshots of x86_64 machines.
+    with KVM (`x86.yml`); x86_64 Linux releases; AVX and AVX-512 state
+    (XSAVE, in Linux's signal frame). Left: SMP (INIT/SIPI), and
+    snapshots of x86_64 machines.
 20. **An outside security review** (after the above).
 
 ## Agent integrations

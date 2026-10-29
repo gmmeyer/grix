@@ -2220,6 +2220,30 @@ fn user_registers_stay_out_of_the_kernel() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// x86_64's AVX state (XSAVE): ymm registers survive context switches
+/// and signal handlers, whose frame holds them in Linux's layout, and a
+/// frame whose XSAVE header xrstor would refuse is a SIGSEGV, not a fault
+/// in the kernel. (On arm64 the fixture only says ok.)
+#[test]
+fn vector_registers_are_the_programs_own() {
+    let out = run(with("fpstate").allow(Capability::Threads), &["/bin/fpstate"]);
+    assert_eq!(out.stdout_str(), "fpstate ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    if !x86_64_guest() {
+        return;
+    }
+    for bad in ["badheader", "badfeatures"] {
+        let out = run(with("fpstate").allow(Capability::Threads), &["/bin/fpstate", bad]);
+        assert_eq!(out.status, ExitStatus::Signaled(11), "{bad}: {}", out.stdout_str());
+        assert!(
+            matches!(&out.events[..], [GuestEvent::Fault { signal: 11, detail, .. }] if detail.contains("rt_sigreturn")),
+            "{bad}: {:?}",
+            out.events
+        );
+    }
+}
+
 /// More CPUs: programs see them, threads run in parallel on them, and
 /// execve and exit work while other threads spin on other CPUs.
 #[test]

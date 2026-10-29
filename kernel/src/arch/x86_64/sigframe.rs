@@ -1,7 +1,10 @@
 //! Linux's x86_64 signal frame (arch/x86/kernel/signal_64.c):
 //! `struct rt_sigframe { char *pretcode; ucontext uc; siginfo info; }`, the
-//! kernel's ucontext (an 8-byte sigset), and the FP state (fxsave's 512
-//! bytes, 64-byte aligned) above it, which `sigcontext.fpstate` points at.
+//! kernel's ucontext (an 8-byte sigset), and the FP state above it
+//! (64-byte aligned), which `sigcontext.fpstate` points at: fxsave's 512
+//! bytes, or with XSAVE the whole XSAVE area, described in the 48 bytes
+//! fxsave leaves to software (`struct _fpx_sw_bytes`) and followed by
+//! FP_XSTATE_MAGIC2 (arch/x86/kernel/fpu/signal.c).
 
 use alloc::vec;
 
@@ -30,10 +33,21 @@ const INFO: usize = UC_SIGMASK + 8;
 const FRAME_SIZE: usize = INFO + 128;
 const _: () = assert!(FRAME_SIZE == 440);
 
-const FP_SIZE: u64 = 512;
+/// fxsave's area: XSAVE's legacy region.
+const FXSAVE_SIZE: usize = 512;
+/// `struct _fpx_sw_bytes` in the legacy region: magic1, extended_size,
+/// xfeatures, xstate_size.
+const SW_BYTES: usize = 464;
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// The XSAVE header, after the legacy region: XSTATE_BV, XCOMP_BV, and
+/// 48 reserved bytes.
+const XHEADER: usize = 512;
+const XHEADER_END: usize = 576;
 /// Below the stack pointer user code may use without moving it.
 const RED_ZONE: u64 = 128;
 
+const UC_FP_XSTATE: u64 = 1;
 const UC_SIGCONTEXT_SS: u64 = 2;
 const UC_STRICT_RESTORE_SS: u64 = 4;
 
@@ -98,18 +112,33 @@ fn regs(tf: &mut TrapFrame) -> [&mut u64; 18] {
 pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context) -> Result<u64, Errno> {
     // On the stack it was using, past its red zone.
     let top = if top == tf.rsp { top.checked_sub(RED_ZONE).ok_or(EFAULT)? } else { top };
-    let fp_at = top.checked_sub(FP_SIZE).ok_or(EFAULT)? & !63;
+    let xsize = super::xsave_size();
+    let fp_size = if xsize == 0 { FXSAVE_SIZE } else { xsize + 4 };
+    let fp_at = top.checked_sub(fp_size as u64).ok_or(EFAULT)? & !63;
     // As if a return address had been pushed: a function's entry alignment.
     let frame = (fp_at.checked_sub(FRAME_SIZE as u64).ok_or(EFAULT)? & !15).checked_sub(8).ok_or(EFAULT)?;
 
     let mut fp = FpState::default();
     super::save_fp(&mut fp);
-    copy_out(a, fp_at, &fp.area)?;
+    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    if xsize == 0 {
+        copy_out(a, fp_at, &fp.area[..FXSAVE_SIZE])?;
+    } else {
+        let sw = &mut fp.area[SW_BYTES..FXSAVE_SIZE];
+        sw.fill(0);
+        sw[0..4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+        sw[4..8].copy_from_slice(&(fp_size as u32).to_le_bytes());
+        sw[8..16].copy_from_slice(&super::xsave_features().to_le_bytes());
+        sw[16..20].copy_from_slice(&(xsize as u32).to_le_bytes());
+        copy_out(a, fp_at, &fp.area[..xsize])?;
+        copy_out(a, fp_at + xsize as u64, &FP_XSTATE_MAGIC2.to_le_bytes())?;
+        uc_flags |= UC_FP_XSTATE;
+    }
 
     let mut b = vec![0u8; FRAME_SIZE];
     let mut regs_tf = *tf;
     put_u64(&mut b, PRETCODE, ctx.restorer);
-    put_u64(&mut b, UC_FLAGS, UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS);
+    put_u64(&mut b, UC_FLAGS, uc_flags);
     put_u64(&mut b, UC_STACK, ctx.stack.0);
     b[UC_STACK + 8..UC_STACK + 12].copy_from_slice(&ctx.stack.1.to_le_bytes());
     put_u64(&mut b, UC_STACK + 16, ctx.stack.2);
@@ -157,16 +186,7 @@ pub fn sigreturn(a: &mut AddressSpace, tf: &mut TrapFrame) -> Result<(u64, (u64,
     let mut fp = FpState::default();
     let fp_at = get_u64(&b, MC_FPSTATE);
     if fp_at != 0 {
-        copy_in(a, fp_at, &mut fp.area)?;
-        // Reserved MXCSR bits would fault in fxrstor: only the CPU's own.
-        let mut cur = FpState::default();
-        super::save_fp(&mut cur);
-        let mask = match u32::from_le_bytes(cur.area[28..32].try_into().unwrap()) {
-            0 => 0xffbf,
-            m => m,
-        };
-        let mxcsr = u32::from_le_bytes(fp.area[24..28].try_into().unwrap()) & mask;
-        fp.area[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        read_fp(a, fp_at, &mut fp)?;
     }
     let mut new = *tf;
     for (i, r) in regs(&mut new).into_iter().enumerate() {
@@ -188,4 +208,51 @@ pub fn sigreturn(a: &mut AddressSpace, tf: &mut TrapFrame) -> Result<(u64, (u64,
         get_u64(&b, UC_STACK + 16),
     );
     Ok((get_u64(&b, UC_SIGMASK), stack))
+}
+
+/// The FP state of a frame at `fp_at` into `fp`, as `restore_fp` will
+/// take it. With XSAVE, a frame with the whole area (its software bytes
+/// and both magics as `push_frame` writes them) restores every component;
+/// any other, its x87/SSE state only, the rest starting over, as Linux's
+/// fx_only. An XSAVE header that xrstor would refuse is rejected, as
+/// Linux's validate_user_xstate_header does.
+fn read_fp(a: &mut AddressSpace, fp_at: u64, fp: &mut FpState) -> Result<(), Errno> {
+    copy_in(a, fp_at, &mut fp.area[..FXSAVE_SIZE])?;
+    // Reserved MXCSR bits would fault in fxrstor or xrstor: only the CPU's own.
+    let mut cur = FpState::default();
+    super::save_fp(&mut cur);
+    let mask = match u32::from_le_bytes(cur.area[28..32].try_into().unwrap()) {
+        0 => 0xffbf,
+        m => m,
+    };
+    let mxcsr = u32::from_le_bytes(fp.area[24..28].try_into().unwrap()) & mask;
+    fp.area[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+
+    let (xsize, xcr0) = (super::xsave_size(), super::xsave_features());
+    if xsize == 0 {
+        return Ok(());
+    }
+    let sw = &fp.area[SW_BYTES..FXSAVE_SIZE];
+    let word = |off: usize| u32::from_le_bytes(sw[off..off + 4].try_into().unwrap());
+    let whole = word(0) == FP_XSTATE_MAGIC1 && word(4) as usize == xsize + 4 && word(16) as usize == xsize && {
+        let mut magic2 = [0u8; 4];
+        copy_in(a, fp_at + xsize as u64, &mut magic2)?;
+        u32::from_le_bytes(magic2) == FP_XSTATE_MAGIC2
+    };
+    if !whole {
+        // x87 and SSE from the frame (XSTATE_BV), every other component initial.
+        fp.area[XHEADER..XHEADER + 8].copy_from_slice(&0b11u64.to_le_bytes());
+        return Ok(());
+    }
+    let features = u64::from_le_bytes(sw[8..16].try_into().unwrap());
+    copy_in(a, fp_at + FXSAVE_SIZE as u64, &mut fp.area[FXSAVE_SIZE..xsize])?;
+    let bv = get_u64(&fp.area, XHEADER);
+    // Components outside XCR0, the compacted format (XCOMP_BV) or the
+    // reserved bytes would make xrstor fault.
+    if bv & !xcr0 != 0 || fp.area[XHEADER + 8..XHEADER_END].iter().any(|&b| b != 0) {
+        return Err(EINVAL);
+    }
+    // Components the frame doesn't say it has start over.
+    put_u64(&mut fp.area, XHEADER, bv & features);
+    Ok(())
 }
