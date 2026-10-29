@@ -44,6 +44,27 @@ int main(int argc, char **argv) {
     CHECK(contains("/sys/devices/system/cpu/online", "0"));
     CHECK(contains("/proc/sys/kernel/osrelease", "6.1.0-grix"));
     CHECK(contains("/proc/self/mounts", " / "));
+    // What monitoring agents read (the Datadog Agent's file_handle, io,
+    // memory and network checks, psutil, gohai).
+    CHECK(contains("/proc/meminfo", "\nActive:") && contains("/proc/meminfo", "\nInactive:"));
+    CHECK(contains("/proc/vmstat", "\npswpin 0\npswpout 0\n"));
+    CHECK(contains("/proc/partitions", "major minor"));
+    CHECK(access("/proc/diskstats", R_OK) == 0);
+    CHECK(contains("/proc/sys/kernel/cap_last_cap", "40\n"));
+    CHECK(contains("/proc/sys/fs/file-max", "4096\n"));
+    CHECK(contains("/proc/sys/fs/inode-nr", "\t0\n"));
+    CHECK(contains("/sys/class/net/lo/mtu", "65536\n"));
+    CHECK(contains("/sys/devices/system/cpu/cpu0/topology/core_id", "0\n"));
+    // file-nr counts open files, everywhere: one more while this one is open.
+    unsigned long nr1, nr2, unused, max;
+    FILE *f = fopen("/proc/sys/fs/file-nr", "r");
+    CHECK(f && fscanf(f, "%lu %lu %lu", &nr1, &unused, &max) == 3 && unused == 0 && max == 4096);
+    fclose(f);
+    int extra = open("/bin/compat", O_RDONLY);
+    f = fopen("/proc/sys/fs/file-nr", "r");
+    CHECK(f && fscanf(f, "%lu", &nr2) == 1 && nr2 == nr1 + 1);
+    fclose(f);
+    close(extra);
 
     // /proc/self/fd and /dev aliases.
     char link[64] = {0};

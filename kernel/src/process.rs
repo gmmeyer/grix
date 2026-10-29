@@ -743,7 +743,8 @@ pub fn start(img: Image<'static>) -> ! {
         klog!("exec {}: {}\n", img.exe, reason);
         finish(ExitKind::Exited, code)
     };
-    let mut fs = fs::Fs::build(entries, &img.mounts, &img.live_mounts, img.uid, img.gid);
+    let cpus = img.cpus.clamp(1, grix_abi::machine::MAX_CPUS);
+    let mut fs = fs::Fs::build(entries, &img.mounts, &img.live_mounts, (img.uid, img.gid), cpus);
     for m in &img.mounts {
         fs.mark_mount(m);
     }
@@ -755,7 +756,7 @@ pub fn start(img: Image<'static>) -> ! {
     // Like tmpfs's default size: half of RAM for written file data.
     fs::set_limit(crate::mm::frame::stats().0 / 2);
 
-    let (stdin, gicr, cpus) = (img.stdin, img.gicr, img.cpus);
+    let (stdin, gicr) = (img.stdin, img.gicr);
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);

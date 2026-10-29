@@ -16,6 +16,11 @@ pub const MAX_FDS: usize = 1024;
 pub const MAX_OPEN_FILES: usize = 4096;
 static OPEN_FILES: AtomicUsize = AtomicUsize::new(0);
 
+/// Open file descriptions now (/proc/sys/fs/file-nr).
+pub fn open_files() -> usize {
+    OPEN_FILES.load(Ordering::Relaxed)
+}
+
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_RDONLY: u32 = 0o0;
 pub const O_WRONLY: u32 = 0o1;

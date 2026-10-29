@@ -43,6 +43,13 @@ pub enum ProcFile {
     CgroupCpuMax,
     ProcStat,
     Meminfo,
+    Vmstat,
+    /// /proc/sys/fs/file-nr and file-max.
+    FileNr,
+    FileMax,
+    InodeNr,
+    /// /sys/devices/system/cpu/cpuN/topology/core_id.
+    CoreId(u32),
     Uptime,
     Loadavg,
     Version,
@@ -91,8 +98,17 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/vm/overcommit_memory", ProcFile::Text("0\n")),
     ("/proc/sys/vm/max_map_count", ProcFile::Text("65530\n")),
     ("/proc/sys/vm/mmap_min_addr", ProcFile::Text("65536\n")), // syscall::mem::MMAP_MIN_ADDR
-    ("/proc/sys/fs/file-max", ProcFile::Text("1024\n")),
+    ("/proc/sys/fs/file-max", ProcFile::FileMax),
+    ("/proc/sys/fs/file-nr", ProcFile::FileNr),
+    ("/proc/sys/fs/inode-nr", ProcFile::InodeNr),
     ("/proc/sys/fs/nr_open", ProcFile::Text("1024\n")),
+    // Linux 6.1's last capability, CAP_CHECKPOINT_RESTORE (libcap and Go's
+    // capability packages read it).
+    ("/proc/sys/kernel/cap_last_cap", ProcFile::Text("40\n")),
+    ("/proc/vmstat", ProcFile::Vmstat),
+    // No block devices.
+    ("/proc/diskstats", ProcFile::Text("")),
+    ("/proc/partitions", ProcFile::Text("major minor  #blocks  name\n\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),
     // The only interface is lo (see netlink.rs).
     (
@@ -104,6 +120,15 @@ pub const FILES: &[(&str, ProcFile)] = &[
         ),
     ),
     ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
+    // lo as sysfs shows it (as netlink.rs describes it).
+    ("/sys/class/net/lo/address", ProcFile::Text("00:00:00:00:00:00\n")),
+    ("/sys/class/net/lo/addr_len", ProcFile::Text("6\n")),
+    ("/sys/class/net/lo/carrier", ProcFile::Text("1\n")),
+    ("/sys/class/net/lo/flags", ProcFile::Text("0x9\n")),
+    ("/sys/class/net/lo/ifindex", ProcFile::Text("1\n")),
+    ("/sys/class/net/lo/mtu", ProcFile::Text("65536\n")),
+    ("/sys/class/net/lo/operstate", ProcFile::Text("unknown\n")),
+    ("/sys/class/net/lo/type", ProcFile::Text("772\n")),
     ("/sys/devices/system/cpu/online", ProcFile::CpuList),
     ("/sys/devices/system/cpu/possible", ProcFile::CpuList),
     ("/sys/devices/system/cpu/present", ProcFile::CpuList),
@@ -184,8 +209,33 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
                 s,
                 "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
                  Buffers:               0 kB\nCached:                0 kB\nSwapCached:            0 kB\n\
-                 SwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n"
+                 Active:         {used:8} kB\nInactive:              0 kB\n\
+                 SwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n",
+                used = total - free
             );
+        }
+        // No swap and no block devices: their counters stay at 0.
+        ProcFile::Vmstat => {
+            let (total, used) = frame::stats();
+            let _ = write!(
+                s,
+                "nr_free_pages {}\nnr_dirty 0\nnr_writeback 0\npgpgin 0\npgpgout 0\npswpin 0\npswpout 0\n\
+                 oom_kill 0\n",
+                total - used
+            );
+        }
+        // Allocated, unused (always 0 since 2.6), most.
+        ProcFile::FileNr => {
+            let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::MAX_OPEN_FILES);
+        }
+        ProcFile::FileMax => {
+            let _ = writeln!(s, "{}", crate::fd::MAX_OPEN_FILES);
+        }
+        ProcFile::InodeNr => {
+            let _ = writeln!(s, "{}\t0", fs::lock().node_count());
+        }
+        ProcFile::CoreId(cpu) => {
+            let _ = writeln!(s, "{cpu}");
         }
         ProcFile::Uptime => {
             let ms = time::monotonic_ns() / 1_000_000;

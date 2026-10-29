@@ -882,7 +882,13 @@ fn leak(s: String) -> &'static [u8] {
 }
 
 impl Fs {
-    pub fn build(entries: &[Entry<'static>], mounts: &[&str], live: &[LiveMount], uid: u32, gid: u32) -> Fs {
+    pub fn build(
+        entries: &[Entry<'static>],
+        mounts: &[&str],
+        live: &[LiveMount],
+        (uid, gid): (u32, u32),
+        cpus: u32,
+    ) -> Fs {
         let now = crate::time::realtime_ns();
         // The sandbox user owns the root and everything imported, so a program
         // can create files next to its inputs. System parts (/dev, /proc,
@@ -952,6 +958,12 @@ impl Fs {
             let (dir, name) = path.rsplit_once('/').unwrap();
             let parent = fs.mkdir_p(dir);
             fs.insert(parent, name, Kind::Proc(file), 0o444);
+        }
+        // Each CPU its own core in one package, as a VM's usually are.
+        for cpu in 0..cpus {
+            let dir = fs.mkdir_p(&alloc::format!("/sys/devices/system/cpu/cpu{cpu}/topology"));
+            fs.insert(dir, "core_id", Kind::Proc(ProcFile::CoreId(cpu)), 0o444);
+            fs.insert(dir, "physical_package_id", Kind::Proc(ProcFile::Text("0\n")), 0o444);
         }
         for top in ["/dev", "/proc", "/sys"] {
             if let Ok(ino) = fs.lookup(ROOT, top, false) {
