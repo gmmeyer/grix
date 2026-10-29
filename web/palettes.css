@@ -86,6 +86,97 @@
   --term: #1d2021;
 }
 
+/* GitHub (Primer). */
+:root[data-palette="github"] {
+  --bg: #ffffff; --bg-alt: #f6f8fa; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --code-bg: #eff2f5;
+  --accent: #0969da; --accent-fg: #ffffff; --ok: #1a7f37; --deny: #cf222e;
+  --term: #0d1117; --term-fg: #f0f6fc; --term-muted: #9198a1; --term-border: #3d444d;
+  --term-err: #ffa657; --term-event: #79c0ff; --term-ok: #3fb950; --term-bad: #ff7b72;
+}
+:root[data-palette="github"][data-scheme="dark"] {
+  --bg: #0d1117; --bg-alt: #151b23; --fg: #f0f6fc; --muted: #9198a1; --border: #3d444d; --code-bg: #262c36;
+  --accent: #4493f8; --accent-fg: #0d1117; --ok: #3fb950; --deny: #ff7b72;
+  --term: #010409;
+}
+
+/* One Dark and One Light (Atom's, and VS Code's One Dark Pro). */
+:root[data-palette="one"] {
+  --bg: #fafafa; --bg-alt: #f0f0f1; --fg: #383a42; --muted: #696c77; --border: #e0e0e2; --code-bg: #eaeaeb;
+  --accent: #4078f2; --accent-fg: #ffffff; --ok: #50a14f; --deny: #e45649;
+  --term: #282c34; --term-fg: #abb2bf; --term-muted: #5c6370; --term-border: #3e4451;
+  --term-err: #d19a66; --term-event: #56b6c2; --term-ok: #98c379; --term-bad: #e06c75;
+}
+:root[data-palette="one"][data-scheme="dark"] {
+  --bg: #282c34; --bg-alt: #21252b; --fg: #d7dae0; --muted: #9da5b4; --border: #3e4451; --code-bg: #2c313a;
+  --accent: #61afef; --accent-fg: #282c34; --ok: #98c379; --deny: #e06c75;
+  --term: #21252b;
+}
+
+/* Nord: Polar Night, Snow Storm and Frost. */
+:root[data-palette="nord"] {
+  --bg: #eceff4; --bg-alt: #e5e9f0; --fg: #2e3440; --muted: #4c566a; --border: #d8dee9; --code-bg: #dfe4ec;
+  --accent: #5e81ac; --accent-fg: #ffffff; --ok: #5b7f45; --deny: #bf616a;
+  --term: #2e3440; --term-fg: #d8dee9; --term-muted: #7b88a1; --term-border: #3b4252;
+  --term-err: #d08770; --term-event: #88c0d0; --term-ok: #a3be8c; --term-bad: #bf616a;
+}
+:root[data-palette="nord"][data-scheme="dark"] {
+  --bg: #2e3440; --bg-alt: #3b4252; --fg: #eceff4; --muted: #b4bccb; --border: #434c5e; --code-bg: #3b4252;
+  --accent: #88c0d0; --accent-fg: #2e3440; --ok: #a3be8c; --deny: #bf616a;
+  --term: #242933;
+}
+
+/* Solarized. */
+:root[data-palette="solarized"] {
+  --bg: #fdf6e3; --bg-alt: #eee8d5; --fg: #073642; --muted: #586e75; --border: #e4ddc8; --code-bg: #eee8d5;
+  --accent: #268bd2; --accent-fg: #fdf6e3; --ok: #859900; --deny: #dc322f;
+  --term: #002b36; --term-fg: #93a1a1; --term-muted: #586e75; --term-border: #073642;
+  --term-err: #cb4b16; --term-event: #2aa198; --term-ok: #859900; --term-bad: #dc322f;
+}
+:root[data-palette="solarized"][data-scheme="dark"] {
+  --bg: #002b36; --bg-alt: #073642; --fg: #eee8d5; --muted: #93a1a1; --border: #0e4452; --code-bg: #073642;
+  --accent: #268bd2; --accent-fg: #fdf6e3; --ok: #859900; --deny: #cb4b16;
+  --term: #00212b;
+}
+
+/* Rosé Pine: Main, and Dawn in the light. */
+:root[data-palette="rose-pine"] {
+  --bg: #faf4ed; --bg-alt: #fffaf3; --fg: #575279; --muted: #797593; --border: #dfdad9; --code-bg: #f2e9e1;
+  --accent: #b4637a; --accent-fg: #fffaf3; --ok: #286983; --deny: #b4637a;
+  --term: #191724; --term-fg: #e0def4; --term-muted: #6e6a86; --term-border: #26233a;
+  --term-err: #f6c177; --term-event: #c4a7e7; --term-ok: #9ccfd8; --term-bad: #eb6f92;
+}
+:root[data-palette="rose-pine"][data-scheme="dark"] {
+  --bg: #191724; --bg-alt: #1f1d2e; --fg: #e0def4; --muted: #908caa; --border: #403d52; --code-bg: #26233a;
+  --accent: #ebbcba; --accent-fg: #191724; --ok: #9ccfd8; --deny: #eb6f92;
+  --term: #13111c;
+}
+
+/* Everforest. */
+:root[data-palette="everforest"] {
+  --bg: #fdf6e3; --bg-alt: #f4f0d9; --fg: #5c6a72; --muted: #829181; --border: #e0dcc7; --code-bg: #efebd4;
+  --accent: #35a77c; --accent-fg: #fdf6e3; --ok: #8da101; --deny: #f85552;
+  --term: #2d353b; --term-fg: #d3c6aa; --term-muted: #859289; --term-border: #3d484d;
+  --term-err: #e69875; --term-event: #7fbbb3; --term-ok: #a7c080; --term-bad: #e67e80;
+}
+:root[data-palette="everforest"][data-scheme="dark"] {
+  --bg: #2d353b; --bg-alt: #343f44; --fg: #d3c6aa; --muted: #9da9a0; --border: #475258; --code-bg: #3d484d;
+  --accent: #a7c080; --accent-fg: #2d353b; --ok: #a7c080; --deny: #e67e80;
+  --term: #232a2e;
+}
+
+/* Kanagawa: Wave, and Lotus in the light. */
+:root[data-palette="kanagawa"] {
+  --bg: #f2ecbc; --bg-alt: #e9e2b2; --fg: #545464; --muted: #716e61; --border: #d5cea3; --code-bg: #e7dba0;
+  --accent: #4d699b; --accent-fg: #f2ecbc; --ok: #6f894e; --deny: #c84053;
+  --term: #1f1f28; --term-fg: #dcd7ba; --term-muted: #727169; --term-border: #2a2a37;
+  --term-err: #ffa066; --term-event: #7fb4ca; --term-ok: #98bb6c; --term-bad: #e46876;
+}
+:root[data-palette="kanagawa"][data-scheme="dark"] {
+  --bg: #1f1f28; --bg-alt: #2a2a37; --fg: #dcd7ba; --muted: #a6a28c; --border: #363646; --code-bg: #2a2a37;
+  --accent: #7e9cd8; --accent-fg: #1f1f28; --ok: #98bb6c; --deny: #e46876;
+  --term: #16161d;
+}
+
 /* The demos' colours, from the palette's. */
 :root {
   --grix-bg: var(--bg); --grix-fg: var(--fg); --grix-muted: var(--muted); --grix-border: var(--border);
@@ -103,3 +194,5 @@
   border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
 .palette-chooser button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--accent-fg); }
 .palette-chooser span { color: var(--muted); margin-right: 2px; }
+.palette-chooser select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--fg); }
