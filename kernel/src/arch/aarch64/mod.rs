@@ -475,11 +475,29 @@ pub fn pte_barrier() {
     unsafe { asm!("dsb ishst", "isb") };
 }
 
-/// Forget cached translations, on every CPU (they may run threads of this
-/// address space): before a page whose mapping changed is reused.
-pub fn flush_tlb() {
+/// Above this many pages a flush is of everything (as Linux's
+/// MAX_DVM_OPS bounds a range's TLBIs).
+const FLUSH_PAGES: u64 = 64;
+
+/// Forget cached translations of `[start, end)` (page aligned) in the
+/// address space whose root is `root`, on every CPU: before a page whose
+/// mapping changed is reused. TTBR0's ASID is always 0 (each switch
+/// flushes this CPU's, `set_user_page_table`), so a page's TLBI reaches
+/// every process's entries for that address: more than needed, never less.
+pub fn flush_tlb(_root: u64, start: u64, end: u64) {
     crate::smp::note(crate::smp::Stat::Flush, 1);
-    unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
+    if (end - start) / 4096 > FLUSH_PAGES {
+        unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
+        return;
+    }
+    // SAFETY: TLB maintenance; the page tables were written first.
+    unsafe { asm!("dsb ishst") };
+    for va in (start..end).step_by(4096) {
+        // Last level only (the tables above it don't change while the
+        // address space lives), ASID 0 in bits 63:48.
+        unsafe { asm!("tlbi vale1is, {}", in(reg) (va >> 12) & ((1 << 44) - 1)) };
+    }
+    unsafe { asm!("dsb ish", "isb") };
 }
 
 /// Flushes another CPU asked for and this one missed: none (`flush_tlb`

@@ -235,6 +235,24 @@ impl Vma {
     }
 }
 
+/// The pages whose entries changed, for a flush of just those
+/// (`AddressSpace::flush`).
+struct Span {
+    lo: u64,
+    hi: u64,
+}
+
+impl Span {
+    fn new() -> Self {
+        Span { lo: u64::MAX, hi: 0 }
+    }
+
+    fn add(&mut self, va: u64) {
+        self.lo = self.lo.min(va);
+        self.hi = self.hi.max(va + PAGE_SIZE);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultError {
     /// No mapping, or the mapping forbids this access.
@@ -328,7 +346,7 @@ impl AddressSpace {
         let mut out_of_memory = false;
         // Entries made read-only: until the flush, other CPUs running the
         // parent's threads may still write through their old ones.
-        let mut downgraded = false;
+        let mut downgraded = Span::new();
         for v in self.vmas.values() {
             let cow = v.prot.write && !v.shared_pages();
             self.pt.for_each_mapped(v.start, v.end, |va, pte| unsafe {
@@ -336,7 +354,9 @@ impl AddressSpace {
                     return;
                 }
                 let shared = if cow { paging::read_only(*pte) } else { *pte };
-                downgraded |= shared != *pte;
+                if shared != *pte {
+                    downgraded.add(va);
+                }
                 let pa = shared & ADDR_MASK;
                 if !frame::share(pa) {
                     out_of_memory = true;
@@ -349,9 +369,7 @@ impl AddressSpace {
                 *pte = shared;
             });
         }
-        if downgraded {
-            arch::flush_tlb();
-        }
+        self.flush(downgraded);
         // The child is dropped, which releases what it got; the parent's
         // pages are just read-only now, and fault back in writable.
         if out_of_memory { Err(ENOMEM) } else { Ok(child) }
@@ -382,13 +400,25 @@ impl AddressSpace {
         // new entry, the TLB has the old).
         if pa != old {
             self.pt.for_each_mapped(page, page + PAGE_SIZE, |_, pte| unsafe { *pte = 0 });
-            arch::flush_tlb();
+            self.flush_page(page);
         }
         self.pt.map(page, pa, prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
         if pa == old {
-            arch::flush_tlb();
+            self.flush_page(page);
         }
         Ok(())
+    }
+
+    /// Forget the entries of `span` (if any) on every CPU that may hold
+    /// them: before a page they mapped is freed or mapped elsewhere.
+    fn flush(&self, span: Span) {
+        if span.lo < span.hi {
+            arch::flush_tlb(self.pt.root, span.lo, span.hi);
+        }
+    }
+
+    fn flush_page(&self, page: u64) {
+        arch::flush_tlb(self.pt.root, page, page + PAGE_SIZE);
     }
 
     pub fn activate(&self) {
@@ -527,14 +557,14 @@ impl AddressSpace {
     /// faults in fresh zero (or file) contents. MADV_DONTNEED semantics.
     pub fn discard(&mut self, start: u64, end: u64) {
         let mut freed = Vec::new();
-        self.pt.for_each_mapped(start, end, |_, pte| unsafe {
+        let mut span = Span::new();
+        self.pt.for_each_mapped(start, end, |va, pte| unsafe {
             freed.push(*pte & ADDR_MASK);
+            span.add(va);
             *pte = 0;
         });
-        if !freed.is_empty() {
-            // Other CPUs may still have the pages in their TLBs until this.
-            arch::flush_tlb();
-        }
+        // Other CPUs may still have the pages in their TLBs until this.
+        self.flush(span);
         for pa in freed {
             frame::free(pa);
         }
@@ -618,16 +648,18 @@ impl AddressSpace {
         // Only entries that were there and changed can be in a TLB as they
         // were (thread stacks, mapped PROT_NONE and then opened up, have
         // none yet).
-        let mut changed = false;
+        let mut changed = Span::new();
         for mut piece in self.carve(start, end) {
             piece.prot = prot;
             // A page shared with a forked process stays read-only until
             // it's written (and copied); shared memory is meant to be shared.
             let cow = prot.write && !piece.shared_pages();
-            self.pt.for_each_mapped(piece.start, piece.end, |_, pte| unsafe {
+            self.pt.for_each_mapped(piece.start, piece.end, |va, pte| unsafe {
                 let pa = *pte & ADDR_MASK;
                 let new = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
-                changed |= new != *pte;
+                if new != *pte {
+                    changed.add(va);
+                }
                 *pte = new;
                 if prot.exec {
                     arch::sync_icache(p2v(pa), PAGE_SIZE);
@@ -636,9 +668,7 @@ impl AddressSpace {
             self.vmas.insert(piece.start, piece);
         }
         self.recount();
-        if changed {
-            arch::flush_tlb();
-        }
+        self.flush(changed);
         Ok(())
     }
 
@@ -707,7 +737,7 @@ impl AddressSpace {
             }
         }
         if moved {
-            arch::flush_tlb();
+            arch::flush_tlb(self.pt.root, old, old_end);
         }
         result
     }
@@ -737,7 +767,7 @@ impl AddressSpace {
                     // Break before make, as in `unshare`.
                     if old != pa {
                         self.pt.for_each_mapped(page, page + PAGE_SIZE, |_, pte| unsafe { *pte = 0 });
-                        arch::flush_tlb();
+                        self.flush_page(page);
                         frame::free(old);
                     }
                     let mapped = self.pt.map(page, pa, vma.prot.pte_flags());
@@ -746,13 +776,13 @@ impl AddressSpace {
                     }
                     mapped.ok_or(FaultError::OutOfMemory)?;
                     if old == pa {
-                        arch::flush_tlb();
+                        self.flush_page(page);
                     }
                     Ok(())
                 }
                 Backing::Shared { .. } => {
                     self.pt.map(page, pte & ADDR_MASK, vma.prot.pte_flags()).ok_or(FaultError::OutOfMemory)?;
-                    arch::flush_tlb();
+                    self.flush_page(page);
                     Ok(())
                 }
                 _ => self.unshare(page, pte, vma.prot),

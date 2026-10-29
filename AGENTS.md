@@ -320,11 +320,16 @@ they leave at their next schedule (`exclusive_wanted`, `kick_others`), and
 a process killed while it runs elsewhere is finished off there
 (`smp::running_anywhere`, `procs::reap_others`). Signals for a thread on
 another CPU kick it (`kick_thread`).
-TLB flushes and instruction-cache invalidation are broadcast (on
-x86_64, which has no broadcast invalidation, `flush_tlb` IPIs the other
-CPUs and waits for each, except one in the kernel: IF is clear there and
-it may be waiting for the lock, so it catches up when it gets it,
-`tlb_sync`, before it touches user memory); flush only when an entry
+TLB flushes are of the pages that changed (`flush_tlb(root, start,
+end)`, through `AddressSpace::flush`) and instruction-cache invalidation
+is broadcast. Arm64's TLBIs are broadcast too, per page (`vale1is`;
+every process is ASID 0, so it reaches all of them) or everything past
+`FLUSH_PAGES`. x86_64 has no broadcast invalidation: `flush_tlb` IPIs
+the CPUs with that root in CR3 (`ROOTS`; any other has none of its
+entries, as loading CR3 dropped them) and waits for each, except one in
+the kernel: IF is clear there and it may be waiting for the lock, so it
+catches up when it gets it (the flushes asked of it, `WANTED`, against
+those it did: `tlb_sync`), before it touches user memory. Flush only when an entry
 that was there changed (no TLB holds an empty slot), but do flush one
 made writable: a CPU still holding it read-only would fault on the
 kernel's own write there; free pages

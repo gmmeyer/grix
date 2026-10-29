@@ -626,7 +626,7 @@ pub fn set_user_page_table(root_pa: u64) {
 }
 
 /// Each CPU's CR3 (0 until it has set one), for `flush_tlb`. It changes
-/// only with the kernel lock held.
+/// only with the kernel lock held, so it holds still while a flush looks.
 static ROOTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Order what was written to a page before the entry that publishes it:
@@ -649,33 +649,53 @@ fn reload_cr3() {
     let _ = v;
 }
 
-/// Flushes asked for (`flush_tlb`), and the last each CPU has done.
-static FLUSH_WANTED: AtomicU64 = AtomicU64::new(0);
+/// Above this many pages, this CPU's flush reloads CR3 rather than
+/// invalidating page by page (Linux's tlb_single_page_flush_ceiling).
+const FLUSH_PAGES: u64 = 33;
+
+/// Flushes are numbered; each CPU has the latest asked of it, and the
+/// latest it has done.
+static FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
+static WANTED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static FLUSHED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-/// Forget cached translations on every CPU. x86 has no broadcast
-/// invalidation: this CPU reloads CR3, and each other one does when its
-/// IPI comes (`flush_ipi`), which this waits for. One in the kernel
-/// can't take it (IF is clear there) and may be waiting for the kernel
-/// lock this CPU holds: it touches no user memory before it has the lock,
-/// and catches up then (`tlb_sync`), so it isn't waited for. Nor is one
-/// with the empty root (idle): it caches no user translations, and any
-/// other root it loads, with the lock, comes without them.
-pub fn flush_tlb() {
+/// Forget cached translations of `[start, end)` (page aligned) in the
+/// address space whose root is `root`, wherever they may be cached: on
+/// the CPUs with that root in CR3 (`ROOTS`). Any other CPU has none: there
+/// are no PCIDs and no global user pages, so loading CR3 dropped them.
+/// x86 has no broadcast invalidation: this CPU invalidates its own, and
+/// each other one reloads CR3 when its IPI comes (`flush_ipi`), which this
+/// waits for. One in the kernel can't take it (IF is clear there) and may
+/// be waiting for the kernel lock this CPU holds: it touches no user
+/// memory before it has the lock, and catches up then (`tlb_sync`), so it
+/// isn't waited for.
+pub fn flush_tlb(root: u64, start: u64, end: u64) {
     let me = cpu_number() % MAX_CPUS;
     crate::smp::note_on(me, crate::smp::Stat::Flush, 1);
-    reload_cr3();
+    if ROOTS[me].load(Ordering::Relaxed) == root {
+        if (end - start) / 4096 > FLUSH_PAGES {
+            reload_cr3();
+        } else {
+            for va in (start..end).step_by(4096) {
+                // SAFETY: invalidates a translation; nothing else.
+                unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack)) };
+            }
+        }
+    }
     if crate::smp::count() == 1 {
         return;
     }
-    let want = FLUSH_WANTED.fetch_add(1, Ordering::SeqCst) + 1;
-    FLUSHED[me].fetch_max(want, Ordering::Relaxed);
+    let want = FLUSH_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     let online = crate::smp::online().min(MAX_CPUS);
-    let empty = empty_page_table();
     let mut sent = [false; MAX_CPUS];
     for (cpu, sent) in sent.iter_mut().enumerate().take(online) {
-        let root = ROOTS[cpu].load(Ordering::Relaxed);
-        if cpu != me && root != empty && root != 0 && !crate::smp::in_kernel(cpu) {
+        if cpu == me || ROOTS[cpu].load(Ordering::Relaxed) != root {
+            continue;
+        }
+        // Asked before looking (as it says it's in the kernel before it
+        // looks, in `tlb_sync`): one of the two sees the other.
+        WANTED[cpu].fetch_max(want, Ordering::SeqCst);
+        if !crate::smp::in_kernel(cpu) {
             irq::send_ipi(cpu as u32, irq::FLUSH_INTID);
             *sent = true;
         }
@@ -695,17 +715,18 @@ pub fn flush_tlb() {
 
 /// The flush IPI, from user mode or the idle loop: no lock needed.
 fn flush_ipi() {
-    let want = FLUSH_WANTED.load(Ordering::SeqCst);
+    let me = cpu_number() % MAX_CPUS;
+    let want = WANTED[me].load(Ordering::SeqCst);
     reload_cr3();
-    FLUSHED[cpu_number() % MAX_CPUS].fetch_max(want, Ordering::Release);
+    FLUSHED[me].fetch_max(want, Ordering::Release);
     irq::eoi(irq::FLUSH_INTID);
 }
 
-/// With the kernel lock, before any user memory: the flushes this CPU
-/// missed while it couldn't take their IPI.
+/// With the kernel lock, before any user memory: the flushes asked of
+/// this CPU that it missed while it couldn't take their IPI.
 pub fn tlb_sync() {
-    let want = FLUSH_WANTED.load(Ordering::SeqCst);
     let me = cpu_number() % MAX_CPUS;
+    let want = WANTED[me].load(Ordering::SeqCst);
     if FLUSHED[me].load(Ordering::Relaxed) < want {
         reload_cr3();
         FLUSHED[me].fetch_max(want, Ordering::Release);
