@@ -383,6 +383,11 @@ pub fn running_anywhere(pid: u32) -> bool {
     CPUS.lock().iter().enumerate().any(|(i, c)| i != me && c.pid == Some(pid))
 }
 
+/// Does CPU `cpu` (another) run a thread?
+pub fn has_thread(cpu: usize) -> bool {
+    CPUS.lock()[cpu % N].tid.is_some()
+}
+
 /// Does another CPU run a thread of any process (which may wake anyone)?
 pub fn others_running() -> bool {
     let me = me();

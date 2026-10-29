@@ -169,6 +169,14 @@ impl Timers {
         real.into_iter().chain(posix).chain(fds).min()
     }
 
+    /// Has it a timer at all (armed or not)?
+    pub fn any(&self) -> bool {
+        self.real.next.is_some()
+            || self.cpu_itimers.iter().any(|i| i.next.is_some())
+            || !self.posix.is_empty()
+            || !self.fds.is_empty()
+    }
+
     /// The timing of timer `id` (a POSIX timer's or an itimer's).
     fn timing(&mut self, id: u32) -> Option<&mut Interval> {
         match id {
@@ -202,6 +210,9 @@ fn clock_of(p: &Process, id: u32) -> u64 {
 /// running (the CPU time of n threads goes n times as fast). Firing early
 /// costs nothing: `fire` checks the CPU time.
 pub fn cpu_deadline(p: &Process) -> Option<u64> {
+    if p.timers.cpu_itimers.iter().all(|i| i.next.is_none()) && p.timers.posix.is_empty() {
+        return None;
+    }
     let now = time::monotonic_ns();
     let running = |tid: u32| (p.running && tid == p.current) || crate::smp::running_since(tid).is_some();
     let threads = p.threads.keys().filter(|&&tid| running(tid)).count() as u64;
@@ -244,6 +255,10 @@ fn send_timer_signal(p: &mut Process, target: Target, info: SigInfo, id: u32) ->
 /// Handle every timer whose deadline has passed. Returns whether anything
 /// happened (a signal was sent or a timerfd became readable).
 pub fn fire(p: &mut Process) -> bool {
+    // Most processes have none: the tick needn't count their CPU time.
+    if !p.timers.any() {
+        return false;
+    }
     let now = time::monotonic_ns();
     let mut fired = false;
     if !p.timers.real_pending && p.timers.real.expire(now) > 0 {

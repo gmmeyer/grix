@@ -8,7 +8,7 @@
 //! process (see `smp`).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::console;
@@ -226,11 +226,11 @@ fn wake_expired(p: &mut Process) -> bool {
 fn idle(p: &mut Process, procs: &mut Procs) {
     let others_running = smp::others_running();
     match earliest_deadline(p, procs) {
-        Some(deadline) => irq::timer_at(deadline),
+        Some(deadline) => arm(None, Some(deadline)),
         // The host can still wake whoever waits for I/O, and a thread
         // waiting for a signal may get one: a RunControl's, or the SIGTERM
         // the time limit sends. Threads on other CPUs may wake anyone.
-        None if others_running || waiting_for_input(p, procs) || waiting_for_signal(p, procs) => irq::timer_off(),
+        None if others_running || waiting_for_input(p, procs) || waiting_for_signal(p, procs) => arm(None, None),
         None => deadlock(p, procs),
     }
     p.timer_dirty = true;
@@ -313,17 +313,54 @@ fn deadlock(p: &mut Process, procs: &mut Procs) -> ! {
 }
 
 /// Program the timer for the next thing that needs the CPU's attention: the
-/// end of the time slice (if anything else is runnable) or the next deadline.
+/// end of the time slice (if anything else is runnable), the process's
+/// CPU-time timers, or the next deadline (`arm`).
 pub fn update_timer(p: &mut Process) {
     if !p.timer_dirty {
         return;
     }
     p.timer_dirty = false;
+    // A CPU running a thread keeps the time, if one does (see `KEEPER`).
+    let me = smp::me();
+    let keeper = KEEPER.load(Ordering::Relaxed);
+    if keeper != me && p.running && !smp::has_thread(keeper) {
+        KEEPER.store(me, Ordering::Relaxed);
+    }
     let mut procs = PROCS.lock();
     let slice_end = (runnable(p) || others_wait(&procs)).then(|| p.slice_start + SLICE_NS);
-    match [slice_end, earliest_deadline(p, &mut procs)].into_iter().flatten().min() {
+    let own = slice_end.into_iter().chain(crate::timer::cpu_deadline(p)).min();
+    arm(own, earliest_deadline(p, &mut procs));
+}
+
+/// The CPU whose timer keeps everyone's deadlines (sleepers', timers'),
+/// and when its timer fires next (`u64::MAX`: not at all). Only with the
+/// kernel lock. A CPU running a thread takes the job from an idle one:
+/// its timer is the hardware's, while an idle vCPU waits in its VMM,
+/// which wakes it when the host's timers do (on macOS a 1 ms wait takes
+/// 1.5 ms; an idle timekeeper made sleepers beside busy threads that
+/// late, as they already are alone). On KVM an idle one would do as well
+/// and spare a thread the interrupt.
+static KEEPER: AtomicUsize = AtomicUsize::new(0);
+static KEEPER_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Program this CPU's timer for `own` (what only it can see to: its time
+/// slice, its process's CPU-time timers), and for `all` (the earliest
+/// deadline anywhere) if it's the timekeeper or that comes before the
+/// timekeeper's timer. Every CPU used to arm `all`, so each deadline
+/// interrupted every CPU running a thread, one after another taking the
+/// lock to find it done. A deadline is never missed: whenever a timer
+/// fires, its CPU looks at everything again (`irq`, `idle`), the
+/// timekeeper's included, and all of this happens under the kernel lock.
+fn arm(own: Option<u64>, all: Option<u64>) {
+    let keeper = KEEPER.load(Ordering::Relaxed) == smp::me();
+    let all = all.filter(|&d| keeper || d < KEEPER_AT.load(Ordering::Relaxed));
+    let at = own.into_iter().chain(all).min();
+    match at {
         Some(t) => irq::timer_at(t),
         None => irq::timer_off(),
+    }
+    if keeper {
+        KEEPER_AT.store(at.unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 }
 

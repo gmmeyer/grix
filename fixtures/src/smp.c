@@ -6,6 +6,8 @@
 //   smp exec     a spinning thread, then execve from another thread
 //   smp exit     spinning threads, then exit(3) from main
 //   smp fork     a spinning thread, then fork and wait for the child
+//   smp idle     the machine idles half a second first (every CPU halted,
+//                no timer due), then as `smp`
 //   smp cow      threads write while main forks again and again: each
 //                child sees a consistent snapshot, the parent's reader
 //                never sees a page as it was (prints "cow ok")
@@ -202,6 +204,11 @@ int main(int argc, char **argv) {
         }
         printf("fork ok\n");
         exit(0);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "idle") == 0) {
+        struct timespec half = {0, 500000000};
+        nanosleep(&half, 0);
     }
 
     cpu_set_t set;

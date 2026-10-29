@@ -2988,6 +2988,19 @@ fn threads_run_in_parallel_on_more_cpus() {
             assert!(attempt < tries, "no speedup on 4 CPUs: {seen:?}");
         }
     }
+    // After the whole machine has idled (every CPU halted, none but the
+    // timekeeper with a timer, and that one off), new threads still reach
+    // the other CPUs: they're kicked. (Tried again, as above, in case the
+    // host kept a vCPU off.)
+    for attempt in 1..=3 {
+        let out = run(b().cpus(4), &["/bin/smp", "idle"]);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stdout_str());
+        let line = out.stdout_str().to_string();
+        if field(&line, "cpus_used") >= 2.0 {
+            break;
+        }
+        assert!(attempt < 3, "{line}\n{}", out.stderr_str());
+    }
     let out = run(b().cpus(4), &["/bin/smp", "exec"]);
     assert_eq!(out.stdout_str(), "exec ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));

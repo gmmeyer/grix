@@ -292,7 +292,12 @@ another thread's state into the trap frame. I/O waits are *restarted*: when
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
 Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
 the scheduler programs the CPU timer for the earliest one and calls
-`timer::fire` from the timer interrupt and the idle loop. A CPU-time
+`timer::fire` from the timer interrupt and the idle loop. With more
+CPUs one keeps everyone's deadlines (`sched::KEEPER`, a CPU running a
+thread if one does); the others program their own time slice and
+process's CPU-time timers, and a deadline only if it comes before the
+timekeeper's timer (`sched::arm`). Whichever CPU's timer fires looks at
+everything again, so a deadline is never missed. A CPU-time
 timer's deadline is in CPU time, a wake-up only while its threads run
 (`timer::cpu_deadline`). The vDSO (`vdso.rs`, a page every process
 shares) reads the clocks without a system call from a page only the

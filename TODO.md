@@ -97,8 +97,12 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     Done since: flushes only of the pages that changed and only to the
     CPUs running that address space; a waiter skips the lock's turn of a
     CPU that doesn't take it (twice the kernel-bound throughput with
-    80 other vCPUs on a 32-core host). Next: a timekeeper CPU; then a
-    per-CPU running process and a reader/writer lock (phase 2).
+    80 other vCPUs on a 32-core host); one CPU keeps the deadlines,
+    rather than every CPU being interrupted for each. Next (phase 2): a
+    per-CPU running process, then a reader/writer lock. On macOS an idle
+    vCPU wakes ~0.5 ms late for a 1 ms timer (the host's timer
+    coalescing, in grix-vmm and QEMU alike): a kqueue timer with
+    NOTE_CRITICAL in grix-vmm might fix it.
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
 19. [x] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
