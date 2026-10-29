@@ -122,6 +122,8 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::pwrite64 => file::pwrite(p, a[0], a[1], a[2], a[3]),
         nr::preadv => file::preadv(p, a[0], a[1], a[2], a[3], false),
         nr::pwritev => file::preadv(p, a[0], a[1], a[2], a[3], true),
+        nr::preadv2 => file::preadv2(p, a[0], a[1], a[2], a[3], a[5], false),
+        nr::pwritev2 => file::preadv2(p, a[0], a[1], a[2], a[3], a[5], true),
         nr::lseek => file::lseek(p, a[0], a[1], a[2]),
         nr::fstat => file::fstat(p, a[0], a[1]),
         nr::newfstatat => file::newfstatat(p, a[0], a[1], a[2], a[3]),

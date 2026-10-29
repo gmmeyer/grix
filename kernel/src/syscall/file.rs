@@ -1054,14 +1054,16 @@ fn iovecs(p: &mut Process, iov: u64, cnt: u64) -> Result<Vec<(u64, u64)>, Errno>
 }
 
 /// readv/writev/preadv/pwritev: one buffer after another until one comes up short.
-fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write: bool) -> SysResult {
+/// `extra`: status flags (O_NONBLOCK, O_APPEND) for this call only, as
+/// preadv2's RWF_NOWAIT and RWF_APPEND.
+fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write: bool, extra: u32) -> SysResult {
     let file = p.fds.get(fd)?;
     // A datagram or seqpacket socket: all of it is one message.
     if let Some(sock) = super::unix::sock_of(&file) {
         if at.is_some() {
             return Err(ESPIPE);
         }
-        let nonblock = file.lock().nonblocking();
+        let nonblock = file.lock().nonblocking() || extra & O_NONBLOCK != 0;
         let bufs = iovecs(p, iov, cnt)?;
         return if write {
             super::unix::send_msg(p, &sock, &bufs, 0, nonblock, None, None)
@@ -1070,6 +1072,14 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
         };
     }
     let mut f = file.lock();
+    let added = extra & !f.flags;
+    f.flags |= added;
+    let r = vectored_file(p, &mut f, iov, cnt, at, write);
+    f.flags &= !added;
+    r
+}
+
+fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Option<u64>, write: bool) -> SysResult {
     if at.is_some() {
         match f.kind {
             FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..) => {}
@@ -1093,7 +1103,7 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
         }
         let (base, len) = (base + sent, len - sent);
         let pos = at.map(|o| o + total);
-        let r = if write { write_from(p, &mut f, base, len, pos) } else { read_into(p, &mut f, base, len, pos) };
+        let r = if write { write_from(p, f, base, len, pos) } else { read_into(p, f, base, len, pos) };
         match r {
             Ok(n) => {
                 total += n;
@@ -1119,16 +1129,40 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
 }
 
 pub fn readv(p: &mut Process, fd: u64, iov: u64, cnt: u64) -> SysResult {
-    vectored(p, fd, iov, cnt, None, false)
+    vectored(p, fd, iov, cnt, None, false, 0)
 }
 
 pub fn writev(p: &mut Process, fd: u64, iov: u64, cnt: u64) -> SysResult {
-    vectored(p, fd, iov, cnt, None, true)
+    vectored(p, fd, iov, cnt, None, true, 0)
 }
 
 /// preadv/pwritev. On 64-bit the offset is the first of the two position arguments.
 pub fn preadv(p: &mut Process, fd: u64, iov: u64, cnt: u64, off: u64, write: bool) -> SysResult {
-    vectored(p, fd, iov, cnt, Some(off), write)
+    vectored(p, fd, iov, cnt, Some(off), write, 0)
+}
+
+/// preadv2/pwritev2 (nginx, cargo): preadv/pwritev, or readv/writev at
+/// offset -1, with RWF_* flags. RWF_HIPRI (polling), RWF_DSYNC and
+/// RWF_SYNC change nothing (the data is in memory once the call returns);
+/// RWF_NOWAIT and RWF_APPEND are O_NONBLOCK and O_APPEND for this call.
+pub fn preadv2(p: &mut Process, fd: u64, iov: u64, cnt: u64, off: u64, flags: u64, write: bool) -> SysResult {
+    const RWF_HIPRI: u64 = 1;
+    const RWF_DSYNC: u64 = 2;
+    const RWF_SYNC: u64 = 4;
+    const RWF_NOWAIT: u64 = 8;
+    const RWF_APPEND: u64 = 0x10;
+    if flags & !(RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND) != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    let mut extra = 0;
+    if flags & RWF_NOWAIT != 0 {
+        extra |= O_NONBLOCK;
+    }
+    if flags & RWF_APPEND != 0 && write {
+        extra |= O_APPEND;
+    }
+    let at = (off as i64 != -1).then_some(off);
+    vectored(p, fd, iov, cnt, at, write, extra)
 }
 
 pub fn lseek(p: &mut Process, fd: u64, off: u64, whence: u64) -> SysResult {

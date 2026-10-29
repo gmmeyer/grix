@@ -17,6 +17,7 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -357,6 +358,29 @@ static int sendfile_out(void) {
     return 0;
 }
 
+// nginx and cargo write with pwritev2; offset -1 is the file's own.
+static int rwv2(void) {
+    int fd = open("/tmp/v2", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    struct iovec w[2] = {{"hello ", 6}, {"world", 5}};
+    CHECK(pwritev2(fd, w, 2, -1, 0) == 11 && lseek(fd, 0, SEEK_CUR) == 11);
+    CHECK(pwritev2(fd, w, 1, 0, RWF_DSYNC) == 6 && lseek(fd, 0, SEEK_CUR) == 11);
+    // RWF_APPEND: at the end, whatever the offset, which stays.
+    CHECK(pwritev2(fd, &w[1], 1, 0, RWF_APPEND) == 5 && lseek(fd, 0, SEEK_CUR) == 11);
+    char a[8] = {0}, b[16] = {0};
+    struct iovec r[2] = {{a, 6}, {b, 10}};
+    CHECK(preadv2(fd, r, 2, 0, 0) == 16 && strcmp(a, "hello ") == 0 && strcmp(b, "worldworld") == 0);
+    CHECK(lseek(fd, 6, SEEK_SET) == 6 && preadv2(fd, &r[1], 1, -1, RWF_HIPRI) == 10 && lseek(fd, 0, SEEK_CUR) == 16);
+    CHECK(preadv2(fd, r, 1, 0, 0x10000) == -1 && errno == EOPNOTSUPP);
+    // RWF_NOWAIT on an empty pipe: EAGAIN, not a wait.
+    int pf[2];
+    CHECK(pipe(pf) == 0);
+    CHECK(preadv2(pf[0], r, 1, -1, RWF_NOWAIT) == -1 && errno == EAGAIN);
+    CHECK(preadv2(pf[0], r, 1, 0, 0) == -1 && errno == ESPIPE);
+    CHECK(!(fcntl(pf[0], F_GETFL) & O_NONBLOCK));
+    return 0;
+}
+
 /// A field of `addr`'s mapping in /proc/self/smaps, in kB, or -1.
 static long smaps_field(void *addr, const char *field) {
     if (slurp("/proc/self/smaps") <= 0) return -1;
@@ -416,6 +440,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "sigio") == 0) r = sigio();
         if (strcmp(argv[i], "sigioinit") == 0) r = sigioinit();
         if (strcmp(argv[i], "sendfile") == 0) r = sendfile_out();
+        if (strcmp(argv[i], "rwv2") == 0) r = rwv2();
         if (r) {
             printf("%s failed\n", argv[i]);
             return 1;

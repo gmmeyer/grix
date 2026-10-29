@@ -252,6 +252,8 @@ syscalls! {
     283 membarrier Core;
     284 mlock2 Core;
     285 copy_file_range Core;
+    286 preadv2 Core;
+    287 pwritev2 Core;
     291 statx Core;
     293 rseq Core;
     424 pidfd_send_signal Cap(Process);
@@ -534,6 +536,8 @@ syscalls! {
     324 membarrier Core;
     325 mlock2 Core;
     326 copy_file_range Core;
+    327 preadv2 Core;
+    328 pwritev2 Core;
     332 statx Core;
     334 rseq Core;
     424 pidfd_send_signal Cap(Process);

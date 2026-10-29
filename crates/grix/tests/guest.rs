@@ -1821,6 +1821,11 @@ fn sendfile_to_sockets_and_pipes() {
 }
 
 #[test]
+fn preadv2_and_pwritev2() {
+    popular(with("popular").allow(Capability::FsWrite), &["rwv2"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.
