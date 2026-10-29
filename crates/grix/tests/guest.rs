@@ -1733,6 +1733,23 @@ fn users_proc_dev_statfs_xattr_inotify() {
     assert_eq!(out.events, [GuestEvent::MissingPath { path: "/nope".into() }]);
 }
 
+/// What popular software expects (`fixtures/src/popular.c`, COMPAT.md).
+fn popular(b: SandboxBuilder, checks: &[&str]) {
+    let argv: Vec<&str> = ["/bin/popular"].iter().chain(checks).copied().collect();
+    let out = run(b, &argv);
+    let want: String = checks.iter().map(|c| format!("{c} ok\n")).collect();
+    assert_eq!(out.stdout_str(), want, "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn proc_self_auxv() {
+    // Go's x/sys/cpu reads HWCAP there; without it, it reads ID registers
+    // and dies of SIGILL (Caddy, Traefik).
+    popular(with("popular"), &["auxv"]);
+}
+
 #[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
