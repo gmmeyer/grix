@@ -100,7 +100,8 @@ section { padding: 64px 0 0; }
 .code { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--term); }
 .code .label { font: 600 .75rem/1 var(--mono); color: #9aa1aa; padding: 10px 14px; border-bottom: 1px solid #2c3036;
                text-transform: uppercase; letter-spacing: .06em; }
-.code pre { color: var(--term-fg); padding: 14px; font-size: .82rem; line-height: 1.55; overflow-x: auto; }
+.code pre { color: var(--term-fg); padding: 14px; font-size: .82rem; line-height: 1.55; overflow-x: auto;
+             scrollbar-color: #3a3f47 transparent; }
 .code .c { color: #8b949e; }
 .code .deny { color: #f0a38b; }
 

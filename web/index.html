@@ -200,9 +200,8 @@ grix run --image alpine.grix -a process -a net --allow-host example.com:80 -- \
 <section id="use">
   <div class="eyebrow">Use it</div>
   <h2>From the command line, an agent, or your code</h2>
-  <p class="lead">The same sandbox from the CLI, an MCP server for agents (<code>claude mcp add grix --
-  grix mcp --root "$PWD"</code> in Claude Code), Python (<code>PYTHONPATH=~/.local/grix/python</code>, Python
-  3.9+), or Rust.</p>
+  <p class="lead">The same sandbox from the CLI, from an agent over MCP, from Python (3.9+, with
+  <code>PYTHONPATH=~/.local/grix/python</code>), or from Rust.</p>
   <div class="code-grid">
     <div class="code"><div class="label">CLI</div><pre><span class="c"># Only /bin/net exists, and nothing is granted.</span>
 $ grix run -i ./net:/bin/net -- /bin/net
@@ -212,8 +211,11 @@ socket: Operation not permitted
 <span class="c"># Python, with threads, and the network only to example.com.</span>
 $ grix run -a threads -a net --allow-host example.com:443 \
     -i ./python-rootfs:/ -- /usr/bin/python3 script.py</pre></div>
-    <div class="code"><div class="label">MCP</div><pre><span class="c">// Claude Code, or any MCP client: a `run` tool
-// that runs programs in fresh sandboxes.</span>
+    <div class="code"><div class="label">MCP</div><pre><span class="c"># Claude Code: a `run` tool that runs programs in
+# fresh sandboxes, with host files only under --root.</span>
+claude mcp add grix -- grix mcp --root "$PWD"
+
+<span class="c"># Any other MCP client's config:</span>
 {"mcpServers": {"grix": {
   "command": "grix",
   "args": ["mcp", "--root", "/path/to/project"]
@@ -224,7 +226,8 @@ sb = grix.Sandbox(imports={"./busybox": "/bin/busybox"},
                   files={"/data/in.txt": "b\na\n"},
                   capabilities=["process"], timeout=30)
 r = sb.run(["/bin/busybox", "sort", "/data/in.txt"])
-print(r.exit_code, r.stdout, r.events, r.missing_capabilities)</pre></div>
+print(r.exit_code, r.stdout)
+print(r.events, r.missing_capabilities)</pre></div>
     <div class="code"><div class="label">Rust</div><pre>let sandbox = Sandbox::builder()
     .import("./tools/busybox.static", "/bin/busybox")?
     .file("/data/input.csv", csv_bytes, 0o644)?
@@ -232,7 +235,8 @@ print(r.exit_code, r.stdout, r.events, r.missing_capabilities)</pre></div>
     .export("/out")?
     .build()?;
 let out = sandbox.run(&amp;[
-    "/bin/busybox", "sort", "-o", "/out/sorted.csv", "/data/input.csv",
+    "/bin/busybox", "sort",
+    "-o", "/out/sorted.csv", "/data/input.csv",
 ])?;
 let needed = out.missing_capabilities();</pre></div>
   </div>
