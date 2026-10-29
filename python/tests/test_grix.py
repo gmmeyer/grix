@@ -1,6 +1,7 @@
 """The Python bindings, against the real grix (GRIX_BIN, or target/release/grix)."""
 
 import os
+import platform
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,11 @@ os.environ.setdefault("GRIX_BIN", str(ROOT / "target/release/grix"))
 import grix  # noqa: E402
 
 FIXTURES = ROOT / "fixtures/build"
-BUSYBOX = FIXTURES / "alpine/bin/busybox.static"
+# The guest's architecture, as grix picks it (Arch::from_env): GRIX_ARCH, or the host's.
+ARCH = os.environ.get("GRIX_ARCH", "")
+X86_64 = ARCH in ("x86_64", "amd64") or (ARCH not in ("aarch64", "arm64") and platform.machine() in ("x86_64", "AMD64"))
+BUSYBOX = FIXTURES / ("alpine-x86_64" if X86_64 else "alpine") / "bin/busybox.static"
+HELLO = FIXTURES / ("amd64/hello" if X86_64 else "hello")
 
 
 class Common:
@@ -45,6 +50,11 @@ class Common:
         self.assertEqual(r.events, [])
 
     def test_snapshots(self):
+        if X86_64:
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(grix.GrixError, "x86_64"):
+                sb.snapshot(Path(tmp) / "sh.snap", ["/bin/busybox", "true"])
+            return
         if sys.platform != "darwin" and not os.path.exists("/dev/kvm"):
             self.skipTest("snapshots need grix-vmm (macOS, or Linux with KVM)")
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,7 +86,7 @@ class Common:
     def test_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "hello.grix"
-            grix.build(image, copy={FIXTURES / "hello": "/bin/hello"}, command=["/bin/hello", "py"], env={"GREETING": "yo"})
+            grix.build(image, copy={HELLO: "/bin/hello"}, command=["/bin/hello", "py"], env={"GREETING": "yo"})
             r = grix.Sandbox(image=image).run()
             self.assertEqual(r.exit_code, 7)
             self.assertIn("argv[1]=py\nGREETING=yo\n", r.stdout)
