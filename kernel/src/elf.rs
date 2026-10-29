@@ -114,7 +114,7 @@ pub fn load(aspace: &mut AddressSpace, src: &Source, ino: Ino, base: Option<u64>
     }
     let ty = u16_at(data, 16)?;
     if u16_at(data, 18)? != crate::arch::ELF_MACHINE {
-        return Err("not an AArch64 binary");
+        return Err(crate::arch::ELF_OTHER_MACHINE);
     }
     if ty != ET_EXEC && ty != ET_DYN {
         return Err("not an executable");

@@ -102,8 +102,9 @@ syscall table (`syscall/table.rs`) has each architecture's numbers for
 the same names; x86_64's older calls (`open`, `stat`, `fork`, ...) are
 turned into the calls that replaced them (`syscall/x86.rs`), gated as
 those are. Test with both: `GRIX_ARCH=x86_64 cargo test -p grix --test
-guest --test runtimes` runs the end-to-end tests on the x86_64 kernel
-(fixtures in `fixtures/build/amd64`, and `<name>-x86_64` roots).
+guest --test runtimes --test mcp` (and `python3 -m unittest discover -s
+python/tests`) runs the end-to-end tests on the x86_64 kernel (fixtures
+in `fixtures/build/amd64`, and `<name>-x86_64` roots).
 
 x86_64 (`kernel/src/arch/x86_64`): PVH entry (32-bit, the ELF note) to
 long mode in `boot.S`; the high half at `0xffff8000_00000000` (static,
