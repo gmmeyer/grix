@@ -126,8 +126,7 @@ in Linux's signal frame layout, and `sigframe::read_fp` keeps a frame's
 XSAVE header to what xrstor accepts (invariant 12). More CPUs start
 with INIT and a startup IPI at a real-mode trampoline (`boot.S`
 `ap_trampoline`, copied below 1 MiB), which comes into long mode as CPU
-0 did and finds its stack by its APIC ID (`ap_main`). No snapshots for
-now. grix-vmm runs it on x86 KVM (`vm_x86.rs`,
+0 did and finds its stack by its APIC ID (`ap_main`). grix-vmm runs it on x86 KVM (`vm_x86.rs`,
 `kvm_x86.rs`): microvm's layout again, KVM's own IOAPIC and local APICs,
 COM1 by port I/O, PVH's entry state, a CPUID with nothing of the host's
 but the CPU's model and features (`guest_cpuid`: made-up brand, caches
@@ -306,7 +305,9 @@ host (`inet::host_state`), the kernel flushes the console, takes whatever
 the host sent (`console::take_all_input`: anything there means not now)
 and makes `SNAPSHOT_CALL` (an HVC in SMCCC's OEM range: Hypervisor.framework
 answers the vendor-hypervisor range itself; KVM forwards it only because
-grix-vmm installs an SMCCC filter, `kvm::Vm::forward`, Linux 6.4+).
+grix-vmm installs an SMCCC filter, `kvm::Vm::forward`, Linux 6.4+; on
+x86_64, where KVM answers `vmcall` itself, an `out` to
+`machine::x86_64::VMM_PORT`).
 grix-vmm stops every other vCPU between exits (`pause.rs`: each saves its
 own registers, as only its thread may on Hypervisor.framework; on KVM a
 kick is `immediate_exit` plus a signal, and a vCPU first finishes its last
@@ -317,7 +318,10 @@ the vCPUs, GIC, console device and RAM to its fd 3 and exits, or answers
 vCPU's and the GIC's state are is the hypervisor's (`snapshot_hvf.rs`; on
 KVM, `snapshot_kvm.rs`: every register `KVM_GET_REG_LIST` names and the
 power state, and the vGIC's attributes in one fixed order, so a file only
-supplies values), and a snapshot runs only where it was taken. A restore
+supplies values; on x86 KVM, `snapshot_kvm_x86.rs`: what QEMU saves of a
+vCPU, registers to XSAVE area, MSRs, local APIC and pending events, put
+back in QEMU's order, and the IOAPIC and 8259s), and a snapshot runs only
+where it was taken. A restore
 makes every vCPU, confines grix-vmm before it puts any of the file's state
 back (on KVM, with the ioctls that takes until a second filter goes on),
 puts the GIC back before the console raises its interrupt (`Console::go`,

@@ -1091,9 +1091,6 @@ impl Sandbox {
     /// ones already, which nothing resolves again (see `import_real`).
     pub(crate) fn snapshot_real<S: AsRef<str>>(&self, argv: &[S], path: &Path) -> Result<crate::Snapshot> {
         let cfg = &self.cfg;
-        if cfg.arch == Arch::X86_64 {
-            bail!("snapshots of x86_64 machines aren't there yet (arm64's are)");
-        }
         if cfg.vmm.is_none() {
             bail!(
                 "snapshots need grix's own VMM (grix-vmm: Hypervisor.framework on macOS 15+, KVM on Linux 6.4+), not QEMU"

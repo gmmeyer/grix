@@ -7,15 +7,17 @@
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use grix_abi::image::{self, HEADER_LEN, MAX_RAM};
-use grix_abi::machine::x86_64::{IMAGE_BASE, RAM_BASE, UART_PORT, VIRTIO, VIRTIO_GSI, VIRTIO_STRIDE};
+use grix_abi::machine::x86_64::{IMAGE_BASE, RAM_BASE, UART_PORT, VIRTIO, VIRTIO_GSI, VIRTIO_STRIDE, VMM_PORT};
 
 use crate::Args;
 use crate::console::{Console, Line};
-use crate::kvm_x86::{self, Exit};
+use crate::kvm_x86::{self, Exit, Part};
 use crate::mem::GuestMemory;
+use crate::pause::{Pauses, Power};
+use crate::{snapshot, snapshot_kvm_x86};
 
 /// COM1, transmit only, to the socket. Each byte costs an exit, so the
 /// kernel uses it only before the console is up and for panics.
@@ -65,7 +67,7 @@ impl Machine {
         if ram == 0 || ram > MAX_RAM {
             return Err(format!("--mem {} is outside 1..={} MiB", args.mem_mb, MAX_RAM >> 20));
         }
-        let mem = Arc::new(GuestMemory::new(RAM_BASE, ram as usize).map_err(|e| format!("allocating RAM: {e}"))?);
+        let mem = GuestMemory::new(RAM_BASE, ram as usize).map_err(|e| format!("allocating RAM: {e}"))?;
         let kernel = std::fs::read(&args.kernel).map_err(|e| format!("reading {}: {e}", args.kernel.display()))?;
         let entry = load_kernel(&mem, &kernel)?;
         let img = std::fs::read(&args.image).map_err(|e| format!("reading {}: {e}", args.image.display()))?;
@@ -74,6 +76,12 @@ impl Machine {
         if !mem.write(IMAGE_BASE, &img) {
             return Err(format!("the boot image ({} MiB) doesn't fit in RAM", img.len() >> 20));
         }
+        Ok(Machine { entry, ..Machine::with_memory(args, mem)? })
+    }
+
+    /// The machine around memory that's ready: a snapshot's (whose vCPUs
+    /// are put back, not entered).
+    fn with_memory(args: &Args, mem: GuestMemory) -> Result<Machine, String> {
         let out = match &args.uart {
             Some(p) => {
                 let s = UnixStream::connect(p).map_err(|e| format!("connecting to {}: {e}", p.display()))?;
@@ -81,7 +89,7 @@ impl Machine {
             }
             None => None,
         };
-        Ok(Machine { mem, entry, uart: Mutex::new(Uart { out, lcr: 0 }) })
+        Ok(Machine { mem: Arc::new(mem), entry: 0, uart: Mutex::new(Uart { out, lcr: 0 }) })
     }
 
     /// The time of day the kernel starts from is now (as on arm64).
@@ -185,51 +193,113 @@ fn load_kernel(mem: &GuestMemory, elf: &[u8]) -> Result<u64, String> {
 struct Shared {
     m: Machine,
     console: Arc<Console>,
+    vm: kvm_x86::Vm,
+    kicks: Vec<kvm_x86::Kick>,
+    pauses: Pauses,
+    snapshot: bool,
+    /// A vCPU's XSAVE area's size (`Vm::xsave_size`).
+    xsave: usize,
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
-    if args.snapshot || args.restore {
-        return Err("snapshots of x86_64 machines aren't there yet".into());
+    let saved = if args.restore { Some(snapshot::open()?) } else { None };
+    let (m, restored) = match saved {
+        Some(s) => {
+            let (mem, rest) = s.split();
+            (Machine::with_memory(args, mem)?, Some(rest))
+        }
+        None => (Machine::new(args)?, None),
+    };
+    if let Some(s) = &restored
+        && s.cpus() != args.cpus as usize
+    {
+        return Err(format!("the snapshot is of {} vCPUs, not {}", s.cpus(), args.cpus));
     }
-    let m = Machine::new(args)?;
     // SAFETY: `m.mem` is never unmapped, and lives until the process ends.
-    let (vm, cpus) =
+    let (vm, mut cpus) =
         unsafe { kvm_x86::Vm::create(m.mem.host(), m.mem.size(), m.entry, args.cpus) }.map_err(|e| e.to_string())?;
     let irq_fd = vm.irq_fd();
     let line: Line = Box::new(move |level| kvm_x86::set_irq(irq_fd, VIRTIO_GSI, level));
-    let console = Console::start(m.mem.clone(), line);
-    let shared = Arc::new(Shared { m, console });
-    let mut cpus = cpus.into_iter();
-    let first = cpus.next().ok_or("no vCPU")?;
-    // The threads first (the seccomp filter allows none to be made), then
-    // confined, then any guest code.
-    let confined = Arc::new(Barrier::new(args.cpus.max(1) as usize));
-    for (n, cpu) in cpus.enumerate() {
-        let (shared, confined) = (shared.clone(), confined.clone());
+    let console = match &restored {
+        Some(s) => Console::restore(m.mem.clone(), line, s.console())?,
+        None => Console::start(m.mem.clone(), line),
+    };
+    kvm_x86::handle_kicks()?;
+    let xsave = vm.xsave_size();
+    let shared = Arc::new(Shared {
+        m,
+        console,
+        vm,
+        kicks: cpus.iter().map(|c| c.kick()).collect(),
+        // KVM does INIT and SIPI: every vCPU's thread runs, one that waits
+        // for its start waiting in KVM_RUN.
+        pauses: Pauses::new(vec![Power::On; cpus.len()]),
+        snapshot: args.snapshot,
+        xsave,
+    });
+    // The threads first (the seccomp filter allows none to be made), each
+    // given its vCPU once the VMM is confined and a restored machine is
+    // back (its other vCPUs run at once).
+    let mut given = Vec::new();
+    for n in 1..cpus.len() {
+        let (tx, rx) = std::sync::mpsc::channel::<kvm_x86::Cpu>();
+        let shared = shared.clone();
         std::thread::spawn(move || {
-            confined.wait();
-            let result = vcpu_loop(cpu, &shared);
+            let Ok(cpu) = rx.recv() else { return };
+            let result = vcpu_loop(n, cpu, &shared);
             if let Err(e) = &result {
-                eprintln!("grix-vmm: vCPU {}: {e}", n + 1);
+                eprintln!("grix-vmm: vCPU {n}: {e}");
             }
             // A vCPU's end is the machine's.
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         });
+        given.push(tx);
     }
-    kvm_x86::confine()?;
+    kvm_x86::confine(args.snapshot, restored.is_some())?;
+    // A restored machine, confined first (the file may be anyone's): every
+    // vCPU (from this thread: none runs yet), then the interrupt
+    // controllers, then the counter; all before the console can raise its
+    // interrupt. Then what putting them back took is given up too.
+    if let Some(s) = &restored {
+        for (n, cpu) in cpus.iter_mut().enumerate() {
+            snapshot_kvm_x86::restore_cpu(s, n, cpu, xsave)?;
+        }
+        snapshot_kvm_x86::restore_irqchip(&shared.vm, s)?;
+        snapshot_kvm_x86::set_counter(s, &cpus)?;
+        kvm_x86::confine(args.snapshot, false)?;
+    }
     shared.console.go();
-    shared.m.stamp_boot_time();
-    confined.wait();
-    let result = vcpu_loop(first, &shared);
-    drop(vm);
-    result
+    if !args.restore {
+        shared.m.stamp_boot_time();
+    }
+    let mut cpus = cpus.into_iter();
+    let first = cpus.next().ok_or("no vCPU")?;
+    for (tx, cpu) in given.into_iter().zip(cpus) {
+        tx.send(cpu).map_err(|_| "a vCPU's thread is gone")?;
+    }
+    vcpu_loop(0, first, &shared)
 }
 
-/// Run a vCPU until the machine ends.
-fn vcpu_loop(mut cpu: kvm_x86::Cpu, shared: &Shared) -> Result<(), String> {
-    let (m, console) = (&shared.m, &*shared.console);
+/// Run vCPU `n` until the machine ends.
+fn vcpu_loop(n: usize, mut cpu: kvm_x86::Cpu, shared: &Shared) -> Result<(), String> {
+    let (m, console, kick) = (&shared.m, &*shared.console, &shared.kicks[n]);
+    kick.bind();
     loop {
+        kick.clear();
+        shared.pauses.point(n, || snapshot_kvm_x86::cpu_state(&mut cpu, shared.xsave))?;
         match cpu.run().map_err(|e| e.to_string())? {
+            // The kernel's call (`SNAPSHOT_CALL`): saved, this run ends
+            // there; restored runs go on. Without --snapshot, ignored, as
+            // QEMU does: the kernel finds rax as it was.
+            Exit::Io { port: VMM_PORT, write: true, .. } if shared.snapshot => {
+                if take_snapshot(n, &mut cpu, shared)? {
+                    return Ok(());
+                }
+                // Not now (input is on its way): the call returns that.
+                let mut regs = cpu.get(Part::Regs).map_err(|e| e.to_string())?;
+                regs[..8].copy_from_slice(&grix_abi::image::SNAPSHOT_RETRY.to_le_bytes());
+                cpu.set(Part::Regs, &regs).map_err(|e| e.to_string())?;
+            }
             // One unit at a time, as the instruction would have done them.
             Exit::Io { port, len, write } => {
                 for unit in cpu.io_data().chunks_exact_mut(len as usize) {
@@ -252,4 +322,22 @@ fn vcpu_loop(mut cpu: kvm_x86::Cpu, shared: &Shared) -> Result<(), String> {
             Exit::Other(r) => return Err(format!("unexpected KVM exit {r}")),
         }
     }
+}
+
+/// `SNAPSHOT_CALL` from vCPU `n`: stop every other vCPU, then save the
+/// machine. True once it's saved (this run ends there); false to put it
+/// off (input is on its way), every vCPU going on.
+fn take_snapshot(n: usize, cpu: &mut kvm_x86::Cpu, shared: &Shared) -> Result<bool, String> {
+    let own = snapshot_kvm_x86::cpu_state(cpu, shared.xsave)?;
+    let kick = |m: usize| shared.kicks[m].kick();
+    shared.pauses.take(n, own, kick, |saved| {
+        let counter = match snapshot_kvm_x86::counter(cpu) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        shared.console.save_with(|console| {
+            let chips = snapshot_kvm_x86::irqchip_state(&shared.vm)?;
+            snapshot::save(n, saved, &chips, counter, &shared.m.mem, console)
+        })
+    })
 }

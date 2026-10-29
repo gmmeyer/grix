@@ -429,9 +429,17 @@ extern "C" fn ap_main(cpu: u64, frame: *mut TrapFrame) -> ! {
 /// Tell the VMM CPU `cpu` was kicked: the IPI is enough on x86.
 pub fn vmm_kick(_cpu: usize) {}
 
-/// `SNAPSHOT_CALL`: not on x86_64 yet (the kernel refuses).
+/// `SNAPSHOT_CALL`: rax, rdi, rsi, rdx, rcx and r8 as the VMM leaves them
+/// (a restored run returns here, the rest of the registers as they were).
 pub fn snapshot_call() -> [u64; 6] {
-    [!0; 6]
+    let (rax, rdi, rsi, rdx, rcx, r8): (u64, u64, u64, u64, u64, u64);
+    // SAFETY: port I/O the VMM answers (or ignores); it saves every register.
+    unsafe {
+        asm!("out dx, eax", inout("rax") grix_abi::image::SNAPSHOT_CALL => rax,
+             inout("rdx") grix_abi::machine::x86_64::VMM_PORT as u64 => rdx, out("rdi") rdi, out("rsi") rsi,
+             out("rcx") rcx, out("r8") r8, options(nostack));
+    }
+    [rax, rdi, rsi, rdx, rcx, r8]
 }
 
 /// Drop to user mode at `entry` with stack pointer `sp`. Never returns:

@@ -72,4 +72,10 @@ pub mod x86_64 {
 
     pub const IOAPIC: u64 = 0xfec0_0000;
     pub const LAPIC: u64 = 0xfee0_0000;
+
+    /// The port the kernel's calls to the VMM go out on (KVM answers
+    /// `vmcall` itself): `out` of [`crate::image::SNAPSHOT_CALL`] in eax,
+    /// the answer in rax, rdi, rsi, rdx, rcx and r8, as arm64's x0..x5.
+    /// Nothing else is there: QEMU ignores it, and rax comes back as it was.
+    pub const VMM_PORT: u16 = 0x0e10;
 }

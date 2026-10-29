@@ -426,9 +426,9 @@ Also from MCP (the `snapshot` tool, and `run`'s `snapshot`) and Python
   mounts can't take one.
 - The file holds the program's memory, so it's created readable only by
   you, and written fully before it replaces the old one.
-- Snapshots need grix-vmm: Hypervisor.framework on macOS 15+, or KVM on
-  Linux 6.4+ (for its SMCCC filter). A snapshot runs only on the kind of
-  host that took it. A file may be
+- Snapshots need grix-vmm: Hypervisor.framework on macOS 15+, KVM on
+  arm64 Linux 6.4+ (for its SMCCC filter), or KVM on x86_64 Linux. A
+  snapshot runs only on the kind of host that took it. A file may be
   anyone's, so runs from it get the network only as an image's program
   does: with `-a net` (and `--allow-host`, `--publish` as for any run;
   `Snapshot::allow_net`, `forward`), never the file's own rules or
@@ -678,7 +678,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`brk` (lazy paging), a stack as big as `RLIMIT_STACK` says; more CPUs (`--cpus`): threads and processes run in parallel | `MAP_GROWSDOWN`; finer locking than one kernel lock |
 | Clocks (including per-thread and per-process CPU time; a vDSO reads them without a system call), blocking sleeps, `getrandom` (ChaCha20, host-seeded + RNDR), `membarrier`, `mincore` | |
 | Unhandled faults and signals end the program with the signal (SIGSEGV/SIGILL/SIGTRAP/SIGBUS/SIGPIPE/...) | |
-| x86_64 guests (`--arch x86_64`, `GRIX_ARCH`, `SandboxBuilder::arch`): the same kernel built for x86_64, in grix-vmm on x86 KVM or in QEMU microvm, with x86_64's system calls (the older ones too) and structures; every end-to-end test passes on it, CPython and Node included | Snapshots on x86_64; the old `getdents` and `utime*` calls |
+| x86_64 guests (`--arch x86_64`, `GRIX_ARCH`, `SandboxBuilder::arch`): the same kernel built for x86_64, in grix-vmm on x86 KVM or in QEMU microvm, with x86_64's system calls (the older ones too) and structures; every end-to-end test passes on it, CPython and Node included, and snapshots in grix-vmm | The old `getdents` and `utime*` calls |
 
 Verified programs: the C fixtures in `fixtures/src`; Alpine's busybox (static
 and dynamic: `sha256sum`, `sort`, `grep`, `awk`, `ls`, `sh` builtins, …);
@@ -710,7 +710,7 @@ subshells.
    translator in the arm64 sandbox (`--x86-64 qemu-x86_64`: x86_64 Alpine
    and CPython run). A native x86_64 kernel runs in grix-vmm on x86 KVM
    or in QEMU microvm (`--arch x86_64`), and releases include x86_64
-   Linux, with AVX and AVX-512 state and more CPUs. Next: its snapshots.
+   Linux, with AVX and AVX-512 state, more CPUs and snapshots.
 
 ## Repository layout
 

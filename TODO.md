@@ -94,7 +94,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     and spinlock hints would help).
 18. [x] **Snapshots**: in TTY mode, with live mounts (each run gives
     their host directories again), with more CPUs, and on KVM.
-19. [~] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
+19. [x] **A native x86_64 kernel** and grix-vmm on x86 KVM, for x86 hosts.
     Done: the kernel's arm64 code under `arch/aarch64`, and `arch/x86_64`
     (PVH boot, traps and `syscall`, paging, LAPIC/IOAPIC, the 16550, the
     signal frame, the vDSO), the x86_64 syscall table, its older calls
@@ -102,7 +102,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     x86 KVM; every end-to-end test passes on it, in CI on an x86 runner
     with KVM (`x86.yml`); x86_64 Linux releases; AVX and AVX-512 state
     (XSAVE, in Linux's signal frame); more CPUs (INIT/SIPI, TLB flushes
-    by IPI). Left: snapshots of x86_64 machines.
+    by IPI); snapshots of x86_64 machines (grix-vmm on KVM).
 20. **An outside security review** (after the above).
 
 ## Agent integrations

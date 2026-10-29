@@ -27,20 +27,24 @@
 mod console;
 #[cfg(all(supported, target_os = "macos"))]
 mod hvf;
+#[cfg(all(supported, target_os = "linux"))]
+mod kick;
 #[cfg(all(supported, target_os = "linux", target_arch = "aarch64"))]
 mod kvm;
 #[cfg(all(supported, target_arch = "x86_64"))]
 mod kvm_x86;
 #[cfg(supported)]
 mod mem;
-#[cfg(all(supported, target_arch = "aarch64"))]
+#[cfg(supported)]
 mod pause;
-#[cfg(all(supported, target_arch = "aarch64"))]
+#[cfg(supported)]
 mod snapshot;
 #[cfg(all(supported, target_os = "macos"))]
 mod snapshot_hvf;
 #[cfg(all(supported, target_os = "linux", target_arch = "aarch64"))]
 mod snapshot_kvm;
+#[cfg(all(supported, target_arch = "x86_64"))]
+mod snapshot_kvm_x86;
 #[cfg(all(supported, target_arch = "aarch64"))]
 mod vm;
 #[cfg(all(supported, target_arch = "x86_64"))]

@@ -5,6 +5,9 @@
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+pub use crate::kick::{Kick, handle_kicks};
 
 const KVMIO: u64 = 0xae;
 
@@ -38,6 +41,26 @@ const KVM_GET_SREGS: u64 = ior(0x83, 312);
 const KVM_SET_SREGS: u64 = iow(0x84, 312);
 const KVM_SET_CPUID2: u64 = iow(0x90, 8);
 const KVM_GET_TSC_KHZ: u64 = io(0xa3);
+// A snapshot's state (`snapshot_kvm_x86.rs`).
+const KVM_CHECK_EXTENSION: u64 = io(0x03);
+const KVM_GET_IRQCHIP: u64 = iowr(0x62, 520);
+const KVM_SET_IRQCHIP: u64 = ior(0x63, 520);
+const KVM_GET_MSRS: u64 = iowr(0x88, 8);
+const KVM_SET_MSRS: u64 = iow(0x89, 8);
+const KVM_GET_LAPIC: u64 = ior(0x8e, 1024);
+const KVM_SET_LAPIC: u64 = iow(0x8f, 1024);
+const KVM_GET_MP_STATE: u64 = ior(0x98, 4);
+const KVM_SET_MP_STATE: u64 = iow(0x99, 4);
+const KVM_GET_VCPU_EVENTS: u64 = ior(0x9f, 64);
+const KVM_SET_VCPU_EVENTS: u64 = iow(0xa0, 64);
+const KVM_GET_DEBUGREGS: u64 = ior(0xa1, 128);
+const KVM_SET_DEBUGREGS: u64 = iow(0xa2, 128);
+const KVM_GET_XSAVE: u64 = ior(0xa4, 4096);
+const KVM_SET_XSAVE: u64 = iow(0xa5, 4096);
+const KVM_GET_XCRS: u64 = ior(0xa6, 392);
+const KVM_SET_XCRS: u64 = iow(0xa7, 392);
+const KVM_GET_XSAVE2: u64 = ior(0xcf, 4096);
+const KVM_CAP_XSAVE2: u64 = 208;
 
 const EXIT_IO: u32 = 2;
 const EXIT_MMIO: u32 = 6;
@@ -136,6 +159,43 @@ pub struct Vm {
     vm: OwnedFd,
 }
 
+/// A piece of a vCPU's state, as the ioctl that gets it (and the one that
+/// sets it) has it: plain bytes, which a snapshot keeps.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Part {
+    Regs,
+    Sregs,
+    Xcrs,
+    Lapic,
+    Events,
+    Debugregs,
+}
+
+impl Part {
+    /// Its size, and the get and set requests.
+    fn ioctl(self) -> (usize, u64, u64) {
+        match self {
+            Part::Regs => (144, KVM_GET_REGS, KVM_SET_REGS),
+            Part::Sregs => (312, KVM_GET_SREGS, KVM_SET_SREGS),
+            Part::Xcrs => (392, KVM_GET_XCRS, KVM_SET_XCRS),
+            Part::Lapic => (1024, KVM_GET_LAPIC, KVM_SET_LAPIC),
+            Part::Events => (64, KVM_GET_VCPU_EVENTS, KVM_SET_VCPU_EVENTS),
+            Part::Debugregs => (128, KVM_GET_DEBUGREGS, KVM_SET_DEBUGREGS),
+        }
+    }
+
+    pub fn size(self) -> usize {
+        self.ioctl().0
+    }
+}
+
+/// KVM_MP_STATE_*: runnable, waiting for INIT, for a startup IPI, halted,
+/// startup IPI received.
+pub const MP_STATES: [u32; 5] = [0, 1, 2, 3, 4];
+
+/// IA32_TSC: the guest's counter.
+pub const MSR_TSC: u32 = 0x10;
+
 /// A vCPU and its shared `kvm_run` page, for the thread that runs it.
 pub struct Cpu {
     fd: OwnedFd,
@@ -210,6 +270,43 @@ impl Vm {
     pub fn irq_fd(&self) -> RawFd {
         self.vm.as_raw_fd()
     }
+
+    /// The size of a vCPU's XSAVE area as KVM_GET_XSAVE2 gives it (4096
+    /// unless the guest may use bigger state, AMX's), or KVM_GET_XSAVE's.
+    pub fn xsave_size(&self) -> usize {
+        match ioctl(self.vm.as_raw_fd(), KVM_CHECK_EXTENSION, KVM_CAP_XSAVE2) {
+            Ok(n) if n as usize > 4096 => n as usize,
+            _ => 4096,
+        }
+    }
+
+    /// In-kernel interrupt controller `chip` (0, 1: the 8259s; 2: the
+    /// IOAPIC): struct kvm_irqchip.
+    pub fn irqchip(&self, chip: u32) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; 520];
+        buf[..4].copy_from_slice(&chip.to_le_bytes());
+        ioctl(self.vm.as_raw_fd(), KVM_GET_IRQCHIP, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    /// Put one back: its own chip id, in it.
+    pub fn set_irqchip(&self, saved: &[u8]) -> Result<(), Error> {
+        if saved.len() != 520 {
+            return Err(Error("an interrupt controller's state isn't 520 bytes".into()));
+        }
+        ioctl(self.vm.as_raw_fd(), KVM_SET_IRQCHIP, saved.as_ptr() as u64).map(|_| ())
+    }
+}
+
+/// struct kvm_msrs with its entries (index, reserved, data), as u64s.
+fn msr_buf(entries: impl Iterator<Item = (u32, u64)>) -> Vec<u64> {
+    let mut buf = vec![0u64];
+    for (index, value) in entries {
+        buf.push(index as u64);
+        buf.push(value);
+    }
+    buf[0] = (buf.len() as u64 - 1) / 2; // nmsrs, and padding
+    buf
 }
 
 /// Drive IOAPIC pin (GSI) `gsi` on VM `vm` (any thread).
@@ -400,6 +497,91 @@ impl Cpu {
         ioctl(self.fd.as_raw_fd(), KVM_SET_REGS, regs.as_ptr() as u64).map(|_| ())
     }
 
+    /// A piece of its state.
+    pub fn get(&self, part: Part) -> Result<Vec<u8>, Error> {
+        let (size, get, _) = part.ioctl();
+        let mut buf = vec![0u8; size];
+        ioctl(self.fd.as_raw_fd(), get, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    /// Put a piece back, as `get` gave it.
+    pub fn set(&self, part: Part, saved: &[u8]) -> Result<(), Error> {
+        let (size, _, set) = part.ioctl();
+        if saved.len() != size {
+            return Err(Error(format!("{part:?} isn't {size} bytes")));
+        }
+        ioctl(self.fd.as_raw_fd(), set, saved.as_ptr() as u64).map(|_| ())
+    }
+
+    /// Its XSAVE area (`size`: `Vm::xsave_size`).
+    pub fn xsave(&self, size: usize) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; size.max(4096)];
+        let req = if size > 4096 { KVM_GET_XSAVE2 } else { KVM_GET_XSAVE };
+        ioctl(self.fd.as_raw_fd(), req, buf.as_mut_ptr() as u64)?;
+        Ok(buf)
+    }
+
+    pub fn set_xsave(&self, saved: &[u8], size: usize) -> Result<(), Error> {
+        if saved.len() != size.max(4096) {
+            return Err(Error("the XSAVE area isn't this KVM's size".into()));
+        }
+        ioctl(self.fd.as_raw_fd(), KVM_SET_XSAVE, saved.as_ptr() as u64).map(|_| ())
+    }
+
+    pub fn mp_state(&self) -> Result<u32, Error> {
+        let mut state = 0u32;
+        ioctl(self.fd.as_raw_fd(), KVM_GET_MP_STATE, &mut state as *mut u32 as u64)?;
+        Ok(state)
+    }
+
+    pub fn set_mp_state(&self, state: u32) -> Result<(), Error> {
+        ioctl(self.fd.as_raw_fd(), KVM_SET_MP_STATE, &state as *const u32 as u64).map(|_| ())
+    }
+
+    /// MSRs `which`: (index, value) for each, in order; an error if KVM
+    /// doesn't have one.
+    pub fn msrs(&self, which: &[u32]) -> Result<Vec<(u32, u64)>, Error> {
+        let mut buf = msr_buf(which.iter().map(|&i| (i, 0)));
+        let n = ioctl(self.fd.as_raw_fd(), KVM_GET_MSRS, buf.as_mut_ptr() as u64)? as usize;
+        if n != which.len() {
+            return Err(Error(format!("MSR {:#x} can't be read", which[n.min(which.len() - 1)])));
+        }
+        Ok(buf[1..].chunks(2).map(|e| (e[0] as u32, e[1])).collect())
+    }
+
+    pub fn set_msrs(&self, msrs: &[(u32, u64)]) -> Result<(), Error> {
+        let buf = msr_buf(msrs.iter().copied());
+        let n = ioctl(self.fd.as_raw_fd(), KVM_SET_MSRS, buf.as_ptr() as u64)? as usize;
+        if n != msrs.len() {
+            return Err(Error(format!("MSR {:#x} can't be set", msrs[n.min(msrs.len() - 1)].0)));
+        }
+        Ok(())
+    }
+
+    /// Finish what the last exit left (a port's `in` value, ...): the
+    /// state isn't consistent until KVM_RUN has seen it. With
+    /// `immediate_exit` set, KVM does that and runs nothing.
+    pub fn complete(&mut self) -> Result<(), Error> {
+        self.immediate_exit().store(1, Ordering::SeqCst);
+        match self.run()? {
+            Exit::Interrupted => Ok(()),
+            _ => Err(Error("KVM_RUN with immediate_exit ran the guest".into())),
+        }
+    }
+
+    fn immediate_exit(&self) -> &AtomicU8 {
+        // SAFETY: kvm_run's immediate_exit, a byte at 1, in a page mapped
+        // for as long as the process lives.
+        unsafe { &*(self.run.add(1) as *const AtomicU8) }
+    }
+
+    /// What makes this vCPU's thread leave KVM_RUN, for other threads.
+    pub fn kick(&self) -> Kick {
+        // SAFETY: the run page is never unmapped.
+        unsafe { Kick::new(self.immediate_exit()) }
+    }
+
     pub fn run(&mut self) -> Result<Exit, Error> {
         // SAFETY: KVM_RUN takes no argument; the run page is ours.
         let r = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_RUN as _, 0) };
@@ -467,10 +649,19 @@ impl Cpu {
 /// threads make on what's already open, and of ioctls only running a vCPU
 /// and driving an interrupt line; anything else fails with EPERM. The x32
 /// ABI's calls (another table of numbers on the same entry) kill the
-/// process.
-pub fn confine() -> Result<(), String> {
+/// process. A run that may take a snapshot may also read the machine's
+/// state, kick its own threads and write the file; one being restored may
+/// also put the state back, until a second filter (`restoring` false)
+/// takes that away again.
+pub fn confine(snapshot: bool, restoring: bool) -> Result<(), String> {
     // x86_64 system call numbers.
     const IOCTL: u32 = 16;
+    const TGKILL: u32 = 234;
+    const SNAPSHOT_ALLOWED: &[u32] = &[
+        18, // pwrite64
+        77, // ftruncate
+    ];
+    const SECCOMP: u32 = 317;
     const ALLOWED: &[u32] = &[
         0,   // read
         1,   // write
@@ -513,7 +704,43 @@ pub fn confine() -> Result<(), String> {
     const RET_ERRNO: u32 = 0x0005_0000;
     let stmt = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
     let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
-    let ioctls = [KVM_RUN as u32, KVM_IRQ_LINE as u32];
+    let mut ioctls = vec![KVM_RUN, KVM_IRQ_LINE];
+    let mut allowed = ALLOWED.to_vec();
+    if snapshot {
+        ioctls.extend([
+            KVM_GET_REGS,
+            KVM_SET_REGS,
+            KVM_GET_SREGS,
+            KVM_GET_XSAVE,
+            KVM_GET_XSAVE2,
+            KVM_GET_XCRS,
+            KVM_GET_MSRS,
+            KVM_GET_LAPIC,
+            KVM_GET_MP_STATE,
+            KVM_GET_VCPU_EVENTS,
+            KVM_GET_DEBUGREGS,
+            KVM_GET_IRQCHIP,
+        ]);
+        allowed.extend(SNAPSHOT_ALLOWED);
+    }
+    if restoring {
+        ioctls.extend([
+            KVM_SET_REGS,
+            KVM_SET_SREGS,
+            KVM_SET_XSAVE,
+            KVM_SET_XCRS,
+            KVM_SET_MSRS,
+            KVM_SET_LAPIC,
+            KVM_SET_MP_STATE,
+            KVM_SET_VCPU_EVENTS,
+            KVM_SET_DEBUGREGS,
+            KVM_SET_IRQCHIP,
+        ]);
+        allowed.push(SECCOMP);
+    }
+    let mut ioctls: Vec<u32> = ioctls.into_iter().map(|r| r as u32).collect();
+    ioctls.sort_unstable();
+    ioctls.dedup();
     let mut prog = vec![
         stmt(LD_W_ABS, 4), // seccomp_data.arch
         jump(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
@@ -530,18 +757,34 @@ pub fn confine() -> Result<(), String> {
     }
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
     prog.push(stmt(RET_K, RET_ALLOW));
-    // Everything else, by number (the accumulator still holds it).
-    for (i, &nr) in ALLOWED.iter().enumerate() {
-        let rest = (ALLOWED.len() - i - 1) as u8;
+    // Not ioctl (the accumulator still holds the number). tgkill, for a
+    // snapshot's kicks: only to our own threads (args[0], the process).
+    if snapshot {
+        // SAFETY: getpid has no arguments.
+        let pid = unsafe { libc::getpid() } as u32;
+        prog.extend([
+            jump(JEQ_K, TGKILL, 0, 4),
+            stmt(LD_W_ABS, 16),
+            jump(JEQ_K, pid, 1, 0),
+            stmt(RET_K, RET_ERRNO | libc::EPERM as u32),
+            stmt(RET_K, RET_ALLOW),
+        ]);
+    }
+    // Everything else, by number.
+    for (i, &nr) in allowed.iter().enumerate() {
+        let rest = (allowed.len() - i - 1) as u8;
         prog.push(jump(JEQ_K, nr, rest + 1, 0));
     }
     prog.push(stmt(RET_K, RET_ERRNO | libc::EPERM as u32));
     prog.push(stmt(RET_K, RET_ALLOW));
     let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_mut_ptr() };
+    // A second filter (after a restore): no_new_privs is on already, and
+    // prctl isn't allowed.
+    static CONFINED: AtomicBool = AtomicBool::new(false);
     // SAFETY: prctl and seccomp with a filter that outlives the calls (the
     // kernel copies it). TSYNC applies it to the threads already running.
     unsafe {
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        if !CONFINED.swap(true, Ordering::SeqCst) && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
         }
         const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;

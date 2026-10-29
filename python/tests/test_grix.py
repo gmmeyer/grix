@@ -50,13 +50,15 @@ class Common:
         self.assertEqual(r.events, [])
 
     def test_snapshots(self):
-        if X86_64:
+        # grix-vmm runs the host's own architecture's guests, unless QEMU is
+        # asked for; QEMU can't, and says so.
+        host_x86 = platform.machine() in ("x86_64", "AMD64")
+        qemu = os.environ.get("GRIX_VMM") == "qemu" or "GRIX_ACCEL" in os.environ
+        if qemu or X86_64 != host_x86 or (sys.platform != "darwin" and not os.path.exists("/dev/kvm")):
             sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
-            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(grix.GrixError, "x86_64"):
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(grix.GrixError, "grix's own VMM"):
                 sb.snapshot(Path(tmp) / "sh.snap", ["/bin/busybox", "true"])
             return
-        if sys.platform != "darwin" and not os.path.exists("/dev/kvm"):
-            self.skipTest("snapshots need grix-vmm (macOS, or Linux with KVM)")
         with tempfile.TemporaryDirectory() as tmp:
             sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, capabilities=["process"])
             snap = sb.snapshot(Path(tmp) / "sh.snap", ["/bin/busybox", "sh", "-c", 'read x; echo "got $x"'])
