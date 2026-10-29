@@ -1838,6 +1838,41 @@ fn proc_for_every_process() {
     assert_eq!(lines[8], "init /proc/1", "{text}");
 }
 
+/// A zombie keeps its /proc/<pid> until it's reaped, as on Linux: state Z,
+/// no memory, files, cwd or root, and ps lists it (see the fixture).
+#[test]
+fn proc_of_zombies() {
+    let b = with("zombies")
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process);
+    let out = run(b, &["/bin/zombies"]);
+    assert_eq!(
+        out.stdout_str(),
+        "stat: state Z ppid 1 pgrp=pid 1 threads 1 vsize 0 rss 0 exit_code 0x500\n\
+         status: Z ppid=1 threads=1 fdsize=1 umask=0 vm=0 sigign_usr1=1\n\
+         empty: cmdline 0 environ 0 maps 0\n\
+         statm: 0 0 0 0 0 0 0\n\
+         comm: zombies\n\
+         mountinfo: -1 Invalid argument\n\
+         exe: readlink -1 No such file or directory, stat -1 No such file or directory\n\
+         cwd: readlink -1 No such file or directory, stat -1 No such file or directory\n\
+         root: readlink -1 No such file or directory, stat -1 No such file or directory\n\
+         fd: 0 entries, fd/0 -1 No such file or directory\n\
+         ps: Z [zombies]\n\
+         reaped: gone 1\n\
+         orphan: state Z ppid 1\n\
+         orphan reaped: gone 1\n\
+         SIG_IGN: gone 1\n\
+         SA_NOCLDWAIT: gone 1\n\
+         zombies ok\n",
+        "{}",
+        out.kernel_log
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// A stand-in kernel, hand-assembled: it writes `serial` to the PL011 and
 /// powers off, which is what the real one does when it panics.
 fn fake_kernel(serial: &[u8]) -> Vec<u8> {

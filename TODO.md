@@ -68,13 +68,13 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     Left: UDP port forwarding, datagrams over one frame (~4 KiB),
     SO_PASSCRED.
 14. [x] **Smaller syscalls**: `/proc/<pid>` for every process (`ps`),
-    pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
+    zombies included until they're reaped, pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
     `CLONE_PIDFD`, `waitid(P_PIDFD)`, polling), CPU-time timers
     (`ITIMER_VIRTUAL`/`ITIMER_PROF`, POSIX timers on CPU clocks), a stack
     sized by `RLIMIT_STACK` at exec with mmap kept clear of it, and a vDSO
     (`clock_gettime` and `gettimeofday` without a system call). Left:
     `MAP_GROWSDOWN`; another process's CPU clock as a timer's clock;
-    `/proc/<pid>` of zombies; `PIDFD_THREAD`.
+    `PIDFD_THREAD`.
 15. [x] **Images**: zstd layers, registries that need a login (`grix
     login`, Docker's and Podman's logins and credential helpers), a cache
     of applied base layers and of build steps, and images built on grix

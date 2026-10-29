@@ -7,11 +7,13 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::arch;
+use crate::errno::{EINVAL, ENOENT, Errno};
 use crate::fd::FileKind;
 use crate::fs;
 use crate::mm::aspace::{Backing, STACK_TOP, VVAR};
 use crate::mm::frame;
-use crate::process::Process;
+use crate::process::{Ids, Process};
+use crate::procs::Zombie;
 use crate::time;
 
 pub const HOSTNAME: &str = "grix";
@@ -49,9 +51,9 @@ pub enum ProcFile {
     CgroupMemoryMax,
 }
 
-/// Each process's directory, /proc/<pid> (made at fork, gone when it
-/// ends; `/proc/self` is the caller's): these files, `fd/`, and the `exe`,
-/// `cwd` and `root` links.
+/// Each process's directory, /proc/<pid> (made at fork, gone once it has
+/// ended and been reaped; `/proc/self` is the caller's): these files,
+/// `fd/`, and the `exe`, `cwd` and `root` links.
 pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("maps", ProcFile::Maps),
     ("status", ProcFile::Status),
@@ -116,8 +118,8 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
     match f {
         ProcFile::Text(t) => s.push_str(t),
         ProcFile::Maps => maps(p, &mut s),
-        ProcFile::Status => status(p, &mut s),
-        ProcFile::Stat => stat(p, &mut s),
+        ProcFile::Status => status(&shown(p), &mut s),
+        ProcFile::Stat => stat(&shown(p), &mut s),
         ProcFile::Statm => {
             let (size, rss) = mem_pages(p);
             let _ = writeln!(s, "{size} {rss} 0 0 0 {size} 0");
@@ -134,7 +136,7 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
         ProcFile::Comm => {
             let _ = writeln!(s, "{}", comm(p));
         }
-        ProcFile::Limits => limits(p, &mut s),
+        ProcFile::Limits => limits(&p.rlimits, &mut s),
         // The root is read-only without fs_write.
         ProcFile::Mountinfo => {
             let m = root_mode(p);
@@ -200,6 +202,100 @@ pub fn generate(p: &Process, f: ProcFile) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// What /proc/<pid> still shows of a process that has ended, until it's
+/// reaped (`procs::Zombie`): what Linux keeps of a zombie, its name,
+/// credentials, signal state, limits and times. Its memory, descriptors,
+/// filesystem context and mount namespace went when it exited (Linux's
+/// `exit_mm`, `exit_files`, `exit_fs`, `exit_task_namespaces`).
+pub struct Remains {
+    comm: String,
+    uid: u32,
+    gid: u32,
+    ids: Ids,
+    blocked: u64,
+    ignored: u64,
+    caught: u64,
+    rlimits: [(u64, u64); 16],
+    /// CPU time of the children it reaped (`Zombie::cpu_ns` has its own too).
+    children_ns: u64,
+}
+
+impl Remains {
+    pub fn of(p: &Process) -> Remains {
+        let (ignored, caught) = dispositions(p);
+        Remains {
+            comm: comm(p),
+            uid: p.uid,
+            gid: p.gid,
+            ids: p.ids.clone(),
+            blocked: p.threads.get(&p.current).map_or(0, |t| t.sigmask),
+            ignored,
+            caught,
+            rlimits: p.rlimits,
+            children_ns: p.children_cpu_ns,
+        }
+    }
+}
+
+/// A zombie's /proc/<pid> file, as `reader` sees it: what Linux's procfs
+/// gives for a task without memory, files or namespaces.
+pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> Result<Vec<u8>, Errno> {
+    let r = &z.remains;
+    let mut s = String::new();
+    match f {
+        ProcFile::Text(t) => s.push_str(t),
+        ProcFile::Status | ProcFile::Stat => {
+            // Its exit code is for those ptrace would let look (do_task_stat).
+            let permitted = crate::procs::may_inspect_creds(reader, r.uid, r.gid, &r.ids, false);
+            let sh = Shown {
+                pid,
+                ppid: z.ppid,
+                pgid: z.pgid,
+                sid: z.sid,
+                comm: r.comm.clone(),
+                state: "Z (zombie)",
+                umask: None,
+                uid: r.uid,
+                gid: r.gid,
+                ids: &r.ids,
+                fds: 0,
+                mem: None,
+                // The thread group's leader, until it's reaped.
+                threads: 1,
+                pending: 0,
+                shared_pending: 0,
+                blocked: r.blocked,
+                ignored: r.ignored,
+                caught: r.caught,
+                cpu_ns: z.cpu_ns - r.children_ns,
+                children_ns: r.children_ns,
+                flags: PF_DEFAULT | PF_EXITING,
+                exit_code: if permitted { z.status } else { 0 },
+            };
+            if f == ProcFile::Status { status(&sh, &mut s) } else { stat(&sh, &mut s) }
+        }
+        // No memory: no mappings, arguments or environment (they read empty).
+        ProcFile::Maps | ProcFile::Cmdline | ProcFile::Environ => {}
+        ProcFile::Statm => s.push_str("0 0 0 0 0 0 0\n"),
+        ProcFile::Comm => {
+            let _ = writeln!(s, "{}", r.comm);
+        }
+        ProcFile::Limits => limits(&r.rlimits, &mut s),
+        // No mount namespace: Linux's mounts_open_common fails.
+        ProcFile::Mountinfo | ProcFile::Mounts => return Err(EINVAL),
+        // Not a /proc/<pid> file.
+        _ => return Err(ENOENT),
+    }
+    Ok(s.into_bytes())
+}
+
+/// Signals ignored and caught, as /proc shows them (bit n-1 for signal n).
+fn dispositions(p: &Process) -> (u64, u64) {
+    let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
+    let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
+    (ignored, caught)
+}
+
 fn comm(p: &Process) -> String {
     let n = p.name.iter().position(|&b| b == 0).unwrap_or(p.name.len());
     if n > 0 {
@@ -248,33 +344,97 @@ fn maps(p: &Process, s: &mut String) {
     }
 }
 
-fn status(p: &Process, s: &mut String) {
-    let (size, rss) = mem_pages(p);
+/// What status and stat show of a process, live or a zombie.
+struct Shown<'a> {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    sid: u32,
+    comm: String,
+    state: &'static str,
+    /// None without a filesystem context (a zombie).
+    umask: Option<u32>,
+    uid: u32,
+    gid: u32,
+    ids: &'a Ids,
+    fds: usize,
+    /// (virtual size, resident) in pages; None without memory (a zombie).
+    mem: Option<(u64, u64)>,
+    threads: usize,
+    pending: u64,
+    shared_pending: u64,
+    blocked: u64,
+    ignored: u64,
+    caught: u64,
+    cpu_ns: u64,
+    children_ns: u64,
+    flags: u64,
+    exit_code: i32,
+}
+
+/// The task flags stat shows (PF_RANDOMIZE | PF_SUPERPRIV), and the one
+/// an exiting task gets.
+const PF_DEFAULT: u64 = 0x40_0100;
+const PF_EXITING: u64 = 0x4;
+
+fn shown(p: &Process) -> Shown<'_> {
     let (blocked, pending) = p.threads.get(&p.current).map_or((0, 0), |t| (t.sigmask, t.pending.mask));
-    let ignored: u64 = (1..=64).filter(|&i| p.sigactions[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
-    let caught: u64 = (1..=64).filter(|&i| p.sigactions[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
-    let (ru, u, su) = (p.ids.ruid, p.uid, p.ids.suid);
-    let (rg, g, sg) = (p.ids.rgid, p.gid, p.ids.sgid);
-    let groups = p.ids.groups.iter().map(|g| alloc::format!("{g}")).collect::<alloc::vec::Vec<_>>().join(" ");
-    let (pid, ppid) = (p.pid, p.ppid);
+    let (ignored, caught) = dispositions(p);
+    Shown {
+        pid: p.pid,
+        ppid: p.ppid,
+        pgid: p.pgid,
+        sid: p.sid,
+        comm: comm(p),
+        state: state(p),
+        umask: Some(p.umask),
+        uid: p.uid,
+        gid: p.gid,
+        ids: &p.ids,
+        fds: p.fds.len(),
+        mem: Some(mem_pages(p)),
+        threads: p.threads.len(),
+        pending,
+        shared_pending: p.shared_pending.mask,
+        blocked,
+        ignored,
+        caught,
+        cpu_ns: p.process_cpu_ns(),
+        children_ns: p.children_cpu_ns,
+        flags: PF_DEFAULT,
+        exit_code: 0,
+    }
+}
+
+/// As Linux's proc_pid_status lays it out: without a filesystem context
+/// there's no Umask line, and without memory no Vm lines.
+fn status(sh: &Shown, s: &mut String) {
+    let ids = sh.ids;
+    let (ru, u, su) = (ids.ruid, sh.uid, ids.suid);
+    let (rg, g, sg) = (ids.rgid, sh.gid, ids.sgid);
+    let groups = ids.groups.iter().map(|g| alloc::format!("{g}")).collect::<alloc::vec::Vec<_>>().join(" ");
+    let (pid, ppid) = (sh.pid, sh.ppid);
+    let _ = writeln!(s, "Name:\t{}", sh.comm);
+    if let Some(umask) = sh.umask {
+        let _ = writeln!(s, "Umask:\t{umask:04o}");
+    }
     let _ = write!(
         s,
-        "Name:\t{}\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
-         TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n\
-         VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/0\n\
-         SigPnd:\t{pending:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\n\
-         SigCgt:\t{caught:016x}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
+        "State:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
+         TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n",
+        sh.state, sh.fds,
+    );
+    if let Some((size, rss)) = sh.mem {
+        let _ = write!(s, "VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\n", size * 4, size * 4, rss * 4);
+    }
+    let _ = write!(
+        s,
+        "Threads:\t{}\nSigQ:\t0/0\n\
+         SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
+         SigCgt:\t{:016x}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
          CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\n\
          NoNewPrivs:\t1\nSeccomp:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
-        comm(p),
-        p.umask,
-        state(p),
-        p.fds.len(),
-        size * 4,
-        size * 4,
-        rss * 4,
-        p.threads.len(),
-        p.shared_pending.mask,
+        sh.threads, sh.pending, sh.shared_pending, sh.blocked, sh.ignored, sh.caught,
     );
 }
 
@@ -289,23 +449,24 @@ fn state(p: &Process) -> &'static str {
     }
 }
 
-fn stat(p: &Process, s: &mut String) {
-    let (size, rss) = mem_pages(p);
-    // utime, in clock ticks (all CPU time counts as user time).
-    let ticks = p.process_cpu_ns() / 10_000_000;
-    let (pid, ppid, pgrp, sid) = (p.pid, p.ppid, p.pgid, p.sid);
+fn stat(sh: &Shown, s: &mut String) {
+    let (size, rss) = sh.mem.unwrap_or((0, 0));
+    // utime and cutime, in clock ticks (all CPU time counts as user time).
+    let (ticks, cticks) = (sh.cpu_ns / 10_000_000, sh.children_ns / 10_000_000);
+    let (pid, ppid, pgrp, sid, flags) = (sh.pid, sh.ppid, sh.pgid, sh.sid, sh.flags);
     let _ = writeln!(
         s,
-        "{pid} ({}) {} {ppid} {pgrp} {sid} 0 -1 4194560 0 0 0 0 {ticks} 0 0 0 20 0 {} 0 0 {} {rss} \
-         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
-        comm(p),
-        &state(p)[..1],
-        p.threads.len(),
+        "{pid} ({}) {} {ppid} {pgrp} {sid} 0 -1 {flags} 0 0 0 0 {ticks} 0 {cticks} 0 20 0 {} 0 0 {} {rss} \
+         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 {}",
+        sh.comm,
+        &sh.state[..1],
+        sh.threads,
         size * 4096,
+        sh.exit_code,
     );
 }
 
-fn limits(p: &Process, s: &mut String) {
+fn limits(rlimits: &[(u64, u64); 16], s: &mut String) {
     const NAMES: [(&str, &str); 16] = [
         ("Max cpu time", "seconds"),
         ("Max file size", "bytes"),
@@ -327,7 +488,7 @@ fn limits(p: &Process, s: &mut String) {
     let _ = writeln!(s, "{:<26}{:<21}{:<21}{:<10}", "Limit", "Soft Limit", "Hard Limit", "Units");
     let fmt = |v: u64| if v == u64::MAX { String::from("unlimited") } else { format!("{v}") };
     for (i, (name, unit)) in NAMES.iter().enumerate() {
-        let (cur, max) = p.rlimits[i];
+        let (cur, max) = rlimits[i];
         let _ = writeln!(s, "{name:<26}{:<21}{:<21}{unit:<10}", fmt(cur), fmt(max));
     }
 }

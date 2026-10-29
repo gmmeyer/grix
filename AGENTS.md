@@ -220,8 +220,10 @@ Every way a process ends goes through `Process::terminate`: for init (pid
 `procs::finalize` (run from `schedule`, which `return_to_user` calls for an
 ended process) closes its files, leaves a zombie, gives its children to
 init and sends the exit signal. Each process has a `/proc/<pid>`
-(`Fs::proc_add` at fork, `fs::proc_gone` at its end; `/proc/self` is
-`process::current_pid`); a pidfd (`FileKind::PidFd`) is just the pid,
+(`Fs::proc_add` at fork, `fs::proc_gone` once it's reaped; `/proc/self`
+is `process::current_pid`). A zombie's is generated from what
+`procfs::Remains` kept of it (`Zombie::remains`, `fs::proc_zombie`
+makes its `exe`, `cwd` and `root` fail with ENOENT); a pidfd (`FileKind::PidFd`) is just the pid,
 which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
 caller running. Credentials: `Process::uid`/`gid` are the effective ids

@@ -11,7 +11,7 @@
 //! the filesystem but not the kernel heap.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -721,6 +721,8 @@ pub struct Fs {
     pid_dirs: BTreeMap<u32, Ino>,
     dir_pids: BTreeMap<Ino, u32>,
     fd_dirs: BTreeMap<Ino, u32>,
+    /// Zombies' directories: their `exe`, `cwd` and `root` lead nowhere.
+    zombie_dirs: BTreeSet<Ino>,
     /// `/dev/pts`, and the nodes of the pseudo-terminals ever made: each
     /// index keeps its node, linked there while its master is open.
     pts_dir: Ino,
@@ -737,19 +739,28 @@ pub struct Fs {
 
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
 
-/// Processes that ended while the filesystem was busy: their /proc
-/// directories go at the next chance.
-static PROC_GONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Processes that ended (or were reaped) while the filesystem was busy:
+/// their /proc directories change at the next chance, in order. `true`:
+/// the directory goes; `false`: it stays, a zombie's.
+static PROC_ENDED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
 
-/// Process `pid` ended: its /proc/<pid> goes (now, or once the filesystem
-/// is free).
+/// Process `pid` ended, or its zombie was reaped: its /proc/<pid> goes
+/// (now, or once the filesystem is free).
 pub fn proc_gone(pid: u32) {
-    let mut gone = PROC_GONE.lock();
-    gone.push(pid);
+    proc_ended(pid, true);
+}
+
+/// Process `pid` ended and is a zombie: its /proc/<pid> stays until it's
+/// reaped (`proc_gone`), as on Linux, with what a zombie still has.
+pub fn proc_zombie(pid: u32) {
+    proc_ended(pid, false);
+}
+
+fn proc_ended(pid: u32, gone: bool) {
+    let mut ended = PROC_ENDED.lock();
+    ended.push((pid, gone));
     if let Some(mut fs) = try_lock() {
-        for pid in core::mem::take(&mut *gone) {
-            fs.proc_remove(pid);
-        }
+        fs.proc_apply(&mut ended);
     }
 }
 
@@ -840,6 +851,7 @@ impl Fs {
             pid_dirs: BTreeMap::new(),
             dir_pids: BTreeMap::new(),
             fd_dirs: BTreeMap::new(),
+            zombie_dirs: BTreeSet::new(),
             pts_dir: ROOT,
             pts_nodes: BTreeMap::new(),
             page: None,
@@ -985,9 +997,7 @@ impl Fs {
     /// running: the interpreter, for `#!` scripts), `cwd` and `root`.
     /// Without room for it (the metadata budget), there's none.
     pub fn proc_add(&mut self, pid: u32, owner: (u32, u32), exe: &str, cwd: &str) {
-        for gone in core::mem::take(&mut *PROC_GONE.lock()) {
-            self.proc_remove(gone);
-        }
+        self.proc_apply(&mut PROC_ENDED.lock());
         self.proc_remove(pid);
         let made = (|| -> Result<(), Errno> {
             let dir =
@@ -1043,10 +1053,22 @@ impl Fs {
         }
     }
 
+    /// What `proc_gone` and `proc_zombie` put off.
+    fn proc_apply(&mut self, ended: &mut Vec<(u32, bool)>) {
+        for (pid, gone) in core::mem::take(ended) {
+            if gone {
+                self.proc_remove(pid);
+            } else if let Some(&dir) = self.pid_dirs.get(&pid) {
+                self.zombie_dirs.insert(dir);
+            }
+        }
+    }
+
     /// Process `pid` is gone: so is /proc/<pid>.
     pub fn proc_remove(&mut self, pid: u32) {
         let Some(dir) = self.pid_dirs.remove(&pid) else { return };
         self.dir_pids.remove(&dir);
+        self.zombie_dirs.remove(&dir);
         self.remove_tree(dir);
         if let Kind::Dir(children) = &mut self.nodes[self.proc_dir].kind {
             children.remove(&alloc::format!("{pid}"));
@@ -1077,14 +1099,17 @@ impl Fs {
     }
 
     /// A symlink's target: `/proc/self` and `thread-self` lead to the
-    /// running process's directory.
-    pub fn link_target(&self, ino: Ino) -> Option<String> {
+    /// running process's directory. EINVAL if it isn't one; ENOENT for a
+    /// zombie's `exe`, `cwd` and `root`, as on Linux, where it has no
+    /// memory or filesystem context left to name.
+    pub fn link_target(&self, ino: Ino) -> Result<String, Errno> {
         if self.self_links.contains(&ino) {
-            return Some(alloc::format!("{}", crate::process::current_pid()));
+            return Ok(alloc::format!("{}", crate::process::current_pid()));
         }
         match &self.nodes[ino].kind {
-            Kind::Symlink(t) => Some(t.clone()),
-            _ => None,
+            Kind::Symlink(_) if self.zombie_dirs.contains(&self.nodes[ino].parent) => Err(ENOENT),
+            Kind::Symlink(t) => Ok(t.clone()),
+            _ => Err(EINVAL),
         }
     }
 
@@ -1251,7 +1276,7 @@ impl Fs {
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        let target = self.link_target(child).unwrap();
+                        let target = self.link_target(child)?;
                         cur = self.walk(cur, &target, true, links)?;
                         continue;
                     }

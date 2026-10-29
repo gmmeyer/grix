@@ -302,9 +302,12 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         let data = match proc_pid {
             Some(pid) => {
                 let procs = crate::procs::PROCS.lock();
-                // Ended just now: its directory is on its way out.
-                let q = procs.others.get(&pid).ok_or(ENOENT)?;
-                procfs::generate(q, f)
+                match (procs.others.get(&pid), procs.zombies.get(&pid)) {
+                    (Some(q), _) => procfs::generate(q, f),
+                    (None, Some(z)) => procfs::generate_zombie(p, pid, z, f)?,
+                    // Reaped just now: its directory is on its way out.
+                    (None, None) => return Err(ENOENT),
+                }
             }
             None => procfs::generate(p, f),
         };
@@ -354,8 +357,10 @@ fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32) ->
     let (dir, name) = parent_in(p, base, path)?;
     let mut fs = fs::lock();
     if let Ok(link) = fs.lookup(dir, &name, false)
-        && let Some(target) = fs.link_target(link)
+        && matches!(fs.node(link).kind, Kind::Symlink(_))
     {
+        // A zombie's /proc/<pid>/exe leads nowhere (ENOENT).
+        let target = fs.link_target(link)?;
         drop(fs);
         return if depth >= 8 { Err(ELOOP) } else { create_file(p, dir, &target, perm, depth + 1) };
     }
@@ -1108,7 +1113,7 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
         })?,
         _ => {
             let ino = resolve(p, dirfd, &path, false)?;
-            fs::lock().link_target(ino).ok_or(EINVAL)?
+            fs::lock().link_target(ino)?
         }
     };
     let n = (target.len() as u64).min(size) as usize;

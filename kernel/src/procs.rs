@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::fd::FdTable;
-use crate::process::{INIT, Process};
+use crate::process::{INIT, Ids, Process};
 use crate::signal::{self, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SigInfo, Target};
 
 /// Processes, zombies included, that may exist at once. Each holds page
@@ -21,10 +21,13 @@ pub const MAX_PROCESSES: usize = 128;
 pub struct Zombie {
     pub ppid: u32,
     pub pgid: u32,
+    pub sid: u32,
     /// As wait4 reports it.
     pub status: i32,
     /// CPU time of the process and of the children it reaped.
     pub cpu_ns: u64,
+    /// What its /proc/<pid> still shows.
+    pub remains: crate::procfs::Remains,
 }
 
 pub struct Procs {
@@ -52,8 +55,13 @@ pub fn ended(p: &Process, pid: u32) -> bool {
 /// whose user and group (`real`: real ids, otherwise effective ones) are
 /// all of `q`'s.
 pub fn may_inspect(p: &Process, q: &Process, real: bool) -> bool {
+    may_inspect_creds(p, q.uid, q.gid, &q.ids, real)
+}
+
+/// `may_inspect` for a process with these credentials (a zombie's).
+pub fn may_inspect_creds(p: &Process, quid: u32, qgid: u32, qids: &Ids, real: bool) -> bool {
     let (uid, gid) = if real { (p.ids.ruid, p.ids.rgid) } else { (p.uid, p.gid) };
-    p.uid == 0 || ([q.uid, q.ids.ruid, q.ids.suid] == [uid; 3] && [q.gid, q.ids.rgid, q.ids.sgid] == [gid; 3])
+    p.uid == 0 || ([quid, qids.ruid, qids.suid] == [uid; 3] && [qgid, qids.rgid, qids.sgid] == [gid; 3])
 }
 
 /// A process has ended and may need finishing off (`reap_others`).
@@ -93,6 +101,7 @@ impl Procs {
 pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut Procs) {
     let status = dead.exit_status.expect("finalizing a live process");
     let cpu_ns = dead.process_cpu_ns() + dead.children_cpu_ns;
+    let remains = crate::procfs::Remains::of(dead);
     if dead.posix_locks {
         crate::locks::release_all(crate::locks::Owner::Process(dead.pid));
     }
@@ -105,7 +114,6 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.cwd_pin = None;
     dead.dead = true;
     let (pid, ppid) = (dead.pid, dead.ppid);
-    crate::fs::proc_gone(pid);
     // Its pidfds are readable.
     EXITS.fetch_add(1, Ordering::Relaxed);
     crate::ipc::changed();
@@ -130,15 +138,22 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
         _ => procs.others.get_mut(&ppid),
     };
     // Orphans belong to init, which outlives everything.
-    let Some(parent) = parent else { return };
+    let Some(parent) = parent else {
+        crate::fs::proc_gone(pid);
+        return;
+    };
     if let Some((_, tid)) = dead.vfork_parent.take() {
         parent.wake(tid, Some(pid as u64));
     }
     let act = parent.sigactions[SIGCHLD as usize];
     // Linux reaps at once for a parent that ignores SIGCHLD (or asked with
     // SA_NOCLDWAIT): its wait4 then just waits for the last child.
+    // Its /proc/<pid> stays while it's a zombie.
     if act.handler != SIG_IGN && act.flags & SA_NOCLDWAIT == 0 {
-        procs.zombies.insert(pid, Zombie { ppid, pgid: dead.pgid, status, cpu_ns });
+        procs.zombies.insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains });
+        crate::fs::proc_zombie(pid);
+    } else {
+        crate::fs::proc_gone(pid);
     }
     if dead.exit_signal != 0 && dead.exit_signal <= signal::NSIG {
         let _ = signal::send(parent, Target::Process, SigInfo::child(dead.exit_signal, pid, dead.uid, status));

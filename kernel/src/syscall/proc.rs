@@ -274,6 +274,7 @@ fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<O
         let r = (pid, z.status, z.cpu_ns);
         if reap {
             procs.zombies.remove(&pid);
+            crate::fs::proc_gone(pid);
             p.children_cpu_ns += r.2;
         }
         return Ok(Some(r));
@@ -436,10 +437,8 @@ pub fn group_of(p: &mut Process, pid: u64, session: bool) -> SysResult {
     if let Some(q) = procs.others.get(&pid) {
         return Ok((if session { q.sid } else { q.pgid }) as u64);
     }
-    match procs.zombies.get(&pid) {
-        Some(z) if !session => Ok(z.pgid as u64),
-        _ => Err(ESRCH),
-    }
+    let z = procs.zombies.get(&pid).ok_or(ESRCH)?;
+    Ok((if session { z.sid } else { z.pgid }) as u64)
 }
 
 /// setpgid(pid, pgid): move the caller or one of its children into a
