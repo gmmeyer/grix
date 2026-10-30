@@ -93,15 +93,30 @@ pub enum Links {
     Any,
     /// Only links that stay inside the exported tree: a relative target
     /// that, followed through the tree's own links, never leaves it, as
-    /// Python tarfile's `data` filter allows. Anything else fails the
-    /// whole export before it's written.
+    /// Python tarfile's `data` filter allows. A target that goes on with
+    /// `..` from a name the tree doesn't have as a directory or link is
+    /// refused too (a dangling path's, say): the host may fold case or
+    /// normalise Unicode, and take that name for another. Anything else
+    /// fails the whole export before it's written.
     Inside,
 }
 
 /// Where `target`, the target of the link at `link`, leads in the tree
-/// whose links are `links`: `None` if it leaves the tree, is absolute,
-/// or goes through more than 40 links (Linux's limit).
-fn resolve_inside(links: &BTreeMap<&str, &str>, link: &str, target: &str) -> Option<Vec<String>> {
+/// whose links are `links` and directories `dirs`: `None` if it leaves
+/// the tree, is absolute, or goes through more than 40 links (Linux's
+/// limit), or if `..` follows a name that's neither. Names are the
+/// tree's exactly and a host's filesystem may see them otherwise, so
+/// such a name may be a link here, say `UP` for `up -> ..`, and `..` from
+/// it could be anywhere. Without `..` it can only go down or through
+/// links, each of which stays inside from where it really is. (The other
+/// way, two names of the tree that a host sees as one can't both be
+/// written, which fails the export.)
+fn resolve_inside(
+    links: &BTreeMap<&str, &str>,
+    dirs: &BTreeSet<&str>,
+    link: &str,
+    target: &str,
+) -> Option<Vec<String>> {
     let mut at: Vec<String> = link.split('/').map(String::from).collect();
     at.pop();
     let mut pending: Vec<String> = Vec::new();
@@ -124,12 +139,15 @@ fn resolve_inside(links: &BTreeMap<&str, &str>, link: &str, target: &str) -> Opt
             }
             name => {
                 at.push(name.to_string());
-                if let Some(t) = links.get(at.join("/").as_str()) {
+                let here = at.join("/");
+                if let Some(t) = links.get(here.as_str()) {
                     hops += 1;
                     if hops > 40 || !push_target(&mut pending, t) {
                         return None;
                     }
                     at.pop();
+                } else if !dirs.contains(here.as_str()) {
+                    return (!pending.iter().any(|c| c == "..")).then_some(at);
                 }
             }
         }
@@ -217,7 +235,7 @@ impl Export {
                 })
                 .collect();
             for (path, target) in &all {
-                if resolve_inside(&all, path, target).is_none() {
+                if resolve_inside(&all, &dirs, path, target).is_none() {
                     bail!("export of {} has a link {path:?} to {target:?}, outside it", self.dir);
                 }
             }
@@ -752,7 +770,7 @@ mod tests {
             link("d/e/up", "../.."),
             link("d/b", "e/../../a/e"),
             link("d/e/c", "../../d/b/up/d"),
-            link("dangling", "d/nothing/../e"),
+            link("dangling", "d/nothing/e"),
             link("dot", "."),
         ];
         let ok = tree(fine.to_vec());
@@ -767,6 +785,16 @@ mod tests {
             vec![link("d/e/up", "../.."), link("x", "d/e/up/..")],
             // A loop never resolves.
             vec![link("p", "q"), link("q", "p")],
+            // A host that folds case takes `UP` for the link `up`, which
+            // the tree's names don't say: from a name the tree doesn't
+            // have, `..` could lead anywhere.
+            vec![link("d/up", ".."), link("d/x", "UP/../secret")],
+            vec![link("d/x", "nothing/../e")],
+            vec![link("d/e/up", "../.."), link("x", "d/e/UP/..")],
+            // Through a link, the same.
+            vec![link("d/up", ".."), link("d/y", "x/.."), link("d/x", "UP")],
+            // A file isn't a directory to go back from either.
+            vec![link("d/x", "../f/../..")],
         ] {
             let dest = base.join("bad");
             let ex = tree(bad.clone());
