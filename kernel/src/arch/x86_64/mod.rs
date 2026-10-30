@@ -759,6 +759,8 @@ fn flush(root: u64, start: u64, end: u64, every: bool) {
     let ipis = sent.iter().filter(|&&s| s).count() as u64;
     if ipis > 0 {
         crate::smp::note_on(me, crate::smp::Stat::FlushIpi, ipis);
+    }
+    if ipis > 0 || every {
         crate::smp::note_on(me, crate::smp::Stat::FlushWait, counter() - start);
     }
 }

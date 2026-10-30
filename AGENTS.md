@@ -426,7 +426,7 @@ left untouched for the usual path, which starts again from the
 exception. They use only the CPU's `fast::Snapshot` (set by `unlock`
 from the thread it runs, stale once `fast::changed` moves the
 generation on), the running process's address space under its gate, and
-atomics or leaf locks (frames, counters). Every address space has a gate
+atomics, or leaf locks (frames) once it has the gate. Every address space has a gate
 (`mm::gate::Mm`, `Process::aspace`): the CPU that has the process checked
 out holds it (`smp::lock`/`unlock`, `sched::schedule`'s switch), a fast
 fault holds it, and code looking at another process's takes it
@@ -436,9 +436,12 @@ write nothing the lock covers (the process, `PROCS`, the filesystem,
 timers, wait queues, the console, other CPUs' state: debug-asserted for
 the lock, `fs::lock` and `Procs::each`); never flush a TLB or change a
 present entry (x86's catch-up relies on flushes happening under the
-lock); wait for nothing but a gate (`lock_fast`, which gives way to the
-kernel lock's holder: `wanted`), and never wait for another CPU holding
-one (but in `flush_tlb`); return through x86's `sanitize`; and if what it reports can change
+lock); spin for nothing before the gate but `lock_fast`, which gives way
+to the kernel lock's holder (`wanted`) and answers its `flush_tables`
+(`tlb_sync`): that holder waits for CPUs in fast entries, so any other
+spin there could hang it, and no leaf lock may be held across a flush;
+never wait for another CPU holding a gate but in `flush_tlb` and
+`flush_tables`; return through x86's `sanitize`; and if what it reports can change
 while the thread runs on (another CPU's setuid, a parent's end, TSYNC),
 the change calls `fast::changed`. Pending signals, preemption and stops
 reach a CPU there as interrupts, taken on the way back to user mode.

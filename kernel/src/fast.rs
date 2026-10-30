@@ -17,9 +17,12 @@
 //! names, with its gate. Never the process (it's in `procs::PROCS`, where
 //! the lock's holder may be changing it), another CPU's state, the
 //! filesystem, the scheduler's or anything else the lock covers. Nothing
-//! here waits but for the gate, whose holders never wait for this CPU,
-//! and anything that can't be done this way is left to the usual path,
-//! untouched (it starts again from the exception).
+//! here waits but for the gate (`lock_fast`), and that spin answers what
+//! the gate's holder may be waiting for here (`arch::flush_tables`):
+//! nothing else may spin before the gate is held, and a leaf lock taken
+//! after it (frames) is never held across a flush. Anything that can't be
+//! done this way is left to the usual path, untouched (it starts again
+//! from the exception).
 //!
 //! A snapshot stays right while its thread runs: what only the thread
 //! changes comes back through the lock, which takes a new one, and what
@@ -71,7 +74,9 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Something a thread's snapshot holds changed, and it may be running on
 /// another CPU: a process's parent or credentials, a thread's seccomp
-/// state, a process's AIO polls. With the kernel lock, after the change.
+/// state, a process's AIO polls. With the kernel lock: no snapshot is
+/// taken until it's given back, so before the change or after it is the
+/// same.
 pub fn changed() {
     GENERATION.fetch_add(1, Ordering::Release);
 }

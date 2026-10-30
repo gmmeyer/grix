@@ -252,9 +252,12 @@ pub fn fast_enter() {
 
 /// It's done (still holding the gate: a flush that comes after sees it
 /// out of the kernel, and its IPI is taken on the way back to user mode).
+/// A full barrier, for `barrier_others`, which took being in the kernel
+/// for one: nothing else on the way back to user mode is.
 pub fn fast_leave() {
     check_stack();
     IN_KERNEL[me()].store(false, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// Take the kernel for an exception of kind `why` (`Stat::Syscall`,

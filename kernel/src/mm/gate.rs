@@ -9,7 +9,9 @@
 //! (`Mm::access`). Lock order: a gate (only ever one more than the
 //! running process's, taken through `access`), then the filesystem, then
 //! a `FileData`. Nothing that holds a gate waits for another CPU but in
-//! `arch::flush_tlb`, which doesn't wait for a CPU in the kernel.
+//! `arch::flush_tlb`, which doesn't wait for a CPU in the kernel, and
+//! `arch::flush_tables`, which does: one waiting for the gate or the
+//! kernel lock answers as it spins (`tlb_sync`).
 
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
