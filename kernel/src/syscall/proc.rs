@@ -324,6 +324,7 @@ pub fn execve(
     }
     p.runq.clear();
     p.futexes.clear();
+    crate::futex::forget(p.pid);
     // AIO contexts belong to the old address space (Linux's exit_aio).
     p.aio = Default::default();
     t.tid = p.pid;

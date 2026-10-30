@@ -416,7 +416,7 @@ fn deadlock(p: Option<&mut Process>, procs: &mut Procs) -> ! {
         for t in q.threads.values() {
             n += 1;
             match t.wait.map(|w| w.on) {
-                Some(WaitOn::Futex(_) | WaitOn::FutexV) => futex += 1,
+                Some(WaitOn::Futex(_) | WaitOn::SharedFutex(_) | WaitOn::FutexV) => futex += 1,
                 Some(WaitOn::Io) => io += 1,
                 Some(WaitOn::Signal | WaitOn::SigWait(_)) => sig += 1,
                 _ => {}

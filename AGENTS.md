@@ -348,7 +348,9 @@ that a `Thread` is moved by value (x86_64's FP state is boxed for that,
 `arch::ThreadFp`). Each thread keeps its user registers, TLS and FP/SIMD
 state in `process::Thread`. A syscall that must
 wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
-returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
+returns `EBLOCKED`. Futex words in memory processes share are found by
+what they're in, as Linux's get_futex_key (`futex.rs`,
+`WaitOn::SharedFutex`), any other by address in `Process::futexes`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when
 `ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).

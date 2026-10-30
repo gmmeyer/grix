@@ -24,6 +24,7 @@ mod fast;
 mod fasync;
 mod fd;
 mod fs;
+mod futex;
 mod hostfs;
 mod inet;
 mod inotify;

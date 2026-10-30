@@ -202,7 +202,7 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     }
     crate::fs::task_changed(p.pid, t.tid, false);
     if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
-        futex_wake(p, t.clear_child_tid, 1, u32::MAX);
+        word_wake(p, false, t.clear_child_tid, 1, u32::MAX);
     }
     Err(EBLOCKED)
 }
@@ -264,6 +264,20 @@ pub fn futex_wake(p: &mut Process, addr: u64, n: u32, bitset: u32) -> u32 {
     woken.len() as u32
 }
 
+/// The word at `addr` as a futex call means it: FUTEX_PRIVATE_FLAG says it's
+/// this process's, wherever it is.
+fn word_key(p: &Process, private: bool, addr: u64) -> Option<crate::futex::Key> {
+    if private { None } else { crate::futex::key(&p.aspace, addr) }
+}
+
+/// `futex_wake`, of a word that may be shared.
+fn word_wake(p: &mut Process, private: bool, addr: u64, n: u32, bitset: u32) -> u32 {
+    match word_key(p, private, addr) {
+        Some(key) => crate::futex::wake(p, key, n, bitset),
+        None => futex_wake(p, addr, n, bitset),
+    }
+}
+
 /// Move up to `n` waiters from `from` to `to`.
 fn futex_requeue(p: &mut Process, from: u64, to: u64, n: u32) -> u32 {
     let Some(mut q) = p.futexes.remove(&from) else { return 0 };
@@ -299,7 +313,9 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
     const WAIT_BITSET: u64 = 9;
     const WAKE_BITSET: u64 = 10;
     const CLOCK_REALTIME: u64 = 256;
+    const PRIVATE: u64 = 128;
     let [uaddr, op, val, timeout, uaddr2, val3] = a;
+    let private = op & PRIVATE != 0;
     // `val` and the count in `timeout` are C ints; negative counts wake nobody.
     let count = |v: u64| (v as i32).max(0) as u32;
     if uaddr % 4 != 0 {
@@ -326,22 +342,33 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
                 }
             };
             let tid = p.current;
+            if let Some(key) = word_key(p, private, uaddr) {
+                crate::futex::enqueue(key, p.pid, tid, bitset);
+                return p.block(WaitOn::SharedFutex(key), deadline, Err(ETIMEDOUT));
+            }
             p.futexes.entry(uaddr).or_default().push_back((tid, bitset));
             p.block(WaitOn::Futex(uaddr), deadline, Err(ETIMEDOUT))
         }
-        WAKE => Ok(futex_wake(p, uaddr, count(val), u32::MAX) as u64),
+        WAKE => Ok(word_wake(p, private, uaddr, count(val), u32::MAX) as u64),
         WAKE_BITSET => {
             if val3 as u32 == 0 {
                 return Err(EINVAL);
             }
-            Ok(futex_wake(p, uaddr, count(val), val3 as u32) as u64)
+            Ok(word_wake(p, private, uaddr, count(val), val3 as u32) as u64)
         }
         cmd @ (REQUEUE | CMP_REQUEUE) => {
             if cmd == CMP_REQUEUE && read_u32(&mut p.aspace, uaddr)? != val3 as u32 {
                 return Err(EAGAIN);
             }
-            let woken = futex_wake(p, uaddr, count(val), u32::MAX);
-            let moved = futex_requeue(p, uaddr, uaddr2, count(timeout));
+            let woken = word_wake(p, private, uaddr, count(val), u32::MAX);
+            let moved = match (word_key(p, private, uaddr), word_key(p, private, uaddr2)) {
+                (Some(from), Some(to)) => crate::futex::requeue(p, from, to, count(timeout)),
+                // From one kind of word to the other: there's no moving
+                // it, and waking is always allowed.
+                (Some(from), None) => crate::futex::wake(p, from, count(timeout), u32::MAX),
+                (None, Some(_)) => futex_wake(p, uaddr, count(timeout), u32::MAX),
+                (None, None) => futex_requeue(p, uaddr, uaddr2, count(timeout)),
+            };
             Ok((woken + if cmd == CMP_REQUEUE { moved } else { 0 }) as u64)
         }
         WAKE_OP => {
@@ -376,9 +403,9 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
                 5 => old >= cmparg,
                 _ => return Err(ENOSYS),
             };
-            let mut woken = futex_wake(p, uaddr, count(val), u32::MAX);
+            let mut woken = word_wake(p, private, uaddr, count(val), u32::MAX);
             if hit {
-                woken += futex_wake(p, uaddr2, count(timeout), u32::MAX);
+                woken += word_wake(p, private, uaddr2, count(timeout), u32::MAX);
             }
             Ok(woken as u64)
         }

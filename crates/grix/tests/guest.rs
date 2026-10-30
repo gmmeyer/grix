@@ -2189,6 +2189,17 @@ fn popular(b: SandboxBuilder, checks: &[&str]) {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// A futex wake reaches waiters in other processes: semaphores, mutexes and
+/// condition variables in shared memory, a word at another address in each
+/// process, requeues, and what's left of a killed waiter.
+#[test]
+fn futexes_between_processes() {
+    for cpus in [1, 4] {
+        let b = with("popular").cpus(cpus).allow(Capability::Process).allow(Capability::FsWrite);
+        popular(b.timeout(Duration::from_secs(60)), &["pshared"]);
+    }
+}
+
 /// `open(/proc/self/fd/N)` of an O_PATH descriptor opens the file again;
 /// `readlinkat(fd, "")` reads the link it holds.
 #[test]

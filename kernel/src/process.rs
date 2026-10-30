@@ -41,7 +41,8 @@ pub const THREAD_COST: u64 = (2 * core::mem::size_of::<Thread>()
     + arch::FP_HEAP_BYTES
     + 64
     + 32 * core::mem::size_of::<crate::signal::SigInfo>()) as u64
-    + crate::fs::TASK_NODES_COST;
+    + crate::fs::TASK_NODES_COST
+    + crate::futex::COST;
 /// threads-max at least: what grix always allowed.
 const MIN_THREADS_MAX: usize = 1024;
 
@@ -83,6 +84,8 @@ pub struct SigAction {
 pub enum WaitOn {
     /// A futex word (user virtual address).
     Futex(u64),
+    /// A futex word in memory processes share (`futex.rs`).
+    SharedFutex(crate::futex::Key),
     /// Any of the futex words in `Thread::futexv` (futex_waitv).
     FutexV,
     /// Only the deadline (nanosleep, poll timeouts).
@@ -728,6 +731,10 @@ impl Process {
         let w = t.wait.take()?;
         let addrs = match w.on {
             WaitOn::Futex(addr) => alloc::vec![addr],
+            WaitOn::SharedFutex(key) => {
+                crate::futex::leave(key, tid);
+                Vec::new()
+            }
             WaitOn::FutexV => t.futexv.take().map(|v| v.addrs).unwrap_or_default(),
             _ => Vec::new(),
         };

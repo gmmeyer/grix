@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -1377,6 +1378,117 @@ static int manyconns(void) {
     return 0;
 }
 
+#define FUTEX_WAIT_SHARED 0
+#define FUTEX_WAKE_SHARED 1
+#define FUTEX_CMP_REQUEUE_SHARED 4
+
+static long fx(unsigned *w, int op, unsigned val, const struct timespec *t, unsigned *w2, unsigned val3) {
+    return syscall(SYS_futex, w, op, val, t, w2, val3);
+}
+
+/// A child waits on `w` (`on`'s word, in its own mapping or not): wake it
+/// from here. Whether it's got there yet only the wake's count says.
+static int wake_child(unsigned *w, pid_t child) {
+    int status;
+    long woken = 0;
+    for (int i = 0; i < 5000 && woken == 0; i++) {
+        woken = fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0);
+        if (woken == 0) usleep(1000);
+    }
+    return woken == 1 && waitpid(child, &status, 0) == child && status == 0;
+}
+
+/// Futex words processes share: found by what they're in, wherever each
+/// process has them.
+static int pshared(void) {
+    // Semaphores, ping-pong: PostgreSQL's LWLocks, Python's multiprocessing.
+    int prot = PROT_READ | PROT_WRITE;
+    sem_t *s = mmap(NULL, 4096, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(s != MAP_FAILED && sem_init(&s[0], 1, 0) == 0 && sem_init(&s[1], 1, 0) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (int i = 0; i < 2000; i++) {
+            sem_wait(&s[0]);
+            sem_post(&s[1]);
+        }
+        _exit(0);
+    }
+    for (int i = 0; i < 2000; i++) {
+        CHECK(sem_post(&s[0]) == 0 && sem_wait(&s[1]) == 0);
+    }
+    int status;
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
+    // A process-shared mutex and condition variable.
+    struct both { pthread_mutex_t m; pthread_cond_t c; int turn; } *b = mmap(NULL, 4096, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(b != MAP_FAILED);
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    CHECK(pthread_mutexattr_init(&ma) == 0 && pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_condattr_init(&ca) == 0 && pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutex_init(&b->m, &ma) == 0 && pthread_cond_init(&b->c, &ca) == 0);
+    pid = fork();
+    if (pid == 0) {
+        pthread_mutex_lock(&b->m);
+        for (int i = 0; i < 500; i++) {
+            while (b->turn != 1) pthread_cond_wait(&b->c, &b->m);
+            b->turn = 0;
+            pthread_cond_broadcast(&b->c);
+        }
+        pthread_mutex_unlock(&b->m);
+        _exit(0);
+    }
+    pthread_mutex_lock(&b->m);
+    for (int i = 0; i < 500; i++) {
+        b->turn = 1;
+        pthread_cond_broadcast(&b->c);
+        while (b->turn != 0) pthread_cond_wait(&b->c, &b->m);
+    }
+    pthread_mutex_unlock(&b->m);
+    CHECK(waitpid(pid, &status, 0) == pid && status == 0);
+    // A file's word, at another address in each process.
+    int fd = open("/tmp/futexword", O_CREAT | O_RDWR, 0600);
+    CHECK(fd >= 0 && ftruncate(fd, 4096) == 0);
+    unsigned *here = mmap(NULL, 4096, prot, MAP_SHARED, fd, 0);
+    CHECK(here != MAP_FAILED);
+    pid = fork();
+    if (pid == 0) {
+        unsigned *there = mmap(NULL, 4096, prot, MAP_SHARED, fd, 0);
+        _exit(there != here && there != MAP_FAILED && fx(there, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    }
+    CHECK(pid > 0 && wake_child(here, pid));
+    // A System V segment's, likewise.
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    unsigned *seg = shmat(id, NULL, 0);
+    CHECK(id >= 0 && seg != (void *)-1);
+    pid = fork();
+    if (pid == 0) {
+        unsigned *other = shmat(id, NULL, 0);
+        _exit(other != seg && other != (void *)-1 && fx(other, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    }
+    CHECK(pid > 0 && wake_child(seg, pid));
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    // Moved to another word, still in another process.
+    unsigned *w = (unsigned *)s + 512;
+    pid = fork();
+    if (pid == 0) _exit(fx(w, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    long moved = 0;
+    for (int i = 0; i < 5000 && moved == 0; i++) {
+        moved = fx(w, FUTEX_CMP_REQUEUE_SHARED, 0, (void *)1L, w + 1, 0);
+        if (moved == 0) usleep(1000);
+    }
+    CHECK(moved == 1 && pid > 0 && wake_child(w + 1, pid));
+    // A wait that timed out, or was killed, has left the queue.
+    struct timespec soon = {0, 5000000};
+    CHECK(fx(w, FUTEX_WAIT_SHARED, 0, &soon, NULL, 0) == -1 && errno == ETIMEDOUT);
+    CHECK(fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0) == 0);
+    pid = fork();
+    if (pid == 0) _exit(fx(w, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 3 : 4);
+    usleep(50000);
+    CHECK(pid > 0 && kill(pid, SIGKILL) == 0 && waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status) && fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1419,6 +1531,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "manyfiles") == 0) r = manyfiles();
         if (strcmp(argv[i], "touch") == 0) r = touch();
         if (strcmp(argv[i], "manyconns") == 0) r = manyconns();
+        if (strcmp(argv[i], "pshared") == 0) r = pshared();
         // The arguments after it are only there to be counted.
         if (strcmp(argv[i], "argmaxed") == 0) {
             printf("argmax %s\n", argc == 18002 ? "ok" : "failed");

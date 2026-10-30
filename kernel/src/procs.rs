@@ -166,6 +166,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.threads.clear();
     dead.runq.clear();
     dead.futexes.clear();
+    crate::futex::forget(dead.pid);
     dead.timers = Default::default();
     dead.shared_pending = Default::default();
     // What it shared with others (CLONE_FS, CLONE_SIGHAND) is theirs alone.
