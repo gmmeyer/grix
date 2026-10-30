@@ -1,17 +1,19 @@
-# grix in a container: static grix and grix-vmm, the grix kernels, and QEMU.
-# A run uses the host's KVM when the container has /dev/kvm, in grix's own
-# VMM (arm64 or x86_64 Linux hosts), and emulates the machine in QEMU,
-# many times slower, when it doesn't (saying so; GRIX_ACCEL=tcg chooses
-# that):
+# grix in a container: static grix and grix-vmm, the grix kernels, and
+# nothing else (FROM scratch). It runs programs in grix's own VMM on the
+# host's KVM, so the host must be arm64 or x86_64 Linux and the container
+# needs /dev/kvm:
 #
 #   docker build -t grix .
 #   docker run --rm --device /dev/kvm -v "$PWD:/work" -w /work grix \
 #       run -i ./hello:/bin/hello -- /bin/hello
 #
-# The `kvm-only` target is grix without QEMU, FROM scratch, which needs
-# nothing from the container but /dev/kvm and /tmp (no shell, no libc):
+# grix needs nothing from the container but /tmp: no shell, no libc, no QEMU.
 #
-#   docker build --target kvm-only -t grix:kvm-only .
+# The `kvm-optional` target doesn't need KVM: it adds QEMU, and grix uses
+# KVM when the container has /dev/kvm and emulates the machine, many times
+# slower, when it doesn't (saying so; GRIX_ACCEL=tcg chooses that).
+#
+#   docker build --target kvm-optional -t grix:kvm-optional .
 #
 # In Kubernetes, a pod gets /dev/kvm from a device plugin, not KubeVirt:
 # see examples/kubernetes.
@@ -33,15 +35,10 @@ RUN cargo build --release -p grix -p grix-vmm \
     && cp kernel/target/x86_64-unknown-none/release/grix-kernel /out/bin/grix-kernel-x86_64 \
     && chmod 1777 /out/tmp
 
-FROM scratch AS kvm-only
-COPY --from=build /out/ /
-ENV TMPDIR=/tmp
-ENTRYPOINT ["/bin/grix"]
-CMD ["--help"]
-
-# The default (last) stage: the same with QEMU for both architectures (the
-# host's, without KVM, and images for the other).
-FROM alpine:3
+# The same with QEMU for both architectures (the host's, without KVM, and
+# images for the other). Not the last stage: `docker build` alone still
+# makes the one below.
+FROM alpine:3 AS kvm-optional
 # QEMU's firmware is for machines that boot one: grix's kernel is loaded
 # directly, with no more than microvm's (qboot, and the PVH loader; older
 # QEMUs call qboot bios-microvm.bin).
@@ -51,4 +48,10 @@ RUN apk add --no-cache qemu-system-aarch64 qemu-system-x86_64 \
 COPY --from=build /out/bin/ /usr/local/bin/
 ENV TMPDIR=/tmp
 ENTRYPOINT ["/usr/local/bin/grix"]
+CMD ["--help"]
+
+FROM scratch
+COPY --from=build /out/ /
+ENV TMPDIR=/tmp
+ENTRYPOINT ["/bin/grix"]
 CMD ["--help"]

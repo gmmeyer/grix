@@ -1,13 +1,13 @@
 # /dev/kvm for pods that ask for it, without KubeVirt: a device plugin
 # (squat/generic-device-plugin) on every node, offering two resources:
 #
-#   devic.es/kvm-optional   on every node; the pod gets /dev/kvm if the node
-#                           has it, and grix emulates the machine if not
-#   devic.es/kvm            only on nodes with /dev/kvm, for pods that must
-#                           have it
+#   devic.es/kvm            only on nodes with /dev/kvm
+#   devic.es/kvm-optional   on every node, with /dev/kvm where there is one,
+#                           for grix:kvm-optional, which emulates the machine
+#                           where there isn't
 #
-# A pod with one of them in its limits (`devic.es/kvm-optional: 1`) gets
-# /dev/kvm and nothing else of the node's: it needn't be privileged.
+# A pod with one of them in its limits (`devic.es/kvm: 1`) gets /dev/kvm and
+# nothing else of the node's: it needn't be privileged.
 #
 #   kubectl apply -f kvm-device-plugin.yaml
 #   kubectl get nodes -o custom-columns=NODE:.metadata.name,KVM:.status.allocatable.devic\\.es/kvm

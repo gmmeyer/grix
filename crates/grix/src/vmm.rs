@@ -402,8 +402,8 @@ pub(crate) fn run(
                 // Missing or not allowed is what a container without it sees.
                 let hint = match e.kind() {
                     ErrorKind::NotFound | ErrorKind::PermissionDenied => {
-                        "; in a container, pass --device /dev/kvm, or in Kubernetes ask a KVM device plugin \
-                         for it: see the README"
+                        "; in a container, pass --device /dev/kvm (in Kubernetes, ask a KVM device plugin \
+                         for it), or use grix's kvm-optional image, which emulates without: see the README"
                     }
                     _ => "",
                 };

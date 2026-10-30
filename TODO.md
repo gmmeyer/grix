@@ -250,12 +250,12 @@ Left, in order of impact:
       grix images (`from = "image:FILE"`), and a cache of applied bases and
       of build steps (`--no-cache`).
 - [x] A Docker image of grix itself (`Dockerfile`): static `grix` and
-      `grix-vmm` and QEMU, on KVM with `--device /dev/kvm` and emulated
-      without it; the `kvm-only` target is FROM scratch, without QEMU.
+      `grix-vmm`, FROM scratch, run with `--device /dev/kvm`. Its
+      `kvm-optional` target adds QEMU, and emulates without KVM.
 - [x] Kubernetes without KubeVirt (`examples/kubernetes`): pods get
       `/dev/kvm` from a device plugin (generic-device-plugin, unprivileged):
-      `devic.es/kvm-optional` on every node, with `/dev/kvm` where there is
-      one, or `devic.es/kvm` only where there is.
+      `devic.es/kvm` only on nodes with KVM, or `devic.es/kvm-optional` on
+      every node, with `/dev/kvm` where there is one (for `kvm-optional`).
 
 ## Processes and exec
 

@@ -523,23 +523,23 @@ grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threa
   failed).
 - The container's memory limit needs room for the guest's (`--mem`, 512
   MiB by default) and grix's own.
-- KVM if there is any: given `/dev/kvm` (`docker run --device /dev/kvm`),
-  the container runs the machine in grix-vmm. Without it, grix emulates
-  the machine in QEMU, which the image has, and says so (`grix: no KVM
-  ...`; `GRIX_ACCEL=tcg` chooses emulation, without the notice). That
-  runs anywhere, and boots as quickly, but programs run 20–40× slower
-  than natively (a Python loop 20×, Node's startup 30×), and QEMU
-  doesn't count its emulator as a security boundary, so the container is
-  the boundary to rely on. The `kvm-only` target (`docker build --target
-  kvm-only -t grix:kvm-only .`) is grix without QEMU, FROM scratch: it
-  fails without KVM instead.
+- The image (FROM scratch: grix, grix-vmm and the kernels) runs the
+  machine on KVM, so the container needs `/dev/kvm` (`docker run --device
+  /dev/kvm`).
+- Where there may be no KVM, the `Dockerfile`'s `kvm-optional` target
+  (`docker build --target kvm-optional -t grix:kvm-optional .`) adds
+  QEMU: grix uses KVM when the container has `/dev/kvm`, and emulates the
+  machine when it doesn't, saying so (`grix: no KVM ...`; `GRIX_ACCEL=tcg`
+  chooses emulation, without the notice). Emulated, it boots as quickly,
+  but programs run 20–40× slower than natively (a Python loop 20×,
+  Node's startup 30×), and QEMU doesn't count its emulator as a security
+  boundary, so the container is the boundary to rely on.
 
 ### In Kubernetes
 
 There's no need for KubeVirt: grix's VM runs inside an ordinary pod,
 and the pod only needs `/dev/kvm`, which a device plugin provides.
-`examples/kubernetes` has one, and a Deployment whose pods use KVM where
-their node has it and emulate the machine where it doesn't:
+`examples/kubernetes` has one, and a Deployment whose pods ask for it:
 
 ```sh
 kubectl apply -f examples/kubernetes/kvm-device-plugin.yaml   # once per cluster
@@ -547,13 +547,13 @@ kubectl apply -f examples/kubernetes/grix.yaml                # with your image 
 ```
 
 - `kvm-device-plugin.yaml` runs squat/generic-device-plugin on every node,
-  unprivileged. A pod chooses with its limits:
+  unprivileged. A pod chooses with its image and limits:
 
-  | limit | runs on | gets |
-  |---|---|---|
-  | `devic.es/kvm-optional: 1` (`grix.yaml`'s) | any node | `/dev/kvm` if the node has it, and grix emulates if not |
-  | `devic.es/kvm: 1` | only nodes with KVM (Pending where there are none) | `/dev/kvm` |
-  | none (`GRIX_ACCEL=tcg`) | any node, with no device plugin | emulation |
+  | image | limit | runs on | gets |
+  |---|---|---|---|
+  | `grix` | `devic.es/kvm: 1` (`grix.yaml`'s) | only nodes with KVM (Pending where there are none) | `/dev/kvm` |
+  | `grix:kvm-optional` | `devic.es/kvm-optional: 1` | any node | `/dev/kvm` if the node has it, and grix emulates if not |
+  | `grix:kvm-optional` | none (and `GRIX_ACCEL=tcg`) | any node, with no device plugin | emulation |
 
   Either way the pod gets no other device of the node's, so it needn't be
   privileged: `grix.yaml`'s has no capabilities and a read-only root
@@ -562,7 +562,7 @@ kubectl apply -f examples/kubernetes/grix.yaml                # with your image 
 - Nodes with KVM are bare-metal machines, or VMs with nested
   virtualization, which most clouds offer only on some machine types. In
   a cluster with both kinds, nothing makes a `kvm-optional` pod prefer
-  the nodes with KVM: ask for `devic.es/kvm` where that matters.
+  the nodes with KVM.
 - grix listens on a published port before the program does, so make the
   readiness probe ask the program (`httpGet`), not just open the port.
 
