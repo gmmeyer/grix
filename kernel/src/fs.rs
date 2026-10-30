@@ -19,8 +19,8 @@ use alloc::vec::Vec;
 use core::ops::Bound;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use grix_abi::hostfs::{Attr, FileType};
-use grix_abi::stats::{Limit, Resource};
 use grix_abi::image::{Entry, EntryKind, LiveMount};
+use grix_abi::stats::{Limit, Resource};
 use spin::{Mutex, MutexGuard};
 
 use crate::console::klog;
@@ -33,6 +33,33 @@ pub type Ino = usize;
 pub const ROOT: Ino = 0;
 /// Symlinks followed in one lookup before ELOOP, as on Linux.
 const MAX_SYMLINKS: u32 = 40;
+
+// openat2's RESOLVE_* flags (include/uapi/linux/openat2.h).
+pub const RESOLVE_NO_XDEV: u64 = 0x01;
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+pub const RESOLVE_BENEATH: u64 = 0x08;
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
+pub const RESOLVE_CACHED: u64 = 0x20;
+const RESOLVE_SCOPED: u64 = RESOLVE_BENEATH | RESOLVE_IN_ROOT;
+
+/// How a lookup may go, as fs/namei.c's LOOKUP_* flags for openat2:
+/// `root` is the directory RESOLVE_BENEATH keeps it under and
+/// RESOLVE_IN_ROOT treats as `/`. The mounts RESOLVE_NO_XDEV won't cross
+/// are /proc, /dev and the host's directories (`Node::mount_point`).
+#[derive(Clone, Copy)]
+pub struct Scope {
+    pub flags: u64,
+    pub root: Ino,
+}
+
+impl Scope {
+    pub const NONE: Scope = Scope { flags: 0, root: ROOT };
+
+    fn has(&self, flag: u64) -> bool {
+        self.flags & flag != 0
+    }
+}
 pub const NAME_MAX: usize = 255;
 
 pub const S_IFIFO: u32 = 0o010000;
@@ -739,6 +766,8 @@ pub struct Fs {
     /// index keeps its node, linked there while its master is open.
     pts_dir: Ino,
     pts_nodes: BTreeMap<u32, Ino>,
+    /// /dev, a mount of its own (RESOLVE_NO_XDEV).
+    dev_dir: Ino,
     /// The last page read of a large live directory.
     page: Option<Page>,
     /// A live mount's files' contents by host id, so a node made again for
@@ -908,6 +937,7 @@ impl Fs {
             zombie_dirs: BTreeSet::new(),
             pts_dir: ROOT,
             pts_nodes: BTreeMap::new(),
+            dev_dir: ROOT,
             page: None,
             remote_files: BTreeMap::new(),
             lazy: Vec::new(),
@@ -939,6 +969,7 @@ impl Fs {
         // What comes after the imports is the kernel's own.
         let imported = fs.nodes.len();
         let dev = fs.mkdir_p("/dev");
+        fs.dev_dir = dev;
         fs.insert(dev, "null", Kind::Dev(Dev::Null), 0o666);
         fs.insert(dev, "zero", Kind::Dev(Dev::Zero), 0o666);
         fs.insert(dev, "random", Kind::Dev(Dev::Random), 0o666);
@@ -1182,10 +1213,16 @@ impl Fs {
     /// `/var/log/nginx/error.log -> /dev/stderr`. Asked only once a lookup
     /// found nothing.
     pub fn fd_link(&mut self, start: Ino, path: &str, follow: bool) -> Option<(u32, u64)> {
+        self.fd_link_in(start, path, follow, &Scope::NONE)
+    }
+
+    /// `fd_link`, for a lookup `scope` limits (which then decides whether
+    /// the descriptor, a magic link, may be followed).
+    pub fn fd_link_in(&mut self, start: Ino, path: &str, follow: bool, scope: &Scope) -> Option<(u32, u64)> {
         let mut links = 0;
         let (mut dir, mut path) = (start, String::from(path));
         loop {
-            let (parent, name) = self.lookup_parent(dir, &path).ok()?;
+            let (parent, name) = self.lookup_parent_in(dir, &path, scope).ok()?;
             if let Some(pid) = self.fd_dir_pid(parent) {
                 return Some((pid, name.parse().ok()?));
             }
@@ -1361,17 +1398,30 @@ impl Fs {
 
     /// Resolve `path` relative to directory `start`.
     pub fn lookup(&mut self, start: Ino, path: &str, follow_last: bool) -> Result<Ino, Errno> {
+        self.lookup_in(start, path, follow_last, &Scope::NONE)
+    }
+
+    /// `lookup`, as openat2's `resolve` allows.
+    pub fn lookup_in(&mut self, start: Ino, path: &str, follow_last: bool, scope: &Scope) -> Result<Ino, Errno> {
         let mut links = 0;
-        self.walk(start, path, follow_last, &mut links)
+        self.walk(start, path, follow_last, &mut links, scope)
     }
 
     /// `links` counts every symlink followed in the whole lookup, so a chain
     /// of links that each expand into several more can't make it exponential.
-    fn walk(&mut self, start: Ino, path: &str, follow_last: bool, links: &mut u32) -> Result<Ino, Errno> {
+    fn walk(
+        &mut self,
+        start: Ino,
+        path: &str,
+        follow_last: bool,
+        links: &mut u32,
+        scope: &Scope,
+    ) -> Result<Ino, Errno> {
         if path.is_empty() {
             return Err(ENOENT);
         }
-        let mut cur = if path.starts_with('/') { ROOT } else { start };
+        let mut cur = if path.starts_with('/') { self.root_of(scope)? } else { start };
+        self.cached(cur, scope)?;
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let must_be_dir = path.ends_with('/');
         for (i, c) in comps.iter().enumerate() {
@@ -1381,17 +1431,32 @@ impl Fs {
             }
             match *c {
                 "." => {}
-                ".." => cur = self.nodes[cur].parent,
+                // follow_dotdot: the scope's root is as far up as it goes
+                // (EXDEV for BENEATH), and leaving a mount is crossing it.
+                ".." if scope.has(RESOLVE_SCOPED) && cur == scope.root => {
+                    if scope.has(RESOLVE_BENEATH) {
+                        return Err(EXDEV);
+                    }
+                }
+                ".." => {
+                    if scope.has(RESOLVE_NO_XDEV) && self.mount_root(cur) {
+                        return Err(EXDEV);
+                    }
+                    cur = self.nodes[cur].parent
+                }
                 name => {
                     let child =
                         self.find_child(cur, name)?.ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
+                    if scope.has(RESOLVE_NO_XDEV) && self.mount_root(child) {
+                        return Err(EXDEV);
+                    }
+                    self.cached(child, scope)?;
                     if matches!(self.nodes[child].kind, Kind::Symlink(_)) && (!last || follow_last || must_be_dir) {
                         *links += 1;
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        let target = self.link_target(child)?;
-                        cur = self.walk(cur, &target, true, links)?;
+                        cur = self.follow(cur, child, links, scope)?;
                         continue;
                     }
                     cur = child;
@@ -1404,19 +1469,101 @@ impl Fs {
         Ok(cur)
     }
 
+    /// Where symlink `link` in `dir` leads, as pick_link and nd_jump_link
+    /// allow: no symlinks at all (ELOOP), no magic ones (ELOOP), none
+    /// leaving the mount (EXDEV), and in a scoped lookup no magic ones
+    /// (EXDEV, "not currently safe").
+    fn follow(&mut self, dir: Ino, link: Ino, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
+        if scope.has(RESOLVE_NO_SYMLINKS) {
+            return Err(ELOOP);
+        }
+        let target = self.link_target(link)?;
+        if self.magic_link(link) {
+            if scope.has(RESOLVE_NO_MAGICLINKS) {
+                return Err(ELOOP);
+            }
+            if scope.has(RESOLVE_SCOPED) {
+                return Err(EXDEV);
+            }
+            // A magic link jumps to what it names, wherever that is.
+            let to = self.walk(dir, &target, true, links, &Scope::NONE)?;
+            if scope.has(RESOLVE_NO_XDEV) && self.mount_of(to) != self.mount_of(dir) {
+                return Err(EXDEV);
+            }
+            return Ok(to);
+        }
+        // nd_jump_root: an absolute link may not leave the mount either.
+        if target.starts_with('/') && scope.has(RESOLVE_NO_XDEV) {
+            let root = self.root_of(scope)?;
+            if self.mount_of(root) != self.mount_of(dir) {
+                return Err(EXDEV);
+            }
+        }
+        self.walk(dir, &target, true, links, scope)
+    }
+
+    /// Where an absolute path starts: EXDEV beneath a directory, which it
+    /// would leave; the directory itself in RESOLVE_IN_ROOT.
+    fn root_of(&self, scope: &Scope) -> Result<Ino, Errno> {
+        if scope.has(RESOLVE_BENEATH) {
+            Err(EXDEV)
+        } else if scope.has(RESOLVE_IN_ROOT) {
+            Ok(scope.root)
+        } else {
+            Ok(ROOT)
+        }
+    }
+
+    /// RESOLVE_CACHED: everything is in memory but a live mount's nodes,
+    /// which may need the host (EAGAIN, so the caller tries without).
+    fn cached(&self, ino: Ino, scope: &Scope) -> Result<(), Errno> {
+        if scope.has(RESOLVE_CACHED) && self.nodes[ino].remote.is_some() { Err(EAGAIN) } else { Ok(()) }
+    }
+
+    /// The top of a mount other than `/`: /proc, /dev, or a directory from
+    /// the host.
+    fn mount_root(&self, ino: Ino) -> bool {
+        ino != ROOT && (ino == self.proc_dir || ino == self.dev_dir || self.nodes[ino].mount_point)
+    }
+
+    /// The mount `ino` is in (its root).
+    fn mount_of(&self, mut ino: Ino) -> Ino {
+        // Bounded: a removed node's parent may have been reused since.
+        for _ in 0..4096 {
+            if ino == ROOT || self.mount_root(ino) {
+                return ino;
+            }
+            ino = self.nodes[ino].parent;
+        }
+        ROOT
+    }
+
+    /// /proc/<pid>/exe, cwd and root: Linux's magic links, which jump to
+    /// what they name rather than being read as a path (nd_jump_link).
+    pub fn magic_link(&self, ino: Ino) -> bool {
+        let n = &self.nodes[ino];
+        matches!(n.kind, Kind::Symlink(_))
+            && self.dir_pids.contains_key(&n.parent)
+            && matches!(n.name.as_str(), "exe" | "cwd" | "root")
+    }
+
     /// Split `path` into its parent directory (resolved) and last component,
     /// for calls that create or remove a name. The root has no last
     /// component (""); a trailing slash is allowed.
     pub fn lookup_parent(&mut self, start: Ino, path: &str) -> Result<(Ino, String), Errno> {
+        self.lookup_parent_in(start, path, &Scope::NONE)
+    }
+
+    pub fn lookup_parent_in(&mut self, start: Ino, path: &str, scope: &Scope) -> Result<(Ino, String), Errno> {
         if path.is_empty() {
             return Err(ENOENT);
         }
         let trimmed = path.trim_end_matches('/');
         let (dir, name) = match trimmed.rsplit_once('/') {
-            Some(("", name)) => (ROOT, name),
-            Some((dir, name)) => (self.lookup(start, dir, true)?, name),
-            None if trimmed.is_empty() => (ROOT, ""),
-            None => (if path.starts_with('/') { ROOT } else { start }, trimmed),
+            Some(("", name)) => (self.root_of(scope)?, name),
+            Some((dir, name)) => (self.lookup_in(start, dir, true, scope)?, name),
+            None if trimmed.is_empty() => (self.root_of(scope)?, ""),
+            None => (start, trimmed),
         };
         if !self.is_dir(dir) {
             return Err(ENOTDIR);

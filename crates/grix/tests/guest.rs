@@ -1941,6 +1941,27 @@ fn mkdir_of_an_existing_name_without_fs_write() {
 }
 
 #[test]
+fn openat2_and_its_resolve_flags() {
+    // rsync keeps its walk in the tree it copies with RESOLVE_*.
+    let out = run(with("popular").allow(Capability::FsWrite), &["/bin/popular", "openat2"]);
+    assert_eq!(out.stdout_str(), "openat2 ok\n");
+    assert_eq!(out.stderr_str(), "via openat2\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Gated as openat: writing needs fs_write.
+    let out = run(with("popular"), &["/bin/popular", "openat2ro"]);
+    assert_eq!(out.stdout_str(), "openat2ro ok\n");
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied {
+            syscall: "openat2".into(),
+            capability: "fs_write".into(),
+            detail: "/bin/popular".into()
+        }]
+    );
+}
+
+#[test]
 fn arguments_and_environment_in_linux_order() {
     // libuv's process title (mongosh) measures the area by it.
     let out = run(with("popular").env("A", "1").env("BB", "22"), &["/bin/popular", "argvlayout", "x", "yy"]);

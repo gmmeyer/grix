@@ -19,6 +19,7 @@
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -557,6 +558,135 @@ static int argvlayout(int argc, char **argv) {
     return 0;
 }
 
+// rsync opens what it copies with openat2 and RESOLVE_*, keeping its walk
+// inside the tree it was given.
+#ifndef SYS_openat2
+#define SYS_openat2 437
+#endif
+struct how {
+    unsigned long long flags, mode, resolve;
+};
+#define RESOLVE_NO_XDEV 0x01
+#define RESOLVE_NO_MAGICLINKS 0x02
+#define RESOLVE_NO_SYMLINKS 0x04
+#define RESOLVE_BENEATH 0x08
+#define RESOLVE_IN_ROOT 0x10
+#define RESOLVE_CACHED 0x20
+
+static int o2(int dirfd, const char *path, unsigned long long flags, unsigned long long mode,
+              unsigned long long resolve) {
+    struct how h = {flags, mode, resolve};
+    return syscall(SYS_openat2, dirfd, path, &h, sizeof h);
+}
+
+/// openat2 fails with `err` (and so returns -1).
+#define FAILS(call, err) CHECK((call) == -1 && errno == (err))
+/// openat2 opens something (which is closed again).
+#define OPENS(call) do { int fd_ = (call); CHECK(fd_ >= 0); close(fd_); } while (0)
+
+static int openat2_check(void) {
+    CHECK(mkdir("/tmp/o2", 0755) == 0 && mkdir("/tmp/o2/d", 0755) == 0);
+    int fd = open("/tmp/o2/d/f", O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && write(fd, "in d", 4) == 4 && close(fd) == 0);
+    CHECK(symlink("d/f", "/tmp/o2/rel") == 0);
+    CHECK(symlink("/tmp/o2/d/f", "/tmp/o2/abs") == 0);
+    CHECK(symlink("../o2/d/f", "/tmp/o2/up") == 0);
+    CHECK(symlink("/d/f", "/tmp/o2/rootabs") == 0);
+    CHECK(symlink("/tmp/o2/made", "/tmp/o2/dangling") == 0);
+    int dir = open("/tmp/o2", O_PATH | O_DIRECTORY);
+    CHECK(dir >= 0);
+
+    // The struct: at least version 0's 24 bytes, at most a page, and
+    // anything past what the kernel knows zero.
+    fd = o2(dir, "d/f", O_RDONLY, 0, 0);
+    char got[8] = {0};
+    CHECK(fd >= 0 && read(fd, got, sizeof got) == 4 && memcmp(got, "in d", 4) == 0);
+    close(fd);
+    unsigned long long big[5] = {O_RDONLY, 0, 0, 0, 0};
+    OPENS(syscall(SYS_openat2, dir, "d/f", big, sizeof big));
+    big[4] = 1;
+    FAILS(syscall(SYS_openat2, dir, "d/f", big, sizeof big), E2BIG);
+    FAILS(syscall(SYS_openat2, dir, "d/f", big, 16), EINVAL);
+    FAILS(syscall(SYS_openat2, dir, "d/f", big, 4097), E2BIG);
+    FAILS(syscall(SYS_openat2, dir, "d/f", NULL, 24), EFAULT);
+    // Flags are checked, not ignored.
+    FAILS(o2(dir, "d/f", O_RDONLY | (1ULL << 40), 0, 0), EINVAL);
+    FAILS(o2(dir, "d/f", O_RDONLY, 0, 0x40), EINVAL);
+    FAILS(o2(dir, "d/f", O_RDONLY, 0, RESOLVE_BENEATH | RESOLVE_IN_ROOT), EINVAL);
+    FAILS(o2(dir, "d/f", O_RDONLY, 0644, 0), EINVAL);
+    FAILS(o2(dir, "d/g", O_RDWR | O_CREAT, 010000, 0), EINVAL);
+    FAILS(o2(dir, "d", O_DIRECTORY | O_CREAT, 0644, 0), EINVAL);
+    FAILS(o2(dir, "d", O_PATH | O_RDWR, 0, 0), EINVAL);
+    OPENS(o2(dir, "d", O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0));
+
+    // RESOLVE_NO_SYMLINKS: none at all, but a last one not followed.
+    FAILS(o2(dir, "rel", O_RDONLY, 0, RESOLVE_NO_SYMLINKS), ELOOP);
+    OPENS(o2(dir, "rel", O_PATH | O_NOFOLLOW, 0, RESOLVE_NO_SYMLINKS));
+    FAILS(o2(dir, "dangling", O_WRONLY | O_CREAT, 0644, RESOLVE_NO_SYMLINKS), ELOOP);
+    OPENS(o2(dir, "d/f", O_RDONLY, 0, RESOLVE_NO_SYMLINKS));
+
+    // RESOLVE_BENEATH: never above the directory, nor absolute.
+    OPENS(o2(dir, "rel", O_RDONLY, 0, RESOLVE_BENEATH));
+    OPENS(o2(dir, "d/../d/f", O_RDONLY, 0, RESOLVE_BENEATH));
+    FAILS(o2(dir, "abs", O_RDONLY, 0, RESOLVE_BENEATH), EXDEV);
+    FAILS(o2(dir, "up", O_RDONLY, 0, RESOLVE_BENEATH), EXDEV);
+    FAILS(o2(dir, "../o2/d/f", O_RDONLY, 0, RESOLVE_BENEATH), EXDEV);
+    FAILS(o2(dir, "/tmp/o2/d/f", O_RDONLY, 0, RESOLVE_BENEATH), EXDEV);
+    FAILS(o2(dir, "dangling", O_WRONLY | O_CREAT, 0644, RESOLVE_BENEATH), EXDEV);
+    OPENS(o2(dir, "d/new", O_WRONLY | O_CREAT, 0644, RESOLVE_BENEATH));
+    OPENS(o2(dir, "d", O_TMPFILE | O_RDWR, 0600, RESOLVE_BENEATH));
+
+    // RESOLVE_IN_ROOT: the directory is "/", and ".." stops there.
+    OPENS(o2(dir, "/d/f", O_RDONLY, 0, RESOLVE_IN_ROOT));
+    OPENS(o2(dir, "rootabs", O_RDONLY, 0, RESOLVE_IN_ROOT));
+    OPENS(o2(dir, "../../d/f", O_RDONLY, 0, RESOLVE_IN_ROOT));
+    FAILS(o2(dir, "abs", O_RDONLY, 0, RESOLVE_IN_ROOT), ENOENT);
+    FAILS(o2(dir, "rootabs", O_RDONLY, 0, 0), ENOENT);
+    OPENS(o2(dir, "/d/made", O_WRONLY | O_CREAT, 0644, RESOLVE_IN_ROOT));
+    CHECK(access("/tmp/o2/d/made", F_OK) == 0);
+
+    // RESOLVE_NO_XDEV: /proc and /dev are mounts of their own.
+    int root = open("/", O_PATH | O_DIRECTORY);
+    CHECK(root >= 0);
+    OPENS(o2(root, "tmp/o2/d/f", O_RDONLY, 0, RESOLVE_NO_XDEV));
+    FAILS(o2(root, "proc/self/status", O_RDONLY, 0, RESOLVE_NO_XDEV), EXDEV);
+    FAILS(o2(AT_FDCWD, "/dev/null", O_RDONLY, 0, RESOLVE_NO_XDEV), EXDEV);
+    int proc = open("/proc", O_PATH | O_DIRECTORY);
+    CHECK(proc >= 0);
+    OPENS(o2(proc, "self/status", O_RDONLY, 0, RESOLVE_NO_XDEV));
+    FAILS(o2(proc, "../tmp", O_RDONLY, 0, RESOLVE_NO_XDEV), EXDEV);
+    FAILS(o2(proc, "self/exe", O_RDONLY, 0, RESOLVE_NO_XDEV), EXDEV);
+
+    // RESOLVE_NO_MAGICLINKS: /proc/<pid>/{exe,cwd,root,fd/N}, however
+    // reached; /proc/self itself is an ordinary link.
+    OPENS(o2(AT_FDCWD, "/proc/self/exe", O_RDONLY, 0, 0));
+    FAILS(o2(AT_FDCWD, "/proc/self/exe", O_RDONLY, 0, RESOLVE_NO_MAGICLINKS), ELOOP);
+    FAILS(o2(AT_FDCWD, "/proc/self/cwd/", O_RDONLY, 0, RESOLVE_NO_MAGICLINKS), ELOOP);
+    FAILS(o2(AT_FDCWD, "/proc/self/fd/1", O_WRONLY, 0, RESOLVE_NO_MAGICLINKS), ELOOP);
+    FAILS(o2(AT_FDCWD, "/dev/stdout", O_WRONLY, 0, RESOLVE_NO_MAGICLINKS), ELOOP);
+    OPENS(o2(AT_FDCWD, "/proc/self/exe", O_PATH | O_NOFOLLOW, 0, RESOLVE_NO_MAGICLINKS));
+    OPENS(o2(AT_FDCWD, "/proc/self/status", O_RDONLY, 0, RESOLVE_NO_MAGICLINKS));
+    fd = o2(AT_FDCWD, "/dev/stderr", O_WRONLY, 0, 0);
+    CHECK(fd >= 0 && write(fd, "via openat2\n", 12) == 12);
+    close(fd);
+    // Scoped lookups don't follow them at all.
+    FAILS(o2(proc, "self/exe", O_RDONLY, 0, RESOLVE_BENEATH), EXDEV);
+    FAILS(o2(proc, "self/fd/1", O_WRONLY, 0, RESOLVE_IN_ROOT), EXDEV);
+
+    // RESOLVE_CACHED: everything here is in memory; creating isn't tried.
+    OPENS(o2(dir, "d/f", O_RDONLY, 0, RESOLVE_CACHED));
+    FAILS(o2(dir, "d/f", O_RDONLY | O_TRUNC, 0, RESOLVE_CACHED), EAGAIN);
+    FAILS(o2(dir, "d/h", O_WRONLY | O_CREAT, 0644, RESOLVE_CACHED), EAGAIN);
+    return 0;
+}
+
+// Without fs_write: reading as openat would, writing denied (and named).
+static int openat2_ro(void) {
+    OPENS(o2(AT_FDCWD, "/bin/popular", O_RDONLY, 0, RESOLVE_NO_SYMLINKS));
+    FAILS(o2(AT_FDCWD, "/bin/popular", O_WRONLY, 0, 0), EPERM);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -574,6 +704,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "rwv2") == 0) r = rwv2();
         if (strcmp(argv[i], "sysvshm") == 0) r = sysvshm();
         if (strcmp(argv[i], "mkdirexist") == 0) r = mkdirexist();
+        if (strcmp(argv[i], "openat2") == 0) r = openat2_check();
+        if (strcmp(argv[i], "openat2ro") == 0) r = openat2_ro();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

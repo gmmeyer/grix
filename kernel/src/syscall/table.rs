@@ -274,7 +274,7 @@ syscalls! {
     435 clone3 Core; // gated by flags: threads vs process
     438 pidfd_getfd Cap(Process);
     436 close_range Core;
-    437 openat2 Core;
+    437 openat2 Core; // as openat: write flags need fs_write in the handler
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
     452 fchmodat2 Cap(FsWrite);
@@ -569,7 +569,7 @@ syscalls! {
     434 pidfd_open Cap(Process);
     435 clone3 Core; // gated by flags: threads vs process
     436 close_range Core;
-    437 openat2 Core;
+    437 openat2 Core; // as openat: write flags need fs_write in the handler
     438 pidfd_getfd Cap(Process);
     439 faccessat2 Core;
     441 epoll_pwait2 Core;

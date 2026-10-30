@@ -135,11 +135,11 @@ Left, in order of impact:
 22. [x] **x86_64 images from registries**: done with images per
     architecture (`grix build --arch x86_64` pulls linux/amd64); nginx
     and Redis from Docker Hub run on the x86_64 kernel.
-23. [ ] **`openat2`** (unsupported; rsync falls back to `openat`): `struct
-    open_how`, and `RESOLVE_NO_SYMLINKS`, `NO_MAGICLINKS`, `BENEATH`,
-    `IN_ROOT`, `NO_XDEV` in `Fs::walk` (ELOOP on a symlink, EXDEV leaving
-    the start or crossing a live mount, the dirfd as `/`).
-    `RESOLVE_CACHED` may always be EAGAIN.
+23. [x] **`openat2`**: `struct open_how` checked as `build_open_flags`
+    does, and every `RESOLVE_*` flag in `Fs::walk` (`fs::Scope`): the
+    mounts NO_XDEV won't cross are /proc, /dev and the host's
+    directories; magic links are /proc/<pid>/{exe,cwd,root,fd/N};
+    RESOLVE_CACHED is EAGAIN on a live mount (the host would be asked).
 24. [ ] **More than 1024 descriptors** (`RLIMIT_NOFILE` is 1024/1024):
     Redis lowers `maxclients` to 992. A higher hard limit needs a
     descriptor table that grows with use, with the global open-file cap

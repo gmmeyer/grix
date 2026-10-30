@@ -155,6 +155,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
     match n {
         // files
         nr::openat => file::openat(p, a[0], a[1], a[2], a[3]),
+        nr::openat2 => file::openat2(p, a[0], a[1], a[2], a[3]),
         nr::close => file::close(p, a[0]),
         nr::read => file::read(p, a[0], a[1], a[2]),
         nr::write => file::write(p, a[0], a[1], a[2]),

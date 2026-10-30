@@ -216,27 +216,108 @@ fn need_write(p: &mut Process, n: u32, path: &str) -> Result<(), Errno> {
 
 pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) -> SysResult {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    open(p, nr::openat, dirfd, &path, flags as u32, mode as u32, 0)
+}
+
+/// `struct open_how`'s size in its first version, and the most of one
+/// openat2 reads (copy_struct_from_user: anything past what's known must
+/// be zero).
+const OPEN_HOW_SIZE_VER0: u64 = 24;
+/// Every flag open knows (fs/fcntl.c's VALID_OPEN_FLAGS: O_ACCMODE up to
+/// __O_TMPFILE; arm64 and x86_64 use the same bits, in another order).
+const VALID_OPEN_FLAGS: u64 = 0o37777703;
+/// What O_PATH may come with (O_CLOEXEC is taken off first).
+const O_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH;
+const VALID_RESOLVE_FLAGS: u64 = fs::RESOLVE_NO_XDEV
+    | fs::RESOLVE_NO_MAGICLINKS
+    | fs::RESOLVE_NO_SYMLINKS
+    | fs::RESOLVE_BENEATH
+    | fs::RESOLVE_IN_ROOT
+    | fs::RESOLVE_CACHED;
+
+/// openat2: openat with `struct open_how { u64 flags, mode, resolve }`,
+/// whose flags are checked rather than ignored (fs/open.c's
+/// build_open_flags), and `resolve` limiting how the path is walked.
+pub fn openat2(p: &mut Process, dirfd: u64, pathp: u64, howp: u64, size: u64) -> SysResult {
+    if size < OPEN_HOW_SIZE_VER0 {
+        return Err(EINVAL);
+    }
+    if size > crate::mm::PAGE_SIZE {
+        return Err(E2BIG);
+    }
+    let mut how = [0u8; OPEN_HOW_SIZE_VER0 as usize];
+    copy_in(&mut p.aspace, howp, &mut how)?;
+    // A newer caller's fields we don't know must be zero.
+    let mut at = OPEN_HOW_SIZE_VER0;
+    while at < size {
+        let mut tail = [0u8; 64];
+        let n = (size - at).min(tail.len() as u64);
+        copy_in(&mut p.aspace, howp + at, &mut tail[..n as usize])?;
+        if tail[..n as usize].iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+        at += n;
+    }
+    let word = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap());
+    let (flags, mode, resolve) = (word(0), word(1), word(2));
+    let open_flags = flags & !(O_CLOEXEC as u64);
+    if open_flags & !VALID_OPEN_FLAGS != 0 || resolve & !VALID_RESOLVE_FLAGS != 0 {
+        return Err(EINVAL);
+    }
     let flags = flags as u32;
+    if resolve & fs::RESOLVE_BENEATH != 0 && resolve & fs::RESOLVE_IN_ROOT != 0 {
+        return Err(EINVAL);
+    }
+    let creates = flags & (O_CREAT | O_TMPFILE) != 0;
+    if (creates && mode & !0o7777 != 0) || (!creates && mode != 0) {
+        return Err(EINVAL);
+    }
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(EINVAL);
+    }
+    // O_TMPFILE is __O_TMPFILE | O_DIRECTORY, and for writing.
+    if flags & O_TMPFILE != 0 && (flags & O_DIRECTORY == 0 || flags & O_ACCMODE == O_RDONLY) {
+        return Err(EINVAL);
+    }
+    if flags & O_PATH != 0 && flags & !(O_PATH_FLAGS | O_CLOEXEC) != 0 {
+        return Err(EINVAL);
+    }
+    // Nothing that would create or truncate is tried from the cache.
+    if resolve & fs::RESOLVE_CACHED != 0 && flags & (O_TRUNC | O_CREAT | O_TMPFILE) != 0 {
+        return Err(EAGAIN);
+    }
+    let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    open(p, nr::openat2, dirfd, &path, flags, mode as u32, resolve)
+}
+
+/// openat and openat2 (`resolve`, its RESOLVE_* flags, 0 for openat).
+/// Calls `n` in denials.
+fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, resolve: u64) -> SysResult {
     let acc = flags & O_ACCMODE;
     let cloexec = flags & O_CLOEXEC != 0;
     // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file.
-    if let Some(fd) = procfs::fd_path(&path) {
+    // (With `resolve`, they're walked to, as anything else.)
+    if resolve == 0
+        && let Some(fd) = procfs::fd_path(path)
+    {
         let file = p.fds.get(fd).map_err(|_| ENOENT)?;
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
-    let base = base_of(p, dirfd, &path)?;
+    // RESOLVE_IN_ROOT: "/" is the directory too.
+    let base = if resolve & fs::RESOLVE_IN_ROOT != 0 { dir_base(p, dirfd)? } else { base_of(p, dirfd, path)? };
+    let scope = fs::Scope { flags: resolve, root: base };
     if !p.fds.has_room() {
         return Err(EMFILE); // before creating or truncating anything
     }
-    let perm = mode as u32 & 0o7777 & !p.umask();
+    let perm = mode & 0o7777 & !p.umask();
     if flags & O_TMPFILE == O_TMPFILE {
         if acc == O_RDONLY {
             return Err(EINVAL);
         }
-        need_write(p, nr::openat, &path)?;
+        need_write(p, n, path)?;
         let (ino, content) = {
             let mut fs = fs::lock();
-            let dir = fs.lookup(base, &path, true)?;
+            let dir = fs.lookup_in(base, path, true, &scope)?;
             if !fs.is_dir(dir) {
                 return Err(ENOTDIR);
             }
@@ -247,12 +328,19 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
     let creat = flags & O_CREAT != 0;
     let excl = creat && flags & O_EXCL != 0;
     let follow = flags & O_NOFOLLOW == 0 && !excl;
-    let found = fs::lock().lookup(base, &path, follow);
+    let found = fs::lock().lookup_in(base, path, follow, &scope);
     // A descriptor reached through a symlink or a relative path.
     if found == Err(ENOENT)
-        && let Some((pid, fd)) = fs::lock().fd_link(base, &path, follow)
+        && let Some((pid, fd)) = fs::lock().fd_link_in(base, path, follow, &scope)
         && pid == p.pid
     {
+        // It's a magic link, as Linux's /proc/<pid>/fd/N.
+        if follow && resolve & (fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS) != 0 {
+            return Err(ELOOP);
+        }
+        if follow && resolve & (fs::RESOLVE_NO_XDEV | fs::RESOLVE_BENEATH | fs::RESOLVE_IN_ROOT) != 0 {
+            return Err(EXDEV);
+        }
         if excl {
             return Err(EEXIST);
         }
@@ -266,17 +354,17 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
             if flags & O_DIRECTORY != 0 {
                 return Err(EINVAL);
             }
-            need_write(p, nr::openat, &path)?;
-            match create_file(p, base, &path, perm, 0) {
+            need_write(p, n, path)?;
+            match create_file(p, base, path, perm, 0, &scope) {
                 Ok(ino) => (ino, true),
                 // Made meanwhile, on a live mount's host: open that one.
-                Err(EEXIST) => (fs::lock().lookup(base, &path, flags & O_NOFOLLOW == 0)?, false),
+                Err(EEXIST) => (fs::lock().lookup_in(base, path, flags & O_NOFOLLOW == 0, &scope)?, false),
                 Err(e) => return Err(e),
             }
         }
         Err(e) => {
-            if e == ENOENT {
-                p.missing_path(base, &path);
+            if e == ENOENT && resolve & fs::RESOLVE_IN_ROOT == 0 {
+                p.missing_path(base, path);
             }
             return Err(e);
         }
@@ -369,7 +457,7 @@ pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) ->
         && !created
     {
         if writes {
-            need_write(p, nr::openat, &path)?;
+            need_write(p, n, path)?;
         }
         let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
         if !fs::lock().permits(ino, p.uid, p.gid, want) {
@@ -455,16 +543,20 @@ fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cl
 
 /// Create the regular file `path` (which doesn't exist). A dangling symlink
 /// in its place is followed, as Linux does for O_CREAT without O_EXCL.
-fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32) -> Result<Ino, Errno> {
-    let (dir, name) = parent_in(p, base, path)?;
+fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32, scope: &fs::Scope) -> Result<Ino, Errno> {
+    let (dir, name) =
+        if scope.flags == 0 { parent_in(p, base, path)? } else { fs::lock().lookup_parent_in(base, path, scope)? };
     let mut fs = fs::lock();
     if let Ok(link) = fs.lookup(dir, &name, false)
         && matches!(fs.node(link).kind, Kind::Symlink(_))
     {
+        if scope.flags & fs::RESOLVE_NO_SYMLINKS != 0 {
+            return Err(ELOOP);
+        }
         // A zombie's /proc/<pid>/exe leads nowhere (ENOENT).
         let target = fs.link_target(link)?;
         drop(fs);
-        return if depth >= 8 { Err(ELOOP) } else { create_file(p, dir, &target, perm, depth + 1) };
+        return if depth >= 8 { Err(ELOOP) } else { create_file(p, dir, &target, perm, depth + 1, scope) };
     }
     if name.is_empty() || name == "." || name == ".." {
         return Err(EISDIR);
