@@ -4026,6 +4026,10 @@ fn threads_run_in_parallel_on_more_cpus() {
     // the kernel's frees: both see it in one place afterwards.
     let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "discard"]);
     assert_eq!(out.stdout_str(), "discard ok\n", "{:?}\n{}", out.status, out.kernel_log);
+    // Faults filling a range in, without the kernel lock, while another
+    // thread unmaps it and its page tables go.
+    let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "unmap"]);
+    assert_eq!(out.stdout_str(), "unmap ok\n", "{:?}\n{}", out.status, out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     // What the kernel answers without its lock (`fast`) follows changes
     // made on other CPUs: a parent's end, another thread's seccomp TSYNC.

@@ -141,6 +141,8 @@ impl Inner {
                 self.taken(me);
                 return;
             }
+            // The holder may be waiting for this (`flush_tables`).
+            crate::arch::tlb_sync();
             core::hint::spin_loop();
         }
     }

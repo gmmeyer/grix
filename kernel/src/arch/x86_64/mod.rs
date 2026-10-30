@@ -714,8 +714,9 @@ pub fn flush_tlb(root: u64, start: u64, end: u64) {
 }
 
 /// `flush_tlb`, waiting for CPUs in the kernel too if `every`: they catch
-/// up as they spin for the kernel lock (`tlb_sync`), the only place one
-/// with this root can be while this CPU has the lock.
+/// up as they spin for the kernel lock or a gate (`tlb_sync`), the only
+/// places one with this root can be while this CPU has the lock and the
+/// address space's gate (fast entries' flushes aside: they make none).
 fn flush(root: u64, start: u64, end: u64, every: bool) {
     let me = cpu_number() % MAX_CPUS;
     crate::smp::note_on(me, crate::smp::Stat::Flush, 1);
@@ -785,9 +786,10 @@ pub fn flush_tables(root: u64, vas: &[u64]) {
     }
 }
 
-/// Before any user memory, with the kernel lock (and while waiting for
-/// it: `flush_tables` waits for that): the flushes asked of this CPU that
-/// it missed while it couldn't take their IPI.
+/// Before any user memory, with the kernel lock or the address space's
+/// gate (and while waiting for either: `flush_tables` waits for that):
+/// the flushes asked of this CPU that it missed while it couldn't take
+/// their IPI.
 pub fn tlb_sync() {
     let me = cpu_number() % MAX_CPUS;
     let want = WANTED[me].load(Ordering::SeqCst);

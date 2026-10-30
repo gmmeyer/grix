@@ -15,6 +15,10 @@
 //                pages up (MADV_DONTNEED) again and again, then that page
 //                is where both see it: no CPU keeps a mapping of a page
 //                that went (prints "discard ok")
+//   smp unmap    threads fault pages of a range in while another unmaps
+//                and maps it again, its page tables going each time:
+//                a thread only ever reads back what it wrote, or a new
+//                zero page, or faults (prints "unmap ok")
 //   smp fast     what the kernel answers without its lock (getppid,
 //                getpid) follows changes made on other CPUs while a
 //                thread asks again and again: its parent's end, a
@@ -28,6 +32,8 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <linux/filter.h>
 #include <linux/membarrier.h>
 #include <linux/seccomp.h>
@@ -231,6 +237,74 @@ static int discard(void) {
     return 0;
 }
 
+// smp unmap. Alone in its 512 GiB, so unmapping it empties tables at every
+// level: 2 MiB of pages, shared out among the threads by page.
+#define UNMAP_BASE 0x500000000000ul
+#define UNMAP_SIZE (2ul << 20)
+#define UNMAP_PAGES (UNMAP_SIZE / 4096)
+
+static _Atomic int unmap_done;
+static _Atomic long unmap_writes, unmap_faults;
+static long unmap_threads;
+static _Thread_local sigjmp_buf unmap_escape;
+
+static void unmap_segv(int sig) {
+    (void)sig;
+    siglongjmp(unmap_escape, 1);
+}
+
+static void *unmap_toucher(void *arg) {
+    long me = (long)arg;
+    // Volatile: they outlive a siglongjmp.
+    volatile long writes = 0, faults = 0;
+    volatile unsigned long seq = 0;
+    if (sigsetjmp(unmap_escape, 1)) faults++;
+    while (!atomic_load(&unmap_done)) {
+        for (unsigned long p = me; p < UNMAP_PAGES; p += unmap_threads) {
+            volatile unsigned long *w = (volatile unsigned long *)(UNMAP_BASE + p * 4096);
+            unsigned long want = (unsigned long)(me + 1) << 48 | ++seq;
+            *w = want;
+            unsigned long got = *w;
+            // Unmapped and mapped again in between: a new page. Anything
+            // else is someone else's page, or a page that had gone.
+            if (got != want && got != 0) {
+                printf("FAILED: page %lu holds %#lx, not %#lx\n", p, got, want);
+                exit(1);
+            }
+            writes++;
+        }
+    }
+    atomic_fetch_add(&unmap_writes, writes);
+    atomic_fetch_add(&unmap_faults, faults);
+    return 0;
+}
+
+static int unmap_race(long cpus) {
+    struct sigaction sa = {.sa_handler = unmap_segv};
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGSEGV, &sa, 0) == 0);
+    pthread_t t[8];
+    unmap_threads = cpus > 1 ? (cpus - 1 < 8 ? cpus - 1 : 8) : 1;
+    int prot = PROT_READ | PROT_WRITE, flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+    CHECK(mmap((void *)UNMAP_BASE, UNMAP_SIZE, prot, flags, -1, 0) == (void *)UNMAP_BASE);
+    for (long i = 0; i < unmap_threads; i++) CHECK(pthread_create(&t[i], 0, unmap_toucher, (void *)i) == 0);
+    long rounds = 0;
+    for (double t0 = now(); now() - t0 < 1.0; rounds++) {
+        CHECK(munmap((void *)UNMAP_BASE, UNMAP_SIZE) == 0);
+        // Some rounds leave it unmapped a moment, for faults to find.
+        for (volatile int i = 0; i < (rounds % 3) * 2000; i++) {
+        }
+        CHECK(mmap((void *)UNMAP_BASE, UNMAP_SIZE, prot, flags, -1, 0) == (void *)UNMAP_BASE);
+    }
+    atomic_store(&unmap_done, 1);
+    for (long i = 0; i < unmap_threads; i++) pthread_join(t[i], 0);
+    CHECK(rounds > 0 && atomic_load(&unmap_writes) > 0);
+    fprintf(stderr, "unmap: %ld rounds, %ld writes, %ld faults\n", rounds, atomic_load(&unmap_writes),
+            atomic_load(&unmap_faults));
+    printf("unmap ok\n");
+    return 0;
+}
+
 // smp fast. Each check spins on a call while the change is made
 // elsewhere, then sees the change; spinning on the stale answer for 10 s
 // fails.
@@ -360,6 +434,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "cow") == 0) return cow(cpus);
     if (argc > 1 && strcmp(argv[1], "discard") == 0) return discard();
     if (argc > 1 && strcmp(argv[1], "fast") == 0) return fast(cpus);
+    if (argc > 1 && strcmp(argv[1], "unmap") == 0) return unmap_race(cpus);
     if (argc > 1 && strcmp(argv[1], "fork") == 0) {
         // The child is another process: the spinning thread's CPU has to
         // give way for it to run at all.
