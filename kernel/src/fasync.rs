@@ -36,15 +36,26 @@ pub enum Owner {
 }
 
 /// A file's owner and the signal it gets (F_SETSIG; 0 is SIGIO without
-/// details), and who named the owner: the signals are that process's, as
-/// if it sent them with kill, so they can't reach init unless it asked.
+/// details), and who chose them: the signals are those processes', as if
+/// they sent them with kill, so they can't reach init unless it asked for
+/// both, nor anyone the one that named the owner couldn't signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fown {
     pub owner: Owner,
     pub sig: u32,
-    /// The process that called F_SETOWN, and its effective uid then.
+    /// The process that called F_SETOWN, and its real and effective uid
+    /// then (Linux's f_modown).
     pub sender: u32,
-    pub sender_uid: u32,
+    pub uid: u32,
+    pub euid: u32,
+    /// The process that called F_SETSIG (0: none has).
+    pub sig_sender: u32,
+}
+
+/// May the F_SETOWN caller signal `q`? Linux's sigio_perm: its ids then,
+/// against what `q`'s are now.
+fn sigio_perm(q: &Process, fown: &Fown) -> bool {
+    fown.euid == 0 || [q.ids.suid, q.ids.ruid].iter().any(|&id| id == fown.euid || id == fown.uid)
 }
 
 struct Entry {
@@ -89,11 +100,11 @@ pub fn watch(file: &FileRef, fd: u64) {
 }
 
 /// Signal the owners of files that became ready since the I/O state last
-/// changed.
-pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) {
+/// changed. Returns whether it signalled anyone.
+pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) -> bool {
     let generation = crate::ipc::generation();
     if SEEN.swap(generation, Ordering::Relaxed) == generation {
-        return;
+        return false;
     }
     let mut due = Vec::new();
     {
@@ -116,14 +127,16 @@ pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) {
             }
         }
     }
+    let mut sent = false;
     for (fown, fd, ready) in due {
-        send(p.as_deref_mut(), procs, fown, fd, ready);
+        sent |= send(p.as_deref_mut(), procs, fown, fd, ready);
     }
+    sent
 }
 
 /// Linux's send_sigio: SIGIO plain, or F_SETSIG's signal with the reason
 /// (si_code), the poll bits (si_band) and the descriptor (si_fd).
-fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
+fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) -> bool {
     // POLLIN|POLLRDNORM, POLLOUT|POLLWRNORM|POLLWRBAND, POLLERR, POLLHUP|POLLERR.
     let (code, band) = if ready & EPOLLHUP != 0 {
         (POLL_HUP, 0x18)
@@ -144,6 +157,7 @@ fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: 
         timer: None,
         why: "I/O possible (O_ASYNC)",
     };
+    let mut sent = false;
     for q in procs.each(p) {
         let target = match fown.owner {
             Owner::Process(pid) if q.pid == pid => Target::Process,
@@ -151,11 +165,15 @@ fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: 
             Owner::Thread(tid) if q.threads.contains_key(&tid) => Target::Thread(tid),
             _ => continue,
         };
-        // As kill's: init only takes what it handles, unless it asked.
-        if crate::syscall::shields_init(q, fown.sender, signo) {
+        if !sigio_perm(q, &fown) {
             continue;
         }
-        let _ = signal::send(q, target, info);
-        q.timer_dirty = true;
+        // As kill's: init only takes what it handles, unless it asked.
+        let chose = [fown.sender, fown.sig_sender];
+        if chose.iter().any(|&s| s != 0 && crate::syscall::shields_init(q, s, signo)) {
+            continue;
+        }
+        sent |= signal::send(q, target, info).is_ok();
     }
+    sent
 }

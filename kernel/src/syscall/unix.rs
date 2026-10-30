@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
 
-use super::file::{base_of, pipe_read_rights, pipe_write, would_block};
+use super::file::{base_of, would_block};
 use super::{AT_FDCWD, require, table::nr};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, FileRef, O_RDWR, new_file};
@@ -88,9 +88,10 @@ pub fn pair(p: &mut Process, ty: u64) -> Result<(FileKind, FileKind), Errno> {
     let me = cred(p);
     match ty {
         SOCK_STREAM => {
-            let (mut a, mut b) = crate::ipc::socketpair();
+            let (mut a, mut b) = unix::stream_pair();
             for end in [&mut a, &mut b] {
-                end.unix = Some(alloc::boxed::Box::new(StreamInfo { local: None, peer: None, peer_cred: me }));
+                let info = StreamInfo { local: None, peer: None, peer_cred: me, passcred: false };
+                end.unix = Some(alloc::boxed::Box::new(info));
             }
             Ok((FileKind::Socket(a), FileKind::Socket(b)))
         }
@@ -139,6 +140,11 @@ pub fn bind(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResult {
             let perm = 0o777 & !p.umask();
             let mut fs = fs::lock();
             let (dir, leaf) = fs.lookup_parent(base, &path)?;
+            if let Some(d) = crate::landlock::domain_changing(p, &fs, dir)
+                && fs.child_of(dir, &leaf).is_none()
+            {
+                d.check(&fs, dir, crate::landlock::MAKE_SOCK)?;
+            }
             match fs.create(dir, &leaf, Kind::Socket(id), perm, p.uid, p.gid) {
                 Ok(_) => {}
                 Err(EEXIST) => return Err(EADDRINUSE),
@@ -197,7 +203,11 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
     let blocked = |p: &mut Process| if nonblock { Err(EAGAIN) } else { would_block(p, false) };
     match ty {
         SOCK_STREAM => match unix::connect_stream(&target, me, cred(p)) {
-            Ok((end, _)) => {
+            Ok((mut end, _)) => {
+                // SO_PASSCRED set before it connected.
+                if let (Some(s), Some(info)) = (&mine, end.unix.as_mut()) {
+                    info.passcred = s.lock().passcred;
+                }
                 file.lock().kind = FileKind::Socket(end);
                 Ok(0)
             }
@@ -206,6 +216,9 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
         },
         SOCK_SEQPACKET => match unix::connect_packet(&target, me, cred(p)) {
             Ok(sock) => {
+                if let Some(s) = &mine {
+                    sock.lock().passcred = s.lock().passcred;
+                }
                 file.lock().kind = FileKind::Unix(sock);
                 Ok(0)
             }
@@ -320,12 +333,18 @@ pub fn peer_cred(file: &FileRef) -> Cred {
 
 // ---------------------------------------------------------------- ancillary data
 
-/// sendmsg's control messages: the descriptors of SCM_RIGHTS (SCM_CREDENTIALS
-/// is checked and dropped: nothing here asks for credentials with
-/// messages).
-pub fn read_rights(p: &mut Process, control: u64, len: u64) -> Result<Option<Rights>, Errno> {
+/// What sendmsg's control messages carry: descriptors (SCM_RIGHTS), and
+/// the credentials to send with them (SCM_CREDENTIALS).
+#[derive(Default)]
+pub struct Control {
+    pub rights: Option<Rights>,
+    pub cred: Option<Cred>,
+}
+
+/// sendmsg's control messages.
+pub fn read_control(p: &mut Process, control: u64, len: u64) -> Result<Control, Errno> {
     if control == 0 || len == 0 {
-        return Ok(None);
+        return Ok(Control::default());
     }
     if len > 4096 {
         return Err(ENOBUFS);
@@ -333,6 +352,7 @@ pub fn read_rights(p: &mut Process, control: u64, len: u64) -> Result<Option<Rig
     let mut b = alloc::vec![0u8; len as usize];
     copy_in(&mut p.aspace, control, &mut b)?;
     let mut files = Vec::new();
+    let mut cred = None;
     let mut off = 0;
     while off + 16 <= b.len() {
         // (The length is the program's: no arithmetic on it may wrap.)
@@ -347,24 +367,54 @@ pub fn read_rights(p: &mut Process, control: u64, len: u64) -> Result<Option<Rig
             (SOL_SOCKET, SCM_RIGHTS) => {
                 for c in b[off + 16..off + clen].as_chunks::<4>().0 {
                     let fd = i32::from_le_bytes(*c);
-                    files.push(p.fds.get(fd as u64)?);
+                    files.push(p.fds.get_raw(fd as u64)?);
                     if files.len() > unix::SCM_MAX_FD {
                         return Err(EINVAL);
                     }
                 }
             }
             (SOL_SOCKET, SCM_CREDENTIALS) if clen >= 28 => {
-                // Only one's own, unless privileged (as on Linux).
                 let w = |i: usize| u32::from_le_bytes(b[off + 16 + i * 4..off + 20 + i * 4].try_into().unwrap());
-                if p.uid != 0 && (w(0) != p.pid || w(1) != p.uid || w(2) != p.gid) {
+                let (pid, uid, gid) = (w(0), w(1), w(2));
+                // Only one's own process and ids, unless privileged (as
+                // Linux's scm_check_creds).
+                let ids = &p.ids;
+                let own_uid = [ids.ruid, p.uid, ids.suid].contains(&uid);
+                let own_gid = [ids.rgid, p.gid, ids.sgid].contains(&gid);
+                if p.uid != 0 && (pid != p.pid || !own_uid || !own_gid) {
                     return Err(EPERM);
                 }
+                cred = Some(Cred { pid, uid, gid });
             }
             _ => return Err(EINVAL),
         }
         off += clen.next_multiple_of(8);
     }
-    if files.is_empty() { Ok(None) } else { Rights::new(files).map(Some) }
+    let rights = if files.is_empty() { None } else { Some(Rights::new(files)?) };
+    Ok(Control { rights, cred })
+}
+
+/// The credentials a message carries unless its sender says otherwise:
+/// its process and real ids, as Linux's scm_send.
+pub(super) fn sender(p: &Process) -> Cred {
+    Cred { pid: p.pid, uid: p.ids.ruid, gid: p.ids.rgid }
+}
+
+/// SCM_CREDENTIALS into a recvmsg's control buffer of `room` bytes
+/// (nothing if there's no room: MSG_CTRUNC). Returns the length used and
+/// the flags.
+fn deliver_cred(p: &mut Process, cred: Cred, control: u64, room: u64) -> Result<(u64, u32), Errno> {
+    const LEN: u64 = 16 + 12;
+    if control == 0 || room < LEN {
+        return Ok((0, MSG_CTRUNC));
+    }
+    let mut b = Vec::with_capacity(LEN as usize);
+    b.extend_from_slice(&LEN.to_le_bytes());
+    b.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+    b.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+    b.extend_from_slice(&cred.bytes());
+    copy_out(&mut p.aspace, control, &b)?;
+    Ok((LEN.next_multiple_of(8).min(room), 0))
 }
 
 /// recvmsg: the descriptors received, as new ones in the caller's table
@@ -415,6 +465,8 @@ pub struct Received {
     pub full: u64,
     pub from: Option<Name>,
     pub rights: Vec<Rights>,
+    /// The sender's credentials, if the socket has SO_PASSCRED.
+    pub cred: Option<Cred>,
 }
 
 /// Send on a message socket: to `to`, or its peer.
@@ -425,8 +477,9 @@ pub fn send_msg(
     flags: u64,
     nonblock: bool,
     to: Option<SockRef>,
-    rights: Option<Rights>,
+    control: Control,
 ) -> SysResult {
+    let Control { rights, cred } = control;
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (ty, from, wr_shut, peer) = {
         let s = sock.lock();
@@ -472,13 +525,15 @@ pub fn send_msg(
         }
         return if nonblock { Err(EAGAIN) } else { would_block(p, false) };
     }
-    let mut data = Vec::with_capacity(len as usize);
+    let mut data = Vec::new();
+    data.try_reserve_exact(len as usize).map_err(|_| ENOMEM)?;
     for &(base, n) in bufs {
         let at = data.len();
         data.resize(at + n as usize, 0);
         copy_in(&mut p.aspace, base, &mut data[at..])?;
     }
-    target.lock().push(Msg { data, from, rights })?;
+    let cred = cred.unwrap_or_else(|| sender(p));
+    target.lock().push(Msg { data, from, rights, cred })?;
     Ok(len)
 }
 
@@ -492,21 +547,22 @@ pub fn recv_msg(
 ) -> Result<Received, Errno> {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let mut s = sock.lock();
+    let passcred = s.passcred;
     let msg = if flags & MSG_PEEK != 0 {
         match &s.state {
-            State::Messages { queue, .. } => queue.front().map(|m| (m.data.clone(), m.from.clone(), None)),
+            State::Messages { queue, .. } => queue.front().map(|m| (m.data.clone(), m.from.clone(), None, m.cred)),
             _ => None,
         }
     } else {
-        s.pop().map(|m| (m.data, m.from, m.rights))
+        s.pop().map(|m| (m.data, m.from, m.rights, m.cred))
     };
-    let Some((data, from, rights)) = msg else {
+    let Some((data, from, rights, cred)) = msg else {
         let eof = match &s.state {
             State::Messages { eof, .. } => *eof,
             _ => return Err(ENOTCONN),
         };
         if eof {
-            return Ok(Received { n: 0, full: 0, from: None, rights: Vec::new() });
+            return Ok(Received { n: 0, full: 0, from: None, rights: Vec::new(), cred: None });
         }
         drop(s);
         return match would_block(p, nonblock) {
@@ -524,11 +580,13 @@ pub fn recv_msg(
         copy_out(&mut p.aspace, base, &data[n..n + k])?;
         n += k;
     }
-    Ok(Received { n: n as u64, full: data.len() as u64, from, rights: rights.into_iter().collect() })
+    let cred = passcred.then_some(cred);
+    Ok(Received { n: n as u64, full: data.len() as u64, from, rights: rights.into_iter().collect(), cred })
 }
 
 /// Send on a connected stream, with descriptors attached to its first
-/// byte.
+/// byte, and as `cred` (SCM_CREDENTIALS) or the sender.
+#[allow(clippy::too_many_arguments)]
 pub fn send_stream(
     p: &mut Process,
     tx: &PipeEnd,
@@ -537,12 +595,13 @@ pub fn send_stream(
     nonblock: bool,
     sigpipe: bool,
     rights: Option<Rights>,
+    cred: Option<Cred>,
 ) -> SysResult {
     if rights.as_ref().is_some_and(|r| r.holds_pipe(&tx.pipe)) {
         return Err(Errno(109)); // ETOOMANYREFS: it would hold itself open
     }
     let at = tx.pipe.lock().written;
-    let n = pipe_write(p, tx, super::file::Src::User(buf), len, nonblock, sigpipe)?;
+    let n = super::file::pipe_write_as(p, tx, super::file::Src::User(buf), len, nonblock, sigpipe, cred)?;
     if let Some(r) = rights
         && n > 0
     {
@@ -551,6 +610,10 @@ pub fn send_stream(
     Ok(n)
 }
 
+/// Receive from a connected stream: descriptors that came with the bytes
+/// into `rights`, and, with `cred` (SO_PASSCRED), only one writer's bytes,
+/// whose credentials it gets (if it has some already, only theirs).
+#[allow(clippy::too_many_arguments)]
 pub fn recv_stream(
     p: &mut Process,
     rx: &PipeEnd,
@@ -559,20 +622,35 @@ pub fn recv_stream(
     nonblock: bool,
     peek: bool,
     rights: &mut Vec<Rights>,
+    cred: Option<&mut Option<Cred>>,
 ) -> SysResult {
-    pipe_read_rights(p, rx, buf, len, nonblock, peek, rights)
+    super::file::pipe_read_full(p, rx, buf, len, nonblock, peek, rights, cred)
 }
 
-/// recvmsg's results into the msghdr: the sender's name, descriptors, flags.
+/// Does this connected stream want its writers' credentials?
+pub fn stream_passcred(end: &crate::ipc::SocketEnd) -> bool {
+    end.unix.as_ref().is_some_and(|u| u.passcred)
+}
+
+/// What comes with received data: descriptors, and the sender's
+/// credentials (SO_PASSCRED).
+pub struct Ancillary {
+    pub rights: Vec<Rights>,
+    pub cred: Option<Cred>,
+}
+
+/// recvmsg's results into the msghdr: the sender's name, credentials,
+/// descriptors, flags.
 pub fn finish_recvmsg(
     p: &mut Process,
     msg: u64,
     name: u64,
     from: Option<&Name>,
-    rights: Vec<Rights>,
+    anc: Ancillary,
     flags: u64,
     truncated: bool,
 ) -> Result<(), Errno> {
+    let Ancillary { rights, cred } = anc;
     if name != 0 {
         match from {
             Some(_) => {
@@ -586,7 +664,15 @@ pub fn finish_recvmsg(
     }
     let control = read_u64(&mut p.aspace, msg + 32)?;
     let room = read_u64(&mut p.aspace, msg + 40)?;
-    let (used, mut mflags) = deliver_rights(p, rights, control, room, flags & MSG_CMSG_CLOEXEC != 0)?;
+    // Credentials first, then descriptors, as Linux's scm_recv.
+    let (mut used, mut mflags) = match cred {
+        Some(c) => deliver_cred(p, c, control, room)?,
+        None => (0, 0),
+    };
+    let at = if used > 0 { control + used } else { control };
+    let (more, f) = deliver_rights(p, rights, at, room - used, flags & MSG_CMSG_CLOEXEC != 0)?;
+    used += more;
+    mflags |= f;
     if truncated {
         mflags |= MSG_TRUNC as u32;
     }

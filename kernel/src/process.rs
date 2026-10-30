@@ -24,6 +24,7 @@ pub use crate::mm::aspace::Access;
 use crate::mm::aspace::{
     AddressSpace, Backing, FaultError, MAX_STACK, SIGPAGE, STACK_SIZE, STACK_TOP, VDSO, VVAR, Vma,
 };
+use crate::mm::gate::Mm;
 use crate::mm::paging::Prot;
 use crate::rng;
 use crate::signal::{self, AltStack, SigQueue};
@@ -31,9 +32,27 @@ use crate::uaccess::copy_out;
 
 /// The program the sandbox runs. When it ends, the sandbox does.
 pub const INIT: u32 = 1;
-/// Threads in all processes together. Linux allows far more; this bounds
-/// kernel memory per sandbox.
-pub const MAX_THREADS: usize = 1024;
+/// What a thread holds of the kernel heap, charged to `kmem` while it
+/// lives: its `Thread` twice over (threads made one after another leave
+/// the process's B-tree nodes half full), x86_64's boxed XSAVE area, its
+/// /proc/<pid>/task/<tid> nodes, and a signal of each standard kind
+/// pending (real-time ones have `MAX_QUEUED_RT`).
+pub const THREAD_COST: u64 = (2 * core::mem::size_of::<Thread>()
+    + arch::FP_HEAP_BYTES
+    + 64
+    + 32 * core::mem::size_of::<crate::signal::SigInfo>()) as u64
+    + crate::fs::TASK_NODES_COST
+    + crate::futex::COST;
+/// threads-max at least: what grix always allowed.
+const MIN_THREADS_MAX: usize = 1024;
+
+/// Threads in all processes together (/proc/sys/kernel/threads-max): as
+/// many as the heap's share of RAM holds (`mm::init`), as Linux sizes
+/// threads-max from RAM. Each also takes its `THREAD_COST` from `kmem`,
+/// which fails first if buffers have taken the rest.
+pub fn threads_max() -> usize {
+    (((crate::kmem::limit() - crate::kmem::BASE) / THREAD_COST) as usize).max(MIN_THREADS_MAX)
+}
 
 /// Thread and process ids, from one sequence (a process's id is its first
 /// thread's). Never reused.
@@ -65,6 +84,10 @@ pub struct SigAction {
 pub enum WaitOn {
     /// A futex word (user virtual address).
     Futex(u64),
+    /// A futex word in memory processes share (`futex.rs`).
+    SharedFutex(crate::futex::Key),
+    /// Any of the futex words in `Thread::futexv` (futex_waitv).
+    FutexV,
     /// Only the deadline (nanosleep, poll timeouts).
     Sleep,
     /// I/O readiness (pipes, eventfds, epoll). The syscall is restarted from
@@ -156,6 +179,26 @@ pub struct Thread {
     /// Its seccomp mode, filters and no_new_privs (inherited by threads and
     /// processes it makes, kept across execve).
     pub seccomp: crate::seccomp::State,
+    /// Its Landlock domain (landlock.rs): inherited like `seccomp`, and
+    /// only ever replaced by one with a layer more.
+    pub landlock: Option<alloc::sync::Arc<crate::landlock::Domain>>,
+    /// Its NUMA memory policy (set_mempolicy's mode and mode flags), kept
+    /// to be read back: with one node, every policy places memory alike.
+    pub mempolicy: u32,
+    /// Its name (PR_SET_NAME, /proc/<pid>/task/<tid>/comm); all zeros:
+    /// the process's (`Process::name`, which is the main thread's).
+    pub name: [u8; 16],
+    /// Its `THREAD_COST` (none for a placeholder that's replaced).
+    pub charge: crate::kmem::Charge,
+    /// The futex words a futex_waitv waits on, in its order (a wake
+    /// returns the index of the word that woke it), while it waits.
+    pub futexv: Option<FutexV>,
+}
+
+/// futex_waitv's words, charged to kmem (up to 128 per thread).
+pub struct FutexV {
+    pub addrs: Vec<u64>,
+    pub _charge: crate::kmem::Charge,
 }
 
 impl Thread {
@@ -181,6 +224,11 @@ impl Thread {
             fifo_wait: None,
             call: (0, 0),
             seccomp: Default::default(),
+            landlock: None,
+            mempolicy: 0,
+            name: [0; 16],
+            charge: Default::default(),
+            futexv: None,
         }
     }
 }
@@ -281,7 +329,8 @@ pub struct Process {
     pub vfork_parent: Option<(u32, u32)>,
     /// CPU time of reaped children (RUSAGE_CHILDREN, times).
     pub children_cpu_ns: u64,
-    pub aspace: AddressSpace,
+    /// Held by this CPU while the process is checked out here (`mm::gate`).
+    pub aspace: Mm,
     pub fds: FdTable,
     /// The working directory and umask (`cwd`, `umask`).
     pub fs: Shared<FsInfo>,
@@ -320,8 +369,6 @@ pub struct Process {
     /// A thread waits to be the only one running (execve): other CPUs
     /// leave this process at their next scheduling point (see `smp`).
     pub exclusive_wanted: bool,
-    /// The timer needs reprogramming (runnable set or deadlines changed).
-    pub timer_dirty: bool,
     /// `ipc::generation()` when I/O waiters were last woken.
     pub io_seen: u64,
     /// setitimer, POSIX timers and timerfds (see timer.rs).
@@ -347,6 +394,9 @@ pub struct Process {
     pub ctty: Option<crate::tty::TtyRef>,
     /// AIO contexts (io_setup), shared by its threads, not inherited.
     pub aio: crate::syscall::aio::Contexts,
+    /// A thread of it may have a Landlock domain: without, checks are this
+    /// one test (`landlock::domain`).
+    pub landlocked: bool,
 }
 
 /// What a child made by clone shares with its parent instead of copying.
@@ -383,6 +433,8 @@ impl RunQ {
     pub fn push_back(&mut self, tid: u32) {
         self.0.push_back(tid);
         QUEUED.fetch_add(1, Ordering::Relaxed);
+        // Whichever process it's in, this CPU may have no slice to end.
+        crate::sched::timer_changed();
     }
 
     pub fn pop_front(&mut self) -> Option<u32> {
@@ -439,6 +491,7 @@ pub fn set_current_pid(pid: u32) {
 static REPORTED: Mutex<BTreeSet<(u8, u32, String)>> = Mutex::new(BTreeSet::new());
 
 const MAX_REPORTS: usize = 512;
+const MAX_REPORT_BYTES: usize = 512;
 const RLIM_INFINITY: u64 = u64::MAX;
 
 impl Process {
@@ -458,7 +511,7 @@ impl Process {
             running: false,
             vfork_parent: None,
             children_cpu_ns: 0,
-            aspace,
+            aspace: Mm::new(aspace),
             fds: FdTable::with_stdio(),
             fs: Shared::new(FsInfo { cwd: ROOT, cwd_pin: None, umask: 0o022 }),
             policy,
@@ -481,7 +534,6 @@ impl Process {
             slice_start: 0,
             resched: false,
             exclusive_wanted: false,
-            timer_dirty: true,
             io_seen: 0,
             timers: crate::timer::Timers::default(),
             exited_cpu_ns: 0,
@@ -493,6 +545,7 @@ impl Process {
             job_notice: None,
             ctty: None,
             aio: Default::default(),
+            landlocked: false,
         }
     }
 
@@ -520,7 +573,6 @@ impl Process {
         c.envp = self.envp.clone();
         c.auxv = self.auxv.clone();
         c.io_seen = self.io_seen;
-        c.timers.fds = self.timers.fds.clone();
         c.uses_signalfd = self.uses_signalfd;
         Ok(c)
     }
@@ -539,6 +591,27 @@ impl Process {
 
     pub fn set_action(&self, sig: u32, act: SigAction) {
         self.sigactions.update(|a| a[sig as usize] = act);
+    }
+
+    /// Name thread `tid` (PR_SET_NAME, a write to its comm file): the main
+    /// thread's is the process's.
+    pub fn set_thread_name(&mut self, tid: u32, name: [u8; 16]) {
+        if tid == self.pid {
+            self.name = name;
+            if let Some(t) = self.threads.get_mut(&tid) {
+                t.name = [0; 16];
+            }
+        } else if let Some(t) = self.threads.get_mut(&tid) {
+            t.name = name;
+        }
+    }
+
+    /// Thread `tid`'s name as comm holds it (16 bytes, NUL-padded).
+    pub fn thread_name(&self, tid: u32) -> [u8; 16] {
+        match self.threads.get(&tid) {
+            Some(t) if t.name[0] != 0 => t.name,
+            _ => self.name,
+        }
     }
 
     /// The command name (comm), for reports.
@@ -580,7 +653,7 @@ impl Process {
         let t = self.cur();
         t.wait = Some(Wait { on, deadline, timeout_ret, rerun: false });
         t.restart_deadline = deadline;
-        self.timer_dirty = true;
+        crate::sched::timer_changed();
         if let Some(deadline) = deadline {
             crate::sched::deadline_at(deadline);
         }
@@ -628,7 +701,6 @@ impl Process {
             t.restarting = true;
             t.recheck = true;
             self.runq.push_back(tid);
-            self.timer_dirty = true;
         }
         any
     }
@@ -648,27 +720,38 @@ impl Process {
             t.restart_deadline = None;
         }
         self.runq.push_back(tid);
-        self.timer_dirty = true;
     }
 
     /// Stop a thread's wait (leaving its futex queue) without making it runnable.
     pub fn cancel_wait(&mut self, tid: u32) -> Option<Wait> {
-        let w = self.threads.get_mut(&tid)?.wait.take()?;
-        if let WaitOn::Futex(addr) = w.on
-            && let Some(q) = self.futexes.get_mut(&addr)
-        {
-            q.retain(|&(t, _)| t != tid);
-            if q.is_empty() {
-                self.futexes.remove(&addr);
+        let t = self.threads.get_mut(&tid)?;
+        let w = t.wait.take()?;
+        let addrs = match w.on {
+            WaitOn::Futex(addr) => alloc::vec![addr],
+            WaitOn::SharedFutex(key) => {
+                crate::futex::leave(key, tid);
+                Vec::new()
+            }
+            WaitOn::FutexV => t.futexv.take().map(|v| v.addrs).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for addr in addrs {
+            if let Some(q) = self.futexes.get_mut(&addr) {
+                q.retain(|&(t, _)| t != tid);
+                if q.is_empty() {
+                    self.futexes.remove(&addr);
+                }
             }
         }
-        self.timer_dirty = true;
+        crate::sched::timer_changed();
         Some(w)
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {
+        // Enough to tell reports apart: a path has no limit but the tree's.
+        let kept = detail.floor_char_boundary(MAX_REPORT_BYTES);
         let mut reported = REPORTED.lock();
-        reported.len() < MAX_REPORTS && reported.insert((kind, nr, detail.into()))
+        reported.len() < MAX_REPORTS && reported.insert((kind, nr, detail[..kept].into()))
     }
 
     /// End the process with wait status `status`. The main program ending
@@ -833,6 +916,7 @@ pub fn start(img: Image<'static>) -> ! {
     let entries: &'static [grix_abi::image::Entry<'static>] = img.entries.leak();
     crate::export::init(&img.exports, &img.mounts, entries, img.export_budget);
     crate::inet::init(img.forwards.clone(), img.udp_forwards.clone());
+    crate::procfs::set_hostname(img.hostname);
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);
@@ -857,6 +941,9 @@ pub fn start(img: Image<'static>) -> ! {
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");
+    // This CPU's process from the start (`mm::gate`).
+    p.aspace.lock();
     if let Some((rows, cols)) = img.tty {
         // The program leads its session, with the terminal as its
         // controlling one, in the foreground.
@@ -874,7 +961,7 @@ pub fn start(img: Image<'static>) -> ! {
     let argv = img.argv.iter().map(|s| String::from(*s)).collect();
     let envp: Vec<String> = img.envp.iter().map(|s| String::from(*s)).collect();
     let exe = search_path(cwd, img.exe, &envp);
-    let program = match load_program(&p, cwd, &exe, argv, envp) {
+    let program = match load_program(&p, Start::Path(cwd), &exe, argv, envp) {
         Ok(program) => program,
         Err(e) => fail(if e.errno == ENOENT { 127 } else { 126 }, &e.reason),
     };
@@ -894,6 +981,10 @@ pub fn start(img: Image<'static>) -> ! {
     crate::smp::unlock();
     arch::enter_user(entry, sp)
 }
+
+/// The heap an argument takes beyond its bytes: its `String` (Vecs leave
+/// room to grow) and the smallest allocation.
+pub const ARG_OVERHEAD: u64 = 2 * core::mem::size_of::<String>() as u64 + 16;
 
 /// Why a program couldn't be loaded: the errno execve returns, and the
 /// explanation reported for the first program.
@@ -921,22 +1012,34 @@ pub struct Program {
     auxv: Vec<u64>,
 }
 
-/// Find `path` (relative to directory `base`), follow `#!` lines, and load
-/// the ELF and its interpreter into a new address space with the initial
-/// stack built. `p` is untouched, so a failure leaves it running.
+/// What execve starts from.
+pub enum Start {
+    /// A path, from this directory.
+    Path(Ino),
+    /// A file open at a descriptor (fexecve): `path` is only its name.
+    File { ino: Ino, content: fs::Content, cwd: Ino, reachable: bool },
+}
+
+/// Find what `start` and `path` name, follow `#!` lines, and load the ELF
+/// and its interpreter into a new address space with the initial stack
+/// built. `p` is untouched, so a failure leaves it running.
 pub fn load_program(
     p: &Process,
-    base: Ino,
+    start: Start,
     path: &str,
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<Program, ExecError> {
+    let landlock = crate::landlock::domain(p);
     let (exe, ino, src, argv) = {
         let mut fs = fs::lock();
-        resolve_interpreters(&mut fs, base, path, argv)?
+        resolve_interpreters(&mut fs, landlock.as_deref(), (p.uid, p.gid), start, path, argv)?
     };
-    let bytes = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
-    let args_charge = crate::kmem::Charge::new(bytes)
+    let bytes: u64 = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
+    // What they hold on the heap (`Process::argv`, the name): an empty
+    // string costs more than its byte, and execve takes 100,000 of them.
+    let held = bytes + (argv.len() + envp.len()) as u64 * ARG_OVERHEAD + exe.len() as u64;
+    let args_charge = crate::kmem::Charge::new(held)
         .map_err(|e| exec_error(e, "no kernel memory left for argv and environment".into()))?;
     let mut aspace = AddressSpace::new().ok_or_else(|| exec_error(ENOMEM, "out of memory".into()))?;
     // The stack is as big as RLIMIT_STACK lets it grow on Linux, with room
@@ -955,7 +1058,11 @@ pub fn load_program(
                     exec_error(ENOENT, alloc::format!("ELF interpreter {ipath} not found (was it imported?)"))
                 })?;
                 match &fs.node(ino).kind {
-                    Kind::File(c) => (elf::Source::of(c), ino),
+                    Kind::File(c) => {
+                        let src = elf::Source::of(c);
+                        may_execute(&mut fs, landlock.as_deref(), ino, cwd, ipath)?;
+                        (src, ino)
+                    }
                     _ => {
                         return Err(exec_error(
                             EACCES,
@@ -988,22 +1095,23 @@ pub fn load_program(
     aspace.map(Vma { start: VDSO, end: VDSO + PAGE_SIZE, prot: Prot::RX, backing: Backing::KernelPage(vdso) });
 
     let auxv = [
-        (33, VDSO),              // AT_SYSINFO_EHDR
-        (3, loaded.phdr),        // AT_PHDR
-        (4, 56),                 // AT_PHENT
-        (5, loaded.phnum),       // AT_PHNUM
-        (6, 4096),               // AT_PAGESZ
-        (7, interp_base),        // AT_BASE
-        (8, 0),                  // AT_FLAGS
-        (9, loaded.entry),       // AT_ENTRY
-        (11, p.ids.ruid as u64), // AT_UID
-        (12, p.uid as u64),      // AT_EUID
-        (13, p.ids.rgid as u64), // AT_GID
-        (14, p.gid as u64),      // AT_EGID
-        (16, arch::hwcap()),     // AT_HWCAP
-        (17, 100),               // AT_CLKTCK
-        (23, 0),                 // AT_SECURE
-        (26, 0),                 // AT_HWCAP2
+        (33, VDSO),                       // AT_SYSINFO_EHDR
+        (3, loaded.phdr),                 // AT_PHDR
+        (4, 56),                          // AT_PHENT
+        (5, loaded.phnum),                // AT_PHNUM
+        (6, 4096),                        // AT_PAGESZ
+        (7, interp_base),                 // AT_BASE
+        (8, 0),                           // AT_FLAGS
+        (9, loaded.entry),                // AT_ENTRY
+        (11, p.ids.ruid as u64),          // AT_UID
+        (12, p.uid as u64),               // AT_EUID
+        (13, p.ids.rgid as u64),          // AT_GID
+        (14, p.gid as u64),               // AT_EGID
+        (16, arch::hwcap()),              // AT_HWCAP
+        (17, 100),                        // AT_CLKTCK
+        (23, 0),                          // AT_SECURE
+        (26, arch::hwcap2()),             // AT_HWCAP2
+        (51, arch::sigframe::max_size()), // AT_MINSIGSTKSZ
     ];
     // The stack is written through the new address space's own mapping.
     aspace.activate();
@@ -1022,7 +1130,9 @@ impl Program {
     /// Replace `p`'s image with this program (the point of no return).
     /// Returns where it starts: (entry, sp).
     pub fn install(self, p: &mut Process) -> (u64, u64) {
-        let old = core::mem::replace(&mut p.aspace, self.aspace);
+        // Held here, as the process is (`mm::gate`); the old one's gate
+        // goes with it.
+        let old = core::mem::replace(&mut p.aspace, Mm::new_held(self.aspace));
         p.aspace.activate();
         drop(old);
         let base = self.exe.rsplit('/').next().unwrap_or(&self.exe).as_bytes();
@@ -1053,24 +1163,55 @@ fn is_x86_64_elf(head: &[u8]) -> bool {
 /// `interp [arg] script args...`, and x86_64 programs through their
 /// translator. Returns the ELF to load (its path, node and bytes) and the
 /// final argv.
+/// Landlock's check of a file execve opens (the program, a script's
+/// interpreter, the ELF interpreter) by `path` from `base`: as Linux's
+/// open_exec, it's read too.
+fn may_execute(
+    fs: &mut fs::Fs,
+    landlock: Option<&crate::landlock::Domain>,
+    ino: Ino,
+    base: Ino,
+    path: &str,
+) -> Result<(), ExecError> {
+    use crate::landlock::{EXECUTE, READ_FILE};
+    let Some(d) = landlock else { return Ok(()) };
+    let dir = fs.found_in(ino, base, path, &fs::Scope::NONE);
+    d.check_in(fs, ino, dir, EXECUTE | READ_FILE)
+        .map_err(|e| exec_error(e, alloc::format!("{path}: refused by the program's Landlock rules")))
+}
+
 fn resolve_interpreters(
     fs: &mut fs::Fs,
-    cwd: Ino,
+    landlock: Option<&crate::landlock::Domain>,
+    (uid, gid): (u32, u32),
+    start: Start,
     path: &str,
     mut argv: Vec<String>,
 ) -> Result<(String, Ino, elf::Source, Vec<String>), ExecError> {
     let mut path = String::from(path);
+    let (cwd, mut opened, mut reachable) = match start {
+        Start::Path(base) => (base, None, true),
+        Start::File { ino, content, cwd, reachable } => (cwd, Some((ino, content)), reachable),
+    };
     for _ in 0..5 {
         let what = if argv.first().is_some_and(|a| *a == path) || argv.is_empty() { "program" } else { "interpreter" };
-        let ino = fs
-            .lookup(cwd, &path, true)
-            .map_err(|e| exec_error(e, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        let node = fs.node(ino);
-        let src = match &node.kind {
-            Kind::File(c) if node.perm & 0o111 != 0 => elf::Source::of(c),
-            Kind::File(_) => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable"))),
-            _ => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file"))),
+        let (ino, content) = match opened.take() {
+            Some((ino, content)) => (ino, Some(content)),
+            None => {
+                let ino = fs
+                    .lookup(cwd, &path, true)
+                    .map_err(|e| exec_error(e, alloc::format!("{what} {path} not found (was it imported?)")))?;
+                (ino, fs.content(ino).filter(|_| matches!(fs.node(ino).kind, Kind::File(_))))
+            }
         };
+        let Some(content) = content else {
+            return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file")));
+        };
+        if !fs.permits(ino, uid, gid, fs::MAY_EXEC) {
+            return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable")));
+        }
+        let src = elf::Source::of(&content);
+        may_execute(fs, landlock, ino, cwd, &path)?;
         // Linux reads at most this much of the #! line.
         let mut buf = [0u8; 256];
         let n = src.read(0, &mut buf);
@@ -1094,6 +1235,13 @@ fn resolve_interpreters(
             continue;
         }
         let Some(rest) = head.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), ino, src, argv)) };
+        if !reachable {
+            return Err(exec_error(
+                ENOENT,
+                alloc::format!("{path}: a close-on-exec script can't be read by its #! line"),
+            ));
+        }
+        reachable = true;
         let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
         let line = core::str::from_utf8(&line[..line.len().min(254)])
             .map_err(|_| exec_error(ENOEXEC, alloc::format!("{path}: invalid #! line")))?
@@ -1115,6 +1263,11 @@ fn resolve_interpreters(
     Err(exec_error(ELOOP, alloc::format!("{path}: too many levels of #! interpreters")))
 }
 
+/// The most argv + envp may hold, their pointers counted: a quarter of the
+/// default stack, as Linux and so `sysconf(_SC_ARG_MAX)`, which is what
+/// `find -exec {} +` fills.
+pub const MAX_ARGS: usize = (crate::mm::aspace::STACK_SIZE / 4) as usize;
+
 /// Lay out argc/argv/envp/auxv at the top of the stack as Linux does.
 /// Returns the stack pointer and the auxiliary vector as written.
 fn build_stack(
@@ -1125,7 +1278,7 @@ fn build_stack(
     aux: &[(u64, u64)],
 ) -> Result<(u64, Vec<u64>), Errno> {
     let total: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1;
-    if total > 1 << 20 {
+    if total > MAX_ARGS {
         return Err(E2BIG);
     }
     // As Linux's exec, the strings start a pointer below the top: the

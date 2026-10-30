@@ -165,13 +165,15 @@ pub enum Request<'a> {
         name: &'a str,
         is_dir: bool,
     },
-    /// Within one mount. With `noreplace`, fail if `to` exists.
+    /// Within one mount. With `noreplace`, fail if `to` exists; with
+    /// `exchange`, swap the two (both must exist).
     Rename {
         from_dir: u64,
         from: &'a str,
         to_dir: u64,
         to: &'a str,
         noreplace: bool,
+        exchange: bool,
     },
     SetAttr {
         id: u64,
@@ -202,6 +204,13 @@ pub enum Request<'a> {
     /// No more notices about `id`. No answer.
     Unwatch {
         id: u64,
+    },
+    /// Another name, `name` in `dir`, for `id` (not a directory), within
+    /// one mount: `Created` with the new name's id.
+    Link {
+        id: u64,
+        dir: u64,
+        name: &'a str,
     },
 }
 
@@ -320,13 +329,13 @@ impl<'a> Request<'a> {
                 put_str(&mut w, name);
                 w.u8(is_dir as u8);
             }
-            Request::Rename { from_dir, from, to_dir, to, noreplace } => {
+            Request::Rename { from_dir, from, to_dir, to, noreplace, exchange } => {
                 w.u8(8);
                 w.u64(from_dir);
                 put_str(&mut w, from);
                 w.u64(to_dir);
                 put_str(&mut w, to);
-                w.u8(noreplace as u8);
+                w.u8(noreplace as u8 | (exchange as u8) << 1);
             }
             Request::SetAttr { id, mode, atime_ns, mtime_ns } => {
                 w.u8(9);
@@ -355,6 +364,12 @@ impl<'a> Request<'a> {
             Request::Unwatch { id } => {
                 w.u8(14);
                 w.u64(id);
+            }
+            Request::Link { id, dir, name } => {
+                w.u8(15);
+                w.u64(id);
+                w.u64(dir);
+                put_str(&mut w, name);
             }
         }
         w.buf
@@ -386,7 +401,11 @@ impl<'a> Request<'a> {
                 let from = get_str(&mut r)?;
                 let to_dir = r.u64()?;
                 let to = get_str(&mut r)?;
-                Request::Rename { from_dir, from, to_dir, to, noreplace: r.u8()? != 0 }
+                let flags = r.u8()?;
+                if flags > 3 {
+                    return Err(DecodeError);
+                }
+                Request::Rename { from_dir, from, to_dir, to, noreplace: flags & 1 != 0, exchange: flags & 2 != 0 }
             }
             9 => {
                 let id = r.u64()?;
@@ -398,6 +417,7 @@ impl<'a> Request<'a> {
             12 => Request::Forget { id: r.u64()? },
             13 => Request::Watch { id: r.u64()? },
             14 => Request::Unwatch { id: r.u64()? },
+            15 => Request::Link { id: r.u64()?, dir: r.u64()?, name: get_str(&mut r)? },
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -587,7 +607,9 @@ mod tests {
             Request::SetLen { id: 9, len: 0 },
             Request::Create { dir: 1, name: "l", ty: FileType::Symlink, mode: 0o777, target: "x" },
             Request::Remove { dir: 1, name: "d", is_dir: true },
-            Request::Rename { from_dir: 1, from: "a", to_dir: 2, to: "b", noreplace: true },
+            Request::Rename { from_dir: 1, from: "a", to_dir: 2, to: "b", noreplace: true, exchange: false },
+            Request::Rename { from_dir: 1, from: "a", to_dir: 2, to: "b", noreplace: false, exchange: true },
+            Request::Link { id: 9, dir: 1, name: "again" },
             Request::SetAttr { id: 9, mode: Some(0o600), atime_ns: None, mtime_ns: Some(5) },
             Request::Fsync { id: 9 },
             Request::Lookup { dir: 1, name: "x" },

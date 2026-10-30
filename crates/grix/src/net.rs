@@ -26,8 +26,9 @@ use grix_abi::wire::{self, Input};
 
 use crate::event::GuestEvent;
 
-/// Connections at once (the guest has its own, lower, limit).
-const MAX_CONNS: usize = 512;
+/// Connections at once, two threads each (the guest has its own, lower,
+/// limit, and a thread that can't be made refuses the connection).
+const MAX_CONNS: usize = 4096;
 /// Connects still waiting for the peer.
 const MAX_CONNECTING: u32 = 128;
 /// DNS lookups in flight; more get SERVFAIL.
@@ -298,6 +299,16 @@ fn host_v4() -> IpAddr {
     IpAddr::V4(Ipv4Addr::from(link::HOST_V4))
 }
 
+fn host_v6() -> IpAddr {
+    IpAddr::V6(Ipv6Addr::from(link::HOST_V6))
+}
+
+/// The guest's IPv6 network (`link::GUEST_V6`'s): nothing there but the
+/// guest and the host.
+fn in_guest_v6_net(ip: IpAddr) -> bool {
+    in_net(ip, IpAddr::V6(Ipv6Addr::from(link::GUEST_V6)), link::NET_V6_PREFIX)
+}
+
 /// The address the guest means. A v4-mapped v6 address is its v4 one, so
 /// it gets the same checks.
 fn ip_of(a: Addr) -> IpAddr {
@@ -324,26 +335,59 @@ fn guest_view(peer: SocketAddr) -> Option<(Addr, u16)> {
         return Some((Addr::V4(link::HOST_V4), peer.port()));
     }
     let own = [link::GUEST_V4, link::HOST_V4, link::DNS_V4].map(|a| IpAddr::V4(Ipv4Addr::from(a)));
-    if ip.is_unspecified() || own.contains(&ip) || peer.port() == 0 {
+    if ip.is_unspecified() || own.contains(&ip) || in_guest_v6_net(ip) || peer.port() == 0 {
         return None;
     }
     Some((addr_of(ip), peer.port()))
 }
 
+/// The IPv4 address an IPv6 one carries, as something on the way would
+/// take it out, and how many of the v6 address's bits come before it.
+fn embedded_v4(a: Ipv6Addr) -> Option<(Ipv4Addr, u8)> {
+    let (s, o) = (a.segments(), a.octets());
+    let low = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    match s {
+        // IPv4-compatible (deprecated), SIIT's IPv4-translated, NAT64's
+        // well-known prefix.
+        [0, 0, 0, 0, 0, 0, ..] | [0, 0, 0, 0, 0xffff, 0, ..] | [0x64, 0xff9b, 0, 0, 0, 0, ..] => Some((low, 96)),
+        // 6to4: its relay is the v4 address.
+        [0x2002, ..] => Some((Ipv4Addr::new(o[2], o[3], o[4], o[5]), 16)),
+        // ISATAP: the interface identifier, under any prefix.
+        [_, _, _, _, x, 0x5efe, ..] if x & 0xfdff == 0 => Some((low, 96)),
+        _ => None,
+    }
+}
+
 /// Addresses that only a rule for them (or their range) reaches, and the
 /// shortest prefix such a rule may have, so a broad rule like `0.0.0.0/0`
 /// doesn't open them: loopback, link-local (cloud metadata services live at
-/// 169.254.169.254), multicast, broadcast and "this network".
+/// 169.254.169.254), multicast, broadcast and "this network", and the
+/// metadata services that live elsewhere.
+///
+/// IPv6's own are the same, with what has no IPv4 twin: unique local
+/// addresses (AWS's metadata is fd00:ec2::254, GCP's fd20:ce::254, Oracle's
+/// fd00:c1::a9fe:a9fe: no list of them would be complete, so unlike RFC
+/// 1918's ranges, the whole of fc00::/7), site-local, Teredo (two v4
+/// addresses, one obfuscated) and NAT64's local-use prefix (RFC 8215: its
+/// v4 address can be anywhere in it). An address that carries a v4 one is
+/// as special as that is, or it would be a way round it.
 fn special(ip: IpAddr) -> Option<u8> {
     match ip {
         IpAddr::V4(a) if a.is_loopback() || a.octets()[0] == 0 => Some(8),
         IpAddr::V4(a) if a.is_link_local() => Some(16),
         IpAddr::V4(a) if a.is_multicast() => Some(4),
         IpAddr::V4(a) if a.is_broadcast() => Some(32),
+        // Alibaba's metadata service, and Azure's wire server.
+        IpAddr::V4(a) if [[100, 100, 100, 200], [168, 63, 129, 16]].contains(&a.octets()) => Some(32),
+        IpAddr::V4(_) => None,
         IpAddr::V6(a) if a.is_loopback() || a.is_unspecified() => Some(128),
         IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfe80 => Some(10),
+        IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfec0 => Some(10),
+        IpAddr::V6(a) if a.segments()[0] & 0xfe00 == 0xfc00 => Some(7),
         IpAddr::V6(a) if a.is_multicast() => Some(8),
-        _ => None,
+        IpAddr::V6(a) if a.segments()[..2] == [0x2001, 0] => Some(32),
+        IpAddr::V6(a) if a.segments()[..3] == [0x64, 0xff9b, 1] => Some(48),
+        IpAddr::V6(a) => embedded_v4(a).and_then(|(v4, bits)| Some(bits + special(v4.into())?)),
     }
 }
 
@@ -353,12 +397,17 @@ impl NetPolicy {
     fn check(&self, ip: IpAddr, port: u16, name: Option<&str>) -> Result<SocketAddr, String> {
         let rules = self.allow.as_deref().unwrap_or(&[]);
         // The host's own services: only for a rule naming exactly that.
-        if ip == host_v4() {
-            let explicit = rules
-                .iter()
-                .any(|r| r.port_ok(port) && (r.matches_name(link::HOST_NAME) || r.host == Pattern::Net(host_v4(), 32)));
+        if ip == host_v4() || ip == host_v6() {
+            let explicit = rules.iter().any(|r| {
+                r.port_ok(port)
+                    && (r.matches_name(link::HOST_NAME)
+                        || r.host == Pattern::Net(host_v4(), 32)
+                        || r.host == Pattern::Net(host_v6(), 128))
+            });
+            let loopback: IpAddr =
+                if ip == host_v4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
             return if explicit {
-                Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+                Ok(SocketAddr::new(loopback, port))
             } else {
                 Err(format!("{ip}:{port} is the host itself; allow it with allow_host(\"{}:{port}\")", link::HOST_NAME))
             };
@@ -367,8 +416,13 @@ impl NetPolicy {
             return Err("DNS over TCP isn't supported".into());
         }
         // The guest's kernel connects its own address itself.
-        if ip == IpAddr::V4(Ipv4Addr::from(link::GUEST_V4)) {
+        if ip == IpAddr::V4(Ipv4Addr::from(link::GUEST_V4)) || ip == IpAddr::V6(Ipv6Addr::from(link::GUEST_V6)) {
             return Err(format!("{ip}:{port} is the guest's own address"));
+        }
+        // The rest of the guest's IPv6 network is no one (and not the
+        // host's own fd00::/64, if it has one).
+        if in_guest_v6_net(ip) {
+            return Err(format!("{ip}:{port} is on the guest's own network, where nothing is"));
         }
         reachable(self.allow.as_deref(), ip, port, name).map(|()| SocketAddr::new(ip, port))
     }
@@ -1365,6 +1419,9 @@ mod tests {
         assert_eq!(host.check(ip("10.0.2.2"), 8000, None), Ok("127.0.0.1:8000".parse().unwrap()));
         assert!(host.check(ip("10.0.2.2"), 8001, None).is_err());
         assert!(policy(&["10.0.2.2/32"]).check(ip("10.0.2.2"), 1, None).is_ok());
+        assert_eq!(host.check(ip("fd00::2"), 8000, None), Ok("[::1]:8000".parse().unwrap()));
+        assert!(open.check(ip("fd00::2"), 8000, None).is_err());
+        assert!(policy(&["fd00::2/128"]).check(ip("fd00::2"), 1, None).is_ok());
         // Broad rules don't open the host, special addresses or the guest.
         let broad = policy(&["0.0.0.0/0", "::/0"]);
         assert!(broad.check(ip("10.0.2.2"), 8000, None).is_err());
@@ -1372,7 +1429,11 @@ mod tests {
         assert!(broad.check(ip("169.254.169.254"), 80, None).is_err());
         assert!(broad.check(ip("127.0.0.1"), 80, None).is_err());
         assert!(broad.check(ip("fe80::1"), 80, None).is_err());
+        assert!(broad.check(ip("fd00:ec2::254"), 80, None).is_err());
         assert!(broad.check(ip("10.0.2.15"), 80, None).is_err());
+        assert!(broad.check(ip("fd00::15"), 80, None).is_err());
+        assert!(broad.check(ip("fd00::7"), 80, None).is_err());
+        assert!(policy(&["fc00::/7"]).check(ip("fd00:0:0:1::7"), 80, None).is_ok());
         assert!(broad.check(ip("1.1.1.1"), 443, None).is_ok());
         assert!(policy(&["169.254.169.254"]).check(ip("169.254.169.254"), 80, None).is_ok());
         assert!(policy(&["127.0.0.0/8"]).check(ip("127.0.0.1"), 80, None).is_ok());
@@ -1577,5 +1638,67 @@ mod tests {
         assert!(t.join().unwrap());
         o.close();
         assert!(!o.send(vec![4]) && o.next().is_none());
+    }
+
+    /// IPv6 has as many ways to a metadata service or this machine as IPv4
+    /// has, and some of its own: none opens with `net` and no allow-list, or
+    /// with a broad rule, and a rule for exactly that does.
+    #[test]
+    fn special_addresses_in_ipv6_clothes() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let (open, broad) = (NetPolicy::default(), policy(&["0.0.0.0/0", "::/0"]));
+        for bad in [
+            // Metadata services, on unique local addresses.
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "fd00:c1::a9fe:a9fe",
+            // Any unique local address, and site-local.
+            "fc00::1",
+            "fdff:ffff::1",
+            "fec0::1",
+            // v4's special addresses in every way of carrying one.
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "::7f00:1",
+            "::a9fe:a9fe",
+            "::1:2",
+            "::ffff:0:7f00:1",
+            "::ffff:0:a9fe:a9fe",
+            "2002:a9fe:a9fe::",
+            "2002:7f00:1::1",
+            "2001:db8::5efe:a9fe:a9fe",
+            "2001:db8::200:5efe:7f00:1",
+            // Teredo and NAT64's local-use prefix, whatever's in them.
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "64:ff9b:1::a9fe:a9fe",
+            "64:ff9b:1:2::1",
+            // As v4, and mapped.
+            "169.254.169.254",
+            "::ffff:169.254.169.254",
+            "100.100.100.200",
+            "168.63.129.16",
+            // What was special before.
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(open.check(ip(bad), 80, None).is_err(), "{bad}");
+            assert!(broad.check(ip(bad), 80, None).is_err(), "{bad} with a broad rule");
+            // The same whatever name DNS gave it, and for a pull.
+            assert!(open.check(ip(bad), 80, Some("registry.example")).is_err(), "{bad}");
+            assert!(reachable(None, ip(bad), 443, Some("registry.example")).is_err(), "{bad}");
+            assert!(policy(&[&format!("[{bad}]")]).check(ip(bad), 80, None).is_ok() || bad.contains('.'), "{bad}");
+        }
+        for fine in ["2600:1f18::1", "2a00:1450:4001::1", "64:ff9b::808:808", "2002:808:808::", "10.1.2.3", "8.8.8.8"] {
+            assert!(open.check(ip(fine), 80, None).is_ok(), "{fine}");
+        }
+        // A rule as narrow as the address's own range opens it, a broader one
+        // doesn't.
+        assert!(policy(&["fc00::/7"]).check(ip("fd12::1"), 80, None).is_ok());
+        assert!(policy(&["64:ff9b::/96"]).check(ip("64:ff9b::a9fe:a9fe"), 80, None).is_err());
+        assert!(policy(&["64:ff9b::a9fe:0/112"]).check(ip("64:ff9b::a9fe:a9fe"), 80, None).is_ok());
+        assert!(policy(&["2002::/16"]).check(ip("2002:a9fe:a9fe::"), 80, None).is_err());
     }
 }

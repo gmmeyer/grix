@@ -6,8 +6,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
-use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, MAX_RAM, RAM_BASE};
-use grix_abi::machine::{GICD, GICR_GRIX_VMM, UART, UART_SIZE, VIRTIO, VIRTIO_IRQ, VIRTIO_STRIDE};
+use grix_abi::image::{self, HEADER_LEN, IMAGE_BASE, MAX_RAM};
+use grix_abi::machine::{GICD, GICR_GRIX_VMM, UART, UART_SIZE, VIRTIO, VIRTIO_IRQ, VIRTIO_STRIDE, ram_regions};
 
 use crate::Args;
 use crate::console::{Console, Line};
@@ -81,7 +81,7 @@ impl Machine {
         if ram == 0 || ram > MAX_RAM {
             return Err(format!("--mem {} is outside 1..={} MiB", args.mem_mb, MAX_RAM >> 20));
         }
-        let mem = Arc::new(GuestMemory::new(RAM_BASE, ram as usize).map_err(|e| format!("allocating RAM: {e}"))?);
+        let mem = Arc::new(GuestMemory::new(ram_regions(ram)).map_err(|e| format!("allocating RAM: {e}"))?);
         let kernel = std::fs::read(&args.kernel).map_err(|e| format!("reading {}: {e}", args.kernel.display()))?;
         let entry = load_kernel(&mem, &kernel)?;
         let img = std::fs::read(&args.image).map_err(|e| format!("reading {}: {e}", args.image.display()))?;
@@ -161,7 +161,7 @@ fn load_kernel(mem: &GuestMemory, elf: &[u8]) -> Result<u64, String> {
         let data = elf.get(offset..offset.checked_add(filesz).ok_or_else(bad)?).ok_or_else(bad)?;
         // The rest of memsz is zero already (fresh memory).
         let end = paddr.checked_add(memsz).ok_or_else(bad)?;
-        if paddr < mem.base() || end > mem.base() + mem.size() as u64 || !mem.write(paddr, data) {
+        if !mem.contains(paddr, (end - paddr) as usize) || !mem.write(paddr, data) {
             return Err(format!("the kernel segment at {paddr:#x} doesn't fit in RAM"));
         }
     }
@@ -280,9 +280,12 @@ mod hvf_loop {
                 "the hypervisor's GIC needs {room:#x} bytes of redistributors, more than this layout has"
             ));
         }
-        hvf::create_vm(GICD, GICR_GRIX_VMM).map_err(|e| e.to_string())?;
-        // SAFETY: `m.mem` is never unmapped, and lives until the process ends.
-        unsafe { hvf::map(m.mem.host(), RAM_BASE, m.mem.size()) }.map_err(|e| e.to_string())?;
+        let top = m.mem.regions().map(|(base, _, size)| base + size as u64).max().unwrap_or(0);
+        hvf::create_vm(GICD, GICR_GRIX_VMM, hvf::ipa_bits(top)?).map_err(|e| e.to_string())?;
+        for (base, host, size) in m.mem.regions() {
+            // SAFETY: `m.mem` is never unmapped, and lives until the process ends.
+            unsafe { hvf::map(host, base, size) }.map_err(|e| e.to_string())?;
+        }
         let cpus = args.cpus as usize;
         let wakes: Vec<Arc<Wake>> = (0..cpus).map(|_| Arc::new(Wake::new())).collect();
         let mut cpu = Cpu::create().map_err(|e| e.to_string())?;
@@ -547,7 +550,7 @@ mod kvm_loop {
         }
         // SAFETY: `m.mem` is never unmapped, and lives until the process ends.
         let (vm, mut cpus) =
-            unsafe { kvm::Vm::create(m.mem.host(), RAM_BASE, m.mem.size(), GICD, GICR_GRIX_VMM, m.entry, args.cpus) }
+            unsafe { kvm::Vm::create(&m.mem.regions().collect::<Vec<_>>(), GICD, GICR_GRIX_VMM, m.entry, args.cpus) }
                 .map_err(|e| e.to_string())?;
         // The kernel's snapshot call comes back to us (KVM answers SMCCC
         // calls itself).

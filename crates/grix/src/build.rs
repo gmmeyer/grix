@@ -194,7 +194,10 @@ impl Default for BuildPolicy {
             local_registries: true,
             cache: true,
             step_timeout: Duration::from_secs(1800),
-            step_memory_mb: 3000,
+            // Files a step writes live in its memory (half of it at
+            // most), and memory it doesn't touch costs nothing. Enough
+            // for `apk add chromium`; a step may ask for up to this.
+            step_memory_mb: 4 << 10,
         }
     }
 }
@@ -306,7 +309,11 @@ impl Grixfile {
                 config.capabilities.push(name.clone());
             }
         }
-        if self.memory_mb.is_some() {
+        if let Some(mb) = self.memory_mb {
+            let max = grix_abi::image::MAX_RAM >> 20;
+            if mb == 0 || mb > max {
+                bail!("memory_mb = {mb}: a sandbox has 1 to {max} MiB");
+            }
             config.memory_mb = self.memory_mb;
         }
         for c in &self.copies {
@@ -405,7 +412,7 @@ fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     ]
     .map(|p| p.to_vec());
     let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    crate::treecache::key("build-step-v2", &parts)
+    crate::treecache::key("build-step-v3", &parts)
 }
 
 /// Run one build step in `image` and take the file tree it leaves (or
@@ -458,7 +465,19 @@ fn run_step(
     }
     let out = b.build()?.run_streaming(&argv, |s, d| on_output(s, d))?;
     if out.status != ExitStatus::Exited(0) {
-        bail!("build step {step:?} failed: {:?}\n{}", out.status, out.stderr_str());
+        // What the guest says it ran out of (its say-so, only for a hint):
+        // a full file system shows as ENOSPC, or as SIGBUS through a mapping.
+        use grix_abi::stats::Limit;
+        let full = out.guest_stats.as_ref().is_some_and(|s| s.hits(Limit::FileData) + s.hits(Limit::Memory) > 0);
+        let hint = if full {
+            format!(
+                "\nThe step ran out of room: its files live in guest memory ({memory_mb} MiB, half of it for \
+                 files). Ask for more with `memory_mb` in the Grixfile."
+            )
+        } else {
+            String::new()
+        };
+        bail!("build step {step:?} failed: {:?}{hint}\n{}", out.status, out.stderr_str());
     }
     let ex = out.export("/").context("no export")?;
     if ex.state != crate::ExportState::Complete {
@@ -530,5 +549,10 @@ mod tests {
         assert_eq!(step_memory_mb(base, Some(256), 3000), 812);
         assert_eq!(step_memory_mb(base, Some(2048), 3000), 2048);
         assert_eq!(step_memory_mb(base, Some(8192), 3000), 3000);
+        // By default a step gets what `apk add chromium` takes, and an image
+        // asking for more than that doesn't get it unless the caller says.
+        let limit = BuildPolicy::default().step_memory_mb;
+        assert_eq!(limit, 4096);
+        assert_eq!(step_memory_mb(base, Some(64 << 10), limit), limit);
     }
 }

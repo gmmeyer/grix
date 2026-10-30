@@ -9,6 +9,7 @@ mod proc;
 pub use proc::shields_init;
 mod shm;
 mod signal;
+mod splice;
 pub mod table;
 mod thread;
 mod timer;
@@ -31,10 +32,27 @@ pub(crate) const AT_FDCWD: i32 = -100;
 
 /// Debug builds only: a call no Linux has, which runs this CPU's kernel
 /// stack 1 KiB past its bottom, then returns (its first argument 0) or
-/// faults there (1), for the test that either is reported
-/// (`kernel_stack_overflow_is_reported`, with fixtures/src/kstack.c).
+/// faults there (1), or leaves that for the next CPU that picks a thread
+/// to do on its way out (2, `overflow_if_asked`), for the test that each
+/// is reported (`kernel_stack_overflow_is_reported`, with
+/// fixtures/src/kstack.c). And x86_64's next idle wait starts with the console's vector in service
+/// (3, `irq::take_device_beneath`), for
+/// `a_device_interrupt_beneath_a_timer_is_not_left_behind`.
 #[cfg(debug_assertions)]
 const STACK_OVERFLOW_TEST: u64 = 0x6772_6978;
+
+#[cfg(debug_assertions)]
+static OVERFLOW_ASKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A thread was picked, and `signal::return_to_user` has run for it, which
+/// is as deep as a signal frame takes the stack: the `smp::finish` path no
+/// other way back to user mode goes.
+#[cfg(debug_assertions)]
+pub fn overflow_if_asked() {
+    if OVERFLOW_ASKED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        overflow_stack(crate::arch::stack_bottom(crate::smp::me()) - 1024, false);
+    }
+}
 
 #[cfg(debug_assertions)]
 fn overflow_stack(to: u64, fault: bool) -> u64 {
@@ -55,6 +73,15 @@ pub fn handle(tf: &mut TrapFrame) {
     let a = tf.syscall_args();
     #[cfg(debug_assertions)]
     if n == STACK_OVERFLOW_TEST {
+        if a[0] == 2 {
+            OVERFLOW_ASKED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if a[0] == 3 {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::irq::device_beneath_next_wake(crate::console::irq());
+            return;
+        }
         let bottom = crate::arch::stack_bottom(crate::smp::me());
         overflow_stack(bottom - 1024, a[0] == 1);
         return;
@@ -81,7 +108,7 @@ pub fn handle(tf: &mut TrapFrame) {
     // were (Linux's syscall_rollback): no result to set.
     let mut trapped = false;
     let result = match u32::try_from(n) {
-        Ok(n) => match gate(p, n) {
+        Ok(n) => match gate(p, n, a) {
             Err(e) => Err(e),
             Ok(()) => match crate::seccomp::verdict(p, n, a, tf.pc()) {
                 Verdict::Allow => dispatch(p, tf, n, a),
@@ -160,11 +187,13 @@ pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) ->
 /// The policy's gate for call `n`. It comes before any seccomp filter:
 /// what the policy refuses is denied (and reported) whatever the
 /// program's filters say.
-fn gate(p: &mut Process, n: u32) -> Result<(), Errno> {
+fn gate(p: &mut Process, n: u32, a: [u64; 6]) -> Result<(), Errno> {
     let (name, gate) = table::info(n);
     match gate {
         Gate::Core => Ok(()),
         Gate::Cap(cap) if p.policy.allows(cap) => Ok(()),
+        // A read-only live mount is read-only whatever the policy says.
+        Gate::Cap(Capability::FsWrite) if file::read_only_target(p, n, a) => Err(EROFS),
         Gate::Cap(cap) => p.deny(n, name, cap.name(), "").map(|_| ()),
         Gate::Privileged => p.deny(n, name, "privileged", "").map(|_| ()),
     }
@@ -230,6 +259,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         }
         nr::close_range => file::close_range(p, a[0], a[1], a[2]),
         nr::statfs => file::statfs(p, a[0], a[1]),
+        nr::name_to_handle_at => file::name_to_handle_at(p, a[0], a[1], a[4]),
         nr::fstatfs => file::fstatfs(p, a[0], a[1]),
         nr::getxattr | nr::lgetxattr | nr::fgetxattr => file::getxattr(p, n, a[0], a[1], a[2], a[3]),
         nr::listxattr | nr::llistxattr | nr::flistxattr => file::listxattr(p, n, a[0], a[1], a[2]),
@@ -257,6 +287,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::setxattr | nr::lsetxattr | nr::fsetxattr => file::setxattr(p, n, a[0], a[1], a[2], a[3], a[4]),
         nr::removexattr | nr::lremovexattr | nr::fremovexattr => file::removexattr(p, n, a[0], a[1]),
         nr::sendfile => file::sendfile(p, a[0], a[1], a[2], a[3]),
+        nr::splice => splice::splice(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::tee => splice::tee(p, a[0], a[1], a[2], a[3]),
+        nr::vmsplice => splice::vmsplice(p, a[0], a[1], a[2], a[3]),
         nr::memfd_create => file::memfd_create(p, a[0], a[1]),
         nr::signalfd4 => file::signalfd4(p, a[0], a[1], a[2], a[3]),
         nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -304,6 +337,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::mprotect => mem::mprotect(p, a[0], a[1], a[2]),
         nr::mremap => mem::mremap(p, a[0], a[1], a[2], a[3], a[4]),
         nr::madvise => mem::madvise(p, a[0], a[1], a[2]),
+        nr::mbind => mem::mbind(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::set_mempolicy => mem::set_mempolicy(p, a[0], a[1], a[2]),
+        nr::get_mempolicy => mem::get_mempolicy(p, a[0], a[1], a[2], a[3], a[4]),
         nr::msync | nr::mlock | nr::munlock | nr::mlock2 | nr::mlockall | nr::munlockall => Ok(0),
 
         // threads (processes are gated in clone, not implemented yet)
@@ -316,6 +352,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
             Err(EBLOCKED)
         }
         nr::futex => thread::futex(p, a),
+        nr::futex_waitv => thread::futex_waitv(p, a[0], a[1], a[2], a[3], a[4]),
         nr::set_tid_address => thread::set_tid_address(p, a[0]),
         nr::set_robust_list => {
             p.cur().robust_list = a[0];
@@ -350,6 +387,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::sigaltstack => signal::sigaltstack(p, tf.sp(), a[0], a[1]),
         nr::kill => signal::kill(p, a[0], a[1]),
         nr::seccomp => crate::seccomp::seccomp(p, a[0], a[1], a[2]),
+        nr::landlock_create_ruleset => crate::landlock::create_ruleset(p, a[0], a[1], a[2]),
+        nr::landlock_add_rule => crate::landlock::add_rule(p, a[0], a[1], a[2], a[3]),
+        nr::landlock_restrict_self => crate::landlock::restrict_self(p, a[0], a[1]),
 
         // processes
         nr::execve => proc::execve(p, tf, AT_FDCWD as u64, a[0], a[1], a[2], 0),

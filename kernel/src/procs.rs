@@ -30,6 +30,8 @@ pub struct Zombie {
     pub cpu_ns: u64,
     /// What its /proc/<pid> still shows.
     pub remains: crate::procfs::Remains,
+    /// What its last thread paid, for the task entry it keeps.
+    pub _charge: crate::kmem::Charge,
 }
 
 pub struct Procs {
@@ -59,7 +61,7 @@ pub fn ended(p: &Process, pid: u32) -> bool {
 /// whose user and group (`real`: real ids, otherwise effective ones) are
 /// all of `q`'s.
 pub fn may_inspect(p: &Process, q: &Process, real: bool) -> bool {
-    may_inspect_creds(p, q.uid, q.gid, &q.ids, real)
+    may_inspect_creds(p, q.uid, q.gid, &q.ids, real) && crate::landlock::may_inspect(p, q)
 }
 
 /// `may_inspect` for a process with these credentials (a zombie's).
@@ -138,6 +140,7 @@ impl Procs {
     /// `all`, from a CPU that may have no process (`cur`: its own, if any).
     pub fn each<'a>(&'a mut self, cur: Option<&'a mut Process>) -> impl Iterator<Item = &'a mut Process> {
         debug_assert!(crate::smp::exclusive(), "another CPU has a process checked out");
+        debug_assert!(!crate::fast::active(), "a fast entry looked at every process");
         cur.into_iter().filter(|p| !p.dead).chain(self.others_mut())
     }
 }
@@ -155,6 +158,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     threads_gone(dead.threads.len());
     // What /proc/<pid> keeps of it, before anything goes.
     let remains = crate::procfs::Remains::of(dead);
+    let charge = dead.threads.values_mut().next().map(|t| core::mem::take(&mut t.charge)).unwrap_or_default();
     // Its POSIX locks go with its descriptor table, unless another process
     // (CLONE_FILES) still uses that.
     dead.fds = FdTable::empty();
@@ -162,6 +166,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     dead.threads.clear();
     dead.runq.clear();
     dead.futexes.clear();
+    crate::futex::forget(dead.pid);
     dead.timers = Default::default();
     dead.shared_pending = Default::default();
     // What it shared with others (CLONE_FS, CLONE_SIGHAND) is theirs alone.
@@ -189,6 +194,8 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
             z.ppid = INIT;
         }
     }
+    // Its children's getppid, which may be a fast call on another CPU.
+    crate::fast::changed();
     // The vfork caller isn't the parent with CLONE_PARENT.
     if let Some((vpid, tid)) = dead.vfork_parent.take() {
         let caller = match cur.as_deref_mut() {
@@ -212,9 +219,12 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     let act = parent.action(SIGCHLD);
     // Linux reaps at once for a parent that ignores SIGCHLD (or asked with
     // SA_NOCLDWAIT): its wait4 then just waits for the last child.
-    // Its /proc/<pid> stays while it's a zombie.
+    // Its /proc/<pid> stays while it's a zombie, its threads' entries
+    // but the leader's going with what paid for them.
     if act.handler != SIG_IGN && act.flags & SA_NOCLDWAIT == 0 {
-        procs.zombies.insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains });
+        procs
+            .zombies
+            .insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains, _charge: charge });
         crate::fs::proc_zombie(pid);
     } else {
         crate::fs::proc_gone(pid);
@@ -222,7 +232,6 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     if dead.exit_signal != 0 && dead.exit_signal <= signal::NSIG {
         let _ = signal::send(parent, Target::Process, SigInfo::child(dead.exit_signal, pid, dead.uid, status));
     }
-    parent.timer_dirty = true;
     // wait4 waits for I/O state to change.
     crate::ipc::changed();
 }
@@ -230,12 +239,9 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
 /// Shared mappings' read-only copies of file pages that now have frames
 /// go from every process (see `fs::take_stale`).
 pub fn zap_stale(cur: Option<&mut Process>, procs: &mut Procs) {
-    let stale = crate::fs::take_stale();
-    if stale.is_empty() {
-        return;
-    }
+    let Some(stale) = crate::fs::take_stale() else { return };
     for q in procs.each(cur) {
-        q.aspace.zap_stale(&stale);
+        q.aspace.access().zap_stale(&stale);
     }
 }
 

@@ -1,7 +1,8 @@
-//! Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise.
+//! Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise, and the
+//! NUMA policies (mbind, set_mempolicy, get_mempolicy).
 
 use crate::errno::*;
-use crate::fd::{FileKind, O_ACCMODE, O_RDWR, O_WRONLY};
+use crate::fd::FileKind;
 use crate::mm::aspace::{Backing, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_up};
@@ -63,10 +64,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
     } else {
         let file = p.fds.get(fd)?;
         let f = file.lock();
-        if f.path_only {
-            return Err(EBADF);
-        }
-        if f.flags & O_ACCMODE == O_WRONLY {
+        if !f.readable() {
             return Err(EACCES);
         }
         match (&f.kind, &f.content) {
@@ -77,7 +75,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
                     return Err(EOVERFLOW);
                 }
                 let ino = *ino;
-                let rdwr = f.flags & O_ACCMODE == O_RDWR;
+                let rdwr = f.writable();
                 if shared && prot.write && !rdwr {
                     return Err(EACCES);
                 }
@@ -228,6 +226,143 @@ pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(EINVAL)?;
     if matches!(advice, MADV_DONTNEED | MADV_FREE) {
         p.aspace.discard(addr, end);
+    }
+    Ok(0)
+}
+
+// NUMA memory policies (mm/mempolicy.c). The machine has one node, 0, so
+// every valid policy puts memory in the same place: they're checked as
+// Linux checks them, and the thread's is kept to be read back. A range's
+// own policy (mbind) isn't kept: get_mempolicy's MPOL_F_ADDR reports the
+// thread's.
+const MPOL_DEFAULT: u32 = 0;
+const MPOL_PREFERRED: u32 = 1;
+const MPOL_BIND: u32 = 2;
+const MPOL_INTERLEAVE: u32 = 3;
+const MPOL_LOCAL: u32 = 4;
+const MPOL_PREFERRED_MANY: u32 = 5;
+const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
+const MPOL_F_STATIC_NODES: u32 = 1 << 15;
+const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
+const MPOL_F_NUMA_BALANCING: u32 = 1 << 13;
+const MPOL_MODE_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING;
+
+/// The nodes a user nodemask of `maxnode` bits names (get_nodes): (any
+/// bit set, node 0's bit set). Other nodes don't exist, so they're
+/// dropped, as Linux drops nodes the task may not use.
+fn read_nodes(p: &mut Process, mask: u64, maxnode: u64) -> Result<(bool, bool), Errno> {
+    let bits = maxnode.saturating_sub(1);
+    if mask == 0 || bits == 0 {
+        return Ok((false, false));
+    }
+    if bits > PAGE_SIZE * 8 {
+        return Err(EINVAL);
+    }
+    // At most a page: on the heap, off the kernel stack.
+    let len = bits.div_ceil(64) as usize * 8;
+    let mut buf = alloc::vec![0u8; len];
+    crate::uaccess::copy_in(&mut p.aspace, mask, &mut buf)?;
+    // Bits past `bits` in the last word don't count.
+    let last = len - 8;
+    let used = bits - last as u64 * 8;
+    if used < 64 {
+        let w = u64::from_le_bytes(buf[last..].try_into().unwrap()) & ((1u64 << used) - 1);
+        buf[last..].copy_from_slice(&w.to_le_bytes());
+    }
+    Ok((buf.iter().any(|&b| b != 0), buf[0] & 1 != 0))
+}
+
+/// Check a policy as mpol_new does: `Ok(mode | flags)`, or EINVAL.
+fn check_policy(p: &mut Process, mode: u64, mask: u64, maxnode: u64) -> Result<u32, Errno> {
+    // An int.
+    let mode = mode as u32;
+    let (flags, base) = (mode & MPOL_MODE_FLAGS, mode & !MPOL_MODE_FLAGS);
+    if base > MPOL_WEIGHTED_INTERLEAVE || flags & MPOL_F_STATIC_NODES != 0 && flags & MPOL_F_RELATIVE_NODES != 0 {
+        return Err(EINVAL);
+    }
+    if flags & MPOL_F_NUMA_BALANCING != 0 && !matches!(base, MPOL_BIND | MPOL_PREFERRED_MANY) {
+        return Err(EINVAL);
+    }
+    let (any, node0) = read_nodes(p, mask, maxnode)?;
+    let ok = match base {
+        MPOL_DEFAULT | MPOL_LOCAL => !any,
+        // No nodes: local allocation.
+        MPOL_PREFERRED => !any || node0,
+        _ => node0,
+    };
+    if !ok {
+        return Err(EINVAL);
+    }
+    Ok(if base == MPOL_DEFAULT { 0 } else { mode })
+}
+
+pub fn set_mempolicy(p: &mut Process, mode: u64, mask: u64, maxnode: u64) -> SysResult {
+    let policy = check_policy(p, mode, mask, maxnode)?;
+    p.cur().mempolicy = policy;
+    Ok(0)
+}
+
+pub fn mbind(p: &mut Process, addr: u64, len: u64, mode: u64, mask: u64, maxnode: u64, flags: u64) -> SysResult {
+    const MPOL_MF_STRICT: u64 = 1;
+    const MPOL_MF_MOVE: u64 = 2;
+    const MPOL_MF_MOVE_ALL: u64 = 4;
+    if flags & !(MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 || !aligned(addr) {
+        return Err(EINVAL);
+    }
+    // Moving other processes' pages needs CAP_SYS_NICE, which nothing has.
+    if flags & MPOL_MF_MOVE_ALL != 0 {
+        return Err(EPERM);
+    }
+    let end = page_up(len).and_then(|l| addr.checked_add(l)).ok_or(EINVAL)?;
+    check_policy(p, mode, mask, maxnode)?;
+    // A hole in the range is EFAULT.
+    let mut at = addr;
+    while at < end {
+        at = p.aspace.find(at).ok_or(EFAULT)?.end;
+    }
+    Ok(0)
+}
+
+pub fn get_mempolicy(p: &mut Process, policy: u64, mask: u64, maxnode: u64, addr: u64, flags: u64) -> SysResult {
+    const MPOL_F_NODE: u64 = 1;
+    const MPOL_F_ADDR: u64 = 2;
+    const MPOL_F_MEMS_ALLOWED: u64 = 4;
+    if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 || mask != 0 && maxnode < 1 {
+        return Err(EINVAL);
+    }
+    let mine = p.cur().mempolicy;
+    let (value, nodes) = if flags & MPOL_F_MEMS_ALLOWED != 0 {
+        if flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 {
+            return Err(EINVAL);
+        }
+        (0, 1u64)
+    } else {
+        if flags & MPOL_F_ADDR != 0 && p.aspace.find(addr).is_none() {
+            return Err(EFAULT);
+        }
+        let nodes = (mine & !MPOL_MODE_FLAGS != MPOL_DEFAULT && mine & !MPOL_MODE_FLAGS != MPOL_LOCAL) as u64;
+        match flags & (MPOL_F_NODE | MPOL_F_ADDR) {
+            // The node the page is on, or the next interleaving one: 0.
+            f if f == MPOL_F_NODE | MPOL_F_ADDR => (0, nodes),
+            MPOL_F_NODE if mine & !MPOL_MODE_FLAGS == MPOL_INTERLEAVE => (0, nodes),
+            MPOL_F_NODE => return Err(EINVAL),
+            _ => (mine, nodes),
+        }
+    };
+    if policy != 0 {
+        crate::uaccess::write_u32(&mut p.aspace, policy, value)?;
+    }
+    if mask != 0 {
+        // copy_nodes_to_user: whole longs for maxnode - 1 bits, past the
+        // first zeroed, at most a page.
+        let len = (maxnode - 1).next_multiple_of(64) / 8;
+        if len > PAGE_SIZE {
+            return Err(EINVAL);
+        }
+        let mut buf = alloc::vec![0u8; len as usize];
+        let n = buf.len().min(8);
+        buf[..n].copy_from_slice(&nodes.to_le_bytes()[..n]);
+        crate::uaccess::copy_out(&mut p.aspace, mask, &buf)?;
     }
     Ok(0)
 }

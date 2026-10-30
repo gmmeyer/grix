@@ -7,7 +7,7 @@ use grix_abi::stats::{Limit, Resource};
 use super::{require, table::nr};
 use crate::arch::{self, TrapFrame};
 use crate::errno::*;
-use crate::process::{self, MAX_THREADS, Process, Thread, WaitOn};
+use crate::process::{self, Process, Thread, WaitOn};
 use crate::time;
 use crate::uaccess::*;
 
@@ -134,10 +134,13 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return Err(EINVAL);
     }
     let threads = crate::procs::threads();
-    if threads >= MAX_THREADS {
+    if threads >= process::threads_max() {
         crate::stats::hit(Limit::Threads);
         return Err(EAGAIN);
     }
+    // Its kernel state, budgeted: EAGAIN as Linux's copy_process fails
+    // when it can't allocate a task.
+    let charge = crate::kmem::Charge::new(process::THREAD_COST).map_err(|_| EAGAIN)?;
 
     let tid = process::new_tid();
     // The child resumes right after the system call with the parent's
@@ -155,8 +158,18 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let sigmask = p.cur().sigmask;
     let seccomp = p.cur().seccomp.clone();
+    let landlock = p.cur().landlock.clone();
+    let mempolicy = p.cur().mempolicy;
+    let name = p.thread_name(p.current);
     let mut t = Thread::new(tid);
+    t.charge = charge;
+    // Named as its creator is (Linux's copy_process copies comm).
+    if name != p.name {
+        t.name = name;
+    }
     t.seccomp = seccomp;
+    t.landlock = landlock;
+    t.mempolicy = mempolicy;
     t.regs = regs;
     arch::save_fp(&mut t.fp);
     t.tls = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tls() };
@@ -164,8 +177,9 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.sigmask = sigmask;
     p.threads.insert(tid, t);
     crate::procs::thread_added();
+    crate::fs::task_changed(p.pid, tid, true);
     p.runq.push_back(tid);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
     Ok(tid as u64)
 }
@@ -186,8 +200,9 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
         p.terminate(process::exited(code));
         return Err(EBLOCKED);
     }
+    crate::fs::task_changed(p.pid, t.tid, false);
     if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
-        futex_wake(p, t.clear_child_tid, 1, u32::MAX);
+        word_wake(p, false, t.clear_child_tid, 1, u32::MAX);
     }
     Err(EBLOCKED)
 }
@@ -241,9 +256,26 @@ pub fn futex_wake(p: &mut Process, addr: u64, n: u32, bitset: u32) -> u32 {
         p.futexes.remove(&addr);
     }
     for &tid in &woken {
-        p.wake(tid, Some(0));
+        // A futex_waitv returns the index of the word that woke it.
+        let index =
+            p.threads.get(&tid).and_then(|t| t.futexv.as_ref()).and_then(|v| v.addrs.iter().position(|&a| a == addr));
+        p.wake(tid, Some(index.unwrap_or(0) as u64));
     }
     woken.len() as u32
+}
+
+/// The word at `addr` as a futex call means it: FUTEX_PRIVATE_FLAG says it's
+/// this process's, wherever it is.
+fn word_key(p: &Process, private: bool, addr: u64) -> Option<crate::futex::Key> {
+    if private { None } else { crate::futex::key(&p.aspace, addr) }
+}
+
+/// `futex_wake`, of a word that may be shared.
+fn word_wake(p: &mut Process, private: bool, addr: u64, n: u32, bitset: u32) -> u32 {
+    match word_key(p, private, addr) {
+        Some(key) => crate::futex::wake(p, key, n, bitset),
+        None => futex_wake(p, addr, n, bitset),
+    }
 }
 
 /// Move up to `n` waiters from `from` to `to`.
@@ -254,8 +286,13 @@ fn futex_requeue(p: &mut Process, from: u64, to: u64, n: u32) -> u32 {
         p.futexes.insert(from, q);
     }
     for &(tid, _) in &moved {
-        if let Some(w) = p.threads.get_mut(&tid).and_then(|t| t.wait.as_mut()) {
-            w.on = WaitOn::Futex(to);
+        let Some(t) = p.threads.get_mut(&tid) else { continue };
+        match (t.wait.as_mut(), t.futexv.as_mut()) {
+            (Some(w), Some(v)) if w.on == WaitOn::FutexV => {
+                v.addrs.iter_mut().filter(|a| **a == from).for_each(|a| *a = to);
+            }
+            (Some(w), _) => w.on = WaitOn::Futex(to),
+            _ => {}
         }
     }
     let count = moved.len() as u32;
@@ -276,7 +313,9 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
     const WAIT_BITSET: u64 = 9;
     const WAKE_BITSET: u64 = 10;
     const CLOCK_REALTIME: u64 = 256;
+    const PRIVATE: u64 = 128;
     let [uaddr, op, val, timeout, uaddr2, val3] = a;
+    let private = op & PRIVATE != 0;
     // `val` and the count in `timeout` are C ints; negative counts wake nobody.
     let count = |v: u64| (v as i32).max(0) as u32;
     if uaddr % 4 != 0 {
@@ -303,22 +342,33 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
                 }
             };
             let tid = p.current;
+            if let Some(key) = word_key(p, private, uaddr) {
+                crate::futex::enqueue(key, p.pid, tid, bitset);
+                return p.block(WaitOn::SharedFutex(key), deadline, Err(ETIMEDOUT));
+            }
             p.futexes.entry(uaddr).or_default().push_back((tid, bitset));
             p.block(WaitOn::Futex(uaddr), deadline, Err(ETIMEDOUT))
         }
-        WAKE => Ok(futex_wake(p, uaddr, count(val), u32::MAX) as u64),
+        WAKE => Ok(word_wake(p, private, uaddr, count(val), u32::MAX) as u64),
         WAKE_BITSET => {
             if val3 as u32 == 0 {
                 return Err(EINVAL);
             }
-            Ok(futex_wake(p, uaddr, count(val), val3 as u32) as u64)
+            Ok(word_wake(p, private, uaddr, count(val), val3 as u32) as u64)
         }
         cmd @ (REQUEUE | CMP_REQUEUE) => {
             if cmd == CMP_REQUEUE && read_u32(&mut p.aspace, uaddr)? != val3 as u32 {
                 return Err(EAGAIN);
             }
-            let woken = futex_wake(p, uaddr, count(val), u32::MAX);
-            let moved = futex_requeue(p, uaddr, uaddr2, count(timeout));
+            let woken = word_wake(p, private, uaddr, count(val), u32::MAX);
+            let moved = match (word_key(p, private, uaddr), word_key(p, private, uaddr2)) {
+                (Some(from), Some(to)) => crate::futex::requeue(p, from, to, count(timeout)),
+                // From one kind of word to the other: there's no moving
+                // it, and waking is always allowed.
+                (Some(from), None) => crate::futex::wake(p, from, count(timeout), u32::MAX),
+                (None, Some(_)) => futex_wake(p, uaddr, count(timeout), u32::MAX),
+                (None, None) => futex_requeue(p, uaddr, uaddr2, count(timeout)),
+            };
             Ok((woken + if cmd == CMP_REQUEUE { moved } else { 0 }) as u64)
         }
         WAKE_OP => {
@@ -353,9 +403,9 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
                 5 => old >= cmparg,
                 _ => return Err(ENOSYS),
             };
-            let mut woken = futex_wake(p, uaddr, count(val), u32::MAX);
+            let mut woken = word_wake(p, private, uaddr, count(val), u32::MAX);
             if hit {
-                woken += futex_wake(p, uaddr2, count(timeout), u32::MAX);
+                woken += word_wake(p, private, uaddr2, count(timeout), u32::MAX);
             }
             Ok(woken as u64)
         }
@@ -363,4 +413,66 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
         6..=8 | 11..=13 => p.unimplemented(nr::futex, "futex", "priority-inheritance futexes", ENOSYS),
         _ => Err(ENOSYS),
     }
+}
+
+/// futex_waitv(2) (Linux 5.16, Wine and Proton's fsync): wait on up to
+/// 128 futex words at once, each with its expected value, until any is
+/// woken (the call returns its index) or the absolute deadline on
+/// `clock` passes. Each word is queued like a FUTEX_WAIT's, so every
+/// futex wake and requeue reaches it.
+pub fn futex_waitv(p: &mut Process, waiters: u64, count: u64, flags: u64, timeout: u64, clock: u64) -> SysResult {
+    /// FUTEX2_SIZE_U32, and FUTEX2_PRIVATE (FUTEX_PRIVATE_FLAG), the only
+    /// flags a waiter may have.
+    const SIZE_U32: u32 = 2;
+    const PRIVATE: u32 = 128;
+    const MAX: u64 = 128;
+    if flags != 0 || count == 0 || count > MAX {
+        return Err(EINVAL);
+    }
+    // Every word is checked before any value is: struct futex_waitv is
+    // { u64 val, u64 uaddr, u32 flags, u32 reserved }.
+    let mut words = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let mut w = [0u8; 24];
+        copy_in(&mut p.aspace, waiters + i * 24, &mut w)?;
+        let val = u64::from_le_bytes(w[0..8].try_into().unwrap());
+        let addr = u64::from_le_bytes(w[8..16].try_into().unwrap());
+        let wflags = u32::from_le_bytes(w[16..20].try_into().unwrap());
+        let reserved = u32::from_le_bytes(w[20..24].try_into().unwrap());
+        if reserved != 0 || wflags & !(SIZE_U32 | PRIVATE) != 0 || wflags & 3 != SIZE_U32 || addr % 4 != 0 {
+            return Err(EINVAL);
+        }
+        // The value is a u32's: anything above it can never match.
+        if val > u32::MAX as u64 {
+            return Err(EINVAL);
+        }
+        words.push((addr, val as u32));
+    }
+    let deadline = match timeout {
+        0 => None,
+        t => {
+            let ns = read_timespec_ns(&mut p.aspace, t)?;
+            match clock {
+                0 => Some(time::realtime_to_monotonic(ns)), // CLOCK_REALTIME
+                1 => Some(ns),                              // CLOCK_MONOTONIC
+                _ => return Err(EINVAL),
+            }
+        }
+    };
+    for &(addr, val) in &words {
+        if read_u32(&mut p.aspace, addr)? != val {
+            return Err(EAGAIN);
+        }
+    }
+    // One queue entry per distinct word: a word given twice wakes as its first.
+    let addrs: Vec<u64> = words.iter().map(|w| w.0).collect();
+    let charge = crate::kmem::Charge::new(addrs.len() as u64 * 16)?;
+    let tid = p.current;
+    for (i, &addr) in addrs.iter().enumerate() {
+        if !addrs[..i].contains(&addr) {
+            p.futexes.entry(addr).or_default().push_back((tid, u32::MAX));
+        }
+    }
+    p.cur().futexv = Some(process::FutexV { addrs, _charge: charge });
+    p.block(WaitOn::FutexV, deadline, Err(ETIMEDOUT))
 }

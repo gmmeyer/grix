@@ -15,8 +15,8 @@
 //! so the rest of the kernel still sees "the running process" and "the
 //! others". Each CPU keeps its own scheduling state (`Cpu`: process,
 //! thread, time slice), swapped into the `Process` fields the kernel uses
-//! (`current`, `slice_start`, `resched`, `timer_dirty`, `running`) while it
-//! holds the lock. Finishing off a process that ended, and execve, wait
+//! (`current`, `slice_start`, `resched`, `running`) while it holds the
+//! lock. Finishing off a process that ended, and execve, wait
 //! until the CPU doing it is the only one running the process (`alone`):
 //! the others leave it at their next scheduling point, which a kick (an
 //! SGI) brings forward.
@@ -41,12 +41,11 @@ struct Cpu {
     tid: Option<u32>,
     slice_start: u64,
     resched: bool,
-    timer_dirty: bool,
     /// The user page table in TTBR0 (0: the empty one).
     ttbr: u64,
 }
 
-const IDLE: Cpu = Cpu { pid: None, tid: None, slice_start: 0, resched: false, timer_dirty: true, ttbr: 0 };
+const IDLE: Cpu = Cpu { pid: None, tid: None, slice_start: 0, resched: false, ttbr: 0 };
 
 /// Indexed by CPU; only touched with the kernel lock held.
 static CPUS: spin::Mutex<[Cpu; N]> = spin::Mutex::new([IDLE; N]);
@@ -113,9 +112,12 @@ pub enum Stat {
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     FlushIpi,
     FlushWait,
+    /// Entries handled without the kernel lock (`fast`), counted among
+    /// the syscalls and faults too.
+    Fast,
 }
 
-const STATS: usize = Stat::FlushWait as usize + 1;
+const STATS: usize = Stat::Fast as usize + 1;
 /// The names /proc/grix/smp shows, in `Stat`'s order (times in µs).
 const STAT_NAMES: [&str; STATS] = [
     "syscall",
@@ -133,14 +135,18 @@ const STAT_NAMES: [&str; STATS] = [
     "flush",
     "flush_ipi",
     "flush_wait_us",
+    "fast",
 ];
-static COUNTS: [[AtomicU64; STATS]; N] = [const { [const { AtomicU64::new(0) }; STATS] }; N];
+/// A CPU's counts, on cache lines of their own.
+#[repr(align(128))]
+struct Counts([AtomicU64; STATS]);
+static COUNTS: [Counts; N] = [const { Counts([const { AtomicU64::new(0) }; STATS]) }; N];
 /// When this CPU took the kernel lock (`Stat::LockHeld`).
 static TAKEN: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
 /// Count `n` of `stat` on CPU `cpu`.
 pub fn note_on(cpu: usize, stat: Stat, n: u64) {
-    COUNTS[cpu % N][stat as usize].fetch_add(n, Ordering::Relaxed);
+    COUNTS[cpu % N].0[stat as usize].fetch_add(n, Ordering::Relaxed);
 }
 
 /// Count `n` of `stat` on this CPU.
@@ -218,7 +224,7 @@ pub fn stats(s: &mut alloc::string::String) {
     let (mut all, mut stack) = ([0u64; STATS], 0);
     for (cpu, counts) in COUNTS.iter().enumerate().take(count() as usize) {
         let _ = write!(s, "{cpu}");
-        for (i, c) in counts.iter().enumerate() {
+        for (i, c) in counts.0.iter().enumerate() {
             let v = c.load(Ordering::Relaxed);
             all[i] = if i == Stat::LockWaitMax as usize { all[i].max(v) } else { all[i] + v };
             let _ = write!(s, " {}", shown(i, v));
@@ -234,6 +240,25 @@ pub fn stats(s: &mut alloc::string::String) {
     let _ = writeln!(s, " {stack}");
 }
 
+/// A fast entry (`fast`) starts, without the kernel lock: as one in the
+/// kernel for `barrier_others` and x86_64's TLB flushes, which then leave
+/// it to catch up (`arch::tlb_sync`) once it has the address space's gate.
+pub fn fast_enter() {
+    let cpu = me();
+    IN_KERNEL[cpu].store(true, Ordering::SeqCst);
+    ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
+}
+
+/// It's done (still holding the gate: a flush that comes after sees it
+/// out of the kernel, and its IPI is taken on the way back to user mode).
+/// A full barrier, for `barrier_others`, which took being in the kernel
+/// for one: nothing else on the way back to user mode is.
+pub fn fast_leave() {
+    check_stack();
+    IN_KERNEL[me()].store(false, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
 /// Take the kernel for an exception of kind `why` (`Stat::Syscall`,
 /// `Fault` or `Irq`).
 pub fn enter(why: Stat) {
@@ -246,6 +271,7 @@ pub fn enter(why: Stat) {
 /// schedules from no process (`sched::schedule`), so it never holds one
 /// another CPU may want.
 pub fn lock() {
+    debug_assert!(!crate::fast::active(), "a fast entry took the kernel lock");
     let cpu = me();
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
     ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
@@ -254,14 +280,15 @@ pub fn lock() {
     let taken = arch::counter();
     let waited = taken.wrapping_sub(start);
     note_on(cpu, Stat::LockWait, waited);
-    COUNTS[cpu][Stat::LockWaitMax as usize].fetch_max(waited, Ordering::Relaxed);
+    COUNTS[cpu].0[Stat::LockWaitMax as usize].fetch_max(waited, Ordering::Relaxed);
     TAKEN[cpu].store(taken, Ordering::Relaxed);
     arch::tlb_sync();
     let me = me();
     let cpu = CPUS.lock()[me];
     let mut guard = process::running().lock();
     let mut procs = PROCS.lock();
-    if guard.is_none() {
+    let checked_out = guard.is_none();
+    if checked_out {
         // Gone if it ended (finished off on another CPU).
         *guard = cpu.pid.and_then(|pid| procs.others.remove(&pid));
     }
@@ -273,8 +300,11 @@ pub fn lock() {
         p.running = tid.is_some();
         p.slice_start = cpu.slice_start;
         p.resched = cpu.resched || tid.is_none() && cpu.tid.is_some();
-        p.timer_dirty = cpu.timer_dirty;
         process::set_current_pid(p.pid);
+        // Its address space, from a fast entry on another CPU if one has it.
+        if checked_out {
+            p.aspace.lock();
+        }
     }
     drop(procs);
     drop(guard);
@@ -305,6 +335,7 @@ pub fn unlock() {
         let mut procs = PROCS.lock();
         if taken.is_none() {
             (cpus[me].tid, cpus[me].pid) = (None, None);
+            crate::fast::update(None);
         }
         if let Some(mut p) = taken {
             let c = &mut cpus[me];
@@ -312,18 +343,19 @@ pub fn unlock() {
             c.pid = c.tid.map(|_| p.pid);
             c.slice_start = p.slice_start;
             c.resched = p.resched;
-            c.timer_dirty = p.timer_dirty;
+            crate::fast::update(c.tid.map(|tid| (&*p, tid)));
             // What's per CPU stays with the CPU.
             p.running = false;
             p.current = NO_THREAD;
             if p.dead {
                 // Finished off (no other CPU runs it): its address space
                 // goes, once it isn't this CPU's.
-                if c.ttbr == p.aspace.pt.root {
+                if c.ttbr == p.aspace.root() {
                     arch::set_user_page_table(arch::empty_page_table());
                     c.ttbr = 0;
                 }
             } else {
+                p.aspace.unlock();
                 procs.others.insert(p.pid, p);
             }
         }
@@ -349,6 +381,8 @@ pub fn unlock() {
         }
     }
     note_on(me, Stat::LockHeld, arch::counter().wrapping_sub(TAKEN[me].load(Ordering::Relaxed)));
+    // Back to user mode (or idle) holding no address space's gate.
+    debug_assert!(crate::mm::gate::none_held(), "CPU {me} left the kernel holding an address space's gate");
     IN_KERNEL[me].store(false, Ordering::SeqCst);
     // Only the holder changes it while it's held: the next turn, free.
     let served = LOCK.load(Ordering::Relaxed) as u32;
@@ -395,6 +429,8 @@ fn acquire() {
                 }
             }
         }
+        // The lock's holder may be waiting for this (`flush_tables`).
+        arch::tlb_sync();
         core::hint::spin_loop();
     }
 }
@@ -519,7 +555,6 @@ fn kick(cpu: usize) {
 /// no thread (it parked, or idles), wait for something to run without
 /// holding anything, and load it into `tf`. Then give the kernel back.
 pub fn finish(tf: &mut TrapFrame) {
-    check_stack();
     // Schedule before waiting: a CPU whose thread just ended may have
     // others to run.
     loop {
@@ -544,20 +579,23 @@ pub fn finish(tf: &mut TrapFrame) {
             // never take them: Go waits for each preemption signal to land
             // before sending another).
             crate::signal::return_to_user(tf);
+            #[cfg(debug_assertions)]
+            crate::syscall::overflow_if_asked();
             continue;
         }
         // Checking on the host may itself have freed room for a writer.
-        let quiet = crate::ipc::generation() == crate::sched::polled();
+        let quiet = crate::sched::quiet();
         check_stack();
         unlock_idle();
         if quiet {
             wait();
         }
         lock();
-        if let Some(id) = irq::ack() {
-            crate::sched::handle_interrupt(id);
-        }
+        crate::sched::interrupts();
     }
+    // Last, as what ran above may have gone deep (a signal frame pushed
+    // for the thread just picked).
+    check_stack();
     unlock();
 }
 
@@ -586,7 +624,7 @@ fn wait() {
 
 /// Point this CPU's TTBR0 at `p`'s address space, if it isn't already.
 fn activate(p: &Process) {
-    let root = p.aspace.pt.root;
+    let root = p.aspace.root();
     let mut cpus = CPUS.lock();
     let c = &mut cpus[me()];
     if c.ttbr != root {
@@ -603,7 +641,7 @@ pub fn activated(root: u64) {
 /// Start the other CPUs (on CPU 0, before the program runs).
 pub fn start(cpus: u32) {
     COUNT.store(cpus.clamp(1, MAX_CPUS), Ordering::Relaxed);
-    CPUS.lock()[0].ttbr = process::running().lock().as_ref().map_or(0, |p| p.aspace.pt.root);
+    CPUS.lock()[0].ttbr = process::running().lock().as_ref().map_or(0, |p| p.aspace.root());
     for cpu in 1..count() {
         let entry = arch::secondary_entry_phys();
         let stack = arch::stack_top(cpu as usize);

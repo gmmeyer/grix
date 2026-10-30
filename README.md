@@ -57,6 +57,11 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # with job control, Ctrl-C and Ctrl-Z.
 ./target/release/grix run -t -a process -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -i
 
+# A host name of its own, and HOME, PATH, LANG and TMPDIR as a login would set them
+# (otherwise the program gets only the environment it's given).
+./target/release/grix run --hostname worker-1 --default-env -a process \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -c 'hostname; env'
+
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox cp /etc/passwd /out/
@@ -291,11 +296,14 @@ let sandbox = Sandbox::builder()
 ```
 
 - Without `allow_host` rules, the program may connect anywhere except the
-  host itself and special addresses (loopback, link-local such as cloud
-  metadata at 169.254.169.254, multicast). With rules, only what they match,
-  and DNS answers only names they cover, so lookups can't carry data out
-  either. Special addresses need a rule for them specifically: `0.0.0.0/0`
-  doesn't open them.
+  host itself and special addresses: loopback, link-local such as cloud
+  metadata at 169.254.169.254, multicast, IPv6 unique local addresses
+  (`fc00::/7`, where AWS's and GCP's metadata services also are; IPv4's
+  private ranges aren't special), and any IPv6 address that carries a
+  special IPv4 one (NAT64, 6to4, Teredo and the like). With rules, only
+  what they match, and DNS answers only names they cover, so lookups can't
+  carry data out either. Special addresses need a rule for them
+  specifically: `0.0.0.0/0` and `::/0` don't open them.
 - The host's own services are `host.grix.internal` (10.0.2.2) and need a
   rule naming them.
 - Connections inside the sandbox (127.0.0.1, `::1`, its own 10.0.2.15) stay
@@ -645,8 +653,9 @@ grix run --image alpine-x86_64.grix -a process -- uname -m    # x86_64
   again; `grix build --no-cache` runs them all.
 - Build steps (`run`) run in grix itself, with `fs_write`, `process`,
   `threads` and `net`, and three times the image's size plus 512 MiB of
-  memory, or `memory_mb` if that's more (up to 3000 MiB; files written
-  take at most half). A string runs with `/bin/sh -c`; a list such as
+  memory, or `memory_mb` if that's more (up to 4 GiB unless
+  `BuildPolicy::step_memory_mb` says otherwise; files written take at most
+  half). A string runs with `/bin/sh -c`; a list such as
   `["/bin/setup", "--fast"]` runs as it is, without a shell. The file tree
   a step leaves is the image's, minus what the kernel makes at boot
   (`/etc/passwd`, `/tmp`, ...). `apt-get install` works in a Debian or
@@ -822,7 +831,7 @@ ELF executables, the same files you'd run on an arm64 Linux machine.
 | Terminals: pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`, Python's `pty`), termios, controlling terminals and `/dev/tty`, TTY mode (`grix run -t`, `tty`) with an interactive shell's job control | Packet mode (`TIOCPKT`), `TIOCSTI`; `VMIN` and `VTIME` together return at the first byte; orphaned process groups aren't treated specially |
 | argv/envp/auxv, HWCAP, ID registers read from user mode on arm64 (emulated as Linux's `HWCAP_CPUID`, sanitized to what HWCAP says), AT_RANDOM, TLS, stdin from the host (`run_with_stdin`, or piped into the CLI), output limits (`max_output`), fast stdio with backpressure (a slow reader blocks the writer, or EAGAIN) | Raw sockets, ICMP (`ping`); UDP datagrams over about 4 KiB |
 | With `net`: TCP clients and servers (AF_INET/AF_INET6, blocking and non-blocking, epoll, `SO_ERROR`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, half-close), UDP (each destination asked of the host once), DNS through the host, loopback inside the sandbox, TCP and UDP ports forwarded from the host, an allow-list | Socket options beyond timeouts (`SO_RCVBUF` and TCP options are accepted and ignored); bandwidth limits |
-| Interface listing: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls, `/proc/net/dev`, `/proc/net/route` and `/sys/class/net` report `lo`, and with `net` also `eth0` (10.0.2.15/24, the default route via the host, 10.0.2.2), which describes the host's proxy: there's no device | IPv6 on `eth0`; interface counters |
+| Interface listing: netlink route sockets, `getifaddrs`, `if_nameindex`, interface ioctls, `/proc/net/dev`, `/proc/net/route` and `/sys/class/net` report `lo`, and with `net` also `eth0` (10.0.2.15/24 and fd00::15/64, the default routes via the host, 10.0.2.2 and fd00::2), which describes the host's proxy: there's no device. `SIOCETHTOOL` answers as a veth | Interface counters |
 | Threads: `clone`/`clone3`, futexes (incl. requeue, wake-op, timeouts), preemption, deadlock detection | |
 | With `process`: `fork`/`vfork`/posix_spawn (copy-on-write), `execve` of imported and written programs and `#!` scripts, `wait4`/`waitid`, `SIGCHLD`, zombies and orphans, process groups and sessions, `MAP_SHARED` anonymous memory shared across fork. Shell pipelines, Python `subprocess`, Node `child_process`, Go `os/exec`. Job control: stopping and continuing, `WUNTRACED`/`WCONTINUED`, `CLD_STOPPED`. pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`, `CLONE_PIDFD`, `waitid(P_PIDFD)`). `clone`/`clone3`'s `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND` (with vfork), `CLONE_PARENT`, `CLONE_CLEAR_SIGHAND`, and `unshare(2)` of them. `/proc/<pid>` for every process (`ps`), zombies included until they're reaped | `CLONE_VM` without vfork or threads; new namespaces |
 | Linux AIO (`io_setup`, `io_submit` of reads, writes, syncs and polls, `io_getevents`/`io_pgetevents`, `io_cancel`): requests complete as they're submitted, into Linux's ring in the program's memory, with eventfd notification | io_uring (ENOSYS on purpose, as Docker's default seccomp profile has it); AIO on a pipe or socket that isn't ready completes with EAGAIN instead of waiting |

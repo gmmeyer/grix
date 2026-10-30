@@ -63,6 +63,10 @@ unsafe extern "C" {
     fn hv_gic_set_spi(intid: u32, level: bool) -> HvReturn;
     fn hv_gic_get_redistributor_region_size(size: *mut usize) -> HvReturn;
     fn os_release(object: *mut c_void);
+    fn hv_vm_config_create() -> *mut c_void;
+    fn hv_vm_config_get_default_ipa_size(bits: *mut u32) -> HvReturn;
+    fn hv_vm_config_get_max_ipa_size(bits: *mut u32) -> HvReturn;
+    fn hv_vm_config_set_ipa_size(config: *mut c_void, bits: u32) -> HvReturn;
 }
 
 #[repr(C)]
@@ -162,11 +166,54 @@ pub fn redistributor_region_size() -> Result<usize, Error> {
     Ok(size)
 }
 
-/// Create the VM (one per process) and its GICv3 at the given bases.
-pub fn create_vm(gicd: u64, gicr: u64) -> Result<(), Error> {
-    // SAFETY: plain calls; the config object is released after use.
+/// The guest-physical address size (IPA bits) a VM reaching `top` needs,
+/// if that's more than the framework's default (36 bits, 64 GiB, where
+/// arm64's RAM, from 1 GiB, stops short of `MAX_RAM`); an error that says
+/// so if it's more than this Mac's hypervisor can map.
+pub fn ipa_bits(top: u64) -> Result<Option<u32>, String> {
+    let need = 64 - top.saturating_sub(1).leading_zeros();
+    let (mut default, mut max) = (0, 0);
+    // SAFETY: out-pointers to locals.
     unsafe {
-        check("hv_vm_create", hv_vm_create(std::ptr::null_mut()))?;
+        check("hv_vm_config_get_default_ipa_size", hv_vm_config_get_default_ipa_size(&mut default))
+            .map_err(|e| e.to_string())?;
+        check("hv_vm_config_get_max_ipa_size", hv_vm_config_get_max_ipa_size(&mut max)).map_err(|e| e.to_string())?;
+    }
+    if need <= default {
+        return Ok(None);
+    }
+    if need > max {
+        let ram_gib = ((1u64 << max) - grix_abi::image::RAM_BASE) >> 30;
+        return Err(format!(
+            "this Mac's hypervisor maps at most {} GiB of guest physical memory ({max}-bit addresses), and the \
+             machine needs {} GiB: give it at most {ram_gib} GiB of RAM (memory_mb = {})",
+            1u64 << (max - 30),
+            top.div_ceil(1 << 30),
+            ram_gib << 10
+        ));
+    }
+    Ok(Some(need))
+}
+
+/// Create the VM (one per process), with `ipa_bits` of guest physical
+/// addresses (`ipa_bits`; None: the default), and its GICv3 at the given
+/// bases.
+pub fn create_vm(gicd: u64, gicr: u64, ipa_bits: Option<u32>) -> Result<(), Error> {
+    // SAFETY: plain calls; the config objects are released after use.
+    unsafe {
+        match ipa_bits {
+            None => check("hv_vm_create", hv_vm_create(std::ptr::null_mut()))?,
+            Some(bits) => {
+                let config = hv_vm_config_create();
+                if config.is_null() {
+                    return Err(Error { what: "hv_vm_config_create", code: -1 });
+                }
+                let r = check("hv_vm_config_set_ipa_size", hv_vm_config_set_ipa_size(config, bits))
+                    .and_then(|_| check("hv_vm_create", hv_vm_create(config)));
+                os_release(config);
+                r?
+            }
+        }
         let config = hv_gic_config_create();
         if config.is_null() {
             return Err(Error { what: "hv_gic_config_create", code: -1 });

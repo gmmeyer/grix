@@ -101,6 +101,9 @@ syscalls! {
     69 preadv Core;
     70 pwritev Core;
     71 sendfile Core;
+    75 vmsplice Core;
+    76 splice Core;
+    77 tee Core;
     72 pselect6 Core;
     73 ppoll Core;
     78 readlinkat Core;
@@ -112,7 +115,7 @@ syscalls! {
     88 utimensat Cap(FsWrite);
     89 acct Privileged;
     90 capget Core;
-    91 capset Privileged;
+    91 capset Core; // dropping what there is (nothing); raising is denied
     92 personality Core;
     93 exit Core;
     94 exit_group Core;
@@ -150,6 +153,8 @@ syscalls! {
     122 sched_setaffinity Core;
     123 sched_getaffinity Core;
     124 sched_yield Core;
+    125 sched_get_priority_max Core;
+    126 sched_get_priority_min Core;
     129 kill Core;
     130 tkill Core;
     131 tgkill Core;
@@ -239,12 +244,17 @@ syscalls! {
     231 munlockall Core;
     232 mincore Core;
     233 madvise Core;
+    235 mbind Core; // one NUMA node: policies are checked, and change nothing
+    236 get_mempolicy Core;
+    237 set_mempolicy Core;
     240 rt_tgsigqueueinfo Core;
     241 perf_event_open Privileged;
     242 accept4 Core; // acts on existing sockets; see net.rs
     243 recvmmsg Core; // acts on existing sockets, like recvmsg
     260 wait4 Cap(Process);
     261 prlimit64 Core;
+    264 name_to_handle_at Core; // EOPNOTSUPP: no file handles here (file.rs)
+    265 open_by_handle_at Privileged;
     268 setns Privileged;
     269 sendmmsg Core; // acts on existing sockets, like sendmsg
     270 process_vm_readv Privileged;
@@ -277,6 +287,11 @@ syscalls! {
     437 openat2 Core; // as openat: write flags need fs_write in the handler
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    // Landlock: a program's own restrictions (landlock.rs).
+    444 landlock_create_ruleset Core;
+    445 landlock_add_rule Core;
+    446 landlock_restrict_self Core;
+    449 futex_waitv Core;
     452 fchmodat2 Cap(FsWrite);
 }
 
@@ -403,7 +418,7 @@ syscalls! {
     123 setfsgid Core;
     124 getsid Core;
     125 capget Core;
-    126 capset Privileged;
+    126 capset Core;
     127 rt_sigpending Core;
     128 rt_sigtimedwait Core;
     129 rt_sigqueueinfo Core;
@@ -421,6 +436,8 @@ syscalls! {
     143 sched_getparam Core;
     144 sched_setscheduler Core;
     145 sched_getscheduler Core;
+    146 sched_get_priority_max Core;
+    147 sched_get_priority_min Core;
     149 mlock Core;
     150 munlock Core;
     151 mlockall Core;
@@ -493,6 +510,9 @@ syscalls! {
     233 epoll_ctl Core;
     234 tgkill Core;
     235 utimes Cap(FsWrite);
+    237 mbind Core;
+    238 set_mempolicy Core;
+    239 get_mempolicy Core;
     246 kexec_load Privileged;
     247 waitid Cap(Process);
     248 add_key Privileged;
@@ -519,6 +539,9 @@ syscalls! {
     272 unshare Core; // new namespaces refused in the handler
     273 set_robust_list Core;
     274 get_robust_list Core;
+    275 splice Core;
+    276 tee Core;
+    278 vmsplice Core;
     280 utimensat Cap(FsWrite);
     281 epoll_pwait Core;
     282 signalfd Core;
@@ -540,6 +563,8 @@ syscalls! {
     298 perf_event_open Privileged;
     299 recvmmsg Core; // acts on existing sockets, like recvmsg
     302 prlimit64 Core;
+    303 name_to_handle_at Core; // EOPNOTSUPP: no file handles here (file.rs)
+    304 open_by_handle_at Privileged;
     307 sendmmsg Core; // acts on existing sockets, like sendmsg
     308 setns Privileged;
     309 getcpu Core;
@@ -573,5 +598,10 @@ syscalls! {
     438 pidfd_getfd Cap(Process);
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    // Landlock: a program's own restrictions (landlock.rs).
+    444 landlock_create_ruleset Core;
+    445 landlock_add_rule Core;
+    446 landlock_restrict_self Core;
+    449 futex_waitv Core;
     452 fchmodat2 Cap(FsWrite);
 }

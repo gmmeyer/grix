@@ -22,7 +22,8 @@ make check       # clippy for host and kernel
   `cargo test` at the root does **not** rebuild it, so after changing kernel code
   run `make kernel` (or `make test`) before the end-to-end tests.
 - End-to-end tests live in `crates/grix/tests/guest.rs` (C fixtures, busybox)
-  and `crates/grix/tests/runtimes.rs` (Python, Node). They need
+  and `crates/grix/tests/runtimes.rs` (Python, Node); `hostfds.rs` is alone
+  in a process, as it lowers the process's descriptor limit. They need
   `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
   built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
   are never skipped.
@@ -67,6 +68,13 @@ physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
 the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
 (`elf.rs`, `process.rs`), and drops to EL0.
+RAM is in the regions `grix_abi::machine::ram_regions` gives for its size
+(up to `image::MAX_RAM`, 64 GiB): on arm64 one, from 1 GiB on past 4 GiB;
+on x86_64 up to 3 GiB below the devices and the rest from 4 GiB, as
+QEMU's `microvm` puts it. boot.S maps the first 4 GiB and `arch::map_ram`
+the rest; the boot image must fit below 4 GiB (`image::LOW_RAM`), and
+grix-vmm's `GuestMemory` is one mapping for every region, as is a
+snapshot's RAM. Frames above 4 GiB are handed out first.
 After that, every bit of kernel work happens in an exception handler
 (`arch/aarch64/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames
@@ -121,7 +129,11 @@ touches user memory only inside `arch::user_access`. The GDT has no 32-bit
 user code segment, so user code can't enter compatibility mode (AMD's
 `syscall` from there would go to CSTAR). The idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
-instruction), as a masked one waits in the GIC on arm64. The TSC is the
+instruction), as a masked one waits in the GIC on arm64. A wake-up can
+note two, a device's and just before the `cli` a timer's or a kick's
+above it, each in service until its `eoi`: `sched::interrupts` takes
+every one (`irq::more`), or the device's would hold up its priority
+class until the CPU next idled. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
 PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
 x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
@@ -176,14 +188,23 @@ socket is a `unix::Sock`, found by name in `unix::NAMES` (a path is an
 `fs::Kind::Socket` node whose id is the key, so a reused inode can't be
 reached). Descriptors passed with SCM_RIGHTS are `unix::Rights` (at most
 `MAX_INFLIGHT`), attached to a message or to a stream's byte position
-(`Pipe::rights`); reads stop at them.
+(`Pipe::rights`); reads stop at them. A stream's pipe also keeps who
+wrote what (`Pipe::creds`, a run per writer, at most `MAX_CRED_RUNS`):
+with SO_PASSCRED (`StreamInfo::passcred`, inherited from a listener)
+reads stop where the writer changes and carry SCM_CREDENTIALS.
+splice, tee and vmsplice (`syscall/splice.rs`) copy a chunk at a time,
+looking at the source first and consuming only what the destination
+took.
 
 Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 `crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):
 the guest has no TCP/IP stack. A TCP connect becomes `link::ToHost::Connect`
 on `Channel::Link`, the host checks its `NetPolicy` and connects, and data
 flows as `Data` messages with credit-based flow control (`link::WINDOW` per
-connection each way; stdin uses the same scheme). Connections to the
+connection each way; stdin uses the same scheme). Everything the proxy or a build connects to goes through
+`net::reachable`, whose `special` addresses need a rule of their own:
+loopback, link-local, multicast, all of `fc00::/7`, and any IPv6 address
+that carries a special IPv4 one (`embedded_v4`). Connections to the
 guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
 as `Incoming`, for a listener on the guest's address or all of them,
@@ -207,15 +228,22 @@ Restoring a snapshot forgets them. The guest is 10.0.2.15, the host's own loopba
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.
 Interface listings (`netlink.rs`: netlink, the `SIOCGIF*` ioctls,
-`/proc/net/dev` and `route`; `procfs::ETH0_FILES` for
-`/sys/class/net/eth0`) show `lo`, and with `net` also `eth0`
-(10.0.2.15/24, a made-up MAC, the default route via 10.0.2.2), set at
-boot (`netlink::init`). It's no device: a description of what the
-proxy does, which still decides what sockets reach.
+`SIOCETHTOOL`, `/proc/net/dev`, `route`, `if_inet6` and `ipv6_route`;
+`procfs::ETH0_FILES` for `/sys/class/net/eth0`) show `lo`, and with
+`net` also `eth0` (10.0.2.15/24 and `link::GUEST_V6`, fd00::15/64, a
+made-up MAC, the default routes via 10.0.2.2 and fd00::2), set at boot
+(`netlink::init`). It's no device: a description of what the proxy
+does, which still decides what sockets reach. The IPv6 address is a
+ULA on purpose: a connection to a global address leaves from it
+(`inet::source_for`), and RFC 6724 then sorts IPv4 first; fd00::2 is
+the host's loopback as 10.0.2.2 is, and the rest of fd00::/64 nobody.
+A NETLINK_KOBJECT_UEVENT socket (`Netlink::uevent`) hears nothing.
 
 Live mounts (`hostfs.rs` in the kernel and in `crates/grix/src`, messages
 in `crates/abi/src/hostfs.rs`): directories the host serves while the
-program runs. Their nodes carry `Node::remote` (the host's id), and their
+program runs. A read-only one is EROFS for every change, before the
+policy's `fs_write` gate (`file::read_only_target`). A hard link's new
+name is a node of its own (the host has an id per name). Their nodes carry `Node::remote` (the host's id), and their
 files' `FileData` reads and writes go to the host. A directory's entries
 are fetched on first use and kept for `hostfs::FRESH_NS` (`Fs::ensure`).
 Under memory pressure `Fs::evict` forgets idle directories' entries. A
@@ -248,8 +276,10 @@ IN_Q_OVERFLOW), which queues them on the matching watches (each event
 charged, `MAX_QUEUED` per instance) and marks what changed for fetching
 again (`fs::host_changed`, applied when the filesystem is next free).
 The host bounds what it keeps (`hostfs::MAX_WATCHES`; on macOS entries
-and descriptors) and a round of changes (`watch::MAX_BATCH`, then an
-overflow), and sends as the guest takes them, within a quarter of the
+and descriptors: a share of RLIMIT_NOFILE, `watch::fd_budget`, for every
+watcher in the process, past which files are polled and a node goes
+unwatched, the guest told by an overflow), and a round of changes
+(`watch::MAX_BATCH`, then an overflow, kept to as it's made), and sends as the guest takes them, within a quarter of the
 outbox (`Outbox::send_notice`: stats requests and datagrams still fit),
 so its own kernel's queue holds the rest. A restored snapshot's host watches nothing:
 `inotify::rewatch` asks again for every node and queues an overflow,
@@ -273,7 +303,8 @@ init and sends the exit signal. Each process has a `/proc/<pid>`
 (`Fs::proc_add` at fork, `fs::proc_gone` once it's reaped; `/proc/self`
 is `process::current_pid`). A zombie's is generated from what
 `procfs::Remains` kept of it (`Zombie::remains`, `fs::proc_zombie`
-makes its `exe`, `cwd` and `root` fail with ENOENT); a pidfd (`FileKind::PidFd`) is just the pid,
+makes its `exe`, `cwd` and `root` fail with ENOENT, and leaves its
+leader alone in `task`, paid for by what its last thread held); a pidfd (`FileKind::PidFd`) is just the pid,
 which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
 caller running. What clone can share between processes is a handle to
@@ -295,13 +326,25 @@ anything). They only matter inside the guest filesystem: root bypasses
 mode bits but not `Node::system`, and nothing honours setuid bits, so
 keep it that way rather than giving uid 0 anything else.
 
-Threads (`sched.rs`): one kernel stack per CPU (`arch::stack`'s
+Threads (`sched.rs`): each takes `process::THREAD_COST` from `kmem`
+for as long as it lives (its `Thread`, x86_64's FP box, its
+`/proc/<pid>/task/<tid>` nodes, which are `prepaid` and stay out of the
+metadata budget); `process::threads_max` is what the heap's share of
+RAM gives (`mm::init`: the heap is 32 MiB plus 1/16 of what the boot
+image leaves of RAM, at most 128 MiB more, from the top of the highest
+RAM region, half of that for `kmem`, a quarter for files' names and
+nodes, the rest for fragmentation), and clone
+and fork fail with EAGAIN at either. A thread has its own name
+(`Thread::name`, zeros meaning the process's, `Process::name` being the
+main thread's), state and CPU time in its task directory, whose
+entries come and go one at a time (`fs::task_changed`). One kernel
+stack per CPU (`arch::stack`'s
 `STACK_SIZE`, which the linker scripts and assembly take from there),
 with that CPU's emergency stack below it. There's no guard page (4 KiB
 mappings there cost contended system calls a fifth of their speed):
 the lowest `CANARY_SIZE` bytes of each stack are painted and checked on
-every way back to user mode and before the idle wait
-(`smp::check_stack`), and an exception taken that low is reported too
+every way back to user mode, the last thing before the lock goes, and
+before the idle wait (`smp::check_stack`), and an exception taken that low is reported too
 (arm64's vectors check sp against `tpidr_el1` before pushing a frame
 and move to the emergency stack), all as "kernel stack overflow on CPU
 n". `stack_max` in /proc/grix/smp is each CPU's high-water mark (about
@@ -310,11 +353,15 @@ that a `Thread` is moved by value (x86_64's FP state is boxed for that,
 `arch::ThreadFp`). Each thread keeps its user registers, TLS and FP/SIMD
 state in `process::Thread`. A syscall that must
 wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
-returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
+returns `EBLOCKED`. Futex words in memory processes share are found by
+what they're in, as Linux's get_futex_key (`futex.rs`,
+`WaitOn::SharedFutex`), any other by address in `Process::futexes`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when
 `ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
-Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
+Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too
+(a process's, but a timerfd's its file's: `timer::TIMER_FDS`, as the file
+outlives whoever made it, over fork and SCM_RIGHTS):
 the scheduler programs the CPU timer for the earliest one and calls
 `timer::fire` from the timer interrupt and the idle loop. With more
 CPUs one keeps everyone's deadlines (`sched::KEEPER`, a CPU running a
@@ -333,15 +380,32 @@ new that sets a deadline must do one or the other, or its sleeper wakes
 only when something else comes due. So too I/O waiters are looked for
 only once the I/O generation has moved past the one they all saw
 (`sched::POLLED`), and the threads waiting to run are counted
-(`process::queued`, kept by `RunQ`). The vDSO (`vdso.rs`, a page every process
+(`process::queued`, kept by `RunQ`). The rule for anything that changes
+what a waiter sees (data, room, a closed end, a process's end or stop):
+it calls `ipc::changed()`, and nobody then decides what can run until
+every waiter has been told. `sched::settle` is how: it finishes off what
+ended, fires what's due and wakes I/O waiters in every process, round
+and round until the generation is back at `POLLED` (`sched::quiet`), as
+each makes work for the other: a timer's signal ends a process, and a
+process's end is what wait4 and a pipe's reader wait for. `schedule`
+does that before `pick` and `idle`, and `irq` and the end of a system
+call (`wake_io_everywhere`, if not quiet or something ended) before user
+mode, where a spinning thread may never come back by itself. `idle`
+calls nothing a deadlock unless `quiet` holds, and `smp::finish` doesn't
+wait unless it does. So anything new that ends or wakes belongs in
+`sched::end_processes` or `poll`, not in one more poll after some step.
+A thread that comes to wait to run, in any process (`RunQ::push_back`),
+or a stopped process that continues, marks this CPU's timer
+(`sched::timer_changed`, which never needs a process: the timer is the
+CPU's, and only it ends the slice the thread is waiting for). The vDSO (`vdso.rs`, a page every process
 shares) reads the clocks without a system call from a page only the
 kernel writes (`vdso::publish`); the kernel's clock uses the same
 `(ticks * mult) >> 32`, so keep the two in step.
 
 More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
 is still the single-CPU kernel, made safe by a big kernel lock that every
-exception takes (`smp::lock` in `trap_handler`) and gives back on the way
-to EL0 (`smp::finish`). It's a ticket lock whose turn a waiter skips
+exception but a fast one (below) takes (`smp::lock` in `trap_handler`)
+and gives back on the way to EL0 (`smp::finish`). It's a ticket lock whose turn a waiter skips
 when the lock has lain free and untaken for `SKIP_US` (that CPU's vCPU
 is likely descheduled; it takes a new ticket when it runs): FIFO hands
 off as a futex ping-pong wants, and a descheduled waiter doesn't stall
@@ -355,7 +419,7 @@ first), so kernel code still sees "the running process" and "the
 others", and a process in `PROCS` may be running on another CPU. Under
 the lock only the holder's slot is filled (a debug assertion checks). Each
 CPU's scheduling state (`smp::CPUS`: its process and thread, time slice,
-resched, timer_dirty) is swapped into the `Process` fields while it holds
+resched) is swapped into the `Process` fields while it holds
 the lock, so `p.current` is this CPU's thread, and a thread running on
 another CPU is in neither `runq` nor `current`, its registers live in that
 CPU: don't touch them. A CPU with nothing to run waits in `smp::finish`
@@ -377,6 +441,36 @@ work to its next holder (`fs::later`); the process and thread counts are
 kept as they change (`procs::born`, `threads_gone`); a pipe is held
 across the copy to a reader as to a writer; a socket polls its peer
 without its own lock.
+Fast entries (`fast.rs`) take no kernel lock: page faults that fill an
+empty entry of anonymous memory or an imported file
+(`AddressSpace::fast_fault`), and getpid, getppid, gettid, get[e]uid,
+get[e]gid and a sched_yield with nothing queued anywhere. Each is tried
+in `trap_handler` before `smp::enter`, and anything it can't finish is
+left untouched for the usual path, which starts again from the
+exception. They use only the CPU's `fast::Snapshot` (set by `unlock`
+from the thread it runs, stale once `fast::changed` moves the
+generation on), the running process's address space under its gate, and
+atomics, or leaf locks (frames) once it has the gate. Every address space has a gate
+(`mm::gate::Mm`, `Process::aspace`): the CPU that has the process checked
+out holds it (`smp::lock`/`unlock`, `sched::schedule`'s switch), a fast
+fault holds it, and code looking at another process's takes it
+(`q.aspace.access()`; `Deref` debug-asserts it's held). Rules for
+anything new there: decide from the snapshot or the address space alone;
+write nothing the lock covers (the process, `PROCS`, the filesystem,
+timers, wait queues, the console, other CPUs' state: debug-asserted for
+the lock, `fs::lock` and `Procs::each`); never flush a TLB or change a
+present entry (x86's catch-up relies on flushes happening under the
+lock); spin for nothing before the gate but `lock_fast`, which gives way
+to the kernel lock's holder (`wanted`) and answers its `flush_tables`
+(`tlb_sync`): that holder waits for CPUs in fast entries, so any other
+spin there could hang it, and no leaf lock may be held across a flush;
+never wait for another CPU holding a gate but in `flush_tlb` and
+`flush_tables`; return through x86's `sanitize`; and if what it reports can change
+while the thread runs on (another CPU's setuid, a parent's end, TSYNC),
+the change calls `fast::changed`. Pending signals, preemption and stops
+reach a CPU there as interrupts, taken on the way back to user mode.
+Lock order: kernel lock, a `PROCESS` slot, `PROCS`, gates (the running
+process's, then at most one more), the filesystem, a `FileData`.
 TLB flushes are of the pages that changed (`flush_tlb(root, start,
 end)`, through `AddressSpace::flush`) and instruction-cache invalidation
 is broadcast. Arm64's TLBIs are broadcast too, per page (`vale1is`;
@@ -384,15 +478,24 @@ every process is ASID 0, so it reaches all of them) or everything past
 `FLUSH_PAGES`. x86_64 has no broadcast invalidation: `flush_tlb` IPIs
 the CPUs with that root in CR3 (`ROOTS`; any other has none of its
 entries, as loading CR3 dropped them) and waits for each, except one in
-the kernel: IF is clear there and it may be waiting for the lock, so it
-catches up when it gets it (the flushes asked of it, `WANTED`, against
-those it did: `tlb_sync`), before it touches user memory. Flush only when an entry
+the kernel: IF is clear there and it may be waiting for the lock or a
+gate, so it catches up when it gets it (the flushes asked of it,
+`WANTED`, against those it did: `tlb_sync`), before it touches user
+memory. A fast fault counts as in the kernel (`smp::fast_enter`) and
+catches up once it has the gate, which every flush of that address space
+holds; a fast system call doesn't, and takes the IPI on its way out. Flush only when an entry
 that was there changed (no TLB holds an empty slot), but do flush one
 made writable: a CPU still holding it read-only would fault on the
 kernel's own write there; free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
-(`publish_barrier`). User memory other threads use at the same time is
+(`publish_barrier`). munmap also frees page tables that map nothing now
+(`PageTable::prune`, with the gate, so no fast fault is walking them); a
+table goes only through `arch::flush_tables`, which arm64 needs because
+`flush_tlb` drops last-level entries only, and which on x86_64 also waits
+for CPUs in the kernel, which catch up as they spin for the lock or a
+gate (`tlb_sync`): a speculative walk from one that hadn't could reach a
+freed table. User memory other threads use at the same time is
 updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
@@ -436,7 +539,8 @@ own registers, as only its thread may on Hypervisor.framework; on KVM a
 kick is `immediate_exit` plus a signal, and a vCPU first finishes its last
 exit with a `KVM_RUN` that runs nothing, `kvm::Cpu::complete`), then,
 holding the console's lock so its threads can't touch guest memory, writes
-the vCPUs, GIC, console device and RAM to its fd 3 and exits, or answers
+the vCPUs, GIC, console device and RAM (its regions one after another,
+zero pages left as holes) to its fd 3 and exits, or answers
 `SNAPSHOT_RETRY` if input is on its way and lets them all go on. What a
 vCPU's and the GIC's state are is the hypervisor's (`snapshot_hvf.rs`; on
 KVM, `snapshot_kvm.rs`: every register `KVM_GET_REG_LIST` names and the
@@ -480,8 +584,11 @@ are only bits.
 Shared file mappings and locks: a MAP_SHARED mapping of a file in the
 sandbox maps the file's own frames (`Backing::SharedFile`; the file and
 each mapping hold a reference; a read of a page without a frame maps a
-read-only copy, taken out everywhere once the page gets one,
-`procs::zap_stale`), so it's never copy-on-write, and a file
+read-only copy, marked in `FileData::copied`, a page index of its own,
+and taken out everywhere once the page gets one, `procs::zap_stale`,
+which goes by spans and may take more than it must; `mprotect` keeps it
+read-only, so a write faults and gets the frame), so it's never
+copy-on-write, and a file
 that shrinks takes its pages out of every process's mappings
 (`file::zap_shared`): page tables are kernel memory, so another
 process's can be changed without its address space active. A live
@@ -500,7 +607,8 @@ action, continues it. `job_report` is for wait's WUNTRACED/WCONTINUED;
 
 Terminals (`tty.rs`, `syscall/tty.rs`): a `Tty` is a pseudo-terminal
 pair, its line discipline Linux's N_TTY (`receive` for what the master
-writes, `out` for OPOST). It doesn't touch processes: it returns the
+writes, `out` for OPOST). Its column wraps, as n_tty's: only its low bits
+are used (`erase_tab`), so what a program writes can't make an echo long. It doesn't touch processes: it returns the
 signals to send, and the caller sends them (`signal_group`). /dev/ptmx
 makes one (at most `MAX_PTYS`, each charged its buffers), /dev/pts/N is
 shown while the master is open (`Fs::pts_show`, the node kept for reuse),
@@ -524,12 +632,51 @@ call has to run to make it. A filter can only take away: what it
 refuses isn't a denial and isn't reported, but a kill is (a `Fault`).
 TRAP leaves the registers as they were and forces SIGSYS
 (`signal::force`: fatal if blocked or ignored) with `si_syscall`,
-`si_arch` and the data in `si_errno`. Programs are checked as Linux's
-`bpf_check_classic` and `seccomp_check_filter` check them (only
-forward jumps, so a run ends within its length). TSYNC writes the
+`si_arch` and the data in `si_errno`. Landlock (below) is the other
+way a program restricts itself.
+Programs are checked as Linux's `bpf_check_classic` and
+`seccomp_check_filter` check them (only forward jumps, so a run ends within its length). TSYNC writes the
 other threads' state directly: one running on another CPU is in user
 mode and sees it at its next call. User notification is unimplemented
 (reported).
+
+Landlock (`landlock.rs`): a program's rules on itself, to ABI 5
+(filesystem rights through TRUNCATE and IOCTL_DEV, TCP ports; not ABI
+6's scoping). As with seccomp, the policy comes first: every check
+stands after the handler's `require`, so what the policy refuses is
+denied and reported, and what Landlock refuses is EACCES (EXDEV for a
+move only REFER stops), never reported. A ruleset is a descriptor
+(`FileKind::Landlock`); `restrict_self` merges it into a new immutable
+`Domain` (`Thread::landlock`, an `Arc` shared by fork, clone and
+execve), each layer's rights and every rule by object, each saying what
+each layer grants. `landlock::domain` is the fast path: one test of
+`Process::landlocked` without one. A layer with any filesystem right
+handles REFER too, so moving between directories is EXDEV unless a rule
+grants it. Checks are Linux's: layer masks unmasked from the node up (`Domain::walk`, under the caller's
+`fs::lock()`: `check` takes it, `check_in` and the rest are given it,
+so never call `check` holding it), and `check_refer` is
+current_check_refer_path with the tree as one mount. A rule holds its
+node by `Ino`, pinned: a pinned node is never idle to `Fs::evict`, so a
+live mount's directories with rules (and those above) stay, and
+`copy_up` keeps the slot. A file's path decides what's above it
+(`Fs::found_in`), as a dentry's parent does: `Node::parent` is only the
+first name's. (On a live mount each name is a node of its own, so a rule
+on a file there holds for that name alone.) Links and renames go through
+`check_refer`, an exchange both ways, after what Linux checks first: a
+move across mounts is EXDEV (`Fs::crosses_mount`), and a change on a
+read-only mount EROFS (`landlock::domain_changing`). What matters after the open is decided at open
+(`OpenFile::landlock_denied`, TRUNCATE and IOCTL_DEV, inverted so a file
+made any other way has them). A new way to make, remove, open, execute
+or move a node, or to bind or connect a TCP socket, needs its check.
+`/proc/self/fd/N` isn't re-checked: it's the same open file here
+(`procfs::fd_path`), not a new open, unless that can't do what's asked
+(an O_PATH descriptor can do nothing: `file::reopened`), which opens
+the file again, checked as any open. A path going on through it
+(`/proc/self/fd/N/name`) is an ordinary walk from that directory
+(`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
+only, from `FdTable::walking`), checked as any other. execveat of a
+descriptor runs the file (`process::Start::File`), and is checked as one. `landlock::may_inspect` keeps a
+domain out of processes outside it, as Linux's ptrace hook.
 
 Linux AIO (`syscall/aio.rs`): a context is a ring in the program's
 memory, Linux's `struct aio_ring` at the context's id (libaio reads it;
@@ -643,44 +790,80 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
-10. **The kernel heap is small (32 MiB) and running out of it panics.**
+10. **The kernel heap is small (32 MiB, and 1/16 of the RAM the boot
+    image leaves: `mm::init`) and running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
-    fails with an errno first:
+    fails with an errno first. Nothing that grows with RAM goes on the
+    heap: frame reference counts are RAM set aside below the boot image
+    (`mm::init`), the free list is linked through the free frames, and
+    pages of files and shared memory are indexed in frames
+    (`mm::pageindex`; a file's index nodes count as its data). Nor does
+    anything that grows with page table entries, which outnumber frames
+    by as many mappings as a program makes of one file: what goes through
+    them waits for its flush in a fixed batch (`aspace::Gather`, and
+    `GATHER_TABLES` for page tables), and `mremap` moves them in place.
+    Nor anything per page of a file that the file doesn't hold a frame
+    for: holes cost a program nothing (`FileData::copied`, in frames, and
+    `STALE`, a fixed list of spans).
     - File data counts pages (`fs::set_limit`), and nodes, names and
-      extended attributes count against `META_LIMIT` (ENOSPC).
+      extended attributes count against `META_LIMIT` (ENOSPC), 12 MiB
+      and a quarter of what RAM adds to the heap.
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files, network receive windows, DNS answers, inotify events) take a
-      `kmem::Charge`.
+      `kmem::Charge`. A buffer of tens of KiB is allocated fallibly
+      (`try_reserve`): a budget with room says nothing of holes.
     - A live mount's nodes count against `META_LIMIT` like the program's
       own; when it's full, `Fs::evict` forgets idle ones (the host still
       has them) before anything fails.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
-      all processes), queued real-time signals, inotify watches, POSIX
-      timers, threads (all processes), descriptors (RLIMIT_NOFILE, at
+      all processes, each charged `VMA_COST` to `kmem`), queued real-time
+      signals, inotify watches, POSIX timers (`timer::MAX_POSIX_TIMERS`
+      for scans of a process's, `MAX_TIMERS_TOTAL` in all, each charged
+      to `kmem`; EAGAIN), threads (all processes,
+      `process::threads_max`, and each charged `THREAD_COST` to `kmem`,
+      a pending signal of each kind included), descriptors (RLIMIT_NOFILE, at
       most `fd::MAX_FDS`; a table's slots take a `kmem::Charge`, so
-      fork's copies are budgeted too), open files
-      (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
-      zombies included), network connections (`inet::MAX_CONNS`),
-      connections waiting to be accepted (`inet::MAX_PENDING`),
+      fork's copies are budgeted too), open files (`fd::max_open_files`, in all processes, what
+      `kmem` pays for at `OPEN_FILE_COST` each; the first 4096 work
+      whether it can or not), processes (`MAX_PROCESSES`, zombies
+      included), network connections (`inet::MAX_CONNS`, each charged
+      its window), connections waiting to be accepted
+      (`inet::MAX_PENDING`, each charged `PENDING_COST`; listen's
+      backlog bounds nothing, as a full one has clients wait on Linux),
       pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers),
       file locks (`locks::MAX_LOCKS`), descriptors in flight over
       AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
       `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
-      `kmem`; ENOMEM). AIO contexts count the events they ask for
-      against `aio::AIO_MAX_NR` (EAGAIN, Linux's aio-max-nr), and each
-      context and waiting poll is charged to `kmem`. argv and environment copies take a
-      `kmem::Charge`.
+      `kmem`; ENOMEM), Landlock rules (`landlock::MAX_RULES` in all
+      rulesets and domains, each charged to `kmem`, and `MAX_KEPT` nodes
+      kept, each charged once however many tables hold the rule, as it
+      may be a thread's that's gone; ENOMEM) and layers (`landlock::MAX_LAYERS` per thread;
+      E2BIG). Epoll registrations are charged to `kmem`
+      (`fd::Epoll::add`; ENOSPC, Linux's max_user_watches), as one file
+      can be under every descriptor in every instance, and so are the
+      destinations a UDP socket has asked the host about. AIO contexts
+      count the events they ask for against `aio::AIO_MAX_NR` (EAGAIN,
+      Linux's aio-max-nr), and each context and waiting poll is charged
+      to `kmem`. argv and environment copies take a `kmem::Charge`, each
+      string for what its `String` holds, not only its bytes, and the
+      program's name with them. Reports to the host are kept (`REPORTED`)
+      as `MAX_REPORTS` of `MAX_REPORT_BYTES`.
 
     Limits must be global, not per object: a program can open many objects,
-    and fork copies whatever is per process.
+    and fork copies whatever is per process. A list made for a call stops
+    at what the call can return (`listxattr`).
 11. **`fs::lock()` is not re-entrant**; it panics if this CPU already
     holds it (another CPU's hold is waited for), and `fs::try_lock` fails
     if anyone does. Drop the guard before calling anything that takes it
     (`Process::missing_path`, `procfs::generate`, …). Lock order:
     `OpenFile` → filesystem → `FileData`. Never hold a `FileData` lock
     across `copy_in`/`copy_out`, because a fault may read the same file
-    through a mapping (file.rs uses bounce buffers).
+    through a mapping (file.rs uses bounce buffers). Every other lock is a
+    spinlock that waits for itself, for ever, with no error: two
+    descriptors may be one file (compare with `Arc::ptr_eq` first), and
+    two files are held at once only through `fd::lock_pair`. A guard made
+    in a tuple or an argument lives to the end of the statement.
 12. **User register state never reaches EL1.** `rt_sigreturn` loads every
     register from user memory. It must reject a frame whose pstate names
     another exception level, AArch32 or masked interrupts, and keep only
@@ -692,7 +875,27 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     wait, `finalize`) must not touch its user memory, unless it activates
     that address space first and switches back (fork's `CLONE_CHILD_SETTID`).
     A process that ended keeps its address space until another process is
-    switched in: never free the active one.
+    switched in: never free the active one. `/proc/<pid>/mem`
+    (`FileKind::ProcMem`) is the caller's own memory only: another's
+    can't be opened, one inherited across fork reads EIO, and after
+    execve one reads and writes nothing (`AddressSpace::id`, as Linux's
+    holds the mm it was opened on).
+14. **What's checked is what's used.** User memory can change between two
+    reads (another thread, another CPU), so a value a check looks at is
+    copied in once and everything after uses that copy: a socket address
+    (`net::read_addr_bytes`, then `landlock::check_socket` and the
+    connect), a path string, a signal frame, a seccomp program. Never call
+    `read_cstr` twice for one pointer in one call, and hand a helper the
+    bytes rather than the pointer. (`file::read_only_target` reads a path
+    the handler reads again: only to choose between two refusals.)
+15. **A descriptor's rights are `OpenFile`'s to say.** `FdTable::get` is
+    Linux's fdget: EBADF for an O_PATH descriptor. `get_raw` (fdget_raw)
+    is only for what uses a descriptor as a name: dirfds, fstat, fstatfs,
+    fchdir, dup, close, the fcntls `check_fcntl_cmd` allows, SCM_RIGHTS,
+    pidfd_getfd, execveat, a Landlock rule's parent. May it read or write?
+    `OpenFile::readable` and `writable` (FMODE_READ and FMODE_WRITE) say,
+    and nothing else looks at `O_ACCMODE`: mode 3 is neither, and asks
+    Landlock for no rights at open.
 
 ## Adding a syscall
 

@@ -11,6 +11,18 @@
 //   smp cow      threads write while main forks again and again: each
 //                child sees a consistent snapshot, the parent's reader
 //                never sees a page as it was (prints "cow ok")
+//   smp discard  one thread keeps writing a page while another gives the
+//                pages up (MADV_DONTNEED) again and again, then that page
+//                is where both see it: no CPU keeps a mapping of a page
+//                that went (prints "discard ok")
+//   smp unmap    threads fault pages of a range in while another unmaps
+//                and maps it again, its page tables going each time:
+//                a thread only ever reads back what it wrote, or a new
+//                zero page, or faults (prints "unmap ok")
+//   smp fast     what the kernel answers without its lock (getppid,
+//                getpid) follows changes made on other CPUs while a
+//                thread asks again and again: its parent's end, a
+//                sibling's seccomp TSYNC (prints "fast ok")
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -19,7 +31,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <linux/filter.h>
 #include <linux/membarrier.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -169,6 +188,232 @@ static int cow(long cpus) {
     return 0;
 }
 
+// smp discard. The page that ends a batch of the kernel's frees (each
+// resident page in turn: the 256th, and it's the last here) is the one
+// written: it must be gone from every TLB with the rest. The word written
+// isn't the first, which a free frame's may be the kernel's.
+#define DISCARD_PAGES 256
+static _Atomic unsigned long discard_want, discard_got;
+static _Atomic int discard_done;
+
+static void *discard_writer(void *arg) {
+    volatile unsigned long *w = (volatile unsigned long *)arg + 1;
+    unsigned long round = 0;
+    while (!atomic_load(&discard_done)) {
+        // Keep it in this CPU's TLB, whatever the other thread is doing.
+        while (atomic_load(&discard_want) == round && !atomic_load(&discard_done)) *w = round;
+        round = atomic_load(&discard_want);
+        *w = round;
+        atomic_store(&discard_got, round);
+    }
+    return 0;
+}
+
+static int discard(void) {
+    char *p = mmap(0, DISCARD_PAGES * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    char *last = p + (DISCARD_PAGES - 1) * 4096;
+    pthread_t t;
+    CHECK(pthread_create(&t, 0, discard_writer, last) == 0);
+    unsigned long round = 0;
+    for (double t0 = now(); now() - t0 < 2.0;) {
+        for (int i = 0; i < DISCARD_PAGES; i++) p[i * 4096] = 1;
+        CHECK(madvise(p, DISCARD_PAGES * 4096, MADV_DONTNEED) == 0);
+        atomic_store(&discard_want, ++round);
+        while (atomic_load(&discard_got) != round) {
+        }
+        // What the other thread just wrote, if it wrote it here.
+        unsigned long seen = ((volatile unsigned long *)last)[1];
+        if (seen != round) {
+            printf("FAILED: round %lu: the page holds %lu\n", round, seen);
+            return 1;
+        }
+    }
+    atomic_store(&discard_done, 1);
+    pthread_join(t, 0);
+    CHECK(round > 0);
+    fprintf(stderr, "discard: %lu rounds\n", round);
+    printf("discard ok\n");
+    return 0;
+}
+
+// smp unmap. Alone in its 512 GiB, so unmapping it empties tables at every
+// level: 2 MiB of pages, shared out among the threads by page.
+#define UNMAP_BASE 0x500000000000ul
+#define UNMAP_SIZE (2ul << 20)
+#define UNMAP_PAGES (UNMAP_SIZE / 4096)
+
+static _Atomic int unmap_done;
+static _Atomic long unmap_writes, unmap_faults;
+static long unmap_threads;
+static _Thread_local sigjmp_buf unmap_escape;
+
+static void unmap_segv(int sig) {
+    (void)sig;
+    siglongjmp(unmap_escape, 1);
+}
+
+static void *unmap_toucher(void *arg) {
+    long me = (long)arg;
+    // Volatile: they outlive a siglongjmp.
+    volatile long writes = 0, faults = 0;
+    volatile unsigned long seq = 0;
+    if (sigsetjmp(unmap_escape, 1)) faults++;
+    while (!atomic_load(&unmap_done)) {
+        for (unsigned long p = me; p < UNMAP_PAGES; p += unmap_threads) {
+            volatile unsigned long *w = (volatile unsigned long *)(UNMAP_BASE + p * 4096);
+            unsigned long want = (unsigned long)(me + 1) << 48 | ++seq;
+            *w = want;
+            unsigned long got = *w;
+            // Unmapped and mapped again in between: a new page. Anything
+            // else is someone else's page, or a page that had gone.
+            if (got != want && got != 0) {
+                printf("FAILED: page %lu holds %#lx, not %#lx\n", p, got, want);
+                exit(1);
+            }
+            writes++;
+        }
+    }
+    atomic_fetch_add(&unmap_writes, writes);
+    atomic_fetch_add(&unmap_faults, faults);
+    return 0;
+}
+
+static int unmap_race(long cpus) {
+    struct sigaction sa = {.sa_handler = unmap_segv};
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGSEGV, &sa, 0) == 0);
+    pthread_t t[8];
+    unmap_threads = cpus > 1 ? (cpus - 1 < 8 ? cpus - 1 : 8) : 1;
+    int prot = PROT_READ | PROT_WRITE, flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+    CHECK(mmap((void *)UNMAP_BASE, UNMAP_SIZE, prot, flags, -1, 0) == (void *)UNMAP_BASE);
+    for (long i = 0; i < unmap_threads; i++) CHECK(pthread_create(&t[i], 0, unmap_toucher, (void *)i) == 0);
+    long rounds = 0;
+    for (double t0 = now(); now() - t0 < 1.0; rounds++) {
+        CHECK(munmap((void *)UNMAP_BASE, UNMAP_SIZE) == 0);
+        // Some rounds leave it unmapped a moment, for faults to find.
+        for (volatile int i = 0; i < (rounds % 3) * 2000; i++) {
+        }
+        CHECK(mmap((void *)UNMAP_BASE, UNMAP_SIZE, prot, flags, -1, 0) == (void *)UNMAP_BASE);
+    }
+    atomic_store(&unmap_done, 1);
+    for (long i = 0; i < unmap_threads; i++) pthread_join(t[i], 0);
+    CHECK(rounds > 0 && atomic_load(&unmap_writes) > 0);
+    fprintf(stderr, "unmap: %ld rounds, %ld writes, %ld faults\n", rounds, atomic_load(&unmap_writes),
+            atomic_load(&unmap_faults));
+    printf("unmap ok\n");
+    return 0;
+}
+
+// smp fast. Each check spins on a call while the change is made
+// elsewhere, then sees the change; spinning on the stale answer for 10 s
+// fails.
+static _Atomic int changed;
+
+// Raw calls, nothing of libc's in between.
+static long call0(long nr) {
+    return syscall(nr);
+}
+
+// The call a thread asks again and again until told its filter is in
+// (either answer meanwhile: the filter may come first), then only EPERM.
+static long asked_nr;
+
+static void *asks(void *arg) {
+    (void)arg;
+    // Before the filter (installed after a sleep): the answer as it was.
+    long was = call0(asked_nr);
+    while (!atomic_load(&changed)) {
+        errno = 0;
+        long r = call0(asked_nr);
+        CHECK(r == was || (r == -1 && errno == EPERM));
+    }
+    errno = 0;
+    CHECK(call0(asked_nr) == -1 && errno == EPERM);
+    return 0;
+}
+
+static void *yields(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100000; i++) CHECK(sched_yield() == 0);
+    return 0;
+}
+
+static int fast(long cpus) {
+    // getppid: a grandchild asks until its parent has ended.
+    pid_t mid = fork();
+    CHECK(mid >= 0);
+    if (mid == 0) {
+        int ready[2];
+        CHECK(pipe(ready) == 0);
+        pid_t c = fork();
+        CHECK(c >= 0);
+        if (c == 0) {
+            pid_t parent = call0(SYS_getppid);
+            CHECK(write(ready[1], "x", 1) == 1);
+            double t0 = now();
+            while (call0(SYS_getppid) == parent) {
+                if (now() - t0 > 10) _exit(2);
+            }
+            _exit(call0(SYS_getppid) == 1 ? 0 : 3);
+        }
+        char x;
+        CHECK(read(ready[0], &x, 1) == 1);
+        // Busy for a while (as below), so the child asks from a CPU of its
+        // own when this one ends.
+        for (double t0 = now(); now() - t0 < 0.01;) {
+        }
+        _exit(0);
+    }
+    for (int i = 0; i < 2; i++) {
+        int status;
+        pid_t pid = waitpid(-1, &status, 0);
+        CHECK(pid > 0 && WIFEXITED(status));
+        if (WEXITSTATUS(status) != 0) {
+            printf("FAILED: getppid (exit %d)\n", WEXITSTATUS(status));
+            return 1;
+        }
+    }
+    // sched_yield, with and without others to run.
+    pthread_t t[8];
+    int n = cpus + 1 < 8 ? cpus + 1 : 8;
+    for (int i = 0; i < n; i++) CHECK(pthread_create(&t[i], 0, yields, 0) == 0);
+    for (int i = 0; i < n; i++) pthread_join(t[i], 0);
+    // Each of those calls in turn, while a sibling installs a filter that
+    // refuses it on every thread: in a child of its own each time, which
+    // starts with no filter (one would keep every call off the fast path).
+    long calls[] = {SYS_getpid, SYS_getppid, SYS_gettid, SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid};
+    for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+            asked_nr = calls[i];
+            CHECK(pthread_create(&t[0], 0, asks, 0) == 0);
+            // Busy, not asleep: a timer waking this thread could preempt
+            // the asking one, whose next run would start from a fresh
+            // snapshot.
+            for (double t0 = now(); now() - t0 < 0.01;) {
+            }
+            struct sock_filter filter[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, calls[i], 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog prog = {sizeof filter / sizeof filter[0], filter};
+            CHECK(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0);
+            atomic_store(&changed, 1);
+            pthread_join(t[0], 0);
+            _exit(0);
+        }
+        int status;
+        CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    printf("fast ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "exec-done") == 0) {
         printf("exec ok\n");
@@ -187,6 +432,9 @@ int main(int argc, char **argv) {
         exit(3);
     }
     if (argc > 1 && strcmp(argv[1], "cow") == 0) return cow(cpus);
+    if (argc > 1 && strcmp(argv[1], "discard") == 0) return discard();
+    if (argc > 1 && strcmp(argv[1], "fast") == 0) return fast(cpus);
+    if (argc > 1 && strcmp(argv[1], "unmap") == 0) return unmap_race(cpus);
     if (argc > 1 && strcmp(argv[1], "fork") == 0) {
         // The child is another process: the spinning thread's CPU has to
         // give way for it to run at all.

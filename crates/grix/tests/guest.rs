@@ -56,10 +56,78 @@ fn args_env_output_and_exit_status() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// A VMM that fails before it connects its serial port: the run says
+/// what it said, rather than "waiting for the VMM: No child processes"
+/// (seen to have exited, it had been reaped already).
+#[test]
+fn a_vmm_that_fails_to_start_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("failing-vmm");
+    let vmm = dir.join("vmm");
+    std::fs::write(&vmm, "#!/bin/sh\necho 'no machine for you' >&2\nexit 3\n").unwrap();
+    std::fs::set_permissions(&vmm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = with("hello").vmm(&vmm).build().unwrap().run(&["/bin/hello"]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    match out.status {
+        ExitStatus::VmFailed(why) => assert!(why.contains("Some(3)") && why.contains("no machine for you"), "{why}"),
+        s => panic!("{s:?}"),
+    }
+}
+
 #[test]
 fn environment_is_empty_unless_given() {
     let out = run(with("hello"), &["/bin/hello"]);
     assert!(out.stdout_str().contains("GREETING=(unset)"));
+}
+
+#[test]
+fn a_default_environment_on_request() {
+    // HOME, PATH, LANG and TMPDIR, unless they're given; nothing else.
+    let busybox = || Sandbox::builder().import(fixture("alpine/bin/busybox.static"), "/bin/busybox").unwrap();
+    let out = run(busybox().default_env().env("LANG", "en_US.UTF-8"), &["/bin/busybox", "env"]);
+    let stdout = out.stdout_str();
+    let mut env: Vec<&str> = stdout.lines().collect();
+    env.sort();
+    assert_eq!(
+        env,
+        [
+            "HOME=/home/grix",
+            "LANG=en_US.UTF-8",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TMPDIR=/tmp"
+        ]
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // An imported /etc/passwd's home.
+    let passwd = "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000::/srv/app:/bin/sh\n";
+    let b = busybox().file("/etc/passwd", passwd, 0o644).unwrap().default_env();
+    let out = run(b, &["/bin/busybox", "sh", "-c", "echo $HOME $TMPDIR"]);
+    assert_eq!(out.stdout_str(), "/srv/app /tmp\n");
+}
+
+#[test]
+fn a_host_name_of_its_own() {
+    // uname, /etc/hostname, /etc/hosts and /proc/sys/kernel/hostname all
+    // say the name given; grix by default.
+    let script = "/bin/busybox hostname; /bin/busybox uname -n; /bin/busybox cat /etc/hostname \
+                  /proc/sys/kernel/hostname; /bin/busybox grep -c \"10.0.2.15\t$(/bin/busybox hostname)$\" /etc/hosts";
+    let busybox = || {
+        Sandbox::builder()
+            .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+            .unwrap()
+            .allow(Capability::Process)
+    };
+    let out = run(busybox().hostname("build-7.example").unwrap(), &["/bin/busybox", "sh", "-c", script]);
+    assert_eq!(out.stdout_str(), "build-7.example\n".repeat(4) + "1\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let out = run(busybox(), &["/bin/busybox", "sh", "-c", script]);
+    assert_eq!(out.stdout_str(), "grix\n".repeat(4) + "1\n");
+    for bad in ["", "-x", ".x", "a b", "a/b", "a\nb", &"x".repeat(65)] {
+        assert!(busybox().hostname(bad).is_err(), "{bad:?}");
+    }
+    assert!(busybox().hostname(&"x".repeat(64)).is_ok());
 }
 
 #[test]
@@ -301,10 +369,20 @@ fn network_interfaces_without_net() {
 
 #[test]
 fn network_interfaces_with_net() {
-    // eth0 (10.0.2.15/24) and the default route through the host: no
-    // device, a description of what the host's proxy does.
+    // eth0 (10.0.2.15/24, fd00::15/64) and the default routes through the
+    // host: no device, a description of what the host's proxy does. IPv6
+    // is there for listeners on [::]. ethtool sees a veth; a udev
+    // monitor's socket hears nothing.
     let out = run(with("netif").allow(Capability::Net), &["/bin/netif", "eth0"]);
     assert_eq!(out.stdout_str(), "netif eth0 ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // IPv4 still comes first for a name with both (RFC 6724: the ULA's
+    // label doesn't match a global address's).
+    let hosts = "2001:db8::7\tdual.example\n192.0.2.7\tdual.example\n";
+    let out =
+        run(with("netif").allow(Capability::Net).file("/etc/hosts", hosts, 0o644).unwrap(), &["/bin/netif", "dual"]);
+    assert_eq!(out.stdout_str(), "netif dual ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
@@ -472,6 +550,76 @@ fn filesystem_size_limit() {
     assert!(data.peak >= mib << 20 && data.peak <= data.limit, "{data:?}");
 }
 
+/// The tests of guests bigger than 3 GiB touch gigabytes each: one at a
+/// time, so they fit on a CI runner's 16 GB.
+static BIG_GUEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn big_guest() -> std::sync::MutexGuard<'static, ()> {
+    BIG_GUEST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn guests_bigger_than_3_gib() {
+    let _one = big_guest();
+    // RAM past 4 GiB of guest physical memory (arm64's from 1 GiB runs on
+    // past it; x86_64's past 3 GiB is from 4 GiB): 5 GiB touched in a
+    // 6 GiB guest, and checked. The frames above 4 GiB go first.
+    let b = with("bigmem").memory_mb(6144).timeout(Duration::from_secs(300));
+    let out = run(b.clone(), &["/bin/bigmem", "mem", "5120"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.stdout_str(), "mem 5120 MiB, 0 bad pages\n");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let memory = out.guest_stats.expect("the kernel's report").usage(Resource::Memory);
+    assert!(memory.peak >= 5 << 30 && memory.limit > 5 << 30, "{memory:?}");
+    // Shared memory's pages are indexed in frames, not the kernel's heap.
+    let out = run(b.allow(Capability::Process), &["/bin/bigmem", "shared", "1024"]);
+    assert_eq!(out.stdout_str(), "shared 1024 MiB, 0 bad pages\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // More than there is room for, said clearly.
+    let err = with("bigmem").memory_mb((64 << 10) + 1).build().err().unwrap().to_string();
+    assert!(err.contains("exceeds the 65536 MiB limit"), "{err}");
+}
+
+#[test]
+fn files_past_what_3_gib_held() {
+    let _one = big_guest();
+    // Half of a 5 GiB guest for files: a 2 GiB one (more than the old
+    // 3 GiB's half), read back, a sparse one, and then as much as fits.
+    let b = with("bigmem").memory_mb(5120).allow(Capability::FsWrite).timeout(Duration::from_secs(300));
+    let out = run(b, &["/bin/bigmem", "file", "2048", "/tmp/big"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    let stdout = out.stdout_str();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[..2], ["file 2048 MiB, 0 bad pages", "sparse ok"], "{stdout}");
+    let more: u64 = lines[2].strip_prefix("filled ").unwrap().strip_suffix(" MiB more").unwrap().parse().unwrap();
+    assert!((2300..=2560).contains(&(2048 + more)), "{stdout}");
+    let stats = out.guest_stats.expect("the kernel's report");
+    assert!(stats.hits(Limit::FileData) > 0, "{stats:?}");
+    let data = stats.usage(Resource::FileData);
+    assert!(data.peak <= data.limit && data.limit <= 2560 << 20, "{data:?}");
+}
+
+#[test]
+fn snapshots_of_guests_bigger_than_3_gib() {
+    let _one = big_guest();
+    // 1 GiB filled in a 4.5 GiB guest, so above 4 GiB, before the
+    // snapshot: each run from it finds it as it was.
+    let b = with("bigmem").cpus(1).memory_mb(4608).timeout(Duration::from_secs(120));
+    if b.vmm_path().is_none() {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let dir = temp_dir("snapshot-big");
+    let snap = b.build().unwrap().snapshot(&["/bin/bigmem", "wait", "1024"], dir.join("big.snap")).unwrap();
+    assert_eq!(snap.memory_mb(), 4608);
+    for word in ["one", "two"] {
+        let out = snap.run(format!("{word}\n")).unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+        assert_eq!(out.stdout_str(), format!("{word}\n0 bad pages\n"));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn filesystem_metadata_limit() {
     // Names and nodes are bounded too: ENOSPC instead of exhausting kernel memory.
@@ -598,13 +746,14 @@ fn images_built_from_oci_images() {
     let dir = temp_dir("image");
     std::fs::write(dir.join("hello.sh"), "echo \"$GREETING from $(cat /etc/alpine-release) in $PWD\"\n").unwrap();
     std::fs::copy(fixture("procperm"), dir.join("procperm")).unwrap();
+    std::fs::copy(fixture("hardening2"), dir.join("hardening2")).unwrap();
     let grixfile = format!(
         r#"
 from = "oci:{}"
 command = ["/bin/sh", "/app/hello.sh"]
 cwd = "/app"
 capabilities = ["process"]
-run = ["echo built > /app/stamp", "rm /etc/motd"]
+run = ["echo built > /app/stamp", "rm /etc/motd", "echo $HOME > /app/home", "cp /bin/hardening2 /app/mine", "chmod 700 /app/mine"]
 
 [env]
 GREETING = "hi"
@@ -616,6 +765,10 @@ guest = "/app/hello.sh"
 [[copy]]
 host = "procperm"
 guest = "/bin/procperm"
+
+[[copy]]
+host = "hardening2"
+guest = "/bin/hardening2"
 
 [[file]]
 guest = "/app/note"
@@ -676,8 +829,28 @@ content = "a note"
     assert_eq!(out.stdout_str(), "procperm ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+    // Root can be anyone: another uid's terminal isn't everyone's,
+    // O_ASYNC's signals are as F_SETOWN's caller's ids allow, and execute
+    // permission is whoever's it is.
+    for name in ["ptsperm", "sigioperm", "execperm"] {
+        let out = sb.run(&["/bin/hardening2", name]).unwrap();
+        assert_eq!(out.stdout_str(), format!("{name} ok\n"), "{}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     let out = sb.run(&["uname", "-m"]).unwrap();
     assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
+    // Docker's HOME (root's, from the image's /etc/passwd, for build
+    // steps too) and HOSTNAME; a variable set for the run replaces the
+    // image's, never beside it (a program's getenv takes the first).
+    let out = sb.run(&["cat", "/app/home"]).unwrap();
+    assert_eq!(out.stdout_str(), "/root\n");
+    let sb2 = Sandbox::builder().image(&image).unwrap().env("GREETING", "bye").build().unwrap();
+    let out = sb2.run(&["env"]).unwrap();
+    let env = out.stdout_str();
+    assert!(env.contains("HOME=/root\n") && env.contains("HOSTNAME=grix\n"), "{env}");
+    assert_eq!(env.matches("GREETING=").count(), 1, "{env}");
+    assert!(env.contains("GREETING=bye\n"), "{env}");
     assert_eq!(image.arch().unwrap(), grix::Arch::from_env());
 
     // An image is one architecture's: a build for another refuses this
@@ -750,6 +923,30 @@ fn images_for_the_other_architecture_run_anywhere() {
     let (code, _, err) = grix(&[&run[..3], &["--arch", host.name(), "--", "/bin/true"]].concat());
     assert_ne!(code, Some(0));
     assert!(err.contains(&format!("the image is for {other}")) && err.contains("--arch"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn build_steps_that_run_out_of_room_say_so() {
+    // Files live in guest memory: a step that fills it fails with ENOSPC
+    // (or SIGBUS, through a mapping: `apk add chromium`), and the error
+    // says what to change.
+    let dir = temp_dir("full-step");
+    let g = grix::build::Grixfile {
+        from: Some(format!("oci:{}", fixture("oci/alpine").display())),
+        from_outside_context: true,
+        run: vec![grix::build::Step::Shell("head -c 3000000000 /dev/zero > /big".into())],
+        ..Default::default()
+    };
+    let opts = grix::build::BuildOptions {
+        arch: None,
+        kernel: None,
+        on_output: &mut |_, _| {},
+        policy: Default::default(),
+        control: None,
+    };
+    let err = format!("{:#}", g.build(&dir, opts).err().unwrap());
+    assert!(err.contains("ran out of room") && err.contains("`memory_mb`"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1086,6 +1283,47 @@ fn waiting_for_a_host_signal_is_not_a_deadlock() {
 
 // ---------------------------------------------------------------- real-world binaries (Alpine)
 
+#[test]
+fn exports_with_links_inside_only() {
+    // The program's links are its own business, unless asked: with
+    // `Links::Inside` an export with a link out of it (absolute, `..`
+    // past its top, or out through another of its links) isn't written.
+    let script = |links: &str| {
+        let b = "/bin/busybox";
+        format!(
+            "{b} mkdir -p /out/d && echo hi > /out/d/f && cd /out && {b} ln -s d/f inside && {b} ln -s d up && {b} {links}"
+        )
+    };
+    let sb = |links: &str| {
+        let b = Sandbox::builder()
+            .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+            .unwrap()
+            .allow(Capability::FsWrite)
+            .allow(Capability::Process)
+            .export("/out")
+            .unwrap();
+        run(b, &["/bin/busybox", "sh", "-c", &script(links)])
+    };
+    let dest = temp_dir("export-links");
+    let ok = sb("ln -s up/../d/f again");
+    assert_eq!(ok.status, ExitStatus::Exited(0), "{}", ok.stderr_str());
+    assert!(ok.events.is_empty(), "{:?}", ok.events);
+    ok.export("/out").unwrap().write_to_with(dest.join("ok"), grix::Links::Inside).unwrap();
+    assert_eq!(std::fs::read(dest.join("ok/again")).unwrap(), b"hi\n");
+    for bad in ["ln -s /etc/passwd p", "ln -s ../../x d/x", "ln -s up/../.. out"] {
+        let out = sb(bad);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
+        let ex = out.export("/out").unwrap();
+        let err = ex.write_to_with(dest.join("bad"), grix::Links::Inside).unwrap_err();
+        assert!(format!("{err:#}").contains("outside it"), "{err:#}");
+        assert!(!dest.join("bad").exists());
+        // As they are, they're written (never followed).
+        ex.write_to(dest.join("bad")).unwrap();
+        std::fs::remove_dir_all(dest.join("bad")).unwrap();
+    }
+    std::fs::remove_dir_all(&dest).unwrap();
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("grix-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -1126,7 +1364,7 @@ fn live_mount_works_on_the_host_directory() {
         $b chmod 600 a.txt
         $b ln -s {outside} out
         echo through > out/secret 2>/dev/null; echo \"write through link: $?\"
-        $b ln a.txt hard 2>&1 | $b grep -o 'Operation not permitted'
+        $b ln a.txt hard && $b rm hard; echo \"hard link: $?\"
         $b mv /work /elsewhere 2>&1 | $b grep -o 'Resource busy'
         $b dd if=/dev/zero of=big bs=1k count=3000 2>/dev/null
         $b sha256sum big | $b cut -c1-16
@@ -1159,7 +1397,7 @@ fn live_mount_works_on_the_host_directory() {
     assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
     assert_eq!(
         out.stdout_str(),
-        "hello\nwrite through link: 1\nOperation not permitted\nResource busy\n\
+        "hello\nwrite through link: 1\nhard link: 0\nResource busy\n\
          76ed5c9c326ba623\nkept\nPermission denied\nOperation not permitted\nhi from the host\n"
     );
     assert!(
@@ -1195,6 +1433,73 @@ fn live_mount_works_on_the_host_directory() {
     std::fs::set_permissions(host.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&host).unwrap();
     std::fs::remove_dir_all(&outside).unwrap();
+}
+
+#[test]
+fn read_only_mounts_without_fs_write() {
+    // A read-only mount is EROFS for every change, as Linux's read-only
+    // filesystems are, with fs_write or without: no "needs fs_write"
+    // denial, which granting it wouldn't answer. Elsewhere it's still one.
+    let host = temp_dir("ro-mount");
+    std::fs::write(host.join("a.txt"), "a\n").unwrap();
+    std::fs::create_dir(host.join("sub")).unwrap();
+    let b = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount_read_only(&host, "/work")
+        .unwrap()
+        .allow(Capability::Process);
+    let changes = [
+        "rm /work/a.txt",
+        "rmdir /work/sub",
+        "mkdir /work/new",
+        "touch /work/new",
+        "touch /work/a.txt",
+        "mv /work/a.txt /work/b.txt",
+        "chmod 600 /work/a.txt",
+        "chown 0 /work/a.txt",
+        "ln -s x /work/link",
+        "ln /work/a.txt /work/hard",
+        "truncate -s 0 /work/a.txt",
+    ];
+    let script: String =
+        changes.iter().map(|c| format!("/bin/busybox {c} 2>&1 | /bin/busybox grep -c 'Read-only' ; ")).collect();
+    let out =
+        run(b, &["/bin/busybox", "sh", "-c", &format!("{script} echo > /work/x.txt; /bin/busybox mkdir /elsewhere")]);
+    assert_eq!(out.stdout_str(), "1\n".repeat(changes.len()), "{}", out.stderr_str());
+    assert!(out.stderr_str().contains("/work/x.txt: Read-only file system"), "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied { syscall: "mkdirat".into(), capability: "fs_write".into(), detail: "/elsewhere".into() }]
+    );
+    assert_eq!(std::fs::read_to_string(host.join("a.txt")).unwrap(), "a\n");
+    let names: Vec<_> = std::fs::read_dir(&host).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    std::fs::remove_dir_all(&host).unwrap();
+}
+
+#[test]
+fn links_and_exchanges_in_a_live_mount() {
+    // Hard links and RENAME_EXCHANGE are made on the host, within the
+    // mount only (EXDEV otherwise), and never through a link.
+    use std::os::unix::fs::MetadataExt;
+    let host = temp_dir("mount-links");
+    std::fs::create_dir(host.join("sub")).unwrap();
+    std::fs::write(host.join("sub/inside"), "in\n").unwrap();
+    let b = with("newcalls").mount(&host, "/work").unwrap();
+    let out = run(b, &["/bin/newcalls", "links"]);
+    assert_eq!(out.stdout_str(), "links ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let (a, hard) = (std::fs::metadata(host.join("a")).unwrap(), std::fs::metadata(host.join("hard")).unwrap());
+    assert_eq!((a.ino(), a.nlink()), (hard.ino(), 2));
+    assert_eq!(std::fs::read_to_string(host.join("a")).unwrap(), "two\n");
+    assert_eq!(std::fs::read_link(host.join("sym2")).unwrap(), PathBuf::from("a"));
+    assert_eq!(std::fs::read_to_string(host.join("x")).unwrap(), "y\n");
+    assert_eq!(std::fs::read_to_string(host.join("sub/inside")).unwrap(), "in\n");
+    assert!(!host.join("local").exists());
+    std::fs::remove_dir_all(&host).unwrap();
 }
 
 #[test]
@@ -1479,6 +1784,49 @@ fn pthreads() {
 }
 
 #[test]
+fn threads_until_eagain() {
+    // More than the 1024 grix used to allow, up to threads-max (sized from
+    // the heap's share of RAM), then EAGAIN; sooner with kernel memory
+    // taken by pipe buffers. Never a kernel panic.
+    let out = run(with("threadmax").allow(Capability::Threads), &["/bin/threadmax"]);
+    assert_eq!(out.stdout_str(), "threadmax ok\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn per_thread_proc_files() {
+    // /proc/<pid>/task/<tid>: each thread's name (PR_SET_NAME,
+    // pthread_setname_np, its comm file), state and CPU time.
+    let out = run(with("taskproc").allow(Capability::Threads).allow(Capability::Process), &["/bin/taskproc"]);
+    assert_eq!(out.stdout_str(), "taskproc ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn splice_tee_vmsplice() {
+    // Between pipes, files, AF_UNIX and loopback TCP sockets, and stdout,
+    // with Linux's errnos.
+    let b = with("splice").allow(Capability::FsWrite).allow(Capability::Net);
+    let out = run(b, &["/bin/splice"]);
+    assert_eq!(out.stdout_str(), "spliced to stdout\nsplice ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn proc_self_mem() {
+    // /proc/self/mem at the process's own addresses (the vDSO's ELF
+    // header, as cilium/ebpf's kernel version probe reads it); another
+    // process's is refused.
+    let out = run(with("procmem").allow(Capability::Process), &["/bin/procmem"]);
+    assert_eq!(out.stdout_str(), "procmem ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn processes() {
     // fork, vfork, posix_spawn, execve of imported and written programs and
     // #! scripts, wait4/waitid, SIGCHLD, orphans, process groups and
@@ -1556,6 +1904,77 @@ fn deadlocks_are_reported_instead_of_hanging() {
         "{:?}",
         out.events
     );
+}
+
+/// A real deadlock is still one just after a process ended, which moved
+/// the I/O state: the parent looks again, and then nothing can wake it.
+#[test]
+fn deadlocks_are_reported_after_a_process_ends() {
+    for cpus in [1, 4] {
+        let b = || with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        for (mode, stdout, on) in [("deadwait", "reaped\n", "1 on futexes"), ("deadread", "", "1 on I/O")] {
+            let out = run(b(), &["/bin/wakeups", mode]);
+            assert_eq!(out.stdout_str(), stdout, "{mode}");
+            assert_eq!(out.status, ExitStatus::Signaled(9), "{mode}: {}", out.stdout_str());
+            assert!(
+                matches!(&out.events[..], [GuestEvent::Fault { signal: 9, detail, .. }]
+                    if detail.starts_with("deadlock") && detail.contains(on)),
+                "{mode}: {:?}",
+                out.events
+            );
+        }
+    }
+}
+
+/// What a process's end changes reaches whoever waits for it, however it
+/// ended, and whatever else the CPUs are doing: a parent alone in wait() is
+/// no deadlock when a timer ends its child, and a thread or process that
+/// spins, with no system call to bring the kernel round, doesn't keep the
+/// waiter from running. Nor one a signal woke (O_ASYNC), or a futex
+/// between processes.
+#[test]
+fn waiters_wake_when_a_process_ends() {
+    for cpus in [1, 4] {
+        let b = || with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        let modes = ["alarm", "killtimer", "timers", "killwait", "killpipe", "timerspin"];
+        for mode in modes.into_iter().chain(["sigio", "sigcont", "futex", "semaphore"]) {
+            let out = run(b(), &["/bin/wakeups", mode]);
+            assert_eq!(out.stdout_str(), format!("{mode} ok\n"), "{cpus} CPUs: {:?}", out.events);
+            assert_eq!(out.status, ExitStatus::Exited(0), "{mode}, {cpus} CPUs");
+            // What timers do to children is reported; nothing else is.
+            assert!(
+                out.events
+                    .iter()
+                    .all(|e| matches!(e, GuestEvent::Fault { detail, .. } if detail.starts_with("process "))),
+                "{mode}, {cpus} CPUs: {:?}",
+                out.events
+            );
+        }
+    }
+}
+
+/// Writes that need the console's interrupts go on while timers fire and
+/// the CPUs go from idle to spinning (x86_64 may take two vectors at once
+/// as it idles, and each is left in service until it's acknowledged).
+#[test]
+fn console_interrupts_survive_timers_around_idle() {
+    for cpus in [1, 4] {
+        let b = with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        let mut seen = 0;
+        // A host that takes a while over each 32 KiB, so the console's ring
+        // fills and the writer waits for its interrupts.
+        let slow = |_: Stream, bytes: &[u8]| {
+            if (seen + bytes.len()) >> 15 != seen >> 15 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            seen += bytes.len();
+        };
+        let out = b.build().unwrap().run_streaming(&["/bin/wakeups", "console", "2"], slow).unwrap();
+        assert!(out.stderr_str().ends_with("console ok\n"), "{cpus} CPUs: {}", out.stderr_str());
+        assert_eq!(out.status, ExitStatus::Exited(0), "{cpus} CPUs: {}", out.stderr_str());
+        assert!(out.stdout.iter().all(|&b| b == b'w' || b == b'\n'));
+        assert!(out.events.is_empty(), "{cpus} CPUs: {:?}", out.events);
+    }
 }
 
 // ---------------------------------------------------------------- pipes, eventfd, epoll
@@ -1841,6 +2260,110 @@ fn popular(b: SandboxBuilder, checks: &[&str]) {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// A futex wake reaches waiters in other processes: semaphores, mutexes and
+/// condition variables in shared memory, a word at another address in each
+/// process, requeues, and what's left of a killed waiter.
+#[test]
+fn futexes_between_processes() {
+    for cpus in [1, 4] {
+        let b = with("popular").cpus(cpus).allow(Capability::Process).allow(Capability::FsWrite);
+        popular(b.timeout(Duration::from_secs(60)), &["pshared"]);
+    }
+}
+
+/// `open(/proc/self/fd/N)` of an O_PATH descriptor opens the file again;
+/// `readlinkat(fd, "")` reads the link it holds.
+#[test]
+fn o_path_descriptors_open_again_through_their_links() {
+    popular(with("popular").allow(Capability::FsWrite), &["reopen"]);
+}
+
+/// A signal frame with no page to go on is out of memory, not a bad stack.
+#[test]
+fn no_memory_for_a_signal_frame() {
+    let out = run(with("popular").memory_mb(256).timeout(Duration::from_secs(120)), &["/bin/popular", "framemem"]);
+    assert_eq!(out.status, ExitStatus::Signaled(9), "{}", out.stdout_str());
+    assert!(out.events.iter().any(|e| e.to_string().contains("out of memory")), "{:?}", out.events);
+    assert!(!out.events.iter().any(|e| e.to_string().contains("signal frame")), "{:?}", out.events);
+    assert_eq!(out.stdout_str(), "");
+}
+
+/// A pipe waiting in splice holds no room for what hasn't come (Go's
+/// io.Copy between sockets, a pipe for each idle connection).
+#[test]
+fn idle_splices_hold_no_kernel_memory() {
+    popular(with("popular").memory_mb(256), &["spliceidle"]);
+}
+
+/// file-max follows the kernel memory budget: a server has two files for
+/// each connection in the guest.
+#[test]
+fn thousands_of_open_files() {
+    popular(with("popular"), &["openfiles"]);
+}
+
+/// More connects than the backlog are queued, never refused.
+#[test]
+fn connects_past_the_backlog_wait_for_accept() {
+    popular(with("popular").allow(Capability::Net).allow(Capability::Threads), &["burst"]);
+}
+
+/// argv and the environment as big as Linux's, and no bigger.
+#[test]
+fn arguments_up_to_arg_max() {
+    popular(with("popular").allow(Capability::Process), &["argmax"]);
+}
+
+/// Names and nodes get a share of a heap that grows with RAM.
+#[test]
+fn more_files_than_the_first_heap_held() {
+    popular(with("popular").allow(Capability::FsWrite), &["manyfiles"]);
+}
+
+/// The heap's share is of what the boot image leaves of RAM: of 1 GiB with
+/// 800 MiB imported, a share of all of it left a program 50 MiB less, as
+/// the JVM in `mvn package` found at 2 GiB, killed.
+#[test]
+fn a_big_image_leaves_its_memory_to_the_program() {
+    let big = std::env::temp_dir().join(format!("grix-big-import-{}", std::process::id()));
+    std::fs::File::create(&big).unwrap().set_len(800 << 20).unwrap();
+    let out = with("popular").import(&big, "/big").map(|b| run(b.memory_mb(1024), &["/bin/popular", "touch"]));
+    std::fs::remove_file(&big).unwrap();
+    let out = out.unwrap();
+    assert_eq!(out.stdout_str(), "touch ok\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Past the 256 connections through the host there were: each is held
+/// open while the next is made.
+#[test]
+fn hundreds_of_connections_through_a_forwarded_port() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sb = with("popular").allow(Capability::Net).forward_listener(listener, 8100).unwrap().build().unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/bin/popular", "manyconns"]).unwrap());
+    let started = std::time::Instant::now();
+    let mut held = Vec::new();
+    while held.len() < 400 {
+        assert!(started.elapsed() < Duration::from_secs(60), "{} connections", held.len());
+        // Until the guest listens, one's closed unanswered: try again.
+        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut b = [0u8; 1];
+        if c.write_all(b"x").is_ok() && c.read_exact(&mut b).is_ok() {
+            held.push(c);
+        } else {
+            assert!(held.is_empty(), "refused after {} connections", held.len());
+        }
+    }
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "manyconns ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn proc_self_auxv() {
     // Go's x/sys/cpu reads HWCAP there; without it, it reads ID registers
@@ -1856,6 +2379,81 @@ fn id_registers_from_user_mode() {
     // fixture just says ok: CPUID needs nothing of the kernel.)
     let out = run(with("idregs"), &["/bin/idregs"]);
     assert_eq!(out.stdout_str(), "idregs ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn many_mappings() {
+    // 20000 mappings: mmap without a hint finds the highest hole that fits
+    // without passing each of them (`AddressSpace::free_hint`), and munmap
+    // gives back the page tables it emptied.
+    let out = run(with("manymaps").memory_mb(512), &["/bin/manymaps"]);
+    assert_eq!(out.stdout_str(), "mappings ok\npage tables ok\n", "{}\n{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // The last thousand cost about what the first did (they took 40 times
+    // as long passing every mapping).
+    let us: Vec<u64> = out.stderr_str().lines().next().unwrap().split(' ').filter_map(|w| w.parse().ok()).collect();
+    let [_, first, _, last] = us[..] else { panic!("{}", out.stderr_str()) };
+    assert!(last < first * 5 + 2000, "{}", out.stderr_str());
+}
+
+#[test]
+fn futex_waitv_waits_on_several_words() {
+    // futex_waitv: the index of the word that woke it, requeues, absolute
+    // deadlines on either clock, EINTR from a handler, and EINVAL for
+    // what Linux refuses.
+    let out = run(with("futexv").allow(Capability::Threads), &["/bin/futexv"]);
+    assert_eq!(
+        out.stdout_str(),
+        "arguments ok\nwoken by word 2\nrequeued and woken\ninterrupted\nfutexv ok\n",
+        "{}",
+        out.kernel_log
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn auxv_hwcap2_and_minsigstksz() {
+    // AT_HWCAP2 (as the ID registers show it: see
+    // `id_registers_from_user_mode`) and AT_MINSIGSTKSZ, which a handler's
+    // frame fits.
+    let out = run(with("newcalls"), &["/bin/newcalls", "auxv"]);
+    assert_eq!(out.stdout_str(), "auxv ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn file_handles() {
+    // name_to_handle_at resolves the path, then says no filesystem here
+    // has handles (EOPNOTSUPP, quietly: callers fall back to paths);
+    // open_by_handle_at is privileged, and reported.
+    let out = run(with("newcalls"), &["/bin/newcalls", "handles"]);
+    assert_eq!(out.stdout_str(), "handles ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(
+        out.events,
+        [
+            GuestEvent::MissingPath { path: "/nope".into() },
+            GuestEvent::Denied {
+                syscall: "open_by_handle_at".into(),
+                capability: "privileged".into(),
+                detail: "".into()
+            }
+        ]
+    );
+}
+
+#[test]
+fn a_sleep_stopped_and_continued_keeps_its_deadline() {
+    // No handler: the stop and continue don't end nanosleep (no EINTR),
+    // and it wakes at its first deadline, as Linux's restart_syscall
+    // makes it.
+    let out = run(with("newcalls").allow(Capability::Process), &["/bin/newcalls", "sleep"]);
+    assert_eq!(out.stdout_str(), "sleep ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
@@ -2049,6 +2647,66 @@ fn arguments_and_environment_in_linux_order() {
 }
 
 #[test]
+fn sysctls_say_what_grix_does() {
+    // Redis warned that overcommit_memory wasn't 1; Chromium reads
+    // inotify's limits.
+    popular(with("popular"), &["sysctls"]);
+}
+
+#[test]
+fn scheduling_priorities() {
+    // .NET's Thread.Priority (every MSBuild worker) asks for the range.
+    popular(with("popular"), &["schedprio"]);
+}
+
+#[test]
+fn numa_policies_on_one_node() {
+    // ClickHouse, .NET and NumPy's allocators ask; numactl sets them.
+    popular(with("popular"), &["numa"]);
+}
+
+#[test]
+fn prctl_options_linux_refuses() {
+    // Alpine's JDK (PR_SET_MM), Chromium (SVE), OpenSearch (a bogus option).
+    popular(with("popular"), &["prctls"]);
+}
+
+#[test]
+fn proc_pid_task() {
+    // Chromium's zygote counts its threads by /proc/self/task's links.
+    popular(with("popular").allow(Capability::Threads), &["tasks"]);
+}
+
+#[test]
+fn credentials_with_messages() {
+    // SO_PASSCRED and SCM_CREDENTIALS: Chromium's zygote.
+    popular(with("popular").allow(Capability::Process), &["passcred"]);
+}
+
+#[test]
+fn credentials_with_streams() {
+    // SO_PASSCRED on a stream: reads stop where the writer changes.
+    popular(with("popular").allow(Capability::Process), &["streamcred"]);
+}
+
+#[test]
+fn dropping_capabilities() {
+    // Dropping all of them succeeds (none are held); raising one is
+    // denied, and reported.
+    let out = run(with("popular"), &["/bin/popular", "capdrop"]);
+    assert_eq!(out.stdout_str(), "capdrop ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied {
+            syscall: "capset".into(),
+            capability: "privileged".into(),
+            detail: "capabilities".into()
+        }]
+    );
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.
@@ -2065,6 +2723,255 @@ fn pidfds() {
     assert_eq!(out.stdout_str(), "pidfd ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn landlock_rulesets() {
+    // The version query and the calls' errors, then rulesets as Linux
+    // enforces them: opens, making and removing nodes, execve, truncate,
+    // rename and link (REFER), stacking, inheritance, no_new_privs, TCP
+    // ports and device ioctls. What they refuse is the program's own
+    // choice: nothing is reported.
+    let b = with("landlock")
+        .allow(Capability::Process)
+        .allow(Capability::Threads)
+        .allow(Capability::Net)
+        .allow(Capability::FsWrite);
+    let out = run(b, &["/bin/landlock"]);
+    assert_eq!(out.stdout_str(), "landlock ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+// ---------------------------------------------------------------- a review's findings
+
+/// `fixtures/src/hardening2.c`'s subcommand `name`, which must say it's ok.
+fn hardening2(b: SandboxBuilder, name: &str) -> RunOutput {
+    let b = b.allow(Capability::Process).allow(Capability::Threads).allow(Capability::Net).allow(Capability::FsWrite);
+    let out = run(b, &["/bin/hardening2", name]);
+    assert!(
+        out.stdout_str().ends_with(&format!("{name} ok\n")),
+        "{:?} {:?}\n{}",
+        out.status,
+        out.events,
+        out.stdout_str()
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    out
+}
+
+#[test]
+fn access_mode_3_reads_and_writes_nothing() {
+    // It asks Landlock for no rights at open, as on Linux, so nothing that
+    // reads or writes may take it.
+    let out = hardening2(with("hardening2"), "mode3");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn o_path_descriptors_only_name_things() {
+    let out = hardening2(with("hardening2"), "opath");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn socket_addresses_are_read_once() {
+    // A thread flips the port Landlock doesn't allow in and out while
+    // connect and bind look at it. It takes a second CPU to win.
+    let out = hardening2(with("hardening2").cpus(4), "race");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn every_budget_full_at_once() {
+    // Timers and mappings in 120 processes, full pipes, a full filesystem:
+    // an errno for each, and no kernel panic (`run` checks).
+    let out = hardening2(with("hardening2"), "heap");
+    let stats = out.guest_stats.unwrap();
+    for l in [Limit::Timers, Limit::Mappings, Limit::FileMetadata] {
+        assert!(stats.hits(l) > 0, "{l:?}: {stats:?}");
+    }
+    let kmem = stats.usage(Resource::KernelMemory);
+    assert!(kmem.peak <= kmem.limit, "{kmem:?}");
+}
+
+#[test]
+fn timers_have_a_limit_for_all_processes() {
+    let out = hardening2(with("hardening2"), "timers");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert!(out.guest_stats.unwrap().hits(Limit::Timers) > 0);
+}
+
+#[test]
+fn epoll_interest_lists_are_charged() {
+    let out = hardening2(with("hardening2"), "epoll");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert!(out.guest_stats.unwrap().hits(Limit::KernelMemory) > 0);
+}
+
+#[test]
+fn empty_arguments_are_charged_for_what_they_take() {
+    // 115,000 empty strings hold 6 MiB of the heap in 115 KiB of bytes, in
+    // every process that holds them.
+    let out = hardening2(with("hardening2"), "argv");
+    assert!(out.guest_stats.unwrap().hits(Limit::KernelMemory) > 0);
+}
+
+#[test]
+fn erasing_a_tab_is_as_wide_as_the_tab() {
+    // At most 8 columns, from what's on the line, whatever column output
+    // has reached, and quickly.
+    let out = hardening2(with("hardening2"), "tabs");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn fasync_to_init_takes_its_own_choice() {
+    // A child choosing F_SETSIG's signal for a file init owns is a child
+    // signalling init, which handles none of them.
+    let out = hardening2(with("hardening2"), "fasync");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn a_passed_timerfd_keeps_its_deadline() {
+    // Its only other holder gone, the reader blocks: not a deadlock.
+    let out = hardening2(with("hardening2"), "timerfd");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn fexecve_runs_the_file() {
+    // Unlinked, or with something else at its name, O_PATH or not, a
+    // script, and Landlock's EXECUTE on the file.
+    let out = hardening2(with("hardening2"), "fexec");
+    assert_eq!(out.stdout_str(), "ran plain\nran o_path\nran unlinked\nran unlinked_o_path\nran jailed\nfexec ok\n");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn paths_go_through_a_descriptor() {
+    let out = hardening2(with("hardening2"), "fdpath");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn the_alternate_stack_ends_where_it_ends() {
+    // What doesn't fit ends the program, as a fault, and writes nothing.
+    let out = hardening2(with("hardening2"), "altstack");
+    assert!(!out.events.is_empty());
+    for e in &out.events {
+        let GuestEvent::Fault { signal, detail, .. } = e else { panic!("{e:?}") };
+        assert_eq!(*signal, 11, "{detail}");
+        assert!(detail.contains("no room for a signal frame"), "{detail}");
+    }
+}
+
+#[test]
+fn a_full_ruleset_can_be_enforced() {
+    let out = hardening2(with("hardening2"), "rules");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn landlock_comes_after_the_policy() {
+    // The policy's gate first: without fs_write, mkdir is denied (EPERM,
+    // reported) though the program's rules would refuse it too.
+    let out = run(with("landlock").allow(Capability::Process), &["/bin/landlock", "policy"]);
+    assert_eq!(out.stdout_str(), "landlock policy ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let denied: Vec<_> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            GuestEvent::Denied { syscall, capability, .. } => Some((syscall.as_str(), capability.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(denied, [("mkdirat", "fs_write")], "{:?}", out.events);
+    assert_eq!(out.events.len(), 1, "{:?}", out.events);
+}
+
+#[test]
+fn landlock_rules_on_live_mounts_and_lazy_imports() {
+    // Rules on a live mount's nodes and a lazy import's (whose file is
+    // copied up by the write), and on a live mount bigger than the kernel
+    // keeps: the directories rules hold aren't forgotten, and what's
+    // listed again under them is still theirs. Links and exchanges there,
+    // in both directions.
+    let host = temp_dir("landlock-mounts");
+    for root in ["live", "lazy"] {
+        for dir in ["open", "shut"] {
+            std::fs::create_dir_all(host.join(root).join(dir)).unwrap();
+            std::fs::write(host.join(root).join(dir).join("f"), "f\n").unwrap();
+        }
+        // Links and exchanges: each file holds its name.
+        for file in ["a/f", "a/x", "a/p", "b/y", "c/g", "c/z", "d/w", "out/v"] {
+            let path = host.join(root).join("m").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, path.file_name().unwrap().as_encoded_bytes()).unwrap();
+        }
+        std::fs::create_dir(host.join(root).join("m/b/sub")).unwrap();
+    }
+    std::fs::create_dir(host.join("ro")).unwrap();
+    std::fs::write(host.join("ro/f"), "f").unwrap();
+    let b = with("landlock")
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .mount(host.join("live"), "/live")
+        .unwrap()
+        .import_lazy(host.join("lazy"), "/lazy")
+        .unwrap()
+        .mount_read_only(host.join("ro"), "/ro")
+        .unwrap();
+    let out = run(b, &["/bin/landlock", "mounts"]);
+    assert_eq!(out.stdout_str(), "landlock mounts ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // The live mount's changes are the host's; the lazy import's aren't.
+    assert_eq!(std::fs::read_to_string(host.join("live/open/f")).unwrap(), "f\n+");
+    assert!(host.join("live/open/new").exists());
+    assert_eq!(std::fs::read_to_string(host.join("lazy/open/f")).unwrap(), "f\n");
+    assert!(!host.join("lazy/open/new").exists());
+    // Links and exchanges allowed happened on the host, those refused
+    // didn't, and the lazy import's stayed in the sandbox.
+    let live = host.join("live/m");
+    assert_eq!(std::fs::read_to_string(live.join("b/f2")).unwrap(), "f");
+    assert!(!live.join("d/f4").exists() && !live.join("out/f5").exists() && !live.join("a/g2").exists());
+    let contents = ["a/x", "a/p", "b/y", "c/z", "d/w", "out/v"].map(|f| std::fs::read_to_string(live.join(f)).unwrap());
+    assert_eq!(contents, ["p", "y", "x", "z", "w", "v"]);
+    assert_eq!(std::fs::read_to_string(host.join("lazy/m/a/x")).unwrap(), "x");
+    assert!(!host.join("lazy/m/b/f2").exists());
+    assert_eq!(std::fs::read_dir(host.join("ro")).unwrap().count(), 1);
+
+    // 30,000 files in 10 directories, about twice what the kernel keeps.
+    let big = temp_dir("landlock-evict");
+    std::fs::create_dir_all(big.join("keep/open/sub")).unwrap();
+    std::fs::create_dir_all(big.join("keep/shut")).unwrap();
+    std::fs::write(big.join("keep/open/sub/x"), "x").unwrap();
+    std::fs::write(big.join("keep/open/f"), "f").unwrap();
+    std::fs::write(big.join("keep/shut/f"), "f").unwrap();
+    for i in 0..10 {
+        let d = big.join(format!("big/d{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::File::create(d.join("f0")).unwrap();
+        for j in 0..3000 {
+            std::fs::File::create(d.join(format!("a-somewhat-long-file-name-{j:05}.txt"))).unwrap();
+        }
+    }
+    let b = with("landlock").allow(Capability::Process).timeout(Duration::from_secs(300)).mount(&big, "/live").unwrap();
+    let out = run(b, &["/bin/landlock", "evict"]);
+    assert_eq!(
+        out.stdout_str(),
+        "60060 entries\nlandlock evict ok\n",
+        "{:?} {:?}\n{}",
+        out.status,
+        out.events,
+        out.kernel_log
+    );
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    std::fs::remove_dir_all(&host).unwrap();
+    std::fs::remove_dir_all(&big).unwrap();
 }
 
 #[test]
@@ -2870,7 +3777,54 @@ fn snapshots_with_live_mounts() {
 }
 
 #[test]
+fn snapshots_of_what_a_live_mount_has_been_through() {
+    // A file moved into a newer directory (its parent's id is the later
+    // one) and a removed directory whose file went on the host first (an
+    // id with no parent): the snapshot's mount state has to load.
+    let dir = temp_dir("mountstate");
+    let work = dir.join("work");
+    std::fs::create_dir_all(work.join("gone")).unwrap();
+    std::fs::write(work.join("gone/f"), "f\n").unwrap();
+    let b = Sandbox::builder()
+        .cpus(1)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .mount(&work, "/work")
+        .unwrap()
+        .timeout(Duration::from_secs(30));
+    if b.vmm_path().is_none() {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let host = work.clone();
+    let ready = dir.join("work/ready");
+    let remover = std::thread::spawn(move || {
+        for _ in 0..3000 {
+            if ready.exists() {
+                std::fs::remove_file(host.join("gone/f")).unwrap();
+                std::fs::write(host.join("removed"), "").unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let script = "cd /work; echo old > a; /bin/busybox mkdir z; /bin/busybox mv a z/a; /bin/busybox cat gone/f; \
+                  /bin/busybox touch ready; \
+                  while ! /bin/busybox test -e removed; do /bin/busybox sleep 0.01; done; \
+                  /bin/busybox rmdir gone; read line; /bin/busybox cat z/a; echo \"$line\" > z/b; echo done";
+    let snap = b.build().unwrap().snapshot(&["/bin/busybox", "sh", "-c", script], dir.join("s.snap")).unwrap();
+    remover.join().unwrap();
+    let out = snap.clone().mount(&work, "/work").unwrap().run("one\n").unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.stdout_str(), "old\ndone\n");
+    assert_eq!(std::fs::read_to_string(work.join("z/b")).unwrap(), "one\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn snapshots_keep_inotify_watches_on_live_mounts() {
+    use std::io::Write;
     // Watched before the snapshot: each restored run asks its host to
     // watch again (and says what happened meanwhile was missed).
     let dir = temp_dir("watchsnap");
@@ -2889,7 +3843,11 @@ fn snapshots_keep_inotify_watches_on_live_mounts() {
         let changes = std::thread::spawn(move || {
             for _ in 0..6000 {
                 if host.join("ctl/1").exists() {
-                    std::fs::write(host.join("w/new.txt"), format!("run {run}\n")).unwrap();
+                    // Made and then written, as fs::write does, with the
+                    // guest told in between: it has to wait for the bytes.
+                    let mut file = std::fs::File::create(host.join("w/new.txt")).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                    file.write_all(format!("run {run}\n").as_bytes()).unwrap();
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -3076,6 +4034,10 @@ fn escape_attempts_are_contained() {
     assert_eq!(esc(&["/bin/escape", "rsp"]).status, ExitStatus::Exited(0));
     assert_eq!(esc(&["/bin/escape", "rsp-kernel"]).status, ExitStatus::Exited(0));
     assert!(matches!(esc(&["/bin/escape", "rsp-use"]).status, ExitStatus::Signaled(11)));
+    // One that returns past the top of user space: rip not canonical.
+    let out = esc(&["/bin/escape", "rip-top"]);
+    assert_eq!(out.status, ExitStatus::Signaled(11), "{}", out.kernel_log);
+    assert!(out.stdout_str().is_empty(), "{}", out.stdout_str());
     // 32-bit compatibility mode through the GDT: there's no 32-bit code
     // segment to enter it by, so the far return faults to the program (a
     // #GP; under QEMU's TCG with SMAP, a page fault, as it reads the far
@@ -3240,6 +4202,23 @@ fn threads_run_in_parallel_on_more_cpus() {
     let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "cow"]);
     assert_eq!(out.stdout_str(), "cow ok\n", "{:?}", out.status);
     assert_eq!(out.status, ExitStatus::Exited(0));
+    // MADV_DONTNEED while a thread writes the page that ends a batch of
+    // the kernel's frees: both see it in one place afterwards.
+    let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "discard"]);
+    assert_eq!(out.stdout_str(), "discard ok\n", "{:?}\n{}", out.status, out.kernel_log);
+    // Faults filling a range in, without the kernel lock, while another
+    // thread unmaps it and its page tables go.
+    let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "unmap"]);
+    assert_eq!(out.stdout_str(), "unmap ok\n", "{:?}\n{}", out.status, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // What the kernel answers without its lock (`fast`) follows changes
+    // made on other CPUs: a parent's end, another thread's seccomp TSYNC.
+    for cpus in [1, 4] {
+        let out = run(b().cpus(cpus).timeout(Duration::from_secs(60)), &["/bin/smp", "fast"]);
+        assert_eq!(out.stdout_str(), "fast ok\n", "{:?}", out.status);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     // The CPU count is checked.
     assert!(Sandbox::builder().cpus(0).build().is_err());
     assert!(Sandbox::builder().cpus(9).build().is_err());
@@ -3271,9 +4250,14 @@ fn smp_counters_and_benchmark() {
             assert!(n("lock_held_us") > 0 && n("syscall") > 0, "{stdout}");
             assert!(n("timer_idle") <= n("timer"), "{stdout}");
             match r["mode"] {
-                "syscall" | "futex" => assert!(n("syscall") >= ops, "{stdout}"),
-                // Each touches 16 new pages, and frees them.
-                "mmap" | "procs" => assert!(n("fault") >= 16 * ops && n("flush") >= ops, "{stdout}"),
+                // getppid is answered without the kernel lock (`fast`).
+                "syscall" => assert!(n("syscall") >= ops && n("fast") >= ops, "{stdout}"),
+                "futex" => assert!(n("syscall") >= ops, "{stdout}"),
+                // Each touches 16 new pages (without the kernel lock), and
+                // frees them.
+                "mmap" | "procs" => {
+                    assert!(n("fault") >= 16 * ops && n("fast") >= 16 * ops && n("flush") >= ops, "{stdout}")
+                }
                 "sleeper" => assert!(n("wakeups") > 0 && n("timer") > 0, "{stdout}"),
                 _ => {}
             }
@@ -3295,7 +4279,11 @@ fn smp_counters_and_benchmark() {
     assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}");
     assert!(out.events.is_empty(), "{:?}", out.events);
     assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
-    assert_eq!(stdout.lines().filter(|l| l.starts_with("smpbench mode=") && l.contains(" bg=4 ")).count(), 4, "{stdout}");
+    assert_eq!(
+        stdout.lines().filter(|l| l.starts_with("smpbench mode=") && l.contains(" bg=4 ")).count(),
+        4,
+        "{stdout}"
+    );
     // A header, a line per CPU, and their sum.
     let out = run(with("cat").cpus(2), &["/bin/cat", "/proc/grix/smp"]);
     let stdout = out.stdout_str();
@@ -3346,9 +4334,13 @@ fn kernel_stack_overflow_is_reported() {
     assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
     let deepest = stdout.rsplit_once(" stack_max=").and_then(|(_, n)| n.split_whitespace().next()?.parse::<u64>().ok());
     assert!(deepest.is_some_and(|n| n < 64 << 10), "{stdout}");
-    for (cpus, how) in [(1, "return"), (4, "return"), (1, "fault"), (4, "fault")] {
-        let threads = cpus.to_string();
-        let argv: &[&str] = if how == "fault" { &["/bin/kstack", &threads, how] } else { &["/bin/kstack", &threads] };
+    for (cpus, how) in [(1, "return"), (4, "return"), (1, "fault"), (4, "fault"), (1, "picked"), (4, "picked")] {
+        // `picked` wants a CPU with no thread to do the picking, which only
+        // one thread makes certain: with threads spinning, one of their
+        // CPUs may switch to the sleeper in its interrupt, and nothing goes
+        // that way before the program ends.
+        let threads = if how == "picked" { 1 } else { cpus }.to_string();
+        let argv: &[&str] = if how == "return" { &["/bin/kstack", &threads] } else { &["/bin/kstack", &threads, how] };
         // Seen by the canary on the way back, or by the exception.
         let says = if how == "fault" { " at " } else { " (its canary " };
         // The CPU the kernel names. With 4, the fixture calls from a
@@ -3358,19 +4350,39 @@ fn kernel_stack_overflow_is_reported() {
             let out = b("kstack", cpus).build().unwrap().run(argv).unwrap();
             assert_eq!(out.status, ExitStatus::KernelPanic, "{}{}", out.stdout_str(), out.kernel_log);
             assert!(out.stdout_str().starts_with("overflowing on cpu "), "{}", out.stdout_str());
+            // Before the thread gets back to user mode at all.
+            assert!(!out.stdout_str().contains("still here"), "{}", out.stdout_str());
             let cpu: u32 = out
                 .kernel_log
                 .split_once("kernel stack overflow on CPU ")
                 .and_then(|(_, rest)| rest.split_once(says))
                 .and_then(|(n, _)| n.parse().ok())
                 .unwrap_or_else(|| panic!("{}", out.kernel_log));
-            if cpus == 1 || cpu != 0 {
+            if cpus == 1 || how == "picked" || cpu != 0 {
                 assert!(cpu < cpus, "{}", out.kernel_log);
                 break;
             }
             assert!(attempt < 5, "always CPU 0: {}", out.kernel_log);
         }
     }
+}
+
+/// x86_64 can take two vectors around `hlt`: a device's, and just before
+/// its `cli` a timer's above it. Both are in service, and the device's must
+/// not wait until the CPU next idles, which holds up the console's every
+/// interrupt (rarely enough that `console_interrupts_survive_timers_around_
+/// idle` only sometimes sees it): a debug kernel arranges it. arm64's GIC
+/// keeps what isn't acknowledged, and the hook does nothing there.
+#[test]
+fn a_device_interrupt_beneath_a_timer_is_not_left_behind() {
+    if !x86_64_guest() {
+        return;
+    }
+    let kernel = debug_kernel();
+    let out = run(with("wakeups").kernel(&kernel), &["/bin/wakeups", "beneath"]);
+    assert_eq!(out.stdout_str(), "beneath ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 /// x86_64 programs run through an x86_64 translator (here Alpine's static
@@ -3483,6 +4495,25 @@ fn metrics_while_a_sandbox_runs() {
     assert!(text.contains("grix_runs_started_total 2\n"), "{text}");
 }
 
+/// `grix run -e KEY` passes the host's value of KEY, as Docker's does: a
+/// secret stays off the command line. One the host hasn't set is left out.
+#[test]
+fn the_cli_passes_variables_by_name() {
+    use std::process::Command;
+    let busybox = format!("{}:/bin/busybox", fixture("alpine/bin/busybox.static").display());
+    let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+        .args(["run", "-i", &busybox, "-e", "GRIX_TEST_SECRET", "-e", "GRIX_TEST_UNSET", "-e", "A=1"])
+        .args(["--", "/bin/busybox", "env"])
+        .env("GRIX_TEST_SECRET", "s3cret")
+        .env_remove("GRIX_TEST_UNSET")
+        .output()
+        .unwrap();
+    let env = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.contains("GRIX_TEST_SECRET=s3cret\n") && env.contains("A=1\n"), "{env}");
+    assert!(!env.contains("GRIX_TEST_UNSET"), "{env}");
+}
+
 /// `grix run` as a container's command: output as it comes, events as they
 /// happen, no time limit, metrics while it runs.
 #[test]
@@ -3522,4 +4553,118 @@ fn the_cli_for_a_server() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(server.wait().unwrap().success());
+}
+
+/// /bin/hardening `what`, which must end well and say `says`, with nothing
+/// reported: a kernel that can't take it panics or hangs (`run` fails then).
+fn hardened(b: SandboxBuilder, argv: &[&str], says: &str) {
+    let argv: Vec<&str> = ["/bin/hardening"].iter().chain(argv).copied().collect();
+    let out = run(b, &argv);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}\n{}", out.stdout_str(), out.kernel_log);
+    assert!(out.stdout_str().contains(says), "{}", out.stdout_str());
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Page table entries can outnumber frames by as many mappings as a program
+/// makes of one file: none of what goes through them may be on the heap.
+/// (64 MiB mapped 140 times is 2.3 million entries, in 256 MiB of RAM.)
+#[test]
+fn page_table_entries_cost_no_heap() {
+    for how in ["munmap", "dontneed", "fixed", "exit", "fork", "kill", "exec"] {
+        let b = with("hardening").allow(Capability::Process).memory_mb(256).timeout(Duration::from_secs(300));
+        hardened(b, &["entries", how], &format!("{how} survived"));
+    }
+    // A page table for each of 100,000 pages, which munmap frees.
+    let b = with("hardening").memory_mb(2048).timeout(Duration::from_secs(120));
+    hardened(b, &["tables", "100000"], "tables survived");
+    // Moved a page at a time, wherever a mapping's entries are.
+    let b = with("hardening").memory_mb(1024).timeout(Duration::from_secs(120));
+    hardened(b, &["mremap", "256"], "moved 65536 pages");
+}
+
+/// A zombie's threads are gone and what they paid is given back, so its
+/// /proc/<pid>/task keeps only the leader, as on Linux. Zombies count
+/// against MAX_PROCESSES, and each of these had all the threads there may
+/// be: with their nodes left, some rounds of this run the heap out.
+#[test]
+fn zombies_keep_nothing_of_their_threads() {
+    let b = with("hardening").allow(Capability::Threads).allow(Capability::Process).timeout(Duration::from_secs(300));
+    hardened(b, &["zombies", "40"], "survived 40 rounds");
+}
+
+/// tee(fd, fd) waited for its own lock, forever, on any file: one file is
+/// EINVAL (and for splice), and a pair of them is locked in one order, so
+/// two CPUs going opposite ways don't wait for each other.
+#[test]
+fn tee_and_splice_with_one_file_or_crossing() {
+    hardened(with("hardening").allow(Capability::FsWrite), &["tee"], "tee refused");
+    let b = with("hardening").allow(Capability::FsWrite).allow(Capability::Threads).cpus(4);
+    hardened(b.timeout(Duration::from_secs(180)), &["teecross", "20000"], "tee crossed 20000 times");
+}
+
+/// One file under every descriptor, in instance after instance of epoll:
+/// no file limit counts that, so the kernel's budget does (ENOSPC).
+#[test]
+fn epoll_registrations_have_a_budget() {
+    let b = with("hardening").timeout(Duration::from_secs(120));
+    hardened(b, &["epolls", "500"], "refused after a while");
+}
+
+/// Reading a hole in a shared file costs the program nothing it keeps, and
+/// the pages needn't exist: a read and a madvise, millions of times, in 256
+/// MiB. What the kernel keeps of that doesn't grow; the mappings still see
+/// each page get its frame, in this process and another.
+#[test]
+fn reading_holes_costs_no_heap() {
+    // (More of them than are marked, too.)
+    let b = with("hardening").memory_mb(256).timeout(Duration::from_secs(600));
+    hardened(b, &["holes", "6000000"], "read 6000000 holes");
+    for cpus in [1, 4] {
+        let b = with("hardening").allow(Capability::Process).cpus(cpus).timeout(Duration::from_secs(120));
+        hardened(b, &["holefill", "4096"], "holes filled");
+    }
+}
+
+/// One node may have as many names as the metadata budget holds: the list
+/// is made only as far as it can be returned (E2BIG past XATTR_LIST_MAX).
+#[test]
+fn xattr_lists_are_bounded() {
+    let b = with("hardening").allow(Capability::FsWrite).timeout(Duration::from_secs(120));
+    hardened(b, &["xattrs", "5000"], "lists refused");
+}
+
+/// O_NOFOLLOW on a magic link is ELOOP, as on any link, with or without
+/// RESOLVE_*: a descriptor isn't reached past what they forbid.
+#[test]
+fn magic_links_are_links() {
+    hardened(with("hardening"), &["magic"], "magic links refused");
+}
+
+/// A stream keeps who wrote what, a run per writer, at most 256: writes
+/// that failed, or said nothing, must not take one, or a stream with
+/// nothing in it would leave both ends waiting for ever.
+#[test]
+fn stream_writers_are_only_those_who_wrote() {
+    let b = with("hardening").allow(Capability::Process);
+    hardened(b, &["creds"], "stream still works");
+}
+
+/// /proc/self/mem is the memory it was opened on: after execve a descriptor
+/// that stayed open reads and writes nothing, as on Linux.
+#[test]
+fn proc_self_mem_stays_with_its_program() {
+    hardened(with("hardening").allow(Capability::Process), &["procmem"], "the old memory is gone");
+}
+
+/// A Landlock rule keeps its node, and a thread stops paying for its
+/// /proc/<pid>/task nodes when it goes: the rule pays. With as many as there
+/// may be and every budget full, what's charged still fits in the heap.
+#[test]
+fn landlock_rules_pay_for_the_nodes_they_keep() {
+    let b = with("hardening")
+        .allow(Capability::Threads)
+        .allow(Capability::FsWrite)
+        .memory_mb(256)
+        .timeout(Duration::from_secs(180));
+    hardened(b, &["pinned", "40000"], "budgets held: full");
 }

@@ -25,7 +25,7 @@ pub mod uart;
 
 /// Where this machine's RAM, boot image and devices are (QEMU `microvm`'s).
 pub mod machine {
-    pub use grix_abi::machine::x86_64::{IMAGE_BASE, RAM_BASE, VIRTIO, VIRTIO_SLOTS, VIRTIO_STRIDE};
+    pub use grix_abi::machine::x86_64::{IMAGE_BASE, VIRTIO, VIRTIO_SLOTS, VIRTIO_STRIDE, ram_regions};
     /// Transport `i` interrupts on GSI `VIRTIO_IRQ + i` (`irq::ack`'s id).
     pub const VIRTIO_IRQ: u32 = grix_abi::machine::x86_64::VIRTIO_GSI;
 }
@@ -173,6 +173,8 @@ pub struct FpState {
 /// A thread's FP state as `process::Thread` holds it: boxed, as a
 /// `Thread` is moved by value and this is 2.7 KiB (arm64's is inline).
 pub type ThreadFp = alloc::boxed::Box<FpState>;
+/// Heap bytes a thread's FP state takes beside its `Thread`: the box.
+pub const FP_HEAP_BYTES: usize = core::mem::size_of::<FpState>();
 
 impl Default for FpState {
     /// The state a new program starts with (as `fninit` and Linux leave
@@ -377,6 +379,8 @@ pub fn cpu_number() -> usize {
 /// none can come between it and `hlt`; one that comes is noted
 /// (`irq::taken`) for `irq::ack`.
 pub fn wait_for_interrupt() {
+    #[cfg(debug_assertions)]
+    irq::take_device_beneath();
     // SAFETY: interrupts on for the halt only.
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
@@ -506,6 +510,19 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
             tf.rcx,
         );
     }
+    // What can be done without the kernel lock (`fast`): some system
+    // calls, and pages not present.
+    let fast = match tf.vector {
+        SYSCALL => crate::fast::syscall(tf),
+        14 if tf.error & 1 == 0 => crate::fast::fault(cr2(), page_access(tf.error)),
+        _ => false,
+    };
+    if fast {
+        // As on the way out of the usual path: `syscall` at the top of
+        // user space leaves a non-canonical return address.
+        sanitize(tf);
+        return;
+    }
     crate::smp::enter(match tf.vector {
         SYSCALL => crate::smp::Stat::Syscall,
         v if v < 32 => crate::smp::Stat::Fault,
@@ -554,19 +571,24 @@ const FPE_INTDIV: i32 = 1;
 const ILL_ILLOPN: i32 = 2;
 const SI_KERNEL: i32 = 0x80;
 
+/// What a page fault with error code `error` tried.
+fn page_access(error: u64) -> process::Access {
+    if error & 0x10 != 0 {
+        process::Access::Exec
+    } else if error & 2 != 0 {
+        process::Access::Write
+    } else {
+        process::Access::Read
+    }
+}
+
 fn user_exception(tf: &mut TrapFrame) {
     // sigcontext's trapno and err.
     let syndrome = Some(tf.vector << 32 | (tf.error & 0xffff_ffff));
     let (sig, code, addr, why) = match tf.vector {
         14 => {
             let addr = cr2();
-            let access = if tf.error & 0x10 != 0 {
-                process::Access::Exec
-            } else if tf.error & 2 != 0 {
-                process::Access::Write
-            } else {
-                process::Access::Read
-            };
+            let access = page_access(tf.error);
             // Not present: demand paging. A write to a present page may be
             // to one shared copy-on-write; `user_fault` tells.
             if tf.error & 1 == 0 || access == process::Access::Write {
@@ -632,6 +654,13 @@ pub fn hwcap() -> u64 {
     cpuid(1, 0)[3] as u64
 }
 
+/// Linux AT_HWCAP2: HWCAP2_FSGSBASE only if the kernel turned on
+/// CR4.FSGSBASE, which this one doesn't (user mode sets its TLS with
+/// arch_prctl), and no RING3MWAIT.
+pub fn hwcap2() -> u64 {
+    0
+}
+
 pub fn set_user_page_table(root_pa: u64) {
     ROOTS[cpu_number() % MAX_CPUS].store(root_pa, Ordering::Relaxed);
     // SAFETY: a root with the kernel's half in it (`pte::new_root`).
@@ -683,6 +712,14 @@ static FLUSHED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// memory before it has the lock, and catches up then (`tlb_sync`), so it
 /// isn't waited for.
 pub fn flush_tlb(root: u64, start: u64, end: u64) {
+    flush(root, start, end, false);
+}
+
+/// `flush_tlb`, waiting for CPUs in the kernel too if `every`: they catch
+/// up as they spin for the kernel lock or a gate (`tlb_sync`), the only
+/// places one with this root can be while this CPU has the lock and the
+/// address space's gate (fast entries' flushes aside: they make none).
+fn flush(root: u64, start: u64, end: u64, every: bool) {
     let me = cpu_number() % MAX_CPUS;
     crate::smp::note_on(me, crate::smp::Stat::Flush, 1);
     if ROOTS[me].load(Ordering::Relaxed) == root {
@@ -701,10 +738,12 @@ pub fn flush_tlb(root: u64, start: u64, end: u64) {
     let want = FLUSH_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     let online = crate::smp::online().min(MAX_CPUS);
     let mut sent = [false; MAX_CPUS];
+    let mut asked = [false; MAX_CPUS];
     for (cpu, sent) in sent.iter_mut().enumerate().take(online) {
         if cpu == me || ROOTS[cpu].load(Ordering::Relaxed) != root {
             continue;
         }
+        asked[cpu] = true;
         // Asked before looking (as it says it's in the kernel before it
         // looks, in `tlb_sync`): one of the two sees the other.
         WANTED[cpu].fetch_max(want, Ordering::SeqCst);
@@ -714,14 +753,16 @@ pub fn flush_tlb(root: u64, start: u64, end: u64) {
         }
     }
     let start = counter();
-    for (cpu, _) in sent.iter().enumerate().filter(|(_, s)| **s) {
-        while FLUSHED[cpu].load(Ordering::Acquire) < want && !crate::smp::in_kernel(cpu) {
+    for cpu in (0..MAX_CPUS).filter(|&cpu| sent[cpu] || every && asked[cpu]) {
+        while FLUSHED[cpu].load(Ordering::Acquire) < want && (every || !crate::smp::in_kernel(cpu)) {
             core::hint::spin_loop();
         }
     }
     let ipis = sent.iter().filter(|&&s| s).count() as u64;
     if ipis > 0 {
         crate::smp::note_on(me, crate::smp::Stat::FlushIpi, ipis);
+    }
+    if ipis > 0 || every {
         crate::smp::note_on(me, crate::smp::Stat::FlushWait, counter() - start);
     }
 }
@@ -735,8 +776,24 @@ fn flush_ipi() {
     irq::eoi(irq::FLUSH_INTID);
 }
 
-/// With the kernel lock, before any user memory: the flushes asked of
-/// this CPU that it missed while it couldn't take their IPI.
+/// The tables that covered `vas` (one address each) are out of `root`:
+/// no TLB or paging-structure cache may lead to them before they're
+/// freed. An INVLPG of an address drops the paging-structure caches'
+/// entries for it too, and a CR3 load all of them, so a flush over the
+/// addresses does, on every CPU with that root, those in the kernel too:
+/// the walker of one that hasn't caught up may still follow a cached entry
+/// into a table, speculatively, whatever the CPU is running, and set an
+/// accessed bit in what's become someone else's page.
+pub fn flush_tables(root: u64, vas: &[u64]) {
+    if let (Some(&lo), Some(&hi)) = (vas.iter().min(), vas.iter().max()) {
+        flush(root, lo, hi + 4096, true);
+    }
+}
+
+/// Before any user memory, with the kernel lock or the address space's
+/// gate (and while waiting for either: `flush_tables` waits for that):
+/// the flushes asked of this CPU that it missed while it couldn't take
+/// their IPI.
 pub fn tlb_sync() {
     let me = cpu_number() % MAX_CPUS;
     let want = WANTED[me].load(Ordering::SeqCst);
@@ -872,9 +929,8 @@ pub(crate) struct PerCpu {
     cpu: AtomicU64,
 }
 
-static PER_CPU: [PerCpu; MAX_CPUS] = [const {
-    PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0), cpu: AtomicU64::new(0) }
-}; MAX_CPUS];
+static PER_CPU: [PerCpu; MAX_CPUS] =
+    [const { PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0), cpu: AtomicU64::new(0) } }; MAX_CPUS];
 
 /// Set the CPU up, before anything else: segments, traps, `syscall`, the
 /// FPU and the clock (boot.S calls it on CPU 0).
@@ -1017,6 +1073,31 @@ fn init_cpu(cpu: usize) {
     // KERNEL_GS_BASE until the return to user mode swaps them.
     wrmsr(MSR_GS_BASE, pc as *const PerCpu as u64);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+}
+
+/// Map physical `start..end` (RAM past the 4 GiB boot.S maps) in the
+/// kernel's half, as boot.S maps the rest: 2 MiB pages, in page
+/// directories from `table` (zeroed), one per GiB. Nothing was there, so
+/// there's nothing to flush, and every root shares the kernel's half.
+pub fn map_ram(start: u64, end: u64, table: &mut dyn FnMut() -> u64) {
+    const GIB: u64 = 1 << 30;
+    const ADDR: u64 = 0x000f_ffff_ffff_f000;
+    let pml4 = crate::mm::p2v(kernel_root()) as *const u64;
+    // SAFETY: the boot tables, mapped linearly: the high half's PML4
+    // entry is boot.S's PDPT, and its entries past 4 GiB are empty.
+    unsafe {
+        let pdpt = crate::mm::p2v(pml4.add(256).read() & ADDR) as *mut u64;
+        for i in start / GIB..end.div_ceil(GIB) {
+            assert!(i < 512, "RAM beyond what one PDPT maps");
+            let pd = table();
+            let entries = crate::mm::p2v(pd) as *mut u64;
+            for j in 0..512 {
+                // Present, writable, large.
+                entries.add(j as usize).write((i * GIB + (j << 21)) | 0x83);
+            }
+            pdpt.add(i as usize).write(pd | 3);
+        }
+    }
 }
 
 /// The boot page tables' root (physical): the kernel's half of every root.

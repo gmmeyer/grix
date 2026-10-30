@@ -180,6 +180,11 @@ struct RunArgs {
     /// not exist yet, or be empty). Repeatable.
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
+    /// Refuse an export holding a symbolic link that is absolute or leads
+    /// out of it (as Python tarfile's `data` filter does): nothing of it is
+    /// written.
+    #[arg(long)]
+    no_outside_links: bool,
     /// Mount host directory HOST at GUEST: live and read-write (rw, the
     /// default, grants fs_write), live and read-only (ro), with the
     /// changes applied when the program ends (on-exit, grants fs_write), or
@@ -201,12 +206,20 @@ struct RunArgs {
     /// Grant a capability (fs_write, threads, process, net). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
-    /// Set an environment variable KEY=VALUE. Repeatable.
-    #[arg(short, long = "env", value_name = "KEY=VALUE")]
+    /// Set an environment variable KEY=VALUE, or KEY to pass on the
+    /// host's value of KEY (if it's set, as Docker's `-e KEY`: a secret
+    /// stays off the command line). Repeatable.
+    #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
     /// Working directory inside the sandbox.
     #[arg(long)]
     cwd: Option<String>,
+    /// The sandbox's host name (default grix).
+    #[arg(long)]
+    hostname: Option<String>,
+    /// Give the program HOME, PATH, LANG and TMPDIR, unless they're set.
+    #[arg(long)]
+    default_env: bool,
     /// Guest memory in MiB.
     #[arg(long)]
     mem: Option<u64>,
@@ -417,7 +430,7 @@ fn run(args: RunArgs) -> Result<i32> {
                 bail!("the snapshot doesn't export {guest} (it exports {:?})", snap.exports());
             }
         }
-        let exports = grix::results::check_destinations(&exports, &[])?;
+        let exports = grix::results::check_destinations(&exports, &[])?.links(links_of(&args));
         // A snapshot taken in TTY mode is a terminal's (`-t` is then ours).
         let tty = snap.tty();
         if args.tty && !tty {
@@ -618,6 +631,11 @@ fn write_stream(stream: Stream, data: &[u8]) {
 }
 
 /// `--arch`'s architecture, if given.
+/// The links exports may have (`--no-outside-links`).
+fn links_of(args: &RunArgs) -> grix::Links {
+    if args.no_outside_links { grix::Links::Inside } else { grix::Links::Any }
+}
+
 fn parse_arch(name: Option<&str>) -> Result<Option<grix::Arch>> {
     name.map(|a| grix::Arch::parse(a).with_context(|| format!("--arch {a}: aarch64 (arm64) or x86_64 (amd64)")))
         .transpose()
@@ -678,7 +696,7 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         mounted.push(PathBuf::from(host));
     }
     // Before the run, so its results have somewhere to go.
-    let exports = grix::results::check_destinations(&exports, &mounted)?;
+    let exports = grix::results::check_destinations(&exports, &mounted)?.links(links_of(args));
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }
@@ -694,11 +712,24 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);
     }
     for kv in &args.env {
-        let (k, v) = kv.split_once('=').with_context(|| format!("--env {kv:?} must be KEY=VALUE"))?;
-        b = b.env(k, v);
+        match kv.split_once('=') {
+            Some((k, v)) => b = b.env(k, v),
+            None => {
+                if let Some(v) = std::env::var_os(kv) {
+                    let v = v.into_string().map_err(|_| anyhow::anyhow!("--env {kv}: the host's value isn't UTF-8"))?;
+                    b = b.env(kv, &v);
+                }
+            }
+        }
     }
     if let Some(cwd) = &args.cwd {
         b = b.cwd(cwd);
+    }
+    if let Some(name) = &args.hostname {
+        b = b.hostname(name)?;
+    }
+    if args.default_env {
+        b = b.default_env();
     }
     if let Some(mb) = args.mem {
         b = b.memory_mb(mb);
@@ -988,6 +1019,10 @@ fn mcp(args: McpArgs) -> Result<i32> {
         config.max_timeout = Duration::from_secs(s);
     }
     if let Some(mb) = args.max_mem {
+        let max = grix_abi::image::MAX_RAM >> 20;
+        if mb == 0 || mb > max {
+            bail!("--max-mem {mb}: a sandbox has 1 to {max} MiB");
+        }
         config.max_memory_mb = mb;
     }
     if let Some(n) = args.max_cpus {

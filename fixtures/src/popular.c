@@ -9,20 +9,27 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -736,10 +743,10 @@ static int nofile(void) {
     if (pid == 0) _exit(fcntl(65535, F_GETFD) == 0 && fcntl(4999, F_GETFD) == 0 ? 0 : 1);
     CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
     // Open files are still limited for all processes together (ENFILE)...
-    static int nulls[8192];
+    static int nulls[60000];
     int n = 0;
-    while (n < 8192 && (nulls[n] = open("/dev/null", O_RDONLY)) >= 0) n++;
-    CHECK(n < 8192 && errno == ENFILE && n > 3000);
+    while (n < 60000 && (nulls[n] = open("/dev/null", O_RDONLY)) >= 0) n++;
+    CHECK(n < 60000 && errno == ENFILE && n > 3000);
     while (n > 0) close(nulls[--n]);
     // ... and tables cost kernel memory: forking a big one, again and
     // again, runs out of it (ENOMEM) before the kernel's heap does.
@@ -907,6 +914,581 @@ static int xattrcopied(void) {
     return copied("/tmp/dst") || copied("/tmp/t/src");
 }
 
+// Settings programs read and warn about: Redis wants overcommit_memory 1
+// (grix takes memory only as it's touched, never reserving it), Chromium
+// reads inotify's limits; each says what grix does.
+static int sysctls(void) {
+    CHECK(slurp("/proc/sys/vm/overcommit_memory") > 0 && strcmp(buf, "1\n") == 0);
+    CHECK(slurp("/proc/sys/vm/max_map_count") > 0 && strcmp(buf, "32768\n") == 0);
+    CHECK(slurp("/proc/sys/fs/inotify/max_user_watches") > 0 && strcmp(buf, "8192\n") == 0);
+    CHECK(slurp("/proc/sys/fs/inotify/max_queued_events") > 0 && strcmp(buf, "16384\n") == 0);
+    return 0;
+}
+
+// .NET's Thread.Priority asks for the policy's priority range (MSBuild
+// sets it on every worker): SCHED_OTHER's is 0..0. Real-time policies
+// need CAP_SYS_NICE, which nothing has, as under Docker. (musl's
+// sched_setscheduler doesn't make the call: syscall() does.)
+static int schedprio(void) {
+    CHECK(sched_get_priority_max(SCHED_OTHER) == 0 && sched_get_priority_min(SCHED_OTHER) == 0);
+    CHECK(sched_get_priority_max(SCHED_FIFO) == 99 && sched_get_priority_min(SCHED_RR) == 1);
+    CHECK(sched_get_priority_max(SCHED_BATCH) == 0 && sched_get_priority_min(SCHED_IDLE) == 0);
+    errno = 0;
+    CHECK(sched_get_priority_max(42) == -1 && errno == EINVAL);
+    struct sched_param sp = {0};
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp) == 0);
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp) == 0);
+    sp.sched_priority = 10;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == -1 && errno == EPERM);
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == -1 && errno == EINVAL);
+    sp.sched_priority = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp) == 0);
+    return 0;
+}
+
+// NUMA policies (numactl, ClickHouse, .NET, NumPy's allocators): one
+// node, 0, so a policy naming it is kept and changes nothing, and one
+// naming another node is EINVAL.
+static int numa(void) {
+    enum { MPOL_DEFAULT, MPOL_PREFERRED, MPOL_BIND, MPOL_INTERLEAVE };
+    int mode = -1;
+    unsigned long mask[2] = {~0ul, ~0ul};
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 128, 0, 0) == 0);
+    CHECK(mode == MPOL_DEFAULT && mask[0] == 0 && mask[1] == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 65, 0, 4 /* MPOL_F_MEMS_ALLOWED */) == 0 && mask[0] == 1);
+    unsigned long one = 1, two = 2;
+    CHECK(syscall(SYS_set_mempolicy, MPOL_BIND, &two, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_DEFAULT, &one, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, 99, &one, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &one, 64) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 65, 0, 0) == 0 && mode == MPOL_INTERLEAVE && mask[0] == 1);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 1 /* MPOL_F_NODE */) == 0 && mode == 0);
+    char *p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    CHECK(syscall(SYS_mbind, p, 8192, MPOL_BIND, &one, 64, 0) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, p, 3 /* MPOL_F_NODE | MPOL_F_ADDR */) == 0 && mode == 0);
+    CHECK(syscall(SYS_mbind, p + 1, 4096, MPOL_BIND, &one, 64, 0) == -1 && errno == EINVAL);
+    munmap(p + 4096, 4096);
+    CHECK(syscall(SYS_mbind, p, 8192, MPOL_BIND, &one, 64, 0) == -1 && errno == EFAULT);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, p + 4096, 2 /* MPOL_F_ADDR */) == -1 && errno == EFAULT);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 1) == -1 && errno == EINVAL);
+    munmap(p, 4096);
+    return 0;
+}
+
+// prctl options Linux refuses here too, quietly: PR_SET_MM (some JDKs'
+// setproctitle) needs CAP_SYS_RESOURCE; there's no SVE; and an option
+// Linux doesn't have (OpenSearch's seccomp self-test) is EINVAL.
+static int prctls(void) {
+    char arg[] = "x";
+    CHECK(prctl(35 /* PR_SET_MM */, 8 /* PR_SET_MM_ARG_START */, (unsigned long)arg, 0, 0) == -1 && errno == EPERM);
+    CHECK(prctl(51 /* PR_SVE_GET_VL */, 0, 0, 0, 0) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_prctl, 0xfffffffff7a46a5cul, 0, 0, 0, 0) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_prctl, 0x100000000ul | PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
+    return 0;
+}
+
+// /proc/<pid>/task: a directory per thread. Chromium's zygote checks that
+// it's alone by the link count (2 + threads); ps -L and psutil list it.
+static pthread_mutex_t task_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *task_park(void *arg) {
+    *(pid_t *)arg = gettid();
+    pthread_mutex_lock(&task_mu);
+    pthread_mutex_unlock(&task_mu);
+    return NULL;
+}
+
+static int task_count(void) {
+    struct stat st;
+    if (stat("/proc/self/task", &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return st.st_nlink == (nlink_t)n + 2 ? n : -1;
+}
+
+static int tasks(void) {
+    CHECK(task_count() == 1);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", getpid());
+    CHECK(slurp(path) > 0 && atoi(buf) == getpid());
+    pthread_mutex_lock(&task_mu);
+    pthread_t t[2];
+    volatile pid_t tid[2] = {0, 0};
+    for (int i = 0; i < 2; i++) CHECK(pthread_create(&t[i], NULL, task_park, (void *)&tid[i]) == 0);
+    while (!tid[0] || !tid[1]) sched_yield();
+    CHECK(task_count() == 3);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/comm", getpid(), tid[1]);
+    CHECK(slurp(path) > 0 && strcmp(buf, "popular\n") == 0);
+    snprintf(path, sizeof path, "/proc/self/task/%d/status", tid[0]);
+    CHECK(slurp(path) > 0 && strstr(buf, "Threads:\t3\n"));
+    pthread_mutex_unlock(&task_mu);
+    for (int i = 0; i < 2; i++) CHECK(pthread_join(t[i], NULL) == 0);
+    CHECK(task_count() == 1);
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid[0]);
+    struct stat st;
+    CHECK(stat(path, &st) == -1 && errno == ENOENT);
+    return 0;
+}
+
+// SO_PASSCRED: a message socket's messages come with SCM_CREDENTIALS, the
+// sender's (Chromium's zygote learns its children's pids so).
+static int recv_cred(int s, struct ucred *uc, char *data) {
+    char control[CMSG_SPACE(sizeof(struct ucred))];
+    struct iovec iov = {data, 16};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    ssize_t n = recvmsg(s, &m, 0);
+    if (n < 0) return -1;
+    data[n] = 0;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    if (!c) return 0;
+    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_CREDENTIALS || c->cmsg_len != CMSG_LEN(sizeof *uc)) return -1;
+    memcpy(uc, CMSG_DATA(c), sizeof *uc);
+    return 1;
+}
+
+static int passcred(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0);
+    int on = 1, v = -1;
+    socklen_t len = sizeof v;
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 0);
+    // Without it, no credentials.
+    struct ucred uc;
+    char data[17];
+    CHECK(write(sv[1], "a", 1) == 1);
+    CHECK(recv_cred(sv[0], &uc, data) == 0 && strcmp(data, "a") == 0);
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    pid_t child = fork();
+    if (child == 0) _exit(write(sv[1], "ping", 4) == 4 ? 0 : 1);
+    CHECK(child > 0);
+    CHECK(recv_cred(sv[0], &uc, data) == 1 && strcmp(data, "ping") == 0);
+    CHECK(uc.pid == child && uc.uid == getuid() && uc.gid == getgid());
+    int st;
+    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    // A sender may say who it is, within its own ids.
+    struct ucred mine = {getpid(), getuid(), getgid()};
+    char control[CMSG_SPACE(sizeof mine)] = {0};
+    struct iovec iov = {"me", 2};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_CREDENTIALS;
+    c->cmsg_len = CMSG_LEN(sizeof mine);
+    memcpy(CMSG_DATA(c), &mine, sizeof mine);
+    CHECK(sendmsg(sv[1], &m, 0) == 2);
+    CHECK(recv_cred(sv[0], &uc, data) == 1 && uc.pid == getpid() && strcmp(data, "me") == 0);
+    // No room for them: cut off.
+    char small[8];
+    struct iovec iov2 = {data, 16};
+    struct msghdr m2 = {.msg_iov = &iov2, .msg_iovlen = 1, .msg_control = small, .msg_controllen = sizeof small};
+    CHECK(write(sv[1], "b", 1) == 1);
+    CHECK(recvmsg(sv[0], &m2, 0) == 1 && (m2.msg_flags & MSG_CTRUNC) && m2.msg_controllen == 0);
+    close(sv[0]);
+    close(sv[1]);
+    return 0;
+}
+
+// SO_PASSCRED on a stream: each read is one writer's bytes, with their
+// credentials, as Linux never glues different writers' together then;
+// without it, reads go across. Set before connecting, or on a listener
+// (which its accepted sockets inherit), it stays.
+static int streamcred(void) {
+    int sv[2], st;
+    struct ucred uc;
+    char data[17];
+    for (int pass = 0; pass < 2; pass++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        int on = 1, v = -1;
+        socklen_t len = sizeof v;
+        if (pass) CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+        CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == pass);
+        CHECK(write(sv[1], "aa", 2) == 2);
+        pid_t child = fork();
+        if (child == 0) _exit(write(sv[1], "bbb", 3) == 3 ? 0 : 1);
+        CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        CHECK(write(sv[1], "c", 1) == 1 && write(sv[1], "d", 1) == 1);
+        if (!pass) {
+            CHECK(recv_cred(sv[0], &uc, data) == 0 && strcmp(data, "aabbbcd") == 0);
+        } else {
+            CHECK(recv_cred(sv[0], &uc, data) == 1 && strcmp(data, "aa") == 0 && uc.pid == getpid());
+            CHECK(uc.uid == getuid() && uc.gid == getgid());
+            // Peeking doesn't go further, and two buffers don't either.
+            CHECK(recv(sv[0], data, 16, MSG_PEEK) == 3);
+            char a[2], b[8];
+            struct iovec iov[2] = {{a, 2}, {b, 8}};
+            char control[CMSG_SPACE(sizeof uc)];
+            struct msghdr m = {.msg_iov = iov, .msg_iovlen = 2, .msg_control = control, .msg_controllen = sizeof control};
+            CHECK(recvmsg(sv[0], &m, 0) == 3 && !memcmp(a, "bb", 2) && b[0] == 'b');
+            memcpy(&uc, CMSG_DATA(CMSG_FIRSTHDR(&m)), sizeof uc);
+            CHECK(uc.pid == child);
+            // Same writer twice: one read. read() stops at writers too.
+            CHECK(write(sv[1], "e", 1) == 1);
+            CHECK(read(sv[0], data, 16) == 3 && !memcmp(data, "cde", 3));
+        }
+        close(sv[0]);
+        close(sv[1]);
+    }
+    // Before connecting, and inherited from a listener.
+    int l = socket(AF_UNIX, SOCK_STREAM, 0), c = socket(AF_UNIX, SOCK_STREAM, 0), on = 1, v = 0;
+    socklen_t len = sizeof v;
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    memcpy(sa.sun_path, "\0streamcred", 11);
+    socklen_t salen = offsetof(struct sockaddr_un, sun_path) + 11;
+    CHECK(bind(l, (void *)&sa, salen) == 0 && listen(l, 1) == 0);
+    CHECK(setsockopt(l, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(setsockopt(c, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(connect(c, (void *)&sa, salen) == 0);
+    int a = accept(l, NULL, NULL);
+    CHECK(a >= 0);
+    CHECK(getsockopt(a, SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    v = 0;
+    CHECK(getsockopt(c, SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    // A sender may say who it is (within its own ids), on a stream too.
+    struct ucred mine = {getpid(), getuid(), getgid()};
+    char control[CMSG_SPACE(sizeof mine)] = {0};
+    struct iovec iov = {"me", 2};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_CREDENTIALS;
+    cm->cmsg_len = CMSG_LEN(sizeof mine);
+    memcpy(CMSG_DATA(cm), &mine, sizeof mine);
+    CHECK(sendmsg(c, &m, 0) == 2);
+    CHECK(recv_cred(a, &uc, data) == 1 && uc.pid == getpid() && strcmp(data, "me") == 0);
+    mine.pid = 1;
+    memcpy(CMSG_DATA(cm), &mine, sizeof mine);
+    CHECK(getpid() == 1 || (sendmsg(c, &m, 0) == -1 && errno == EPERM));
+    close(a);
+    close(c);
+    close(l);
+    return 0;
+}
+
+// capset: nothing has a capability, so dropping them all is allowed
+// (Chromium's zygote does before it forks); raising one is denied.
+struct cap_header { unsigned version; int pid; };
+struct cap_data { unsigned effective, permitted, inheritable; };
+static int capdrop(void) {
+    struct cap_header h = {0x20080522, 0};
+    struct cap_data d[2] = {{0}};
+    CHECK(syscall(SYS_capget, &h, d) == 0 && d[0].effective == 0 && d[0].permitted == 0);
+    CHECK(syscall(SYS_capset, &h, d) == 0);
+    h.pid = getpid() + 1000;
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EPERM);
+    h = (struct cap_header){0x12345678, 0};
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EINVAL && h.version == 0x20080522);
+    h.pid = 0;
+    d[0].effective = d[0].permitted = 1 << 10;  // CAP_NET_BIND_SERVICE
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EPERM);
+    return 0;
+}
+
+// ---- Round 3: what the hardening and old limits kept from real programs
+
+/// An O_PATH descriptor opened again through its magic link is a new open,
+/// and can do what the descriptor can't (runc, systemd, libpathrs, and
+/// Python's listdir of the link), as a write-only O_TMPFILE read back.
+static int reopen(void) {
+    char link[64], got[16];
+    CHECK(mkdir("/tmp/re", 0755) == 0 && mkdir("/tmp/re/d", 0755) == 0);
+    int fd = open("/tmp/re/f", O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0 && write(fd, "hello", 5) == 5 && close(fd) == 0);
+    CHECK(close(open("/tmp/re/d/g", O_CREAT | O_WRONLY, 0644)) == 0);
+    int path = open("/tmp/re/f", O_PATH), dir = open("/tmp/re/d", O_PATH | O_DIRECTORY);
+    CHECK(path >= 0 && dir >= 0 && read(path, got, 1) == -1 && errno == EBADF);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", path);
+    int r = open(link, O_RDONLY);
+    CHECK(r >= 0 && !(fcntl(r, F_GETFL) & O_PATH));
+    CHECK(read(r, got, 5) == 5 && memcmp(got, "hello", 5) == 0);
+    // Each with its own offset.
+    int r2 = open(link, O_RDONLY);
+    CHECK(r2 >= 0 && read(r2, got, 1) == 1 && got[0] == 'h');
+    int w = open(link, O_WRONLY | O_APPEND);
+    CHECK(w >= 0 && write(w, "!", 1) == 1 && read(r, got, 1) == 1 && got[0] == '!');
+    CHECK(open(link, O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
+    // A file, so it's looked at as one: no reference to what's open.
+    CHECK(chmod("/tmp/re/f", 0) == 0);
+    int root = geteuid() == 0;
+    CHECK(!root || seteuid(1000) == 0);
+    CHECK(open(link, O_RDONLY) == -1 && errno == EACCES);
+    CHECK(!root || seteuid(0) == 0);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dir);
+    DIR *d = opendir(link);
+    CHECK(d != NULL);
+    int seen = 0;
+    for (struct dirent *e; (e = readdir(d));) seen += strcmp(e->d_name, "g") == 0;
+    CHECK(seen == 1 && closedir(d) == 0);
+    CHECK(open(link, O_WRONLY) == -1 && errno == EISDIR);
+    int t = open("/tmp/re", O_TMPFILE | O_WRONLY, 0600);
+    CHECK(t >= 0 && write(t, "x", 1) == 1);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", t);
+    int back = open(link, O_RDONLY);
+    CHECK(back >= 0 && read(back, got, 1) == 1 && got[0] == 'x');
+    // readlinkat with an empty path: the link the descriptor holds.
+    CHECK(symlink("f", "/tmp/re/l") == 0);
+    int l = open("/tmp/re/l", O_PATH | O_NOFOLLOW);
+    CHECK(l >= 0 && readlinkat(l, "", got, sizeof got) == 1 && got[0] == 'f');
+    CHECK(readlinkat(path, "", got, sizeof got) == -1 && errno == EINVAL);
+    CHECK(readlinkat(AT_FDCWD, "", got, sizeof got) == -1 && errno == ENOENT);
+    return 0;
+}
+
+static void nothing(int sig) { (void)sig; }
+
+/// No page for a signal frame ends the program as a fault with no page
+/// does: there's nothing wrong with its stack. Returns only on failure.
+static int framemem(void) {
+    size_t big = 1UL << 32;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    char *p = mmap(NULL, big, PROT_READ | PROT_WRITE, flags, -1, 0), *alt = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE, flags, -1, 0);
+    CHECK(p != MAP_FAILED && alt != MAP_FAILED);
+    stack_t ss = {.ss_sp = alt, .ss_size = 1 << 16};
+    struct sigaction sa = {.sa_handler = nothing, .sa_flags = SA_ONSTACK};
+    CHECK(sigaltstack(&ss, NULL) == 0 && sigaction(SIGUSR1, &sa, NULL) == 0);
+    int zero = open("/dev/zero", O_RDONLY);
+    // read says so where touching the pages would be the end of it.
+    size_t at = 0;
+    for (size_t step = 1 << 20; step >= 4096; step /= 2) {
+        ssize_t r;
+        while (at + step <= big && (r = read(zero, p + at, step)) > 0) at += r;
+    }
+    raise(SIGUSR1);
+    printf("FAILED: the handler ran with no memory left\n");
+    return 1;
+}
+
+/// Go's io.Copy between sockets waits in splice, a pipe for each connection:
+/// none of them may hold room for what hasn't come.
+static int spliceidle(void) {
+    struct rlimit rl = {16384, 16384};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    int sv[2], pf[2];
+    for (int i = 0; i < 1500; i++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && pipe(pf) == 0);
+        CHECK(splice(sv[0], NULL, pf[1], NULL, 65536, SPLICE_F_NONBLOCK) == -1 && errno == EAGAIN);
+    }
+    char b[4096] = {0};
+    CHECK(write(sv[1], "x", 1) == 1 && splice(sv[0], NULL, pf[1], NULL, 65536, SPLICE_F_NONBLOCK) == 1);
+    CHECK(read(pf[0], b, sizeof b) == 1 && b[0] == 'x');
+    CHECK(fcntl(pf[1], F_SETFL, O_NONBLOCK) == 0);
+    for (int i = 0; i < 16; i++) CHECK(write(pf[1], b, sizeof b) == sizeof b);
+    return 0;
+}
+
+/// Thousands of open files in all, of more than one kind.
+static int openfiles(void) {
+    struct rlimit rl = {32768, 32768};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    FILE *f = fopen("/proc/sys/fs/file-max", "r");
+    long max = 0;
+    CHECK(f != NULL && fscanf(f, "%ld", &max) == 1 && max >= 12000 && fclose(f) == 0);
+    int pf[2];
+    for (int i = 0; i < 5000; i++) CHECK(pipe(pf) == 0);
+    for (int i = 0; i < 2000; i++) CHECK(timerfd_create(CLOCK_MONOTONIC, 0) >= 0);
+    return 0;
+}
+
+static void *accept_later(void *arg) {
+    int l = *(int *)arg;
+    usleep(100000);
+    for (int i = 0; i < 3000; i++)
+        if (accept(l, NULL, NULL) < 0) return (void *)1;
+    return NULL;
+}
+
+/// More connects at once than the backlog: on Linux they wait for accept,
+/// and none is refused.
+static int burst(void) {
+    struct rlimit rl = {16384, 16384};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(7010), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 8) == 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, accept_later, &l) == 0);
+    for (int i = 0; i < 3000; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(c >= 0 && connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+    }
+    void *failed;
+    CHECK(pthread_join(t, &failed) == 0 && failed == NULL);
+    return 0;
+}
+
+/// As much as glibc's sysconf(_SC_ARG_MAX) says, as `find -exec {} +`
+/// passes, and no more: strings and their pointers count. Ends in
+/// "argmaxed".
+static int argmax(char *self) {
+    enum { LEN = 100, OK = 18000, OVER = 25000 };
+    char **args = calloc(OVER + 3, sizeof *args), *one = malloc(LEN + 1);
+    CHECK(args != NULL && one != NULL);
+    memset(one, 'x', LEN);
+    one[LEN] = 0;
+    args[0] = self;
+    args[1] = "argmaxed";
+    for (int i = 2; i < OVER + 2; i++) args[i] = one;
+    CHECK(execv(self, args) == -1 && errno == E2BIG);
+    args[OK + 2] = NULL;
+    execv(self, args);
+    CHECK(0);
+}
+
+/// More files than 12 MiB of names and nodes hold.
+static int manyfiles(void) {
+    char name[64];
+    CHECK(mkdir("/tmp/many", 0755) == 0);
+    for (int i = 0; i < 50000; i++) {
+        snprintf(name, sizeof name, "/tmp/many/file-%d", i);
+        int fd = open(name, O_CREAT | O_WRONLY, 0644);
+        CHECK(fd >= 0 && close(fd) == 0);
+    }
+    DIR *d = opendir("/tmp/many");
+    CHECK(d != NULL);
+    int seen = 0;
+    while (readdir(d)) seen++;
+    CHECK(seen == 50002 && closedir(d) == 0);
+    return 0;
+}
+
+/// What a big image leaves is the program's: `touch` touches this much.
+static int touch(void) {
+    size_t n = 140 << 20;
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    memset(p, 1, n);
+    return 0;
+}
+
+/// A server behind a forwarded port, past what 256 connections were: each
+/// answers a byte and stays open.
+static int manyconns(void) {
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(8100), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 128) == 0);
+    for (int i = 0; i < 400; i++) {
+        int c = accept(l, NULL, NULL);
+        char b;
+        CHECK(c >= 0 && read(c, &b, 1) == 1 && write(c, &b, 1) == 1);
+    }
+    return 0;
+}
+
+#define FUTEX_WAIT_SHARED 0
+#define FUTEX_WAKE_SHARED 1
+#define FUTEX_CMP_REQUEUE_SHARED 4
+
+static long fx(unsigned *w, int op, unsigned val, const struct timespec *t, unsigned *w2, unsigned val3) {
+    return syscall(SYS_futex, w, op, val, t, w2, val3);
+}
+
+/// A child waits on `w` (`on`'s word, in its own mapping or not): wake it
+/// from here. Whether it's got there yet only the wake's count says.
+static int wake_child(unsigned *w, pid_t child) {
+    int status;
+    long woken = 0;
+    for (int i = 0; i < 5000 && woken == 0; i++) {
+        woken = fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0);
+        if (woken == 0) usleep(1000);
+    }
+    return woken == 1 && waitpid(child, &status, 0) == child && status == 0;
+}
+
+/// Futex words processes share: found by what they're in, wherever each
+/// process has them.
+static int pshared(void) {
+    // Semaphores, ping-pong: PostgreSQL's LWLocks, Python's multiprocessing.
+    int prot = PROT_READ | PROT_WRITE;
+    sem_t *s = mmap(NULL, 4096, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(s != MAP_FAILED && sem_init(&s[0], 1, 0) == 0 && sem_init(&s[1], 1, 0) == 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (int i = 0; i < 2000; i++) {
+            sem_wait(&s[0]);
+            sem_post(&s[1]);
+        }
+        _exit(0);
+    }
+    for (int i = 0; i < 2000; i++) {
+        CHECK(sem_post(&s[0]) == 0 && sem_wait(&s[1]) == 0);
+    }
+    int status;
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
+    // A process-shared mutex and condition variable.
+    struct both { pthread_mutex_t m; pthread_cond_t c; int turn; } *b = mmap(NULL, 4096, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(b != MAP_FAILED);
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    CHECK(pthread_mutexattr_init(&ma) == 0 && pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_condattr_init(&ca) == 0 && pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutex_init(&b->m, &ma) == 0 && pthread_cond_init(&b->c, &ca) == 0);
+    pid = fork();
+    if (pid == 0) {
+        pthread_mutex_lock(&b->m);
+        for (int i = 0; i < 500; i++) {
+            while (b->turn != 1) pthread_cond_wait(&b->c, &b->m);
+            b->turn = 0;
+            pthread_cond_broadcast(&b->c);
+        }
+        pthread_mutex_unlock(&b->m);
+        _exit(0);
+    }
+    pthread_mutex_lock(&b->m);
+    for (int i = 0; i < 500; i++) {
+        b->turn = 1;
+        pthread_cond_broadcast(&b->c);
+        while (b->turn != 0) pthread_cond_wait(&b->c, &b->m);
+    }
+    pthread_mutex_unlock(&b->m);
+    CHECK(waitpid(pid, &status, 0) == pid && status == 0);
+    // A file's word, at another address in each process.
+    int fd = open("/tmp/futexword", O_CREAT | O_RDWR, 0600);
+    CHECK(fd >= 0 && ftruncate(fd, 4096) == 0);
+    unsigned *here = mmap(NULL, 4096, prot, MAP_SHARED, fd, 0);
+    CHECK(here != MAP_FAILED);
+    pid = fork();
+    if (pid == 0) {
+        unsigned *there = mmap(NULL, 4096, prot, MAP_SHARED, fd, 0);
+        _exit(there != here && there != MAP_FAILED && fx(there, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    }
+    CHECK(pid > 0 && wake_child(here, pid));
+    // A System V segment's, likewise.
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    unsigned *seg = shmat(id, NULL, 0);
+    CHECK(id >= 0 && seg != (void *)-1);
+    pid = fork();
+    if (pid == 0) {
+        unsigned *other = shmat(id, NULL, 0);
+        _exit(other != seg && other != (void *)-1 && fx(other, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    }
+    CHECK(pid > 0 && wake_child(seg, pid));
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    // Moved to another word, still in another process.
+    unsigned *w = (unsigned *)s + 512;
+    pid = fork();
+    if (pid == 0) _exit(fx(w, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 0 : 1);
+    long moved = 0;
+    for (int i = 0; i < 5000 && moved == 0; i++) {
+        moved = fx(w, FUTEX_CMP_REQUEUE_SHARED, 0, (void *)1L, w + 1, 0);
+        if (moved == 0) usleep(1000);
+    }
+    CHECK(moved == 1 && pid > 0 && wake_child(w + 1, pid));
+    // A wait that timed out, or was killed, has left the queue.
+    struct timespec soon = {0, 5000000};
+    CHECK(fx(w, FUTEX_WAIT_SHARED, 0, &soon, NULL, 0) == -1 && errno == ETIMEDOUT);
+    CHECK(fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0) == 0);
+    pid = fork();
+    if (pid == 0) _exit(fx(w, FUTEX_WAIT_SHARED, 0, NULL, NULL, 0) == 0 ? 3 : 4);
+    usleep(50000);
+    CHECK(pid > 0 && kill(pid, SIGKILL) == 0 && waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status) && fx(w, FUTEX_WAKE_SHARED, 1, NULL, NULL, 0) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -932,6 +1514,29 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "xattrro") == 0) r = xattrro();
         if (strcmp(argv[i], "xattrmounts") == 0) r = xattrmounts();
         if (strcmp(argv[i], "xattrcopied") == 0) r = xattrcopied();
+        if (strcmp(argv[i], "sysctls") == 0) r = sysctls();
+        if (strcmp(argv[i], "schedprio") == 0) r = schedprio();
+        if (strcmp(argv[i], "numa") == 0) r = numa();
+        if (strcmp(argv[i], "prctls") == 0) r = prctls();
+        if (strcmp(argv[i], "tasks") == 0) r = tasks();
+        if (strcmp(argv[i], "passcred") == 0) r = passcred();
+        if (strcmp(argv[i], "streamcred") == 0) r = streamcred();
+        if (strcmp(argv[i], "capdrop") == 0) r = capdrop();
+        if (strcmp(argv[i], "reopen") == 0) r = reopen();
+        if (strcmp(argv[i], "framemem") == 0) r = framemem();
+        if (strcmp(argv[i], "spliceidle") == 0) r = spliceidle();
+        if (strcmp(argv[i], "openfiles") == 0) r = openfiles();
+        if (strcmp(argv[i], "burst") == 0) r = burst();
+        if (strcmp(argv[i], "argmax") == 0) r = argmax(argv[0]);
+        if (strcmp(argv[i], "manyfiles") == 0) r = manyfiles();
+        if (strcmp(argv[i], "touch") == 0) r = touch();
+        if (strcmp(argv[i], "manyconns") == 0) r = manyconns();
+        if (strcmp(argv[i], "pshared") == 0) r = pshared();
+        // The arguments after it are only there to be counted.
+        if (strcmp(argv[i], "argmaxed") == 0) {
+            printf("argmax %s\n", argc == 18002 ? "ok" : "failed");
+            return argc != 18002;
+        }
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

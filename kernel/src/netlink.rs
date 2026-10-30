@@ -1,6 +1,10 @@
 //! A NETLINK_ROUTE socket that describes the sandbox's network interfaces:
-//! `lo` (127.0.0.1/8 and ::1/128), and with `net` also `eth0` (10.0.2.15/24,
-//! the default route via the host, 10.0.2.2). That's what getifaddrs and
+//! `lo` (127.0.0.1/8 and ::1/128), and with `net` also `eth0` (10.0.2.15/24
+//! and fd00::15/64, the default routes via the host, 10.0.2.2 and fd00::2).
+//! The IPv6 address is a unique local one (`link::GUEST_V6`), so address
+//! selection still prefers IPv4 for anything global, while programs that
+//! want an IPv6 address before they listen on `[::]` (getaddrinfo's
+//! AI_ADDRCONFIG) find one. That's what getifaddrs and
 //! if_nameindex ask for (Node's os.networkInterfaces, Python's
 //! socket.if_nameindex, `ip addr`, `ip route`). It reveals nothing about the
 //! host, so it needs no capability. eth0 is no device: it describes the
@@ -70,6 +74,21 @@ const ETH0_MASK: [u8; 4] = [255, 255, 255, 0];
 const ETH0_NET: [u8; 4] = [ETH0_IP[0], ETH0_IP[1], ETH0_IP[2], 0];
 const ETH0_BROADCAST: [u8; 4] = [ETH0_IP[0], ETH0_IP[1], ETH0_IP[2], 255];
 const GATEWAY: [u8; 4] = link::HOST_V4;
+const ETH0_IP6: [u8; 16] = link::GUEST_V6;
+const GATEWAY6: [u8; 16] = link::HOST_V6;
+/// eth0's IPv6 network: `ETH0_IP6` within its prefix.
+const ETH0_NET6: [u8; 16] = {
+    let mut n = ETH0_IP6;
+    let mut i = (link::NET_V6_PREFIX / 8) as usize;
+    while i < 16 {
+        n[i] = 0;
+        i += 1;
+    }
+    n
+};
+/// Linux's metrics for a prefix route and a default one from a router.
+const METRIC_PREFIX6: u32 = 256;
+const METRIC_DEFAULT6: u32 = 1024;
 
 /// Is there an eth0 (the program has `net`)? Set once at boot.
 static HAS_ETH0: AtomicBool = AtomicBool::new(false);
@@ -146,6 +165,11 @@ fn by_name(name: &[u8]) -> Option<&'static Iface> {
 pub struct Netlink {
     /// Our port id (nl_pid).
     pub port: u32,
+    /// A NETLINK_KOBJECT_UEVENT socket: udev's events, of which there are
+    /// none (no devices come and go), as in a container without udev.
+    /// What's sent to it is refused as Linux refuses it without
+    /// CAP_SYS_ADMIN.
+    pub uevent: bool,
     /// Reply datagrams, oldest first, with the kernel memory they hold.
     pub rx: VecDeque<(Vec<u8>, crate::kmem::Charge)>,
     /// Bumped whenever replies are queued (for edge-triggered epoll).
@@ -154,7 +178,7 @@ pub struct Netlink {
 
 impl Netlink {
     pub fn new(port: u32) -> Self {
-        Netlink { port, rx: VecDeque::new(), version: 0 }
+        Netlink { port, uevent: false, rx: VecDeque::new(), version: 0 }
     }
 
     pub fn poll(&self) -> (u32, u64) {
@@ -193,6 +217,11 @@ impl Netlink {
         if flags & NLM_F_REQUEST == 0 {
             return;
         }
+        // uevent_net_rcv_skb: sending needs CAP_SYS_ADMIN; the error comes
+        // back as a message, as netlink_rcv_skb acks it.
+        if self.uevent {
+            return self.error(out, msg, -(EPERM.0 as i32));
+        }
         // rtgenmsg/ifinfomsg/ifaddrmsg all start with the address family.
         let family = msg.get(HDR).copied().unwrap_or(0);
         // Either half of NLM_F_DUMP (ROOT or MATCH) asks for a dump, as on Linux.
@@ -223,19 +252,24 @@ impl Netlink {
                     }
                 }
                 if family == 0 || family == AF_INET6 {
-                    let mut v6 = [0u8; 16];
-                    v6[15] = 1;
-                    self.addr6(out, seq, &v6);
+                    for (i, ip, prefix) in addrs6() {
+                        self.addr6(out, seq, i, &ip, prefix);
+                    }
                 }
                 self.done(out, seq);
                 Ok(())
             }
-            // The main table's routes: eth0's network, and the default one
-            // through the host.
+            // The main table's routes: eth0's networks, and the default
+            // ones through the host (and IPv6's ::1 on lo, as Linux lists).
             RTM_GETROUTE if dump => {
                 if eth0() && (family == 0 || family == AF_INET) {
                     self.route(out, seq, Some(GATEWAY));
                     self.route(out, seq, None);
+                }
+                if family == 0 || family == AF_INET6 {
+                    for r in routes6() {
+                        self.route6(out, seq, &r);
+                    }
                 }
                 self.done(out, seq);
                 Ok(())
@@ -306,15 +340,39 @@ impl Netlink {
         self.message(out, RTM_NEWADDR, NLM_F_MULTI, seq, &b);
     }
 
-    /// lo's IPv6 address (eth0 has none: the host's proxy is reached over
-    /// IPv4).
-    fn addr6(&self, out: &mut Vec<u8>, seq: u32, ip: &[u8; 16]) {
+    /// An IPv6 address: lo's ::1, or eth0's.
+    fn addr6(&self, out: &mut Vec<u8>, seq: u32, i: &Iface, ip: &[u8; 16], prefix: u8) {
         const IFA_F_PERMANENT: u8 = 0x80;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
         const RT_SCOPE_HOST: u8 = 254;
-        let mut b = alloc::vec![AF_INET6, 128, IFA_F_PERMANENT, RT_SCOPE_HOST];
-        b.extend_from_slice(&LO_INDEX.to_le_bytes());
+        let scope = if i.index == LO_INDEX { RT_SCOPE_HOST } else { RT_SCOPE_UNIVERSE };
+        let mut b = alloc::vec![AF_INET6, prefix, IFA_F_PERMANENT, scope];
+        b.extend_from_slice(&i.index.to_le_bytes());
         attr(&mut b, 1, ip); // IFA_ADDRESS
+        attr(&mut b, 8, &(IFA_F_PERMANENT as u32).to_le_bytes()); // IFA_FLAGS
         self.message(out, RTM_NEWADDR, NLM_F_MULTI, seq, &b);
+    }
+
+    /// An IPv6 route in the main table.
+    fn route6(&self, out: &mut Vec<u8>, seq: u32, r: &Route6) {
+        const RT_TABLE_MAIN: u8 = 254;
+        const RTPROT_KERNEL: u8 = 2;
+        const RTPROT_BOOT: u8 = 3;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
+        const RTN_UNICAST: u8 = 1;
+        let proto = if r.gateway.is_some() { RTPROT_BOOT } else { RTPROT_KERNEL };
+        let mut b = alloc::vec![AF_INET6, r.dst_len, 0, 0, RT_TABLE_MAIN, proto, RT_SCOPE_UNIVERSE, RTN_UNICAST];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        attr(&mut b, 15, &(RT_TABLE_MAIN as u32).to_le_bytes()); // RTA_TABLE
+        if r.dst_len != 0 {
+            attr(&mut b, 1, &r.dst); // RTA_DST
+        }
+        attr(&mut b, 6, &r.metric.to_le_bytes()); // RTA_PRIORITY
+        attr(&mut b, 4, &r.dev.index.to_le_bytes()); // RTA_OIF
+        if let Some(gw) = r.gateway {
+            attr(&mut b, 5, &gw); // RTA_GATEWAY
+        }
+        self.message(out, RTM_NEWROUTE, NLM_F_MULTI, seq, &b);
     }
 
     /// A main-table route on eth0: its network (as the kernel adds for an
@@ -356,6 +414,104 @@ impl Netlink {
         b.extend_from_slice(&errno.to_le_bytes());
         b.extend_from_slice(&request[..HDR]);
         self.message(out, NLMSG_ERROR, NLM_F_CAPPED, u32_at(request, 8), &b);
+    }
+}
+
+/// The IPv6 addresses, by interface: (interface, address, prefix).
+fn addrs6() -> Vec<(&'static Iface, [u8; 16], u8)> {
+    let mut v = alloc::vec![(&LO, crate::inet::LOOPBACK_V6, 128)];
+    if eth0() {
+        v.push((&ETH0, ETH0_IP6, link::NET_V6_PREFIX));
+    }
+    v
+}
+
+struct Route6 {
+    dst: [u8; 16],
+    dst_len: u8,
+    gateway: Option<[u8; 16]>,
+    metric: u32,
+    dev: &'static Iface,
+}
+
+/// The main table's IPv6 routes, as `ip -6 route` lists them.
+fn routes6() -> Vec<Route6> {
+    let mut v = Vec::new();
+    if eth0() {
+        let net =
+            Route6 { dst: ETH0_NET6, dst_len: link::NET_V6_PREFIX, gateway: None, metric: METRIC_PREFIX6, dev: &ETH0 };
+        v.push(net);
+    }
+    v.push(Route6 { dst: crate::inet::LOOPBACK_V6, dst_len: 128, gateway: None, metric: METRIC_PREFIX6, dev: &LO });
+    if eth0() {
+        v.push(Route6 { dst: [0; 16], dst_len: 0, gateway: Some(GATEWAY6), metric: METRIC_DEFAULT6, dev: &ETH0 });
+    }
+    v
+}
+
+/// An IPv6 address as RFC 5952 writes it (the longest run of zero
+/// groups, if more than one, as `::`).
+pub fn ipv6_text(a: &[u8; 16]) -> alloc::string::String {
+    use core::fmt::Write;
+    let g: [u16; 8] = core::array::from_fn(|i| u16::from_be_bytes([a[2 * i], a[2 * i + 1]]));
+    let (mut best, mut run) = ((0, 0), (0, 0));
+    for (i, &x) in g.iter().enumerate() {
+        run = if x == 0 { (if run.1 == 0 { i } else { run.0 }, run.1 + 1) } else { (0, 0) };
+        if run.1 > best.1 {
+            best = run;
+        }
+    }
+    let mut s = alloc::string::String::new();
+    let mut i = 0;
+    while i < 8 {
+        if best.1 > 1 && i == best.0 {
+            s.push_str(if i == 0 { "::" } else { ":" });
+            i += best.1;
+            continue;
+        }
+        let _ = write!(s, "{:x}", g[i]);
+        if i < 7 {
+            s.push(':');
+        }
+        i += 1;
+    }
+    s
+}
+
+/// /proc/net/if_inet6: each IPv6 address, its interface's index, prefix,
+/// scope and flags (IFA_F_PERMANENT), as Linux's if6_seq_show writes them.
+pub fn proc_net_if_inet6(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    for (i, ip, prefix) in addrs6() {
+        let scope = if i.index == LO_INDEX { 0x10 } else { 0 };
+        for b in ip {
+            let _ = write!(s, "{b:02x}");
+        }
+        let name = core::str::from_utf8(i.name).unwrap_or("");
+        let _ = writeln!(s, " {:02x} {prefix:02x} {scope:02x} 80 {name:>8}", i.index);
+    }
+}
+
+/// /proc/net/ipv6_route: the main table's IPv6 routes, as Linux's
+/// ipv6_route_seq_show writes them (no source routing).
+pub fn proc_net_ipv6_route(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
+    let hex = |s: &mut alloc::string::String, a: &[u8; 16]| {
+        for b in a {
+            let _ = write!(s, "{b:02x}");
+        }
+    };
+    for r in routes6() {
+        hex(s, &r.dst);
+        let _ = write!(s, " {:02x} ", r.dst_len);
+        hex(s, &[0; 16]);
+        s.push_str(" 00 ");
+        hex(s, &r.gateway.unwrap_or([0; 16]));
+        let flags = RTF_UP | if r.gateway.is_some() { RTF_GATEWAY } else { 0 };
+        let name = core::str::from_utf8(r.dev.name).unwrap_or("");
+        let _ = writeln!(s, " {:08x} 00000001 00000000 {flags:08x} {name:>8}", r.metric);
     }
 }
 
@@ -519,6 +675,91 @@ pub fn ifreq_ioctl(req: u64, ifr: &mut [u8; 40]) -> Option<Result<(), Errno>> {
         _ => return None,
     };
     Some(result)
+}
+
+// ---------------------------------------------------------------- ethtool
+
+/// SIOCETHTOOL on interface `name`: command `cmd`, whose structure in the
+/// program's memory `read` reads (offset, length). The bytes to write back
+/// there. eth0 answers as a container's veth does (no bus, 10 Gb/s full
+/// duplex, its link up); lo has a link and nothing else. As in Linux's
+/// dev_ethtool: an unknown interface is ENODEV, a command that changes
+/// anything needs CAP_NET_ADMIN (EPERM), and one the driver doesn't have
+/// is EOPNOTSUPP.
+pub fn ethtool(
+    name: &[u8],
+    cmd: u32,
+    mut read: impl FnMut(usize, usize) -> Result<Vec<u8>, Errno>,
+) -> Result<Vec<u8>, Errno> {
+    const GSET: u32 = 0x1;
+    const GDRVINFO: u32 = 0x3;
+    const GLINK: u32 = 0xa;
+    const GPERMADDR: u32 = 0x20;
+    const GLINKSETTINGS: u32 = 0x4c;
+    /// dev_ethtool's commands that need no capability.
+    const GETS: &[u32] = &[
+        0x1, 0x3, 0x7, 0xa, 0xe, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1b, 0x1d, 0x1e, 0x20, 0x21, 0x23, 0x25, 0x27, 0x29,
+        0x2b, 0x2d, 0x2e, 0x2f, 0x30, 0x37, 0x38, 0x3a, 0x3c, 0x41, 0x44, 0x46, 0x48, 0x4a, 0x4c, 0x4e, 0x50,
+    ];
+    /// __ETHTOOL_LINK_MODE_MASK_NU32 (Linux 6.1).
+    const MASK_NU32: i8 = 4;
+    const SPEED: u32 = 10000;
+    const DUPLEX_FULL: u8 = 1;
+    let iface = by_name(name).ok_or(ENODEV)?;
+    if !GETS.contains(&cmd) {
+        return Err(EPERM);
+    }
+    let eth0 = iface.index == ETH0_INDEX;
+    let mut out = Vec::new();
+    out.extend_from_slice(&cmd.to_le_bytes());
+    match cmd {
+        // struct ethtool_value: whether the link is up.
+        GLINK => out.extend_from_slice(&1u32.to_le_bytes()),
+        // struct ethtool_drvinfo.
+        GDRVINFO if eth0 => {
+            let field = |out: &mut Vec<u8>, s: &[u8], len: usize| {
+                out.extend_from_slice(s);
+                out.resize(out.len() + len - s.len(), 0);
+            };
+            field(&mut out, b"veth", 32); // driver
+            field(&mut out, b"1.0", 32); // version
+            field(&mut out, b"", 32); // fw_version
+            field(&mut out, b"", 32); // bus_info
+            field(&mut out, b"", 32); // erom_version
+            out.resize(out.len() + 12 + 5 * 4, 0); // reserved2, counts
+        }
+        // struct ethtool_cmd, the old form of the link's settings.
+        GSET if eth0 => {
+            out.extend_from_slice(&[0; 8]); // supported, advertising
+            out.extend_from_slice(&(SPEED as u16).to_le_bytes());
+            out.extend_from_slice(&[DUPLEX_FULL, 0, 0, 0, 0, 0]); // port TP, autoneg off
+            out.resize(44, 0);
+        }
+        // struct ethtool_link_settings and its masks, after the handshake
+        // that tells the program how many words they take.
+        GLINKSETTINGS if eth0 => {
+            let nwords = read(15, 1)?[0] as i8;
+            if nwords != MASK_NU32 {
+                out.resize(48, 0);
+                out[15] = (-MASK_NU32) as u8;
+            } else {
+                out.extend_from_slice(&SPEED.to_le_bytes());
+                out.extend_from_slice(&[DUPLEX_FULL, 0, 0, 0, 0, 0, 0, MASK_NU32 as u8]);
+                out.resize(48 + 3 * 4 * MASK_NU32 as usize, 0);
+            }
+        }
+        // struct ethtool_perm_addr: the MAC, if `size` has room for it.
+        GPERMADDR if eth0 => {
+            let size = u32::from_le_bytes(read(4, 4)?.try_into().unwrap());
+            if size < 6 {
+                return Err(E2BIG);
+            }
+            out.extend_from_slice(&6u32.to_le_bytes());
+            out.extend_from_slice(&iface.mac);
+        }
+        _ => return Err(EOPNOTSUPP),
+    }
+    Ok(out)
 }
 
 /// SIOCGIFCONF's entries: each interface and its IPv4 address.

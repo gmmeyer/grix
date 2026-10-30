@@ -15,9 +15,12 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
+use crate::errno::*;
 use crate::ipc;
+use crate::kmem::Charge;
 use crate::process::Process;
 use crate::signal::{self, SigInfo, Target};
 use crate::time;
@@ -27,9 +30,15 @@ const SIGVTALRM: u32 = 26;
 const SIGPROF: u32 = 27;
 const SI_KERNEL: i32 = 0x80;
 const SI_TIMER: i32 = -2;
-/// timer_create's per-process limit (Linux's is RLIMIT_SIGPENDING-sized);
-/// it bounds kernel memory.
+/// timer_create's per-process limit (Linux's is RLIMIT_SIGPENDING-sized):
+/// `fire` and the scheduler look through a process's.
 pub const MAX_POSIX_TIMERS: usize = 1024;
+/// And in all processes together: what bounds kernel memory, as each is
+/// charged to `kmem` as well (`TIMER_COST`). EAGAIN at either.
+const MAX_TIMERS_TOTAL: usize = 8192;
+/// A timer's share of the heap: B-tree nodes are half empty when timers
+/// are made in order.
+const TIMER_COST: u64 = 2 * (core::mem::size_of::<PosixTimer>() + 4) as u64;
 /// `SigInfo::timer` for ITIMER_REAL's SIGALRM.
 const REAL_TIMER: u32 = u32::MAX;
 /// `SigInfo::timer` for ITIMER_VIRTUAL's and ITIMER_PROF's signals.
@@ -97,6 +106,31 @@ impl CpuClock {
     }
 }
 
+/// Timers in all processes (`MAX_TIMERS_TOTAL`).
+static TIMERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A timer's place in `TIMERS` and its charge, given back when it's dropped.
+pub struct TimerHeld(#[allow(dead_code)] Charge);
+
+impl TimerHeld {
+    pub fn new() -> Result<TimerHeld, Errno> {
+        if TIMERS.load(Ordering::Relaxed) >= MAX_TIMERS_TOTAL {
+            crate::stats::hit(grix_abi::stats::Limit::Timers);
+            return Err(EAGAIN);
+        }
+        let charge = Charge::new(TIMER_COST).map_err(|_| EAGAIN)?;
+        // Under the kernel lock: check-then-add doesn't race.
+        TIMERS.fetch_add(1, Ordering::Relaxed);
+        Ok(TimerHeld(charge))
+    }
+}
+
+impl Drop for TimerHeld {
+    fn drop(&mut self) {
+        TIMERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct PosixTimer {
     /// In CPU time, for a CPU-time clock's.
     pub timing: Interval,
@@ -108,6 +142,7 @@ pub struct PosixTimer {
     pub overrun: u32,
     /// Its signal is queued and hasn't been taken yet.
     pub pending: bool,
+    pub _held: TimerHeld,
 }
 
 /// A timerfd: readable once it has expired, `read` returns and resets the count.
@@ -147,8 +182,45 @@ pub struct Timers {
     pub cpu_pending: [bool; 2],
     pub posix: BTreeMap<u32, PosixTimer>,
     pub next_id: u32,
-    /// Every timerfd still open, so the scheduler wakes up for them.
-    pub fds: Vec<Weak<Mutex<TimerFd>>>,
+}
+
+/// Every timerfd still open, so the scheduler wakes up for them. A
+/// timerfd belongs to its file, which outlives whoever made it (fork,
+/// SCM_RIGHTS), so no process's list would do. Weak: `add_timerfd` forgets
+/// the closed ones, and open files are bounded (`fd::max_open_files`).
+static TIMER_FDS: Mutex<Vec<Weak<Mutex<TimerFd>>>> = Mutex::new(Vec::new());
+
+pub fn add_timerfd(fd: &Arc<Mutex<TimerFd>>) {
+    let mut fds = TIMER_FDS.lock();
+    // Once it's full, not each time: there may be tens of thousands.
+    if fds.len() == fds.capacity() {
+        fds.retain(|w| w.strong_count() > 0);
+    }
+    fds.push(Arc::downgrade(fd));
+}
+
+/// The earliest deadline of a timerfd that can wake someone up: not one
+/// still readable from its last expiry.
+pub fn timerfd_deadline() -> Option<u64> {
+    let fds = TIMER_FDS.lock();
+    let armed = fds.iter().filter_map(Weak::upgrade).filter_map(|t| {
+        let t = t.lock();
+        t.timing.next.filter(|_| t.expirations == 0)
+    });
+    armed.min()
+}
+
+/// Count the timerfds' expiries. Returns whether one became readable.
+pub fn fire_timerfds() -> bool {
+    let now = time::monotonic_ns();
+    let mut fired = false;
+    for fd in TIMER_FDS.lock().iter().filter_map(Weak::upgrade) {
+        let mut t = fd.lock();
+        if t.expirations == 0 && t.update(now) > 0 {
+            fired = true;
+        }
+    }
+    fired
 }
 
 impl Timers {
@@ -162,19 +234,12 @@ impl Timers {
             .values()
             .filter(|t| t.cpu.is_none() && !t.pending && matches!(t.notify, Notify::Signal { .. }))
             .filter_map(|t| t.timing.next);
-        let fds = self.fds.iter().filter_map(|w| w.upgrade()).filter_map(|t| {
-            let t = t.lock();
-            t.timing.next.filter(|_| t.expirations == 0)
-        });
-        real.into_iter().chain(posix).chain(fds).min()
+        real.into_iter().chain(posix).min()
     }
 
     /// Has it a timer at all (armed or not)?
     pub fn any(&self) -> bool {
-        self.real.next.is_some()
-            || self.cpu_itimers.iter().any(|i| i.next.is_some())
-            || !self.posix.is_empty()
-            || !self.fds.is_empty()
+        self.real.next.is_some() || self.cpu_itimers.iter().any(|i| i.next.is_some()) || !self.posix.is_empty()
     }
 
     /// The timing of timer `id` (a POSIX timer's or an itimer's).
@@ -185,11 +250,6 @@ impl Timers {
             id if id == CPU_ITIMERS[1] => Some(&mut self.cpu_itimers[1]),
             id => self.posix.get_mut(&id).map(|t| &mut t.timing),
         }
-    }
-
-    pub fn add_fd(&mut self, fd: &Arc<Mutex<TimerFd>>) {
-        self.fds.retain(|w| w.strong_count() > 0);
-        self.fds.push(Arc::downgrade(fd));
     }
 }
 
@@ -259,8 +319,8 @@ fn send_timer_signal(p: &mut Process, target: Target, info: SigInfo, id: u32) ->
     false
 }
 
-/// Handle every timer whose deadline has passed. Returns whether anything
-/// happened (a signal was sent or a timerfd became readable).
+/// Handle every timer of `p`'s whose deadline has passed. Returns whether
+/// anything happened (a signal was sent).
 pub fn fire(p: &mut Process) -> bool {
     // Most processes have none: the tick needn't count their CPU time.
     if !p.timers.any() {
@@ -317,15 +377,8 @@ pub fn fire(p: &mut Process) -> bool {
         let queued = send_timer_signal(p, target, info, id);
         p.timers.posix.get_mut(&id).unwrap().pending = queued;
     }
-    p.timers.fds.retain(|w| w.strong_count() > 0);
-    for fd in p.timers.fds.iter().filter_map(|w| w.upgrade()) {
-        let mut t = fd.lock();
-        if t.expirations == 0 && t.update(now) > 0 {
-            fired = true;
-        }
-    }
     if fired {
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     fired
 }
@@ -370,17 +423,17 @@ pub fn resync(p: &mut Process) {
     for id in ids {
         if signal::queued_timer_signal(p, id).is_none() {
             p.timers.posix.get_mut(&id).unwrap().pending = false;
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
     }
     if p.timers.real_pending && signal::queued_timer_signal(p, REAL_TIMER).is_none() {
         p.timers.real_pending = false;
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     for (i, id) in CPU_ITIMERS.into_iter().enumerate() {
         if p.timers.cpu_pending[i] && signal::queued_timer_signal(p, id).is_none() {
             p.timers.cpu_pending[i] = false;
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
     }
 }

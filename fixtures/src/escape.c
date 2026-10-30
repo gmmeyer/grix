@@ -134,6 +134,21 @@ int main(int argc, char **argv) {
     } else if (strcmp(what, "rsp-use") == 0) {
         rsp_use_on_return(0xffff800000000000ul);
         printf("rsp-use: used a kernel-half stack\n");
+    } else if (strcmp(what, "rip-top") == 0) {
+        // A system call in the last two bytes of user space returns to the
+        // first address past it, which isn't canonical: the program faults
+        // there (at 0), not the kernel's iretq. getpid, which the kernel
+        // answers without its lock (`fast`), as other calls.
+        unsigned char *top = mmap((void *)0x7ffffffff000ul, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (top == MAP_FAILED) {
+            printf("FAILED: mmap the top page: %s\n", strerror(errno));
+            return 1;
+        }
+        top[4094] = 0x0f; // syscall
+        top[4095] = 0x05;
+        asm volatile("call *%0" : : "r"(top + 4094), "a"((long)SYS_getpid) : "rcx", "r11", "memory");
+        printf("rip-top: came back\n");
     } else if (strcmp(what, "compat") == 0) {
         compat_roundtrip();
     } else if (strncmp(what, "sigreturn", 9) == 0) {

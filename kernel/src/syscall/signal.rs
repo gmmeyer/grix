@@ -189,7 +189,7 @@ pub fn kill(p: &mut Process, pid: u64, sig: u64) -> SysResult {
         }
         signal::send(q, Target::Process, SigInfo::sent(sig, SI_USER, me, uid, SENT_BY_PROGRAM))?;
     }
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     if found { Ok(0) } else { Err(ESRCH) }
 }
 
@@ -232,7 +232,7 @@ pub fn pidfd_send_signal(p: &mut Process, pidfd: u64, sig: u64, uinfo: u64, flag
         return Ok(0);
     }
     signal::send(q, Target::Process, info)?;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     Ok(0)
 }
 
@@ -257,7 +257,7 @@ pub fn tgkill(p: &mut Process, tgid: Option<u64>, tid: u64, sig: u64) -> SysResu
     }
     let info = SigInfo::sent(sig, SI_TKILL, me, uid, SENT_BY_PROGRAM);
     signal::send(q, Target::Thread(tid), info)?;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     Ok(0)
 }
 

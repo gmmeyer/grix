@@ -21,6 +21,7 @@ use grix_abi::link::{self, Addr};
 const AF_UNIX: u64 = 1;
 const AF_NETLINK: u64 = netlink::AF_NETLINK as u64;
 const NETLINK_ROUTE: u64 = 0;
+const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
@@ -84,15 +85,17 @@ pub fn socket(p: &mut Process, domain: u64, ty: u64, proto: u64) -> SysResult {
             if !matches!(ty & 0xf, SOCK_RAW | SOCK_DGRAM) {
                 return Err(ESOCKTNOSUPPORT);
             }
-            if proto != NETLINK_ROUTE {
+            if proto != NETLINK_ROUTE && proto != NETLINK_KOBJECT_UEVENT {
                 return p.unimplemented(
                     nr::socket,
                     "socket",
-                    "netlink protocols other than NETLINK_ROUTE",
+                    "netlink protocols other than NETLINK_ROUTE and NETLINK_KOBJECT_UEVENT",
                     EPROTONOSUPPORT,
                 );
             }
-            let file = new_file(FileKind::Netlink(Netlink::new(p.pid)), flags);
+            let mut nl = Netlink::new(p.pid);
+            nl.uevent = proto == NETLINK_KOBJECT_UEVENT;
+            let file = new_file(FileKind::Netlink(nl), flags);
             p.fds.alloc(FdEntry { file, cloexec }, 0)
         }
         // Local IPC, so not gated by `net` (binding to a path needs
@@ -138,10 +141,11 @@ fn is_unix(file: &FileRef) -> bool {
 pub fn connect(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
+        let raw = read_addr_bytes(p, addr, len)?;
         let mut of = file.lock();
         let nonblock = of.nonblocking();
         let FileKind::Inet(s) = &mut of.kind else { unreachable!() };
-        return inet_connect(p, s, nonblock, addr, len);
+        return inet_connect(p, s, nonblock, &raw);
     }
     match file.lock().kind {
         FileKind::Netlink(_) => return Ok(0),
@@ -154,7 +158,7 @@ pub fn connect(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
 pub fn listen(p: &mut Process, fd: u64, backlog: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
-        return with_inet(p, fd, |_, s, _| inet_listen(s, backlog))?;
+        return with_inet(p, fd, |_, s, _| inet_listen(s))?;
     }
     match file.lock().kind {
         FileKind::Netlink(_) => return Err(EOPNOTSUPP),
@@ -173,7 +177,13 @@ fn is_netlink(file: &FileRef) -> bool {
 pub fn bind(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
-        return with_inet(p, fd, |p, s, _| inet_bind(p, s, addr, len))?;
+        let raw = read_addr_bytes(p, addr, len)?;
+        return with_inet(p, fd, |p, s, _| {
+            if !s.dgram {
+                crate::landlock::check_socket(p, s.v6, &raw, true)?;
+            }
+            inet_bind(s, &raw)
+        })?;
     }
     if is_unix(&file) {
         return super::unix::bind(p, &file, addr, len);
@@ -279,7 +289,7 @@ pub fn sendto(p: &mut Process, fd: u64, buf: u64, len: u64, flags: u64, addr: u6
     if let Some(sock) = super::unix::sock_of(&file) {
         let to = if addr != 0 { Some(super::unix::resolve_to(p, addr, addrlen)?) } else { None };
         let nonblock = file.lock().nonblocking();
-        return super::unix::send_msg(p, &sock, &[(buf, len)], flags, nonblock, to, None);
+        return super::unix::send_msg(p, &sock, &[(buf, len)], flags, nonblock, to, Default::default());
     }
     if is_unbound(&file) {
         return Err(if addr != 0 { EOPNOTSUPP } else { ENOTCONN });
@@ -305,13 +315,22 @@ fn send(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
     }
 }
 
-/// `send` with descriptors attached (SCM_RIGHTS on a connected stream).
-fn send_rights(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64, r: crate::unix::Rights) -> SysResult {
+/// `send` with descriptors attached (SCM_RIGHTS on a connected stream),
+/// or credentials (SCM_CREDENTIALS).
+fn send_rights(
+    p: &mut Process,
+    file: &FileRef,
+    buf: u64,
+    len: u64,
+    flags: u64,
+    r: Option<crate::unix::Rights>,
+    cred: Option<crate::unix::Cred>,
+) -> SysResult {
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
     match &s.tx {
-        Some(tx) => super::unix::send_stream(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0, Some(r)),
+        Some(tx) => super::unix::send_stream(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0, r, cred),
         None => Err(EPIPE),
     }
 }
@@ -320,8 +339,13 @@ fn recv(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
+    let peek = flags & MSG_PEEK != 0;
     match &s.rx {
-        Some(rx) => pipe_read(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0),
+        // With SO_PASSCRED, one writer's bytes at a time.
+        Some(rx) if super::unix::stream_passcred(s) => {
+            super::unix::recv_stream(p, rx, buf, len, nonblock, peek, &mut Vec::new(), Some(&mut None))
+        }
+        Some(rx) => pipe_read(p, rx, buf, len, nonblock, peek),
         None => Ok(0),
     }
 }
@@ -391,7 +415,7 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
     if m.controllen != 0 && !unix {
         return p.unimplemented(nr::sendmsg, "sendmsg", "ancillary data on this socket", EOPNOTSUPP);
     }
-    let rights = if unix { super::unix::read_rights(p, m.control, m.controllen)? } else { None };
+    let control = if unix { super::unix::read_control(p, m.control, m.controllen)? } else { Default::default() };
     if let Some(sock) = super::unix::sock_of(&file) {
         let to = if m.name != 0 {
             let len = read_u32(&mut p.aspace, msg + 8)? as u64;
@@ -401,7 +425,7 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         };
         let bufs = iovecs(p, m.iov, m.iovlen)?;
         let nonblock = file.lock().nonblocking();
-        return super::unix::send_msg(p, &sock, &bufs, flags, nonblock, to, rights);
+        return super::unix::send_msg(p, &sock, &bufs, flags, nonblock, to, control);
     }
     if is_inet(&file) {
         let to = if m.name != 0 {
@@ -424,17 +448,21 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         return Err(EISCONN);
     }
     let mut total = 0;
-    let mut rights = rights;
+    // A stream's bytes carry who wrote them: SCM_CREDENTIALS's, or the
+    // sender's.
+    let cred = control.cred;
+    let mut rights = control.rights;
     for (i, (base, len)) in iovecs(p, m.iov, m.iovlen)?.into_iter().enumerate() {
         // Only the first chunk may block, so a partial result is returned rather than lost.
         let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
         // Descriptors go with the first byte sent.
         let sent = match rights.take() {
-            Some(r) if len > 0 => send_rights(p, &file, base, len, flags, r),
+            Some(r) if len > 0 => send_rights(p, &file, base, len, flags, Some(r), cred),
             Some(r) => {
                 rights = Some(r);
                 Ok(0)
             }
+            None if cred.is_some() => send_rights(p, &file, base, len, flags, None, cred),
             None => send(p, &file, base, len, flags),
         };
         match sent {
@@ -535,7 +563,8 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         let nonblock = file.lock().nonblocking();
         let r = super::unix::recv_msg(p, &sock, &bufs, flags, nonblock)?;
         let truncated = r.full > r.n;
-        super::unix::finish_recvmsg(p, msg, m.name, r.from.as_ref(), r.rights, flags, truncated)?;
+        let anc = super::unix::Ancillary { rights: r.rights, cred: r.cred };
+        super::unix::finish_recvmsg(p, msg, m.name, r.from.as_ref(), anc, flags, truncated)?;
         return Ok(if flags & MSG_TRUNC != 0 { r.full } else { r.n });
     }
     if is_unbound(&file) {
@@ -543,10 +572,14 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
     }
     let mut total = 0;
     let mut rights = Vec::new();
+    // With SO_PASSCRED, the writer's credentials, and only their bytes.
+    let passcred = matches!(&file.lock().kind, FileKind::Socket(s) if super::unix::stream_passcred(s));
+    let mut cred = None;
     for (i, (base, len)) in iovecs(p, m.iov, m.iovlen)?.into_iter().enumerate() {
         let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
         let before = rights.len();
-        match recv_rights(p, &file, base, len, flags, &mut rights) {
+        let slot = if passcred { Some(&mut cred) } else { None };
+        match recv_rights(p, &file, base, len, flags, &mut rights, slot) {
             Ok(n) => {
                 total += n;
                 // One batch of descriptors per call, as on Linux.
@@ -559,11 +592,13 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         }
     }
     let peer = super::unix::names(&file, true).ok().flatten();
-    super::unix::finish_recvmsg(p, msg, m.name, peer.as_ref(), rights, flags, false)?;
+    let anc = super::unix::Ancillary { rights, cred };
+    super::unix::finish_recvmsg(p, msg, m.name, peer.as_ref(), anc, flags, false)?;
     Ok(total)
 }
 
-/// `recv`, taking descriptors that came with the bytes.
+/// `recv`, taking descriptors that came with the bytes (and, with `cred`,
+/// who wrote them).
 fn recv_rights(
     p: &mut Process,
     file: &FileRef,
@@ -571,12 +606,13 @@ fn recv_rights(
     len: u64,
     flags: u64,
     rights: &mut Vec<crate::unix::Rights>,
+    cred: Option<&mut Option<crate::unix::Cred>>,
 ) -> SysResult {
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
     match &s.rx {
-        Some(rx) => super::unix::recv_stream(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0, rights),
+        Some(rx) => super::unix::recv_stream(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0, rights, cred),
         None => Ok(0),
     }
 }
@@ -639,6 +675,7 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
     const SO_ERROR: u64 = 4;
     const SO_SNDBUF: u64 = 7;
     const SO_RCVBUF: u64 = 8;
+    const SO_PASSCRED: u64 = 16;
     const SO_ACCEPTCONN: u64 = 30;
     const SO_DOMAIN: u64 = 39;
     if level != SOL_SOCKET {
@@ -652,6 +689,11 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
         SO_SNDBUF | SO_RCVBUF => ipc::PIPE_CAPACITY as u32,
         SO_DOMAIN if netlink => AF_NETLINK as u32,
         SO_DOMAIN => AF_UNIX as u32,
+        SO_PASSCRED => u32::from(match &file.lock().kind {
+            FileKind::Unix(s) => s.lock().passcred,
+            FileKind::Socket(end) => super::unix::stream_passcred(end),
+            _ => false,
+        }),
         _ => return Err(ENOPROTOOPT),
     };
     if read_u32(&mut p.aspace, len)? < 4 {
@@ -709,6 +751,31 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
     }
     if level != SOL_SOCKET && !(level == SOL_NETLINK && is_netlink(&file)) {
         return Err(ENOPROTOOPT);
+    }
+    const SO_PASSCRED: u64 = 16;
+    if level == SOL_SOCKET && name == SO_PASSCRED && !is_inet(&file) && !is_netlink(&file) {
+        if len < 4 {
+            return Err(EINVAL);
+        }
+        let on = read_u32(&mut p.aspace, val)? != 0;
+        // Messages, or a stream's bytes, come with their senders'
+        // credentials from now on. A socket not yet bound or connected
+        // becomes one that keeps the setting until it is.
+        let mut f = file.lock();
+        match &mut f.kind {
+            FileKind::Unix(s) => s.lock().passcred = on,
+            FileKind::Socket(end) => {
+                if let Some(info) = end.unix.as_mut() {
+                    info.passcred = on;
+                }
+            }
+            &mut FileKind::UnixUnbound(ty) => {
+                let sock = crate::unix::Sock::new(ty, crate::unix::State::Idle, super::unix::cred(p));
+                sock.lock().passcred = on;
+                f.kind = FileKind::Unix(sock);
+            }
+            _ => {}
+        }
     }
     Ok(0)
 }
@@ -790,13 +857,19 @@ fn new_inet(p: &mut Process, domain: u64, ty: u64, proto: u64, flags: u32, cloex
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
-fn read_sockaddr(p: &mut Process, addr: u64, len: u64) -> Result<SockAddr, Errno> {
+/// A socket address as the program gave it. Read once: another thread can
+/// change it meanwhile, so what's checked must be what's used.
+fn read_addr_bytes(p: &mut Process, addr: u64, len: u64) -> Result<Vec<u8>, Errno> {
     if !(2..=128).contains(&len) {
         return Err(EINVAL);
     }
     let mut b = alloc::vec![0u8; len as usize];
     copy_in(&mut p.aspace, addr, &mut b)?;
-    SockAddr::decode(&b)
+    Ok(b)
+}
+
+fn read_sockaddr(p: &mut Process, addr: u64, len: u64) -> Result<SockAddr, Errno> {
+    SockAddr::decode(&read_addr_bytes(p, addr, len)?)
 }
 
 /// Run `f` on the AF_INET socket at `fd`.
@@ -812,12 +885,12 @@ fn is_inet(file: &FileRef) -> bool {
     matches!(file.lock().kind, FileKind::Inet(_))
 }
 
-fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
-    let a = read_sockaddr(p, addr, len)?;
+fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
+    let a = SockAddr::decode(raw)?;
     if !s.dgram && (s.bound.is_some() || !matches!(s.state, State::Idle)) {
         return Err(EINVAL);
     }
-    let ours = a.is_unspecified() || a.is_loopback() || a.addr == Addr::V4(link::GUEST_V4);
+    let ours = a.is_unspecified() || a.is_local();
     if !ours {
         return Err(EADDRNOTAVAIL);
     }
@@ -846,7 +919,7 @@ fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
     Ok(0)
 }
 
-fn inet_listen(s: &mut Inet, backlog: u64) -> SysResult {
+fn inet_listen(s: &mut Inet) -> SysResult {
     if s.dgram {
         return Err(EOPNOTSUPP);
     }
@@ -857,7 +930,7 @@ fn inet_listen(s: &mut Inet, backlog: u64) -> SysResult {
     }
     let unspecified = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
     let bound = s.bound.unwrap_or(unspecified);
-    let l = Listener::listen(bound.addr, bound.port, (backlog as i32).max(1) as usize, s.v6only)?;
+    let l = Listener::listen(bound.addr, bound.port, s.v6only)?;
     s.bound = Some(SockAddr { port: l.lock().port, ..bound });
     s.state = State::Listening(l);
     Ok(0)
@@ -917,33 +990,32 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
     Ok(nfd)
 }
 
-fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u64) -> SysResult {
-    if s.dgram && len >= 2 {
-        let mut family = [0u8; 2];
-        copy_in(&mut p.aspace, addr, &mut family)?;
-        if u16::from_le_bytes(family) == AF_UNSPEC {
-            // Disconnect, forgetting the address connect chose (glibc's
-            // getaddrinfo sorts its answers this way with one socket).
-            s.peer = None;
-            let u = udp_of(s);
-            let mut u = u.lock();
-            u.peer = None;
-            if !s.addr_bound {
-                let any = if s.v6 { Addr::V6([0; 16]) } else { Addr::V4([0; 4]) };
-                for a in [s.bound.as_mut(), u.local.as_mut()].into_iter().flatten() {
-                    a.addr = any;
-                }
+fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, raw: &[u8]) -> SysResult {
+    if s.dgram && u16::from_le_bytes([raw[0], raw[1]]) == AF_UNSPEC {
+        // Disconnect, forgetting the address connect chose (glibc's
+        // getaddrinfo sorts its answers this way with one socket).
+        s.peer = None;
+        let u = udp_of(s);
+        let mut u = u.lock();
+        u.peer = None;
+        if !s.addr_bound {
+            let any = if s.v6 { Addr::V6([0; 16]) } else { Addr::V4([0; 4]) };
+            for a in [s.bound.as_mut(), u.local.as_mut()].into_iter().flatten() {
+                a.addr = any;
             }
-            return Ok(0);
         }
+        return Ok(0);
     }
-    let to = read_sockaddr(p, addr, len)?.or_loopback();
+    if !s.dgram {
+        crate::landlock::check_socket(p, s.v6, raw, false)?;
+    }
+    let to = SockAddr::decode(raw)?.or_loopback();
     if s.dgram {
         // Nothing is sent: resolvers and "what's my address" code connect a
         // UDP socket just to see the route. From now on datagrams come only
         // from there, to the address that route has (a v6 socket's v4
         // one shows as ::ffff:a.b.c.d), unless bind named one.
-        let ours = if to.is_loopback() { to.addr } else { Addr::V4(link::GUEST_V4) };
+        let ours = if to.is_local() { to.addr } else { inet::source_for(to.addr) };
         let u = udp_of(s);
         if !s.addr_bound {
             let port = s.bound.map_or(0, |b| b.port);
@@ -1201,7 +1273,7 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
                     Addr::V4([127, 0, 0, 1])
                 }
             }
-            _ => Addr::V4(link::GUEST_V4),
+            _ => to.addr,
         };
         let from = SockAddr { addr, port: local.port };
         // Nobody serving DNS here: the host's resolver answers, as it

@@ -139,17 +139,15 @@ pub struct Cpu {
 unsafe impl Send for Cpu {}
 
 impl Vm {
-    /// Create the VM with `size` bytes of memory at host `host`, guest
-    /// `ipa`, a GICv3 at the given bases, and `cpus` vCPUs: the first
+    /// Create the VM with memory `ram` (each region's guest physical
+    /// base, host address and size), a GICv3 at the given bases, and `cpus` vCPUs: the first
     /// starting at `pc`, the others off until PSCI CPU_ON (which KVM
     /// handles).
     ///
     /// # Safety
-    /// `host` must stay mapped for as long as the VM runs.
+    /// `ram`'s memory must stay mapped for as long as the VM runs.
     pub unsafe fn create(
-        host: *mut u8,
-        ipa: u64,
-        size: usize,
+        ram: &[(u64, *mut u8, usize)],
         gicd: u64,
         gicr: u64,
         pc: u64,
@@ -168,8 +166,10 @@ impl Vm {
             unsafe { OwnedFd::from_raw_fd(fd) }
         };
         let vm = own(ioctl(kvm.as_raw_fd(), KVM_CREATE_VM, 0)?);
-        let region: [u64; 4] = [0, ipa, size as u64, host as u64]; // slot 0, flags 0
-        ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, region.as_ptr() as u64)?;
+        for (slot, &(ipa, host, size)) in ram.iter().enumerate() {
+            let region: [u64; 4] = [slot as u64, ipa, size as u64, host as u64]; // slot, flags 0
+            ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, region.as_ptr() as u64)?;
+        }
 
         let mut dev: [u32; 3] = [KVM_DEV_TYPE_ARM_VGIC_V3, 0, 0];
         ioctl(vm.as_raw_fd(), KVM_CREATE_DEVICE, dev.as_mut_ptr() as u64)?;

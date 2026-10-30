@@ -398,11 +398,11 @@ fn node_network_interfaces() {
     );
     assert_eq!(out.stdout_str(), "[ 'lo' ] [ '127.0.0.1/8', '::1/128' ]\n");
     assert_no_surprises(&out);
-    // With `net`, the guest's own interface too.
+    // With `net`, the guest's own interface too, IPv4 and IPv6.
     let code = "const e = require('os').networkInterfaces().eth0; \
-                console.log(e.map(a => [a.cidr, a.mac, a.internal].join(' ')))";
+                console.log(e.map(a => [a.cidr, a.mac, a.internal].join(' ')).join(','))";
     let out = run(sandbox("node").allow(Capability::Net), &["/usr/bin/node", "-e", code]);
-    assert_eq!(out.stdout_str(), "[ '10.0.2.15/24 52:54:00:12:34:56 false' ]\n");
+    assert_eq!(out.stdout_str(), "10.0.2.15/24 52:54:00:12:34:56 false,fd00::15/64 52:54:00:12:34:56 false\n");
     assert_no_surprises(&out);
 }
 

@@ -45,7 +45,7 @@ mod watch;
 pub use container::{Image, ImageConfig};
 pub use control::RunControl;
 pub use event::GuestEvent;
-pub use export::{Export, ExportContent, ExportEntry, ExportState};
+pub use export::{Export, ExportContent, ExportEntry, ExportState, Links};
 pub use grix_abi::policy::{Capability, DenyAction};
 pub use grix_abi::stats::{Limit, Resource, Stats as GuestStats, Usage};
 pub use manifest::{ExportTo, Manifest};

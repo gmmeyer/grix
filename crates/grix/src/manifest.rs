@@ -5,6 +5,8 @@
 //! capabilities = []          # fs_write, threads, process, net
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
+//! hostname = "worker-1"      # grix unless given
+//! default_env = true         # HOME, PATH, LANG and TMPDIR unless set
 //! timeout_secs = 30        # 0: no time limit (a server)
 //! grace_secs = 5             # after the time limit: SIGTERM, then this long to end
 //! max_export_mb = 256
@@ -57,6 +59,9 @@ pub struct Manifest {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub default_env: bool,
     pub memory_mb: Option<u64>,
     /// 0: no time limit.
     pub timeout_secs: Option<u64>,
@@ -162,6 +167,12 @@ impl Manifest {
         }
         if let Some(cwd) = &self.cwd {
             b = b.cwd(cwd);
+        }
+        if let Some(name) = &self.hostname {
+            b = b.hostname(name)?;
+        }
+        if self.default_env {
+            b = b.default_env();
         }
         if let Some(mb) = self.memory_mb {
             b = b.memory_mb(mb);

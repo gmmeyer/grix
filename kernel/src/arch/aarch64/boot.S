@@ -4,7 +4,8 @@
 // 0..4 GiB twice:
 //   - identity (TTBR0), so this code keeps running when the MMU turns on
 //   - high half at KERNEL_OFFSET (TTBR1), where the rest of the kernel is linked
-// 0..1 GiB is device memory (UART etc.), 1..4 GiB is normal memory (RAM).
+// 0..1 GiB is device memory (UART etc.), 1..4 GiB is normal memory (RAM);
+// RAM past 4 GiB is added to the same tables later (`arch::map_ram`).
 // Rust code later replaces TTBR0 with the user address space.
 //
 // The other CPUs (secondary_entry, started with PSCI CPU_ON, x0 = their
@@ -160,6 +161,7 @@ mmu_on:
 .balign 4096
 .global boot_l0
 boot_l0: .space 4096
+.global boot_l1
 boot_l1: .space 4096
 // A user page table with nothing in it, for CPUs with no thread.
 .global empty_l0

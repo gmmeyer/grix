@@ -21,8 +21,19 @@ pub const BOOT_TIME_OFFSET: usize = HEADER_LEN;
 pub const RAM_BASE: u64 = 0x4000_0000;
 /// Guest physical address the host loads the image at.
 pub const IMAGE_BASE: u64 = 0x4800_0000;
-/// The kernel linearly maps physical memory up to 4 GiB.
-pub const MAX_RAM: u64 = 3 << 30;
+/// RAM below 4 GiB: on x86_64 what fits under the devices' hole (QEMU
+/// `microvm`'s 3 GiB; the rest goes above 4 GiB), on arm64 what's from
+/// [`RAM_BASE`] to 4 GiB. The boot image must fit in it with the kernel's
+/// room below it, so it bounds what a sandbox imports.
+pub const LOW_RAM: u64 = 3 << 30;
+/// The most RAM a guest may have, in the regions
+/// [`machine::ram_regions`](crate::machine::ram_regions) says. Memory the
+/// guest doesn't touch costs the host nothing, so this bounds what grows
+/// with RAM: the kernel's reference count per page (32 MiB of RAM at the
+/// most, kept below the boot image, never on its 32 MiB heap) and the
+/// guest-physical room it needs (arm64's RAM ends at 65 GiB, past
+/// Hypervisor.framework's default 36-bit IPA: grix-vmm asks for more).
+pub const MAX_RAM: u64 = 64 << 30;
 /// The most entries (files, directories, links) an image may have, imports
 /// and mounts together. Each costs a few hundred bytes of the kernel's small
 /// heap, and the files a program creates need room there too.
@@ -108,6 +119,8 @@ pub struct Image<'a> {
     /// host: stdin carries what's typed, stdout what the terminal shows
     /// (and `wire::Input::Resize` its new size). Needs `stdin`.
     pub tty: Option<(u16, u16)>,
+    /// The sandbox's host name ([`crate::valid_hostname`]).
+    pub hostname: &'a str,
 }
 
 /// The hypervisor call (HVC, in SMCCC's OEM service range: Hypervisor.framework
@@ -205,6 +218,7 @@ impl<'a> Image<'a> {
         w.u8(self.tty.is_some() as u8);
         let (rows, cols) = self.tty.unwrap_or_default();
         w.u32(rows as u32 | (cols as u32) << 16);
+        w.str(self.hostname);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -273,6 +287,10 @@ impl<'a> Image<'a> {
         let has_tty = r.u8()? != 0;
         let size = r.u32()?;
         let tty = has_tty.then_some((size as u16, (size >> 16) as u16));
+        let hostname = r.str()?;
+        if !crate::valid_hostname(hostname) {
+            return Err(DecodeError);
+        }
         Ok(Image {
             ram_size: header.ram_size,
             gicr: header.gicr,
@@ -297,6 +315,7 @@ impl<'a> Image<'a> {
             cpus,
             x86_64,
             tty,
+            hostname,
         })
     }
 }
@@ -345,6 +364,7 @@ mod tests {
             cpus: 4,
             x86_64: "/usr/bin/qemu-x86_64",
             tty: Some((24, 80)),
+            hostname: "box-1.example",
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -379,6 +399,7 @@ mod tests {
             cpus: 1,
             x86_64: "",
             tty: None,
+            hostname: crate::HOSTNAME,
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

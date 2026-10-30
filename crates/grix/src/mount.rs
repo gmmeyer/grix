@@ -398,7 +398,7 @@ impl Apply<'_> {
             ExportContent::Symlink(target) => cname(target).and_then(|target| at::symlink_at(&target, at.fd(), &tmp)),
             ExportContent::Dir => unreachable!(),
         };
-        let made = made.and_then(|()| at::rename(at.fd(), &tmp, at.fd(), &at.name, false));
+        let made = made.and_then(|()| at::rename(at.fd(), &tmp, at.fd(), &at.name, false, false));
         if let Err(err) = made {
             let _ = at::remove_at(at.fd(), &tmp, false);
             return Err(err).with_context(|| format!("replacing {}", path.display()));

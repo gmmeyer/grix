@@ -21,7 +21,8 @@
 //!       KVM, 3: x86_64 KVM)
 //!   16  ram_size u64, ram_offset u64, state_len u64
 //!   40  state (state_len bytes, `grix_abi::codec`)
-//!   ram_offset (64 KiB aligned): guest RAM, written only where it isn't zero
+//!   ram_offset (64 KiB aligned): guest RAM, written only where it isn't zero,
+//!       its regions (`grix_abi::machine`'s for ram_size) one after another
 //!   ram_offset + ram_size: whatever the host appends (it reads `ram_end`)
 //! ```
 
@@ -49,11 +50,11 @@ const HYPERVISOR: u32 = 2;
 #[cfg(target_arch = "x86_64")]
 const HYPERVISOR: u32 = 3;
 
-/// Where guest RAM starts.
+/// Where guest RAM is.
 #[cfg(target_arch = "aarch64")]
-const RAM_BASE: u64 = grix_abi::image::RAM_BASE;
+use grix_abi::machine::ram_regions;
 #[cfg(target_arch = "x86_64")]
-const RAM_BASE: u64 = grix_abi::machine::x86_64::RAM_BASE;
+use grix_abi::machine::x86_64::ram_regions;
 
 /// The file the host passes us.
 pub const FD: i32 = 3;
@@ -117,12 +118,16 @@ pub fn save(
     // RAM: only what isn't zero; the rest stays a hole in the file.
     file.set_len(ram_offset + mem.size() as u64).map_err(io)?;
     let mut page = vec![0u8; PAGE];
-    for off in (0..mem.size()).step_by(PAGE) {
-        let n = PAGE.min(mem.size() - off);
-        mem.read(mem.base() + off as u64, &mut page[..n]);
-        if page[..n].iter().any(|&b| b != 0) {
-            file.write_all_at(&page[..n], ram_offset + off as u64).map_err(io)?;
+    let mut at = ram_offset;
+    for (base, _, size) in mem.regions() {
+        for off in (0..size).step_by(PAGE) {
+            let n = PAGE.min(size - off);
+            mem.read(base + off as u64, &mut page[..n]);
+            if page[..n].iter().any(|&b| b != 0) {
+                file.write_all_at(&page[..n], at + off as u64).map_err(io)?;
+            }
         }
+        at += size as u64;
     }
     file.write_all_at(&MAGIC, 0).map_err(io)?;
     Ok(())
@@ -194,7 +199,7 @@ pub fn open() -> Result<Saved, String> {
     let gic = r.bytes().map_err(malformed)?.to_vec();
     let (counter, then) = (r.u64().map_err(malformed)?, r.u64().map_err(malformed)?);
     let console = r.bytes().map_err(malformed)?.to_vec();
-    let mem = GuestMemory::map_file(file.as_raw_fd(), ram_offset, RAM_BASE, ram_size as usize)
+    let mem = GuestMemory::map_file(file.as_raw_fd(), ram_offset, ram_regions(ram_size))
         .map_err(|e| format!("mapping the snapshot's memory: {e}"))?;
     let mut entropy = [0u8; 32];
     // SAFETY: a buffer of the size given.

@@ -234,7 +234,13 @@ impl AltStack {
     /// Linux's on_sig_stack: with SS_AUTODISARM we can only be on the stack
     /// if the program re-armed it while running on it, so assume we're not.
     pub fn contains(&self, sp: u64) -> bool {
-        self.flags & SS_AUTODISARM == 0 && sp > self.sp && sp - self.sp <= self.size
+        self.flags & SS_AUTODISARM == 0 && self.holds(sp)
+    }
+
+    /// Linux's __on_sig_stack, SS_AUTODISARM or not: is a frame at `sp`
+    /// on the stack?
+    pub fn holds(&self, sp: u64) -> bool {
+        sp > self.sp && sp - self.sp <= self.size
     }
 
     /// The state sigaltstack reports (sas_ss_flags).
@@ -308,7 +314,7 @@ fn stop(p: &mut Process, sig: u32) {
         p.resched = true;
     }
     crate::smp::kick_others(p.pid);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     // A parent's wait4 looks again.
     crate::ipc::changed();
 }
@@ -332,7 +338,7 @@ fn resume(p: &mut Process) {
     if p.pid == crate::process::INIT {
         crate::console::event(&grix_abi::wire::Event::Continued);
     }
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::ipc::changed();
 }
 
@@ -551,6 +557,8 @@ fn restartable(regs: &TrapFrame) -> bool {
         nr::fcntl => matches!(regs.arg(1), 7 | 38),
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
         nr::futex => matches!(regs.arg(1) & 127, 0 | 9) && regs.arg(3) == 0,
+        // Its deadline is absolute, so it restarts (futex_wait_multiple's -ERESTARTSYS).
+        nr::futex_waitv => true,
         _ => false,
     }
 }
@@ -683,7 +691,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
             break;
         };
         if crate::timer::delivered(p, &mut info) {
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
         let act = p.action(info.signo);
         if is_ignored(&act, info.signo) {
@@ -705,11 +713,19 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         // A FIFO open it waited in is interrupted: its end goes (a
         // restart opens afresh).
         t.fifo_wait = None;
-        if push_frame(p, tf, &info, &act).is_err() {
+        match push_frame(p, tf, &info, &act) {
+            Ok(()) => {}
+            // No page for the frame is no bad stack: as a fault with none.
+            Err(ENOMEM) => {
+                p.kill(SIGKILL, tf.sp(), tf.pc(), "out of memory", true);
+                return;
+            }
             // Linux's force_sigsegv: a signal that can't be delivered ends the program.
-            let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
-            p.kill(SIGSEGV, tf.sp(), tf.pc(), why, true);
-            return;
+            Err(_) => {
+                let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
+                p.kill(SIGSEGV, tf.sp(), tf.pc(), why, true);
+                return;
+            }
         }
         frames += 1;
     }
@@ -729,7 +745,11 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     let t = p.threads.get_mut(&p.current).unwrap();
     let sp = tf.sp();
     let alt = t.altstack;
-    let top = if act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0 { alt.sp.wrapping_add(alt.size) } else { sp };
+    let entering = act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0;
+    let top = if entering { alt.sp.wrapping_add(alt.size) } else { sp };
+    // On the alternate stack a frame must fit (x86's get_sigframe, for
+    // both: 2048 bytes are MINSIGSTKSZ, and AVX-512's frame is 3.5 KiB).
+    let within = (entering || alt.contains(sp)).then_some(alt);
     let restorer = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
     let ctx = arch::sigframe::Context {
         info: info.bytes(),
@@ -738,7 +758,7 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
         fault: info.fault,
         restorer,
     };
-    let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, &ctx)?;
+    let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, within, &ctx)?;
 
     let t = p.threads.get_mut(&p.current).unwrap();
     t.saved_sigmask = None;
@@ -785,7 +805,7 @@ pub fn dequeue(p: &mut Process, set: u64) -> Option<SigInfo> {
     }?;
     let mut info = info;
     if crate::timer::delivered(p, &mut info) {
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     Some(info)
 }

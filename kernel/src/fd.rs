@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 
 use crate::errno::*;
 use crate::fs::{Content, Dev, Ino};
@@ -39,10 +39,30 @@ impl FifoFile {
         (mask, version)
     }
 }
-/// Open file descriptions in all processes together (Linux's file-max):
-/// each takes kernel memory, and descriptor limits are per process.
-pub const MAX_OPEN_FILES: usize = 4096;
+/// An open file description's share of the heap, charged to `kmem`: itself
+/// and what a socket's or pipe's end brings, a pipe.
+const OPEN_FILE_COST: u64 =
+    (core::mem::size_of::<OpenFile>() + core::mem::size_of::<crate::ipc::Pipe>() + 2 * 64) as u64;
+/// Open files that fit in what's left of the heap, charged or not: with
+/// `kmem` full of pipes' data a program can still open a file.
+const OPEN_FILES_ANYWAY: usize = 4096;
 static OPEN_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Open file descriptions in all processes together (Linux's file-max,
+/// which it sizes from RAM too): what the `kmem` budget pays for, as
+/// descriptor limits are per process. A server with thousands of
+/// connections has two files for each in the guest, and a pipe for each
+/// if it's Go's io.Copy.
+pub fn max_open_files() -> usize {
+    (crate::kmem::limit() / OPEN_FILE_COST) as usize
+}
+
+/// No room for another open file? (Past `OPEN_FILES_ANYWAY` each must be
+/// paid for.)
+fn open_files_full() -> bool {
+    let open = OPEN_FILES.load(Ordering::Relaxed);
+    open > max_open_files() || (open > OPEN_FILES_ANYWAY && crate::kmem::available() < OPEN_FILE_COST)
+}
 
 /// Open file descriptions now (/proc/sys/fs/file-nr).
 pub fn open_files() -> usize {
@@ -95,6 +115,11 @@ pub enum FileKind {
     Unix(crate::unix::SockRef),
     /// A pidfd: refers to process `pid` (pids aren't reused).
     PidFd(u32),
+    /// /proc/<pid>/mem, for the process itself: reads and writes at its
+    /// virtual addresses (the offset), through `uaccess`.
+    ProcMem(u32, u64),
+    /// A Landlock ruleset being made (landlock.rs).
+    Landlock(crate::landlock::RulesetRef),
 }
 
 impl FileKind {
@@ -112,7 +137,9 @@ impl FileKind {
                 let (writable, version) = crate::console::output_state();
                 (if writable { EPOLLOUT } else { 0 }, version)
             }
-            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
+            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) | FileKind::ProcMem(..) => {
+                (EPOLLIN | EPOLLOUT, 0)
+            }
             FileKind::Inotify(n) => n.poll(),
             FileKind::TimerFd(t) => {
                 let mut t = t.lock();
@@ -126,6 +153,8 @@ impl FileKind {
             // Depend on the reader's pending signals, or on other
             // processes: see file::poll_kind.
             FileKind::SignalFd(_) | FileKind::PidFd(_) => (0, 0),
+            // No poll of its own: Linux's DEFAULT_POLLMASK.
+            FileKind::Landlock(_) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
             FileKind::Pty(end) => {
@@ -148,7 +177,7 @@ pub struct OpenFile {
     pub offset: u64,
     /// Access mode and status flags (O_APPEND, O_NONBLOCK, ...).
     pub flags: u32,
-    /// Opened with O_PATH: only usable as a dirfd / for fstat.
+    /// Opened with O_PATH: only `FdTable::get_raw` finds it.
     pub path_only: bool,
     /// A regular file's contents, held so they outlive an unlink.
     pub content: Option<Content>,
@@ -162,6 +191,14 @@ pub struct OpenFile {
     pub locked: bool,
     /// O_ASYNC's owner and signal (F_SETOWN, F_SETSIG).
     pub fown: crate::fasync::Fown,
+    /// A writable /proc comm file: the thread it names (pid, tid).
+    pub comm_of: Option<(u32, u32)>,
+    /// Rights the opener's Landlock domain refused that matter after the
+    /// open (`landlock::TRUNCATE`, `IOCTL_DEV`): Linux's allowed_access,
+    /// inverted, so a file opened any other way has them all.
+    pub landlock_denied: u16,
+    /// `OPEN_FILE_COST`, if `kmem` has it (`open_files_full`).
+    _cost: crate::kmem::Charge,
 }
 
 impl Drop for OpenFile {
@@ -176,6 +213,18 @@ impl Drop for OpenFile {
 impl OpenFile {
     pub fn nonblocking(&self) -> bool {
         self.flags & O_NONBLOCK != 0
+    }
+
+    /// Open for reading (Linux's FMODE_READ). Access mode 3 is neither
+    /// this nor `writable`: it's for ioctls, and asks Landlock for no
+    /// rights at open, so it must never read or write.
+    pub fn readable(&self) -> bool {
+        !self.path_only && matches!(self.flags & O_ACCMODE, O_RDONLY | O_RDWR)
+    }
+
+    /// Open for writing (Linux's FMODE_WRITE).
+    pub fn writable(&self) -> bool {
+        !self.path_only && matches!(self.flags & O_ACCMODE, O_WRONLY | O_RDWR)
     }
 
     /// The open file description, as a lock owner.
@@ -196,10 +245,46 @@ impl OpenFile {
 
 pub type FileRef = Arc<Mutex<OpenFile>>;
 
+/// The locks of two different files (`a`'s guard first), always taken in
+/// the same order, so two CPUs with the pair the other way round can't
+/// each hold what the other wants. One file twice would wait for itself:
+/// a caller sees to that first.
+pub fn lock_pair<'a>(a: &'a FileRef, b: &'a FileRef) -> (MutexGuard<'a, OpenFile>, MutexGuard<'a, OpenFile>) {
+    debug_assert!(!Arc::ptr_eq(a, b), "one file locked twice");
+    if Arc::as_ptr(a) < Arc::as_ptr(b) {
+        let first = a.lock();
+        (first, b.lock())
+    } else {
+        let first = b.lock();
+        (a.lock(), first)
+    }
+}
+
 /// An epoll instance: the interest list, keyed by fd.
 #[derive(Default)]
 pub struct Epoll {
     pub interest: BTreeMap<u64, Registration>,
+    /// One file can be under every descriptor, in every instance, so
+    /// neither limit bounds these: the heap's budget does.
+    charge: crate::kmem::Charge,
+}
+
+/// A registration, twice over: B-tree nodes are half full when filled in
+/// order.
+const REGISTRATION_COST: u64 = 2 * core::mem::size_of::<(u64, Registration)>() as u64;
+
+impl Epoll {
+    /// ENOSPC with no room, as Linux's fs.epoll.max_user_watches.
+    pub fn add(&mut self, key: u64, reg: Registration) -> Result<(), Errno> {
+        self.charge.resize((self.interest.len() as u64 + 1) * REGISTRATION_COST).map_err(|_| ENOSPC)?;
+        self.interest.insert(key, reg);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: u64) {
+        self.interest.remove(&key);
+        let _ = self.charge.resize(self.interest.len() as u64 * REGISTRATION_COST);
+    }
 }
 
 pub struct Registration {
@@ -258,7 +343,7 @@ impl Slots {
             let most = if n <= NOFILE_DEFAULT { NOFILE_DEFAULT } else { MAX_FDS };
             let want = (cap * 2).clamp(n, most);
             self.held.resize(slots_cost(want))?;
-            self.entries.reserve_exact(want - self.entries.len());
+            self.entries.try_reserve_exact(want - self.entries.len()).map_err(|_| ENOMEM)?;
         }
         self.entries.resize(n, None);
         Ok(())
@@ -275,6 +360,31 @@ impl Drop for Slots {
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
+/// Each CPU's last `FdTable::walking`. Weak, so it isn't a user of the
+/// table (`FdTable::shared`) and doesn't keep it.
+#[allow(clippy::type_complexity)]
+static WALKING: [Mutex<Option<(u32, Weak<Mutex<Slots>>)>>; grix_abi::machine::MAX_CPUS as usize] =
+    [const { Mutex::new(None) }; grix_abi::machine::MAX_CPUS as usize];
+
+/// The node descriptor `fd` of `pid` has open, for a path going on through
+/// /proc/<pid>/fd/N: ENOENT without such a descriptor (or for another
+/// process's, whose fd directories are only looked at, not walked through),
+/// and ENOTDIR if it's no file with a node.
+pub fn walked_node(pid: u32, fd: u64) -> Result<crate::fs::Ino, Errno> {
+    let walking = WALKING[crate::smp::me()].lock();
+    let table = walking.as_ref().filter(|w| w.0 == pid).and_then(|w| w.1.upgrade()).ok_or(ENOENT)?;
+    drop(walking);
+    let i = FdTable::index(fd).map_err(|_| ENOENT)?;
+    let file = table.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(ENOENT)?.file.clone();
+    // Held already only by this CPU's own caller, which has no business
+    // walking a path through it.
+    let f = file.try_lock().ok_or(ENOENT)?;
+    match f.kind {
+        FileKind::Node(ino) => Ok(ino),
+        _ => Err(ENOTDIR),
+    }
+}
+
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
     OPEN_FILES.fetch_add(1, Ordering::Relaxed);
     Arc::new(Mutex::new(OpenFile {
@@ -288,6 +398,9 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         held: None,
         locked: false,
         fown: Default::default(),
+        comm_of: None,
+        landlock_denied: 0,
+        _cost: crate::kmem::Charge::if_room(OPEN_FILE_COST),
     }))
 }
 
@@ -396,7 +509,20 @@ impl FdTable {
         usize::try_from(fd as i32).map_err(|_| EBADF)
     }
 
+    /// The file at `fd`, as Linux's fdget: an O_PATH descriptor is EBADF
+    /// to everything but the few calls that take one (`get_raw`).
     pub fn get(&self, fd: u64) -> Result<FileRef, Errno> {
+        let file = self.get_raw(fd)?;
+        let path_only = file.lock().path_only;
+        if path_only {
+            return Err(EBADF);
+        }
+        Ok(file)
+    }
+
+    /// The file at `fd`, O_PATH or not (Linux's fdget_raw): for what only
+    /// uses the descriptor's name, as a dirfd, fstat, dup or SCM_RIGHTS do.
+    pub fn get_raw(&self, fd: u64) -> Result<FileRef, Errno> {
         let i = Self::index(fd)?;
         Ok(self.slots.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.file.clone())
     }
@@ -412,12 +538,18 @@ impl FdTable {
         Ok(())
     }
 
+    /// Process `pid`, whose table this is, is about to walk a path:
+    /// `walked_node` needs it, and the path walk has no process to ask.
+    pub fn walking(&self, pid: u32) {
+        *WALKING[crate::smp::me()].lock() = Some((pid, Arc::downgrade(&self.slots)));
+    }
+
     /// Install at the lowest free descriptor >= `min`, below the
     /// process's RLIMIT_NOFILE (EMFILE). Fails with ENFILE once there are
     /// too many open files everywhere (the new one, already made, is then
     /// dropped by the caller).
     pub fn alloc(&mut self, entry: FdEntry, min: usize) -> Result<u64, Errno> {
-        if OPEN_FILES.load(Ordering::Relaxed) > MAX_OPEN_FILES {
+        if open_files_full() {
             crate::stats::hit(grix_abi::stats::Limit::OpenFiles);
             return Err(ENFILE);
         }

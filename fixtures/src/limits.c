@@ -44,9 +44,10 @@ static int test_netlink(void) {
 
 static int test_pipes(void) {
     // Hundreds of full pipes: writes stop with EAGAIN, then work again.
-    static int p[400][2];
+    // (500 of them hold 31 MiB, more than the budget has at 512 MiB.)
+    static int p[500][2];
     int n = 0, stopped = 0;
-    for (; n < 400; n++) {
+    for (; n < 500 && stopped < 8; n++) {
         CHECK(pipe2(p[n], O_NONBLOCK) == 0);
         ssize_t w, total = 0;
         while ((w = write(p[n][1], big, sizeof big)) > 0) total += w;

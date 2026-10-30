@@ -31,9 +31,9 @@ const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+j
 /// The most a manifest, index or config may be.
 const MAX_JSON: u64 = 4 << 20;
 /// The most an image's files may hold in all, and how many there may be,
-/// unpacked: more than any sandbox can boot (`image::MAX_RAM`), and a
+/// unpacked: more than any sandbox can boot (`image::LOW_RAM`), and a
 /// bound on what a malicious layer can make the host allocate.
-const MAX_BYTES: u64 = grix_abi::image::MAX_RAM;
+const MAX_BYTES: u64 = grix_abi::image::LOW_RAM;
 const MAX_FILES: usize = 1_000_000;
 
 /// What an image's layers have added up to so far.

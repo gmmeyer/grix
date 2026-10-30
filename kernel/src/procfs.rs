@@ -11,13 +11,23 @@ use crate::errno::{EINVAL, ENOENT, ENOMEM, Errno};
 use crate::fd::FileKind;
 use crate::fs;
 use crate::kmem::Charge;
-use crate::mm::aspace::{Backing, STACK_TOP, Usage, VVAR};
+use crate::mm::aspace::{AddressSpace, Backing, STACK_TOP, Usage, VVAR};
 use crate::mm::frame;
 use crate::process::{Ids, Process};
 use crate::procs::Zombie;
 use crate::time;
 
-pub const HOSTNAME: &str = "grix";
+/// The sandbox's host name, from the boot image (`set_hostname`).
+static HOSTNAME: spin::Once<String> = spin::Once::new();
+
+pub fn set_hostname(name: &str) {
+    HOSTNAME.call_once(|| String::from(name));
+}
+
+pub fn hostname() -> &'static str {
+    HOSTNAME.get().map_or(grix_abi::HOSTNAME, String::as_str)
+}
+
 pub const RELEASE: &str = "6.1.0-grix";
 pub const VERSION: &str = "#1 SMP grix";
 
@@ -39,6 +49,12 @@ pub enum ProcFile {
     Limits,
     Mountinfo,
     Mounts,
+    /// /proc/<pid>/mem: opened as a `FileKind::ProcMem`, never generated.
+    Mem,
+    // /proc/<pid>/task/<tid>/...: the thread's own.
+    TaskStat(u32),
+    TaskStatus(u32),
+    TaskComm(u32),
     // /proc/...
     Cpuinfo,
     /// 0-(n-1), the CPUs.
@@ -59,6 +75,7 @@ pub enum ProcFile {
     Uptime,
     Loadavg,
     Version,
+    Hostname,
     RandomUuid,
     BootId,
     // /sys/fs/cgroup/...
@@ -66,8 +83,12 @@ pub enum ProcFile {
     /// /proc/net/dev and /proc/net/route: the interfaces there are.
     NetDev,
     NetRoute,
+    NetIfInet6,
+    NetIpv6Route,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
+    /// /proc/sys/kernel/threads-max and /sys/fs/cgroup/pids.max.
+    ThreadsMax,
 }
 
 /// Each process's directory, /proc/<pid> (made at fork, gone once it has
@@ -84,12 +105,44 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("smaps", ProcFile::Smaps),
     ("smaps_rollup", ProcFile::SmapsRollup),
     ("comm", ProcFile::Comm),
+    ("mem", ProcFile::Mem),
     ("limits", ProcFile::Limits),
     ("mountinfo", ProcFile::Mountinfo),
     ("mounts", ProcFile::Mounts),
     ("cgroup", ProcFile::Text("0::/\n")),
     ("oom_score_adj", ProcFile::Text("0\n")),
 ];
+
+/// What /proc/<pid>/task/<tid> has (each made the thread's by `task_file`).
+pub const TASK_FILES: &[(&str, ProcFile)] =
+    &[("stat", ProcFile::Stat), ("status", ProcFile::Status), ("statm", ProcFile::Statm), ("comm", ProcFile::Comm)];
+
+/// A /proc/<pid> file as /proc/<pid>/task/`tid` has it: the thread's name,
+/// state and times rather than the process's.
+pub fn task_file(f: ProcFile, tid: u32) -> ProcFile {
+    match f {
+        ProcFile::Stat => ProcFile::TaskStat(tid),
+        ProcFile::Status => ProcFile::TaskStatus(tid),
+        ProcFile::Comm => ProcFile::TaskComm(tid),
+        f => f,
+    }
+}
+
+/// Files the owner may write (0644): a thread's name, as Linux's
+/// comm_write, for the process's own threads.
+pub fn writable(f: ProcFile) -> bool {
+    matches!(f, ProcFile::Comm | ProcFile::TaskComm(_))
+}
+
+/// A /proc/<pid> file's mode.
+pub fn perm(f: ProcFile) -> u32 {
+    match f {
+        ProcFile::Mem => 0o600,
+        _ if private(f) => 0o400,
+        _ if writable(f) => 0o644,
+        _ => 0o444,
+    }
+}
 
 /// Files of /proc/<pid> that are its owner's (0400), and that another
 /// process may open only if it may inspect this one: Linux's environ and
@@ -114,16 +167,18 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/loadavg", ProcFile::Loadavg),
     ("/proc/version", ProcFile::Version),
     ("/proc/filesystems", ProcFile::Text("nodev\ttmpfs\nnodev\tproc\n")),
-    ("/proc/sys/kernel/hostname", ProcFile::Text("grix\n")),
+    ("/proc/sys/kernel/hostname", ProcFile::Hostname),
     ("/proc/sys/kernel/osrelease", ProcFile::Text("6.1.0-grix\n")),
     ("/proc/sys/kernel/ostype", ProcFile::Text("Linux\n")),
     ("/proc/sys/kernel/pid_max", ProcFile::Text("4194304\n")),
-    ("/proc/sys/kernel/threads-max", ProcFile::Text("1024\n")),
+    ("/proc/sys/kernel/threads-max", ProcFile::ThreadsMax),
     ("/proc/sys/kernel/ngroups_max", ProcFile::Text("65536\n")),
     ("/proc/sys/kernel/random/uuid", ProcFile::RandomUuid),
     ("/proc/sys/kernel/random/boot_id", ProcFile::BootId),
-    ("/proc/sys/vm/overcommit_memory", ProcFile::Text("0\n")),
-    ("/proc/sys/vm/max_map_count", ProcFile::Text("65530\n")),
+    // Linux's "always overcommit": nothing is reserved at mmap or fork,
+    // and memory is only taken as it's touched (Redis warns otherwise).
+    ("/proc/sys/vm/overcommit_memory", ProcFile::Text("1\n")),
+    ("/proc/sys/vm/max_map_count", ProcFile::Text("32768\n")), // mm::aspace::MAX_VMAS
     ("/proc/sys/vm/mmap_min_addr", ProcFile::Text("65536\n")), // syscall::mem::MMAP_MIN_ADDR
     ("/proc/sys/fs/file-max", ProcFile::FileMax),
     ("/proc/sys/fs/file-nr", ProcFile::FileNr),
@@ -131,6 +186,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/fs/aio-max-nr", ProcFile::Text("65536\n")),
     ("/proc/sys/fs/inode-nr", ProcFile::InodeNr),
     ("/proc/sys/fs/nr_open", ProcFile::Text("65536\n")), // fd::MAX_FDS
+    ("/proc/sys/fs/pipe-max-size", ProcFile::Text("1048576\n")), // ipc::PIPE_MAX_SIZE
     // Linux 6.1's last capability, CAP_CHECKPOINT_RESTORE (libcap and Go's
     // capability packages read it).
     ("/proc/sys/kernel/cap_last_cap", ProcFile::Text("40\n")),
@@ -143,10 +199,13 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/diskstats", ProcFile::Text("")),
     ("/proc/partitions", ProcFile::Text("major minor  #blocks  name\n\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),
+    ("/proc/sys/fs/inotify/max_user_watches", ProcFile::Text("8192\n")), // inotify::MAX_WATCHES
+    ("/proc/sys/fs/inotify/max_queued_events", ProcFile::Text("16384\n")), // inotify::MAX_QUEUED
     // lo, and eth0 with `net` (see netlink.rs).
     ("/proc/net/dev", ProcFile::NetDev),
     ("/proc/net/route", ProcFile::NetRoute),
-    ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
+    ("/proc/net/if_inet6", ProcFile::NetIfInet6),
+    ("/proc/net/ipv6_route", ProcFile::NetIpv6Route),
     // lo as sysfs shows it (as netlink.rs describes it).
     ("/sys/class/net/lo/address", ProcFile::Text("00:00:00:00:00:00\n")),
     ("/sys/class/net/lo/addr_len", ProcFile::Text("6\n")),
@@ -164,7 +223,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/sys/fs/cgroup/cgroup.controllers", ProcFile::Text("cpu memory pids\n")),
     ("/sys/fs/cgroup/cpu.max", ProcFile::CgroupCpuMax),
     ("/sys/fs/cgroup/memory.max", ProcFile::CgroupMemoryMax),
-    ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
+    ("/sys/fs/cgroup/pids.max", ProcFile::ThreadsMax),
     ("/proc/grix/smp", ProcFile::SmpStats),
 ];
 
@@ -193,6 +252,16 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         ProcFile::SmapsRollup => smaps(p, &mut s, true)?,
         ProcFile::Status => status(&shown(p), &mut s),
         ProcFile::Stat => stat(&shown(p), &mut s),
+        ProcFile::TaskStatus(tid) => status(&shown_task(p, tid)?, &mut s),
+        ProcFile::TaskStat(tid) => stat(&shown_task(p, tid)?, &mut s),
+        ProcFile::TaskComm(tid) => {
+            let _ = writeln!(s, "{}", thread_comm(p, tid).ok_or(ENOENT)?);
+        }
+        ProcFile::ThreadsMax => {
+            let _ = writeln!(s, "{}", crate::process::threads_max());
+        }
+        // Read and written through its descriptor (`FileKind::ProcMem`).
+        ProcFile::Mem => {}
         ProcFile::Statm => {
             let (size, rss) = mem_pages(p);
             let _ = writeln!(s, "{size} {rss} 0 0 0 {size} 0");
@@ -273,13 +342,13 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         }
         // Allocated, unused (always 0 since 2.6), most.
         ProcFile::FileNr => {
-            let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::MAX_OPEN_FILES);
+            let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::max_open_files());
         }
         ProcFile::AioNr => {
             let _ = writeln!(s, "{}", crate::syscall::aio::aio_nr());
         }
         ProcFile::FileMax => {
-            let _ = writeln!(s, "{}", crate::fd::MAX_OPEN_FILES);
+            let _ = writeln!(s, "{}", crate::fd::max_open_files());
         }
         ProcFile::InodeNr => {
             let _ = writeln!(s, "{}\t0", fs::lock().node_count());
@@ -306,6 +375,9 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         ProcFile::Version => {
             let _ = writeln!(s, "Linux version {RELEASE} (grix) {VERSION}");
         }
+        ProcFile::Hostname => {
+            let _ = writeln!(s, "{}", hostname());
+        }
         ProcFile::RandomUuid => uuid(&mut s, None),
         ProcFile::BootId => uuid(&mut s, Some(time::boot_id())),
         ProcFile::CgroupMemoryMax => {
@@ -314,6 +386,8 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         }
         ProcFile::NetDev => crate::netlink::proc_net_dev(&mut s),
         ProcFile::NetRoute => crate::netlink::proc_net_route(&mut s),
+        ProcFile::NetIfInet6 => crate::netlink::proc_net_if_inet6(&mut s),
+        ProcFile::NetIpv6Route => crate::netlink::proc_net_ipv6_route(&mut s),
     }
     Ok(s.into_bytes())
 }
@@ -360,11 +434,15 @@ pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> R
     let mut s = String::new();
     match f {
         ProcFile::Text(t) => s.push_str(t),
+        ProcFile::TaskStat(_) => return generate_zombie(reader, pid, z, ProcFile::Stat),
+        ProcFile::TaskStatus(_) => return generate_zombie(reader, pid, z, ProcFile::Status),
+        ProcFile::TaskComm(_) => return generate_zombie(reader, pid, z, ProcFile::Comm),
         ProcFile::Status | ProcFile::Stat => {
             // Its exit code is for those ptrace would let look (do_task_stat).
             let permitted = crate::procs::may_inspect_creds(reader, r.uid, r.gid, &r.ids, false);
             let sh = Shown {
                 pid,
+                tid: pid,
                 ppid: z.ppid,
                 pgid: z.pgid,
                 sid: z.sid,
@@ -414,6 +492,14 @@ fn dispositions(p: &Process) -> (u64, u64) {
     (ignored, caught)
 }
 
+/// Thread `tid`'s name: its own (PR_SET_NAME, its comm file), or else the
+/// process's. None if there's no such thread.
+pub fn thread_comm(p: &Process, tid: u32) -> Option<String> {
+    let t = p.threads.get(&tid)?;
+    let n = t.name.iter().position(|&b| b == 0).unwrap_or(t.name.len());
+    Some(if n > 0 { String::from_utf8_lossy(&t.name[..n]).into_owned() } else { comm(p) })
+}
+
 fn comm(p: &Process) -> String {
     let n = p.name.iter().position(|&b| b == 0).unwrap_or(p.name.len());
     if n > 0 {
@@ -425,7 +511,7 @@ fn comm(p: &Process) -> String {
 
 /// (virtual size, resident) in pages.
 fn mem_pages(p: &Process) -> (u64, u64) {
-    let size: u64 = p.aspace.vmas().map(|v| (v.end - v.start) / 4096).sum();
+    let size: u64 = p.aspace.access().vmas().map(|v| (v.end - v.start) / 4096).sum();
     let (_, used) = frame::stats();
     (size, used)
 }
@@ -435,9 +521,10 @@ fn root_mode(p: &Process) -> &'static str {
 }
 
 fn maps(p: &Process, s: &mut String) {
+    let a = p.aspace.access();
     let fs = fs::lock();
-    for v in p.aspace.vmas() {
-        map_line(p, &fs, v, s);
+    for v in a.vmas() {
+        map_line(&a, &fs, v, s);
     }
 }
 
@@ -446,17 +533,18 @@ fn maps(p: &Process, s: &mut String) {
 /// a heap that can't grow is ENOMEM, not a panic.
 fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
     let mut held = Charge::default();
+    let a = p.aspace.access();
     let fs = fs::lock();
     let mut total = Usage::default();
     let mut block = String::new();
-    for v in p.aspace.vmas() {
-        let u = p.aspace.usage(v);
+    for v in a.vmas() {
+        let u = a.usage(v);
         total.add(&u);
         if rollup {
             continue;
         }
         block.clear();
-        map_line(p, &fs, v, &mut block);
+        map_line(&a, &fs, v, &mut block);
         usage_lines(&mut block, v.end - v.start, &u);
         let flags =
             [(v.prot.read, "rd"), (v.prot.write, "wr"), (v.prot.exec, "ex"), (true, "mr"), (true, "mw"), (true, "me")];
@@ -470,7 +558,7 @@ fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
         s.push_str(&block);
     }
     if rollup {
-        let (start, end) = (p.aspace.vmas().next().map_or(0, |v| v.start), p.aspace.vmas().last().map_or(0, |v| v.end));
+        let (start, end) = (a.vmas().next().map_or(0, |v| v.start), a.vmas().last().map_or(0, |v| v.end));
         let _ = writeln!(s, "{start:08x}-{end:08x} ---p 00000000 00:00 0                          [rollup]");
         usage_lines(s, 0, &total);
     }
@@ -506,7 +594,7 @@ fn usage_lines(s: &mut String, size: u64, u: &Usage) {
 }
 
 /// A mapping's line in /proc/<pid>/maps.
-fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String) {
+fn map_line(a: &AddressSpace, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String) {
     let perms = [(v.prot.read || v.prot.write || v.prot.exec, 'r'), (v.prot.write, 'w'), (v.prot.exec, 'x')];
     let mut flags = String::new();
     for (on, c) in perms {
@@ -518,7 +606,7 @@ fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String
         Backing::File { offset, ino, .. }
         | Backing::Data { offset, ino, .. }
         | Backing::SharedFile { offset, ino, .. } => (offset, fs.ino_number(ino), fs.path_of(ino)),
-        Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
+        Backing::Anon if v.start == a.brk_start && v.start < a.brk => (0, 0, "[heap]".into()),
         Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
         // What Linux calls the page holding the signal-return code on arm32.
         Backing::Sigpage => (0, 0, "[sigpage]".into()),
@@ -535,6 +623,8 @@ fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String
 /// What status and stat show of a process, live or a zombie.
 struct Shown<'a> {
     pid: u32,
+    /// The thread shown (the process's: its pid).
+    tid: u32,
     ppid: u32,
     pgid: u32,
     sid: u32,
@@ -572,6 +662,7 @@ fn shown(p: &Process) -> Shown<'_> {
     let (ignored, caught) = dispositions(p);
     Shown {
         pid: p.pid,
+        tid: p.pid,
         ppid: p.ppid,
         pgid: p.pgid,
         sid: p.sid,
@@ -601,6 +692,29 @@ fn shown(p: &Process) -> Shown<'_> {
     }
 }
 
+/// Thread `tid` of `p`, as its /proc/<pid>/task/<tid> shows it: its name,
+/// state, signals and CPU time, and the rest the process's.
+fn shown_task(p: &Process, tid: u32) -> Result<Shown<'_>, Errno> {
+    let t = p.threads.get(&tid).ok_or(ENOENT)?;
+    let mut sh = shown(p);
+    sh.tid = tid;
+    sh.comm = thread_comm(p, tid).ok_or(ENOENT)?;
+    sh.state = thread_state(p, tid);
+    (sh.blocked, sh.pending) = (t.sigmask, t.pending.mask);
+    sh.cpu_ns = p.thread_cpu_ns(tid).unwrap_or(0);
+    sh.children_ns = 0;
+    Ok(sh)
+}
+
+/// Stopped, waiting for something (sleeping), or running or ready to.
+fn thread_state(p: &Process, tid: u32) -> &'static str {
+    match p.threads.get(&tid) {
+        _ if p.stopped => "T (stopped)",
+        Some(t) if t.wait.is_some() => "S (sleeping)",
+        _ => "R (running)",
+    }
+}
+
 /// As Linux's proc_pid_status lays it out: without a filesystem context
 /// there's no Umask line, and without memory no Vm lines.
 fn status(sh: &Shown, s: &mut String) {
@@ -608,14 +722,14 @@ fn status(sh: &Shown, s: &mut String) {
     let (ru, u, su) = (ids.ruid, sh.uid, ids.suid);
     let (rg, g, sg) = (ids.rgid, sh.gid, ids.sgid);
     let groups = ids.groups.iter().map(|g| alloc::format!("{g}")).collect::<alloc::vec::Vec<_>>().join(" ");
-    let (pid, ppid) = (sh.pid, sh.ppid);
+    let (pid, tid, ppid) = (sh.pid, sh.tid, sh.ppid);
     let _ = writeln!(s, "Name:\t{}", sh.comm);
     if let Some(umask) = sh.umask {
         let _ = writeln!(s, "Umask:\t{umask:04o}");
     }
     let _ = write!(
         s,
-        "State:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
+        "State:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{tid}\nPPid:\t{ppid}\n\
          TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n",
         sh.state, sh.fds,
     );
@@ -656,7 +770,7 @@ fn stat(sh: &Shown, s: &mut String) {
     let (size, rss) = sh.mem.unwrap_or((0, 0));
     // utime and cutime, in clock ticks (all CPU time counts as user time).
     let (ticks, cticks) = (sh.cpu_ns / 10_000_000, sh.children_ns / 10_000_000);
-    let (pid, ppid, pgrp, sid, flags) = (sh.pid, sh.ppid, sh.pgid, sh.sid, sh.flags);
+    let (pid, ppid, pgrp, sid, flags) = (sh.tid, sh.ppid, sh.pgid, sh.sid, sh.flags);
     let _ = writeln!(
         s,
         "{pid} ({}) {} {ppid} {pgrp} {sid} 0 -1 {flags} 0 0 0 0 {ticks} 0 {cticks} 0 20 0 {} 0 0 {} {rss} \
@@ -723,6 +837,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         }
         FileKind::Pty(end) => fs::lock().path_of(end.ino),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
+        FileKind::ProcMem(pid, _) => format!("/proc/{pid}/mem"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
         FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),
         FileKind::EventFd(_) => String::from("anon_inode:[eventfd]"),
@@ -731,6 +846,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
         FileKind::SignalFd(_) => String::from("anon_inode:[signalfd]"),
         FileKind::PidFd(_) => String::from("anon_inode:[pidfd]"),
+        FileKind::Landlock(_) => String::from("anon_inode:[landlock-ruleset]"),
         FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_) => {
             alloc::format!("socket:[{}]", 0x3000_0000 + fd)
         }

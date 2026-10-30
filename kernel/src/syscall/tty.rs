@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use super::file::would_block;
 use super::table::nr;
 use crate::errno::*;
-use crate::fd::{FdEntry, FileKind, O_ACCMODE, O_CLOEXEC, O_WRONLY, new_file};
+use crate::fd::{FdEntry, FileKind, O_ACCMODE, O_CLOEXEC, new_file};
 use crate::fs::{self, Dev, Ino};
 use crate::process::Process;
 use crate::signal::{self, SIG_IGN, SIGTTIN, SIGTTOU};
@@ -273,7 +273,7 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
             if let Some(c) = &p.ctty {
                 return if Arc::ptr_eq(c, &tty) { Ok(0) } else { Err(EPERM) };
             }
-            let readable = p.fds.get(fd)?.lock().flags & O_ACCMODE != O_WRONLY;
+            let readable = p.fds.get(fd)?.lock().readable();
             if !readable && p.uid != 0 {
                 return Err(EPERM);
             }
@@ -307,7 +307,7 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
                 let sid = p.sid;
                 let mut procs = crate::procs::PROCS.lock();
                 tty::disassociate(Some(&mut *p), &mut procs, &tty, sid, false);
-                p.timer_dirty = true;
+                crate::sched::timer_changed();
             }
             p.ctty = None;
             Ok(0)
@@ -374,7 +374,16 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
             let flags = arg as u32;
             let index = tty.lock().index;
             let ino = fs::lock().pts_node(index).ok_or(EIO)?;
+            // An open like any other to Landlock (security_file_open).
+            let denied = match crate::landlock::domain(p) {
+                Some(d) => {
+                    let fs = fs::lock();
+                    crate::landlock::open_access(&d, &fs, ino, fs.node(ino).parent, flags & O_ACCMODE)?
+                }
+                None => 0,
+            };
             let file = open_slave(p, &tty, ino, flags)?;
+            file.lock().landlock_denied = denied;
             p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
         }
         // Not terminals Linux's ptys answer for either: consoles, virtual

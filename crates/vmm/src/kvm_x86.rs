@@ -211,14 +211,14 @@ pub struct Cpu {
 unsafe impl Send for Cpu {}
 
 impl Vm {
-    /// Create the VM with `size` bytes of memory at host `host` (guest
-    /// physical 0), KVM's interrupt controllers, and `cpus` vCPUs: the first
+    /// Create the VM with memory `ram` (each region's guest physical
+    /// base, host address and size), KVM's interrupt controllers, and `cpus` vCPUs: the first
     /// entering at `entry` as PVH says (32-bit protected mode, paging off),
     /// the others waiting for the APIC's INIT and start-up IPIs.
     ///
     /// # Safety
-    /// `host` must stay mapped for as long as the VM runs.
-    pub unsafe fn create(host: *mut u8, size: usize, entry: u64, cpus: u32) -> Result<(Vm, Vec<Cpu>), Error> {
+    /// `ram`'s memory must stay mapped for as long as the VM runs.
+    pub unsafe fn create(ram: &[(u64, *mut u8, usize)], entry: u64, cpus: u32) -> Result<(Vm, Vec<Cpu>), Error> {
         let kvm = File::options()
             .read(true)
             .write(true)
@@ -235,12 +235,28 @@ impl Vm {
         ioctl(vm.as_raw_fd(), KVM_SET_TSS_ADDR, TSS_ADDR)?;
         ioctl(vm.as_raw_fd(), KVM_SET_IDENTITY_MAP_ADDR, &IDENTITY_MAP_ADDR as *const u64 as u64)?;
         ioctl(vm.as_raw_fd(), KVM_CREATE_IRQCHIP, 0)?;
-        let region: [u64; 4] = [0, 0, size as u64, host as u64]; // slot 0, flags 0, at 0
-        ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, region.as_ptr() as u64)?;
+        for (slot, &(base, host, size)) in ram.iter().enumerate() {
+            let region: [u64; 4] = [slot as u64, base, size as u64, host as u64]; // slot, flags 0
+            ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, region.as_ptr() as u64)?;
+        }
 
         let mut supported = Box::new(Cpuid { nent: 256, padding: 0, entries: [CpuidEntry::default(); 256] });
         ioctl(kvm.as_raw_fd(), KVM_GET_SUPPORTED_CPUID, &mut *supported as *mut Cpuid as u64)?;
         let run_size = ioctl(kvm.as_raw_fd(), KVM_GET_VCPU_MMAP_SIZE, 0)? as usize;
+        // The guest's physical addresses: 36 bits (64 GiB, as most CPUs
+        // have) unless RAM goes past that, and no more than this CPU's.
+        let top = ram.iter().map(|&(base, _, size)| base + size as u64).max().unwrap_or(0);
+        let phys_bits = (64 - top.saturating_sub(1).leading_zeros()).max(36);
+        let host_bits = supported.entries[..(supported.nent as usize).min(256)]
+            .iter()
+            .find(|e| e.function == 0x8000_0008)
+            .map_or(36, |e| e.eax & 0xff);
+        if phys_bits > host_bits {
+            return Err(Error(format!(
+                "this CPU addresses {host_bits} bits of physical memory, and the guest's RAM reaches {} GiB: give it less",
+                top.div_ceil(1 << 30)
+            )));
+        }
         let mut vcpus = Vec::new();
         for n in 0..cpus.max(1) {
             let fd = own(ioctl(vm.as_raw_fd(), KVM_CREATE_VCPU, n as u64)?);
@@ -259,7 +275,7 @@ impl Vm {
                 return Err(Error(format!("mapping kvm_run: {}", std::io::Error::last_os_error())));
             }
             let cpu = Cpu { fd, run: run.cast(), run_size, io: (0, 0) };
-            cpu.set_cpuid(&supported, n, cpus.max(1))?;
+            cpu.set_cpuid(&supported, n, cpus.max(1), phys_bits)?;
             vcpus.push(cpu);
         }
         vcpus[0].enter_pvh(entry)?;
@@ -361,7 +377,7 @@ const BRAND: &[u8; 48] = b"grix virtual CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
 /// timing leaf (VMware's, which KVM-based VMMs fill in too: the TSC's
 /// rate, `tsc_khz`, which the kernel would otherwise measure) and the
 /// one that says it's there, with no vendor.
-fn guest_cpuid(supported: &[CpuidEntry], n: u32, cpus: u32, tsc_khz: u32) -> Vec<CpuidEntry> {
+fn guest_cpuid(supported: &[CpuidEntry], n: u32, cpus: u32, tsc_khz: u32, phys_bits: u32) -> Vec<CpuidEntry> {
     let cpus = cpus.max(1);
     let leaf = |function, index| CpuidEntry { function, index, ..CpuidEntry::default() };
     let max_ext = supported.iter().find(|e| e.function == 0x8000_0000).map_or(0, |e| e.eax);
@@ -420,10 +436,10 @@ fn guest_cpuid(supported: &[CpuidEntry], n: u32, cpus: u32, tsc_khz: u32) -> Vec
             0x8000_0006 if amd => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0x0400_8140, 0x0080_8140),
             0x8000_0005 => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0, 0),
             0x8000_0006 => (e.eax, e.ebx, e.ecx, e.edx) = (0, 0, 0x0400_8040, 0),
-            // 36 bits physical, 48 virtual; AMD's core count, without the
-            // host's APIC ID size.
+            // Physical address bits enough for RAM (`phys_bits`), 48
+            // virtual; AMD's core count, without the host's APIC ID size.
             0x8000_0008 => {
-                e.eax = 36 | 48 << 8;
+                e.eax = phys_bits | 48 << 8;
                 if amd {
                     e.ecx = (e.ecx & !0xf0ff) | ((cpus - 1) & 0xff);
                 }
@@ -448,9 +464,10 @@ fn guest_cpuid(supported: &[CpuidEntry], n: u32, cpus: u32, tsc_khz: u32) -> Vec
 
 impl Cpu {
     /// The CPUID the guest sees (`guest_cpuid`).
-    fn set_cpuid(&self, supported: &Cpuid, n: u32, cpus: u32) -> Result<(), Error> {
+    fn set_cpuid(&self, supported: &Cpuid, n: u32, cpus: u32, phys_bits: u32) -> Result<(), Error> {
         let tsc_khz = ioctl(self.fd.as_raw_fd(), KVM_GET_TSC_KHZ, 0)? as u32;
-        let entries = guest_cpuid(&supported.entries[..(supported.nent as usize).min(256)], n, cpus, tsc_khz);
+        let entries =
+            guest_cpuid(&supported.entries[..(supported.nent as usize).min(256)], n, cpus, tsc_khz, phys_bits);
         let mut c = Box::new(Cpuid { nent: 0, padding: 0, entries: [CpuidEntry::default(); 256] });
         if entries.len() > c.entries.len() {
             return Err(Error(format!("{} CPUID entries is more than {}", entries.len(), c.entries.len())));
@@ -852,8 +869,9 @@ mod tests {
 
     #[test]
     fn the_guest_cant_tell_hosts_of_a_model_apart() {
-        let a = guest_cpuid(&intel(b"Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz", 49152, 32, 46), 0, 2, 2_900_000);
-        let b = guest_cpuid(&intel(b"Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz", 32768, 16, 52), 0, 2, 2_900_000);
+        let a =
+            guest_cpuid(&intel(b"Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz", 49152, 32, 46), 0, 2, 2_900_000, 36);
+        let b = guest_cpuid(&intel(b"Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz", 32768, 16, 52), 0, 2, 2_900_000, 36);
         assert_eq!(a, b);
         let brand: Vec<u8> =
             (0x8000_0002..=0x8000_0004).flat_map(|f| get(&a, f, 0).unwrap()).flat_map(u32::to_le_bytes).collect();
@@ -877,7 +895,7 @@ mod tests {
 
     #[test]
     fn caches_are_made_up() {
-        let v = guest_cpuid(&intel(b"x", 49152, 32, 46), 3, 4, 1);
+        let v = guest_cpuid(&intel(b"x", 49152, 32, 46), 3, 4, 1, 36);
         let size = |[eax, ebx, ecx, _]: [u32; 4]| {
             (
                 eax & 0x1f,
@@ -910,7 +928,7 @@ mod tests {
         ];
         host.extend((0..4).map(|i| e(0x8000_001d, i, [0x121 + i, 0x01c0_003f, 63, 0])));
         host.push(e(0x8000_001d, 4, [0, 0, 0, 0]));
-        let v = guest_cpuid(&host, 1, 2, 1);
+        let v = guest_cpuid(&host, 1, 2, 1, 36);
         assert_eq!(get(&v, 0x8000_0006, 0), Some([0, 0, 0x0400_8140, 0x0080_8140]));
         assert_eq!(get(&v, 0x8000_0008, 0).unwrap()[2], 1);
         assert_eq!(get(&v, 0x8000_001e, 0), Some([1, 1, 0, 0]));

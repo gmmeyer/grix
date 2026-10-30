@@ -12,7 +12,11 @@
 //! files are watched too, up to a budget (beyond it they're polled).
 //!
 //! What the host keeps is bounded: `hostfs::MAX_WATCHES` nodes, and on
-//! macOS `MAX_ENTRIES` directory entries and `MAX_CHILD_FDS` descriptors.
+//! macOS `MAX_ENTRIES` directory entries and descriptors: `MAX_CHILD_FDS`
+//! of a watcher's, and a share of RLIMIT_NOFILE (`fd_budget`) of every
+//! watcher's in the process, since it needs descriptors for much else.
+//! Past that budget files are polled, and a node isn't watched at all:
+//! the guest is told it may have lost changes (`IN_Q_OVERFLOW`).
 //! The notices of one round of changes are bounded too (`MAX_BATCH`):
 //! past that the guest is told it lost some (`IN_Q_OVERFLOW`), as Linux
 //! does when its queue is full. They're sent as the guest takes them, so
@@ -56,6 +60,15 @@ fn bounded(mut changes: Vec<Change>) -> Vec<Change> {
         changes.push(Change::new(0, IN_Q_OVERFLOW, ""));
     }
     changes
+}
+
+/// `change` for each of `ids` (one file can be many nodes), while a round
+/// has room: one event mustn't turn into thousands of changes to be
+/// thrown away by `bounded`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn for_each_id(out: &mut Vec<Change>, ids: &[u64], mask: u32, cookie: u32, name: &str) {
+    let room = (MAX_BATCH + 1).saturating_sub(out.len());
+    out.extend(ids.iter().take(room).map(|&id| Change { id, mask, cookie, name: name.to_string() }));
 }
 
 /// A name the guest can see: UTF-8, and at most NAME_MAX bytes.
@@ -209,7 +222,7 @@ mod os {
                 bytes = &bytes[16 + len..];
                 let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
                 if mask & IN_Q_OVERFLOW != 0 {
-                    out.push(Change::new(0, IN_Q_OVERFLOW, ""));
+                    super::for_each_id(out, &[0], IN_Q_OVERFLOW, 0, "");
                     continue;
                 }
                 let Some(ids) = self.wds.get(&wd) else { continue };
@@ -220,11 +233,8 @@ mod os {
                     let Some(n) = guest_name(name) else { continue };
                     n
                 };
-                for &id in ids {
-                    let m = mask & NOTICE;
-                    if m != 0 {
-                        out.push(Change { id, mask: m, cookie, name: name.to_string() });
-                    }
+                if mask & NOTICE != 0 {
+                    super::for_each_id(out, ids, mask & NOTICE, cookie, name);
                 }
                 // The file is gone (or its file system): so is the watch.
                 if mask & IN_IGNORED != 0 {
@@ -271,11 +281,42 @@ mod os {
     use super::{Change, ENOSPC, guest_name};
     use crate::at::{Kind, check, ctime_ns, identity, kind, mode, mtime_ns, openat, read_dir, stat_at, stat_fd};
     use grix_abi::hostfs::mask::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Directory entries kept, across every watched directory.
     pub const MAX_ENTRIES: usize = 256 * 1024;
     /// Descriptors held for watched directories' files.
     pub const MAX_CHILD_FDS: usize = 1024;
+    /// Every watcher's descriptors in this process (sandboxes are many).
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+
+    /// The share of the process's descriptors (RLIMIT_NOFILE's soft limit,
+    /// 256 from a macOS shell) that watches may hold: the rest are for live
+    /// mounts' files, the proxy's connections, the VMM's pipes.
+    pub fn fd_budget(soft_limit: u64) -> usize {
+        (soft_limit / 4).clamp(16, 64 * 1024) as usize
+    }
+
+    fn soft_limit() -> u64 {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: getrlimit fills in the struct.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 { lim.rlim_cur } else { 256 }
+    }
+
+    /// One more for a watch, if the budget has room.
+    fn take_fd() -> bool {
+        // (Two sandboxes at once may go one over: it's a share, not a limit.)
+        let room = HELD.load(Ordering::Relaxed) < fd_budget(soft_limit());
+        if room {
+            HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        room
+    }
+
+    fn give_fd() {
+        HELD.fetch_sub(1, Ordering::Relaxed);
+    }
     /// How often directories with files not watched on their own are
     /// compared again.
     const POLL: Duration = Duration::from_secs(1);
@@ -343,6 +384,10 @@ mod os {
         child_fds: usize,
         next_cookie: u32,
         last_poll: Instant,
+        /// Nodes the budget had no descriptor for: nothing reports them,
+        /// which the guest has been told (`lost`).
+        blind: HashSet<u64>,
+        lost: bool,
     }
 
     /// A directory's entries the guest can see, by name; at most `room`.
@@ -372,15 +417,17 @@ mod os {
                 child_fds: 0,
                 next_cookie: 1,
                 last_poll: Instant::now(),
+                blind: HashSet::new(),
+                lost: false,
             })
         }
 
         pub fn watching(&self, id: u64) -> bool {
-            self.watches.contains_key(&id)
+            self.watches.contains_key(&id) || self.blind.contains(&id)
         }
 
         pub fn count(&self) -> usize {
-            self.watches.len()
+            self.watches.len() + self.blind.len()
         }
 
         /// Tell kqueue about `fd`, as `token`.
@@ -403,29 +450,51 @@ mod os {
         /// A descriptor for a watched directory's file `name`, if the
         /// budget allows (closing it takes it out of the kqueue).
         fn child_fd(&mut self, id: u64, dir: RawFd, name: &str, seen: &Seen) -> Option<(OwnedFd, u64)> {
-            if seen.dir || self.child_fds >= MAX_CHILD_FDS {
+            if seen.dir || self.child_fds >= MAX_CHILD_FDS || !take_fd() {
                 return None;
             }
-            let c = std::ffi::CString::new(name).ok()?;
-            let fd = openat(dir, &c, libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0).ok()?;
-            // Only the file that was seen (not a link or FIFO put there since).
-            if stat_fd(fd.as_raw_fd()).ok().map(|st| identity(&st)) != Some(seen.file) {
-                return None;
+            let opened = (|| {
+                let c = std::ffi::CString::new(name).ok()?;
+                let fd = openat(dir, &c, libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0).ok()?;
+                // Only the file that was seen (not a link or FIFO put there since).
+                if stat_fd(fd.as_raw_fd()).ok().map(|st| identity(&st)) != Some(seen.file) {
+                    return None;
+                }
+                let token = self.register(fd.as_raw_fd(), Target::Child(id, name.to_string())).ok()?;
+                Some((fd, token))
+            })();
+            match opened {
+                Some(_) => self.child_fds += 1,
+                None => give_fd(),
             }
-            let token = self.register(fd.as_raw_fd(), Target::Child(id, name.to_string())).ok()?;
-            self.child_fds += 1;
-            Some((fd, token))
+            opened
         }
 
         fn drop_entry(&mut self, e: Entry) {
             if let Some((_, token)) = e.fd {
                 self.tokens.remove(&token);
                 self.child_fds -= 1;
+                give_fd();
             }
             self.entries -= 1;
         }
 
         pub fn add(&mut self, id: u64, fd: OwnedFd) -> Result<(), u16> {
+            // Nothing to spare for it: the host isn't to run out for one
+            // program's watches, and the guest can look for itself.
+            if !take_fd() {
+                self.blind.insert(id);
+                self.lost = true;
+                return Ok(());
+            }
+            let added = self.add_held(id, fd);
+            if added.is_err() {
+                give_fd();
+            }
+            added
+        }
+
+        fn add_held(&mut self, id: u64, fd: OwnedFd) -> Result<(), u16> {
             let st = stat_fd(fd.as_raw_fd()).map_err(|e| crate::hostfs::linux_errno(&e))?;
             let dir = kind(&st) == Kind::Dir;
             let found = if dir {
@@ -449,8 +518,10 @@ mod os {
         }
 
         pub fn remove(&mut self, id: u64) {
+            self.blind.remove(&id);
             let Some(w) = self.watches.remove(&id) else { return };
             self.tokens.remove(&w.token);
+            give_fd();
             for (_, e) in w.entries {
                 self.drop_entry(e);
             }
@@ -555,6 +626,9 @@ mod os {
 
         /// What kqueue said, as changes.
         fn take(&mut self, events: &[libc::kevent], out: &mut Vec<Change>) {
+            if std::mem::take(&mut self.lost) {
+                out.push(Change::new(0, IN_Q_OVERFLOW, ""));
+            }
             let mut changed = BTreeSet::new();
             for ev in events {
                 let token = ev.udata as u64;
@@ -630,6 +704,14 @@ mod os {
         state.lock().unwrap().take(&events[..n.max(0) as usize], &mut out);
         out
     }
+
+    impl Drop for State {
+        fn drop(&mut self) {
+            for _ in 0..self.watches.len() + self.child_fds {
+                give_fd();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +736,30 @@ mod tests {
             }
         }
         got
+    }
+
+    #[test]
+    fn a_round_of_changes_stays_small_as_it_is_made() {
+        // 4096 events on a file with 8192 names: a read's worth would be
+        // 33 million changes before `bounded` could look at them.
+        let ids: Vec<u64> = (0..8192).collect();
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            for_each_id(&mut out, &ids, IN_MODIFY, 0, "x");
+            assert!(out.len() <= MAX_BATCH + 1);
+        }
+        let round = bounded(out);
+        assert_eq!(round.len(), MAX_BATCH);
+        assert_eq!(round.last().unwrap().mask, IN_Q_OVERFLOW);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptors_are_a_share_of_the_limit() {
+        // A macOS shell's default, and the most one host process holds.
+        assert_eq!(os::fd_budget(256), 64);
+        assert_eq!(os::fd_budget(64), 16);
+        assert_eq!(os::fd_budget(u64::MAX), 64 * 1024);
     }
 
     #[test]

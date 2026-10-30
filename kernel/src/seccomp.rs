@@ -444,6 +444,8 @@ fn may_assign(p: &mut Process, mode: u8) -> bool {
 /// Only read, write, exit and rt_sigreturn from now on. (Linux also makes
 /// x86_64's rdtsc fault; here the counter stays readable.)
 fn set_strict(p: &mut Process) -> SysResult {
+    // Fast calls go through the filters from now (`fast::calls_allowed`).
+    crate::fast::changed();
     if !may_assign(p, MODE_STRICT) {
         return Err(EINVAL);
     }
@@ -453,6 +455,9 @@ fn set_strict(p: &mut Process) -> SysResult {
 
 /// SECCOMP_SET_MODE_FILTER (seccomp_set_mode_filter).
 fn set_filter(p: &mut Process, flags: u64, uargs: u64) -> SysResult {
+    // Fast calls go through the filters from now, every thread's with
+    // TSYNC (`fast::calls_allowed`).
+    crate::fast::changed();
     if flags & !FLAG_MASK != 0 {
         return Err(EINVAL);
     }

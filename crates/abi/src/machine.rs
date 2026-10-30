@@ -8,6 +8,18 @@
 //! [`RAM_BASE`](crate::image::RAM_BASE), which the kernel maps as device
 //! memory.
 
+/// Guest RAM as regions of guest physical memory, `(base, size)`, in
+/// ascending order; a region of size 0 isn't there. The VMM makes RAM
+/// this way and the kernel maps and allocates it so.
+pub type RamRegions = [(u64, u64); 2];
+
+/// Where `ram_size` bytes of RAM are on arm64: QEMU `virt`'s, one region
+/// from [`RAM_BASE`](crate::image::RAM_BASE), through 4 GiB and on when
+/// it's that big (nothing of `virt`'s is there).
+pub const fn ram_regions(ram_size: u64) -> RamRegions {
+    [(crate::image::RAM_BASE, ram_size), (0, 0)]
+}
+
 /// GICv3 distributor.
 pub const GICD: u64 = 0x0800_0000;
 /// GICv3 redistributors on QEMU `virt` (128 KiB per CPU, right after the
@@ -53,12 +65,27 @@ pub const CONSOLE_TX: u32 = 2 * CONSOLE_PORT + 3;
 pub const CONSOLE_CONTROL_TX: u32 = 3;
 
 /// The x86_64 machine: QEMU `microvm`'s layout (with `ioapic2=off`), which
-/// `grix-vmm` on x86 KVM follows too. RAM starts at 0 (up to
-/// [`image::MAX_RAM`](crate::image::MAX_RAM), below the devices); the
-/// kernel is loaded at 2 MiB and the boot image at [`x86_64::IMAGE_BASE`].
+/// `grix-vmm` on x86 KVM follows too. RAM starts at 0, up to
+/// [`image::LOW_RAM`](crate::image::LOW_RAM) below the devices and the
+/// rest from 4 GiB ([`x86_64::ram_regions`]); the kernel is loaded at
+/// 2 MiB and the boot image at [`x86_64::IMAGE_BASE`].
 pub mod x86_64 {
+    use crate::image::LOW_RAM;
+
     pub const RAM_BASE: u64 = 0;
     pub const IMAGE_BASE: u64 = 0x0800_0000;
+    /// Where RAM past [`LOW_RAM`] goes.
+    pub const HIGH_RAM_BASE: u64 = 1 << 32;
+
+    /// Where `ram_size` bytes of RAM are: as on `microvm` (and KVM's
+    /// layouts), what doesn't fit below the hole at 3 GiB goes from 4 GiB.
+    pub const fn ram_regions(ram_size: u64) -> super::RamRegions {
+        if ram_size <= LOW_RAM {
+            [(RAM_BASE, ram_size), (0, 0)]
+        } else {
+            [(RAM_BASE, LOW_RAM), (HIGH_RAM_BASE, ram_size - LOW_RAM)]
+        }
+    }
 
     /// The 16550 UART's I/O ports (COM1).
     pub const UART_PORT: u16 = 0x3f8;
@@ -78,4 +105,21 @@ pub mod x86_64 {
     /// the answer in rax, rdi, rsi, rdx, rcx and r8, as arm64's x0..x5.
     /// Nothing else is there: QEMU ignores it, and rax comes back as it was.
     pub const VMM_PORT: u16 = 0x0e10;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::image::{LOW_RAM, MAX_RAM, RAM_BASE};
+
+    #[test]
+    fn ram_regions() {
+        // arm64: one region from 1 GiB, however big.
+        assert_eq!(super::ram_regions(512 << 20), [(RAM_BASE, 512 << 20), (0, 0)]);
+        assert_eq!(super::ram_regions(MAX_RAM), [(RAM_BASE, MAX_RAM), (0, 0)]);
+        // x86_64: up to 3 GiB below the hole, the rest from 4 GiB.
+        assert_eq!(super::x86_64::ram_regions(LOW_RAM), [(0, LOW_RAM), (0, 0)]);
+        assert_eq!(super::x86_64::ram_regions(6 << 30), [(0, LOW_RAM), (1 << 32, 3 << 30)]);
+        let [(_, low), (high, size)] = super::x86_64::ram_regions(MAX_RAM);
+        assert_eq!((low + size, high + size), (MAX_RAM, 65 << 30));
+    }
 }

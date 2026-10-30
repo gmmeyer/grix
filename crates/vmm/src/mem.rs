@@ -1,4 +1,5 @@
-//! Guest RAM: one anonymous mapping, shared with the vCPU.
+//! Guest RAM: one anonymous mapping, shared with the vCPUs, for the
+//! regions of guest physical memory `grix_abi::machine` puts it in.
 //!
 //! Device threads read and write it while the guest runs. Every address the
 //! guest gives a device is checked against it first: a bad one is the
@@ -6,10 +7,14 @@
 
 use std::ptr;
 
+use grix_abi::machine::RamRegions;
+
 pub struct GuestMemory {
     host: *mut u8,
-    base: u64,
     size: usize,
+    /// Guest physical `(base, size)` of each region (`machine::RamRegions`,
+    /// empty ones left out), one after another in the mapping.
+    regions: Vec<(u64, usize)>,
 }
 
 // SAFETY: the mapping lives as long as the process (it's never unmapped),
@@ -19,8 +24,10 @@ unsafe impl Send for GuestMemory {}
 unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
-    /// `size` bytes of zeroed memory for guest physical `base..`.
-    pub fn new(base: u64, size: usize) -> std::io::Result<GuestMemory> {
+    /// Zeroed memory for guest RAM in `regions`.
+    pub fn new(regions: RamRegions) -> std::io::Result<GuestMemory> {
+        let regions = Self::layout(regions)?;
+        let size = regions.iter().map(|r| r.1).sum();
         // SAFETY: a fresh anonymous mapping.
         let host = unsafe {
             libc::mmap(
@@ -35,12 +42,15 @@ impl GuestMemory {
         if host == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(GuestMemory { host: host.cast(), base, size })
+        Ok(GuestMemory { host: host.cast(), size, regions })
     }
 
-    /// `size` bytes of `fd` from `offset`, copy-on-write: a snapshot's RAM,
-    /// paged in as the guest touches it.
-    pub fn map_file(fd: i32, offset: u64, base: u64, size: usize) -> std::io::Result<GuestMemory> {
+    /// `fd` from `offset`, copy-on-write, as guest RAM in `regions` (one
+    /// after another in the file): a snapshot's RAM, paged in as the guest
+    /// touches it.
+    pub fn map_file(fd: i32, offset: u64, regions: RamRegions) -> std::io::Result<GuestMemory> {
+        let regions = Self::layout(regions)?;
+        let size = regions.iter().map(|r| r.1).sum();
         // SAFETY: a fresh private mapping of a file we hold.
         let host = unsafe {
             libc::mmap(
@@ -55,25 +65,41 @@ impl GuestMemory {
         if host == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(GuestMemory { host: host.cast(), base, size })
+        Ok(GuestMemory { host: host.cast(), size, regions })
     }
 
-    pub fn host(&self) -> *mut u8 {
-        self.host
-    }
-
-    pub fn base(&self) -> u64 {
-        self.base
+    fn layout(regions: RamRegions) -> std::io::Result<Vec<(u64, usize)>> {
+        let regions: Vec<(u64, usize)> =
+            regions.iter().filter(|r| r.1 > 0).map(|&(base, size)| (base, size as usize)).collect();
+        if regions.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Ok(regions)
     }
 
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// The host address of guest `addr..addr + len`, if that's all RAM.
+    /// Each region: its guest physical base, where it is in the mapping,
+    /// and its size.
+    pub fn regions(&self) -> impl Iterator<Item = (u64, *mut u8, usize)> + '_ {
+        let mut off = 0;
+        self.regions.iter().map(move |&(base, size)| {
+            let host = self.host.wrapping_add(off);
+            off += size;
+            (base, host, size)
+        })
+    }
+
+    /// The host address of guest `addr..addr + len`, if that's all RAM
+    /// (in one region: they're never adjacent).
     fn at(&self, addr: u64, len: usize) -> Option<*mut u8> {
-        let off = addr.checked_sub(self.base)? as usize;
-        (off <= self.size && len <= self.size - off).then(|| self.host.wrapping_add(off))
+        self.regions().find_map(|(base, host, size)| {
+            let off = addr.checked_sub(base)?;
+            let off = usize::try_from(off).ok().filter(|&o| o < size || (o == size && len == 0))?;
+            (len <= size - off).then(|| host.wrapping_add(off))
+        })
     }
 
     /// Is guest `addr..addr + len` all RAM?

@@ -6,7 +6,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <linux/ethtool.h>
 #include <linux/if_packet.h>
+#include <linux/sockios.h>
+#include <netdb.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
@@ -16,6 +19,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 
 #define CHECK(c) do { if (!(c)) { printf("FAILED: %s (line %d, errno %d)\n", #c, __LINE__, errno); return 1; } } while (0)
@@ -33,12 +37,12 @@ static int slurp(const char *path) {
     return n;
 }
 
-/// A dump of routes (RTM_GETROUTE, AF_INET) into `buf`: how many there are.
-static int routes(char *buf, int size) {
+/// A dump of routes (RTM_GETROUTE, `family`) into `buf`: how many there are.
+static int routes_of(int family, char *buf, int size) {
     int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     struct { struct nlmsghdr h; struct rtmsg r; } req = {
         .h = {.nlmsg_len = sizeof req, .nlmsg_type = RTM_GETROUTE, .nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP},
-        .r = {.rtm_family = AF_INET},
+        .r = {.rtm_family = family},
     };
     if (nl < 0 || send(nl, &req, sizeof req, 0) != sizeof req) return -1;
     int len = recv(nl, buf, size, 0), n = 0;
@@ -49,6 +53,40 @@ static int routes(char *buf, int size) {
         n++;
     }
     return -1;
+}
+
+static int routes(char *buf, int size) { return routes_of(AF_INET, buf, size); }
+
+/// SIOCETHTOOL command `cmd` on interface `name`, with `data` its structure.
+static int ethtool(const char *name, void *data) {
+    int u = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    struct ifreq ifr = {0};
+    strcpy(ifr.ifr_name, name);
+    ifr.ifr_data = data;
+    int r = ioctl(u, SIOCETHTOOL, &ifr), e = errno;
+    close(u);
+    errno = e;
+    return r;
+}
+
+/// A udev monitor's socket: it binds, never hears anything, and what's sent
+/// to it is refused as for anyone without CAP_SYS_ADMIN.
+static int uevent(void) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT);
+    CHECK(s >= 0);
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK, .nl_groups = 1};
+    CHECK(bind(s, (void *)&sa, sizeof sa) == 0);
+    char buf[512];
+    CHECK(recv(s, buf, sizeof buf, 0) == -1 && errno == EAGAIN);
+    struct pollfd pfd = {.fd = s, .events = POLLIN};
+    CHECK(poll(&pfd, 1, 50) == 0);
+    struct nlmsghdr h = {.nlmsg_len = sizeof h, .nlmsg_type = 0x10, .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 3};
+    CHECK(send(s, &h, sizeof h, 0) == sizeof h);
+    CHECK(recv(s, buf, sizeof buf, 0) > 0);
+    struct nlmsghdr *r = (void *)buf;
+    CHECK(r->nlmsg_type == NLMSG_ERROR && r->nlmsg_seq == 3 && ((struct nlmsgerr *)NLMSG_DATA(r))->error == -EPERM);
+    close(s);
+    return 0;
 }
 
 /// The attribute `type` of route message `h`, or NULL.
@@ -67,7 +105,9 @@ static const char route_header[] =
 static int eth0(void) {
     struct ifaddrs *ifa, *i;
     CHECK(getifaddrs(&ifa) == 0);
-    int v4 = 0, link = 0, lo = 0;
+    int v4 = 0, v6 = 0, link = 0, lo = 0;
+    struct in6_addr ula;
+    inet_pton(AF_INET6, "fd00::15", &ula);
     for (i = ifa; i; i = i->ifa_next) {
         if (!strcmp(i->ifa_name, "lo")) {
             lo++;
@@ -86,11 +126,16 @@ static int eth0(void) {
             CHECK(l->sll_halen == 6 && !memcmp(l->sll_addr, "\x52\x54\x00\x12\x34\x56", 6));
             link++;
         } else {
-            CHECK(0); // no IPv6 address
+            // A unique local address, fd00::15/64.
+            CHECK(i->ifa_addr->sa_family == AF_INET6);
+            struct sockaddr_in6 *a = (void *)i->ifa_addr, *m = (void *)i->ifa_netmask;
+            CHECK(!memcmp(&a->sin6_addr, &ula, 16));
+            CHECK(!memcmp(&m->sin6_addr, "\xff\xff\xff\xff\xff\xff\xff\xff\0\0\0\0\0\0\0\0", 16));
+            v6++;
         }
     }
     freeifaddrs(ifa);
-    CHECK(v4 == 1 && link == 1 && lo == 3);
+    CHECK(v4 == 1 && v6 == 1 && link == 1 && lo == 3);
     struct if_nameindex *ni = if_nameindex();
     CHECK(ni && ni[1].if_index == 2 && !strcmp(ni[1].if_name, "eth0") && ni[2].if_index == 0);
     if_freenameindex(ni);
@@ -140,12 +185,112 @@ static int eth0(void) {
     CHECK(slurp("/sys/class/net/eth0/address") > 0 && !strcmp(text, "52:54:00:12:34:56\n"));
     CHECK(slurp("/sys/class/net/eth0/operstate") > 0 && !strcmp(text, "up\n"));
     CHECK(slurp("/sys/class/net/eth0/ifindex") > 0 && !strcmp(text, "2\n"));
+
+    // IPv6: the prefix route, lo's, and the default one through the host.
+    CHECK(routes_of(AF_INET6, buf, sizeof buf) == 3);
+    h = (void *)buf;
+    r = NLMSG_DATA(h);
+    CHECK(r->rtm_family == AF_INET6 && r->rtm_dst_len == 64 && !route_attr(h, RTA_GATEWAY));
+    CHECK(!memcmp(route_attr(h, RTA_DST), "\xfd\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16));
+    for (int k = 0; k < 2; k++) h = NLMSG_NEXT(h, (int){sizeof buf});
+    r = NLMSG_DATA(h);
+    struct in6_addr host6;
+    inet_pton(AF_INET6, "fd00::2", &host6);
+    CHECK(r->rtm_dst_len == 0 && !memcmp(route_attr(h, RTA_GATEWAY), &host6, 16));
+    CHECK(*(int *)route_attr(h, RTA_OIF) == 2 && *(int *)route_attr(h, RTA_PRIORITY) == 1024);
+    CHECK(slurp("/proc/net/if_inet6") > 0);
+    CHECK(!strcmp(text, "00000000000000000000000000000001 01 80 10 80       lo\n"
+                        "fd000000000000000000000000000015 02 40 00 80     eth0\n"));
+    CHECK(slurp("/proc/net/ipv6_route") > 0);
+    CHECK(strstr(text, "fd000000000000000000000000000000 40 00000000000000000000000000000000 00 "
+                       "00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n"));
+    CHECK(strstr(text, "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+                       "fd000000000000000000000000000002 00000400 00000001 00000000 00000003     eth0\n"));
+    CHECK(slurp("/etc/hosts") > 0 && strstr(text, "\nfd00::15\tgrix\n"));
+
+    // AI_ADDRCONFIG finds an IPv6 address, so a passive lookup gives [::]
+    // (ClickHouse's listeners).
+    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_flags = AI_PASSIVE | AI_ADDRCONFIG};
+    struct addrinfo *res, *ai;
+    CHECK(getaddrinfo(NULL, "9000", &hints, &res) == 0);
+    int any6 = 0;
+    for (ai = res; ai; ai = ai->ai_next) any6 |= ai->ai_family == AF_INET6;
+    freeaddrinfo(res);
+    CHECK(any6);
+    // A listener on [::] takes connections to fd00::15 and to 10.0.2.15.
+    int l = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in6 s6 = {.sin6_family = AF_INET6, .sin6_port = htons(9000)};
+    CHECK(l >= 0 && bind(l, (void *)&s6, sizeof s6) == 0 && listen(l, 4) == 0);
+    int c = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    s6.sin6_addr = ula;
+    CHECK(connect(c, (void *)&s6, sizeof s6) == 0);
+    int a = accept(l, NULL, NULL);
+    CHECK(a >= 0 && write(c, "x", 1) == 1 && read(a, buf, 1) == 1 && buf[0] == 'x');
+    struct sockaddr_in6 got;
+    socklen_t glen = sizeof got;
+    CHECK(getsockname(a, (void *)&got, &glen) == 0 && !memcmp(&got.sin6_addr, &ula, 16));
+    close(a);
+    close(c);
+    close(l);
+    // Binding to it works; to someone else's doesn't.
+    int b = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    s6.sin6_port = 0;
+    CHECK(bind(b, (void *)&s6, sizeof s6) == 0);
+    close(b);
+    b = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    inet_pton(AF_INET6, "fd00::99", &s6.sin6_addr);
+    CHECK(bind(b, (void *)&s6, sizeof s6) == -1 && errno == EADDRNOTAVAIL);
+    // The route to a global IPv6 address leaves from the ULA, so RFC 6724
+    // sorting (which compares labels: fc00::/7's differs from 2000::/3's,
+    // while an IPv4 destination and its source match) tries IPv4 first.
+    inet_pton(AF_INET6, "2001:db8::1", &s6.sin6_addr);
+    s6.sin6_port = htons(53);
+    CHECK(connect(b, (void *)&s6, sizeof s6) == 0);
+    glen = sizeof got;
+    CHECK(getsockname(b, (void *)&got, &glen) == 0 && !memcmp(&got.sin6_addr, &ula, 16));
+    close(b);
+    // ethtool: eth0 is a container's veth.
+    struct ethtool_drvinfo drv = {.cmd = ETHTOOL_GDRVINFO};
+    CHECK(ethtool("eth0", &drv) == 0 && !strcmp(drv.driver, "veth") && !strcmp(drv.bus_info, ""));
+    struct ethtool_value link_up = {.cmd = ETHTOOL_GLINK};
+    CHECK(ethtool("eth0", &link_up) == 0 && link_up.data == 1);
+    struct ethtool_cmd old = {.cmd = ETHTOOL_GSET};
+    CHECK(ethtool("eth0", &old) == 0 && ethtool_cmd_speed(&old) == 10000 && old.duplex == DUPLEX_FULL);
+    static __u32 lsbuf[64];
+    struct ethtool_link_settings *ls = (void *)lsbuf;
+    ls->cmd = ETHTOOL_GLINKSETTINGS;
+    CHECK(ethtool("eth0", ls) == 0 && ls->link_mode_masks_nwords < 0);
+    ls->link_mode_masks_nwords = -ls->link_mode_masks_nwords;
+    CHECK(ethtool("eth0", ls) == 0 && ls->speed == 10000 && ls->duplex == DUPLEX_FULL && ls->link_mode_masks_nwords > 0);
+    static __u32 permbuf[4];
+    struct ethtool_perm_addr *perm = (void *)permbuf;
+    *perm = (struct ethtool_perm_addr){.cmd = ETHTOOL_GPERMADDR, .size = 8};
+    CHECK(ethtool("eth0", perm) == 0 && perm->size == 6 && !memcmp(perm->data, "\x52\x54\x00\x12\x34\x56", 6));
+    perm->size = 2;
+    CHECK(ethtool("eth0", perm) == -1 && errno == E2BIG);
+    struct ethtool_ringparam ring = {.cmd = ETHTOOL_GRINGPARAM};
+    CHECK(ethtool("eth0", &ring) == -1 && errno == EOPNOTSUPP);
+    ring.cmd = ETHTOOL_SRINGPARAM;
+    CHECK(ethtool("eth0", &ring) == -1 && errno == EPERM);
+    if (uevent()) return 1;
     printf("netif eth0 ok\n");
+    return 0;
+}
+
+/// A name with a global IPv6 address and an IPv4 one (the test's
+/// /etc/hosts): IPv4's comes first, as the ULA's label doesn't match.
+static int dual(void) {
+    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM}, *res;
+    CHECK(getaddrinfo("dual.example", "80", &hints, &res) == 0);
+    CHECK(res->ai_family == AF_INET && res->ai_next && res->ai_next->ai_family == AF_INET6);
+    freeaddrinfo(res);
+    printf("netif dual ok\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "eth0")) return eth0();
+    if (argc > 1 && !strcmp(argv[1], "dual")) return dual();
     // getifaddrs: lo as a link, an IPv4 address and an IPv6 address.
     struct ifaddrs *ifa, *i;
     CHECK(getifaddrs(&ifa) == 0);
@@ -248,6 +393,15 @@ int main(int argc, char **argv) {
     CHECK(slurp("/proc/net/route") == 128 && !strncmp(text, route_header, strlen(route_header)));
     CHECK(slurp("/proc/net/dev") > 0 && strstr(text, "    lo:") && !strstr(text, "eth0"));
     CHECK(access("/sys/class/net/eth0", F_OK) == -1 && access("/sys/class/net/lo", F_OK) == 0);
+
+    // ethtool: lo has a link and nothing else; eth0 isn't there.
+    struct ethtool_value link_up = {.cmd = ETHTOOL_GLINK};
+    CHECK(ethtool("lo", &link_up) == 0 && link_up.data == 1);
+    struct ethtool_drvinfo drv = {.cmd = ETHTOOL_GDRVINFO};
+    CHECK(ethtool("lo", &drv) == -1 && errno == EOPNOTSUPP);
+    CHECK(ethtool("eth0", &drv) == -1 && errno == ENODEV);
+    CHECK(ethtool("lo", (void *)8) == -1 && errno == EFAULT);
+    if (uevent()) return 1;
 
     // Network sockets still need `net`.
     CHECK(socket(AF_INET, SOCK_DGRAM, 0) == -1 && errno == EPERM);

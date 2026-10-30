@@ -10,6 +10,9 @@ shows progress).
 
 ## Next up
 
+- [ ] `futex_waitv`'s words are the process's: shared ones reach
+      `futex.rs` only through FUTEX_WAIT.
+
 Order: small kernel-only items first, then the ones that need host
 support too, then the big ones. Re-probed 2026-10-26: Python (tempfile,
 pip, sqlite), Node (fs), `git init` and Go now pass.
@@ -67,7 +70,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     bound to paths, abstract names, datagrams, seqpackets and SCM_RIGHTS.
     UDP port forwarding (`forward_udp`, `-p 5353:53/udp`): replies leave
     from the forwarded port, only to its recent senders. Left: datagrams
-    over one frame (~4 KiB), SO_PASSCRED.
+    over one frame (~4 KiB).
 14. [x] **Smaller syscalls**: `/proc/<pid>` for every process (`ps`),
     zombies included until they're reaped, pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
     `CLONE_PIDFD`, `waitid(P_PIDFD)`, polling), CPU-time timers
@@ -190,18 +193,134 @@ Left, in order of impact:
     instruction without it) is emulated as Linux's `emulate_mrs` does,
     with only the fields HWCAP advertises (HWCAP is made from the same
     values, and has `HWCAP_CPUID`); MIDR as /proc/cpuinfo shows it,
-    MPIDR as Linux's safe value. Left: more HWCAPs (ID_AA64ISAR1's
-    LRCPC, JSCVT, FCMA, ...; HWCAP2), which would show there too.
-29. [ ] `/proc/sys/vm/overcommit_memory` says 0, so Redis warns that a
-    background save may fail; what grix actually does (memory is only
-    taken as it's touched) is closer to 1.
+    MPIDR as Linux's safe value. More HWCAPs and HWCAP2 since (see
+    Binary compatibility). Left: DPB (DC CVAP), pointer authentication,
+    SVE and SME, which need the kernel.
+29. [x] `/proc/sys/vm/overcommit_memory` says 1, Linux's "always
+    overcommit", which is what grix does (memory is only taken as it's
+    touched); Redis and Valkey no longer warn. `max_map_count` is the
+    real cap (`MAX_VMAS`), and inotify's limits are there (Chromium).
 30. [x] **A guest interface with `net`** (DATADOG.md: the Agent's "not
     connected to the network"): `eth0`, 10.0.2.15/24, up, and the
     default route via 10.0.2.2, in netlink (links, addresses, the main
     table's routes), the interface ioctls, `/proc/net/dev`,
     `/proc/net/route` and `/sys/class/net/eth0`. No device: the host's
-    proxy still carries and checks every connection. Left: an IPv6
-    address on it, counters.
+    proxy still carries and checks every connection. IPv6 too since
+    round 4 (below). Left: counters.
+
+### Round 4 (2026-10-30): popular software again (COMPAT.md, round 2)
+
+COMPAT.md's programs again, and 23 more (MySQL, ClickHouse, Valkey,
+DuckDB, Envoy, Jetty, Maven, Gradle, the .NET SDK, Bun, Deno, Kafka,
+NATS, Consul, Vault, InfluxDB, OpenSearch, Grafana, headless Chromium,
+web stacks on Node, Ruby and Python). Done: Docker's HOME and HOSTNAME
+in images (and `run -e KEY`), item 29's sysctls,
+`sched_get_priority_max/min` (.NET), NUMA policies for one node,
+`prctl`'s refusals, `/proc/<pid>/task`, `SO_PASSCRED` on message
+sockets and `capset` that drops everything (Chromium), and a build
+step that runs out of room saying so. Left, in order of impact:
+
+31. [x] **Guests bigger than 3 GiB**: up to 64 GiB (`grix_abi::image::MAX_RAM`).
+    RAM is in two regions on x86_64 (below 3 GiB and from 4 GiB, as
+    `microvm` puts it) and runs on past 4 GiB on arm64
+    (`grix_abi::machine::ram_regions`); the kernel maps what's past 4 GiB
+    at boot (`arch::map_ram`) and hands those frames out first. What
+    grew with RAM on the kernel heap is in RAM: frame reference counts,
+    the free list, and the page indexes of files and shared memory
+    (`mm::pageindex`). grix-vmm asks Hypervisor.framework for a bigger
+    IPA when it needs one. The boot image (imports) must still fit below
+    4 GiB.
+30. [x] **IPv6 on `eth0`** (what round 3's item 30 left): with `net`,
+    `fd00::15/64`, a unique local address (`link::GUEST_V6`, the layout
+    slirp4netns and Podman use), in netlink (addresses; the prefix route,
+    `::1`'s and the default one via `fd00::2`), `/proc/net/if_inet6`,
+    `/proc/net/ipv6_route` and `/etc/hosts`. Programs that ask
+    getaddrinfo with `AI_ADDRCONFIG` before listening on `[::]`
+    (ClickHouse) now do; ClickHouse then finds `0.0.0.0` taken by `[::]`,
+    as under Docker with IPv6, which its `listen_try` makes a warning.
+    The proxy carries IPv6 connections where the host can make them, and
+    the route to a global address leaves from the ULA (getsockname), so
+    RFC 6724's sorting (glibc, musl, Go: fc00::/7's label differs from
+    2000::/3's, while an IPv4 destination's matches its source) still
+    tries IPv4 first: the address doesn't make anything prefer a route
+    the host may not have. `fd00::2` is the host's own loopback when
+    named (`allow_host("fd00::2")`, as `10.0.2.2`); the rest of
+    `fd00::/64` is refused. No link-local address (nothing could use it).
+32. [x] **More than 1024 threads**: each thread takes its kernel state
+    from `kmem` (`process::THREAD_COST`: its `Thread` twice over, as
+    B-tree nodes filled in order stay half full, x86_64's XSAVE box, its
+    `/proc/<pid>/task/<tid>` nodes, which no longer count against file
+    metadata). The heap grows by 1/16 of RAM (at most 128 MiB) from the
+    top of RAM: half for that budget, half for the holes thousands of
+    small allocations leave (measured: 15 MiB free in 30,000 pieces once
+    6,000 threads had gone, none big enough for a pipe's buffer).
+    threads-max (and `pids.max`) is what the budget's share holds: 4405
+    at 512 MiB and 17623 from 2 GiB on (the share stops at 128 MiB) on
+    arm64, fewer on x86_64. clone and
+    fork fail with EAGAIN at either limit (the `threadmax` fixture).
+    Left: ClickHouse still warns below 30,000; a thread's task directory
+    is still real nodes (Linux makes them on lookup), whose slots stay
+    allocated for reuse.
+33. [x] **`SO_PASSCRED` on streams**: a stream's pipe keeps a run per
+    writer (`Pipe::creds`, at most `MAX_CRED_RUNS`, charged); reads with
+    SO_PASSCRED stop where the writer changes and carry SCM_CREDENTIALS,
+    sendmsg's SCM_CREDENTIALS names the writer, and the option set before
+    connect, or on a listener, stays.
+34. [x] **Landlock**: ABI 5, as Linux's security/landlock
+    (`landlock.rs`; AGENTS.md): rulesets as descriptors, path and port
+    rules, layers on each thread (at most 16, kept by fork, clone and
+    execve), EACCES and EXDEV, never reported. Filesystem rights through
+    REFER, TRUNCATE and IOCTL_DEV, TCP bind and connect by port, and no
+    looking into processes outside the domain. Left: ABI 6's scoping of
+    abstract sockets and signals (domains already compare, `scope_le`:
+    signals need a check where `kill` picks a receiver, sockets the
+    domain of who bound the name). A descriptor of a generated /proc
+    file is EBADFD as a rule's parent (`O_PATH` works); a memfd is taken
+    (Linux: EBADFD). A rule on a live mount's file holds for that name
+    alone: each name there is a node of its own, and the host says
+    nothing of inodes (its other names just stay refused). Moves within
+    a mount walk up through the mount point, as Linux's check ends up
+    doing, so the tree counts as one mount.
+35. [x] `/proc/<pid>/task/<tid>`: each thread's own name (`Thread::name`:
+    PR_SET_NAME, `pthread_setname_np`, writes to its `comm` by the
+    process's own threads, EINVAL from others), state (stopped, waiting,
+    or running), signals and CPU time. A fork is named as the thread that
+    made it, a thread as its creator.
+36. [x] `SIOCETHTOOL`: eth0 answers as a container's veth (driver info,
+    link up, 10 Gb/s full duplex, the permanent address), lo only its
+    link; changes EPERM, the rest EOPNOTSUPP. A `NETLINK_KOBJECT_UEVENT`
+    socket binds and hears nothing; what's sent to it gets EPERM back.
+37. [x] `splice`, `tee`, `vmsplice` (copies, a chunk per call: nothing
+    taken from a socket is lost to a full pipe), F_SETPIPE_SZ, and
+    `/proc/<pid>/mem` for the process itself (EIO where unmapped or
+    read-only: no FOLL_FORCE; another's EACCES, and a descriptor
+    inherited across fork EIO).
+
+Also found in the re-runs: Chromium writes `/proc/<pid>/oom_score_adj`
+for its renderers (EACCES, logged): a per-process value that may only go
+up without CAP_SYS_RESOURCE would do.
+
+### A second security review (of 0.0.48)
+
+Done (`fixtures/src/hardening2.c`, a test each in `guest.rs`, and
+`tests/hostfds.rs`): POSIX timers, mappings, argv and UDP verdict tables
+charged (timers and argv each panicked the heap); access mode 3 and O_PATH as Linux's FMODE_* and fdget;
+socket addresses and paths read once; `/proc/self/fd/N/name`; fexecve of
+the file; TIOCGPTPEER and a full ruleset under Landlock; device nodes'
+permissions; `sigio_perm`; the tab eraser; timerfds that outlive their
+makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
+
+Left, none of it a way out of the sandbox:
+
+- [ ] Permission checks know one group: `mode_permits` doesn't look at
+      supplementary groups (`Ids::groups`).
+- [ ] `/proc/self/fd/N` opens the same open file (no new access mode, no
+      new offset, no permission check); Linux's is a new open.
+- [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
+      another process's are ENOENT past their own name.
+- [ ] The ELF interpreter (`PT_INTERP`) needs no execute permission.
+- [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
+      stays unwatched until the guest watches it again.
 
 ## Agent integrations
 
@@ -285,9 +404,24 @@ Left, in order of impact:
       `CLONE_INTO_CGROUP` (reported). Threads with their own descriptor table or
       working directory: `CLONE_THREAD` without `CLONE_FILES`/`CLONE_FS` (they
       share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more threads (reported).
+      Few programs need it (glibc's and musl's posix_spawn use
+      `CLONE_VM|CLONE_VFORK`, which works; LinuxThreads-era code and some
+      runtimes' helper processes don't), and it's large, so it waits.
+      What it would take: `Process::aspace` a handle to one
+      `AddressSpace` (as `Process::fs` is a `Shared<FsInfo>`), through its
+      ~300 uses; freed with its last sharer, never while active (invariant
+      13 then holds as it does for threads); futex queues keyed by the
+      address space, not the process, so a wake reaches every sharer's
+      waiters; flushes are by root already (x86's `ROOTS`), but
+      `smp::alone` and execve's unsharing must take sharers into account
+      (execve gives the caller a fresh space, as vfork's child gets);
+      `/proc/<pid>/maps` and the mapping budgets (`MAX_VMAS_TOTAL`) count
+      a shared space once.
 - [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
       `/proc/self` is the caller's. Another process's descriptors need its user (or root).
-- [ ] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
+- [x] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
+      `signal.rs`'s `stop`/`resume`, `job_report`; the `jobs` fixture
+      (`job_control` test). Round 2, item 10.
 
 ## Signals
 
@@ -306,11 +440,16 @@ Left, in order of impact:
       `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks work too.
 - [x] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
       `RunControl::signal` / `stop`, the CLI's Ctrl-C (and SIGTERM, SIGHUP, SIGQUIT), to the program's process group. A timeout sends SIGTERM and waits `grace` (5 s). Threads waiting for a signal (including musl's ppoll-based `pause()`) aren't a deadlock.
-- [ ] Job control from the host (SIGTSTP/SIGCONT stopping and continuing the program).
-- [ ] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT). They are ignored today:
-      there is no job control or host to report the stop to.
-- [ ] Restarted `nanosleep`-style calls without a handler (Linux's
-      `restart_syscall`). This only matters once stop signals exist.
+- [x] Job control from the host (SIGTSTP/SIGCONT stopping and continuing the program).
+      `RunControl::stop`, `ExitStatus::Stopped`, `Event::Stopped`
+      (`stopped_and_continued_from_the_host`).
+- [x] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT): the whole process
+      stops (`Process::stopped`) and the scheduler passes it over.
+- [x] Restarted `nanosleep`-style calls without a handler (Linux's
+      `restart_syscall`): a woken sleep re-runs with its first deadline
+      (`Thread::restart_deadline`), so a stop and continue doesn't
+      lengthen it; with a handler, EINTR and the time left in `rem`
+      (`signals` fixture).
 
 ## Timers and clocks
 
@@ -344,13 +483,31 @@ Left, in order of impact:
       Mounts do this: the kernel compares each node with what was imported and sends new and changed entries and the topmost removed paths.
 - [x] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
       A timeout sends SIGTERM first; a program that ends within the grace period sends its exports.
-- [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
+- [x] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
+      `Export::write_to_with(dest, Links::Inside)`, `Destinations::links`,
+      `grix run --no-outside-links`: a link that is absolute or leads out,
+      followed through the export's own links, fails it before anything
+      is written (`exports_with_links_inside_only`). Not yet in Grixfiles,
+      MCP or Python.
 - [x] Read-write host directory mounts, gated by policy.
       Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.
 - [ ] Live mounts: a file the host replaces while the program has it open can show the new contents once the host's descriptor for it ages out (it reopens by name). Pin descriptors for files the guest has open (Open/Close requests).
-- [ ] Live mounts: changes on a read-only mount without `fs_write` report "needs fs_write" (the syscall gate runs first) instead of EROFS.
+- [x] Live mounts: changes on a read-only mount without `fs_write` report "needs fs_write" (the syscall gate runs first) instead of EROFS.
+      The gate looks at what an `fs_write` call would change first
+      (`file::read_only_target`), as `open` and `mkdir` do
+      (`need_write_in`): EROFS, no denial (`read_only_mounts_without_fs_write`).
 - [x] Live mounts: inotify for host-side changes (the host watches what the guest watches: inotify on Linux, kqueue on macOS).
-- [ ] Live mounts: hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
+- [~] Live mounts: hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
+      Hard links and RENAME_EXCHANGE are done: `hostfs::Request::Link`
+      (`linkat` without AT_SYMLINK_FOLLOW, both ends walked to as always)
+      and `Rename`'s `exchange` (RENAME_EXCHANGE, macOS's RENAME_SWAP),
+      `links_and_exchanges_in_a_live_mount`. A link's new name is a node
+      of its own (the host keeps an id per name), so the guest shows the
+      two names different inode numbers and an nlink of 1. Left:
+      O_TMPFILE, which would need the unnamed local file made the host's
+      when `linkat` names it (Create, then its bytes written over, and
+      its open descriptors and mappings moved to the host's file), or a
+      host-side O_TMPFILE (Linux only; macOS has none).
 - [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
@@ -365,17 +522,22 @@ Left, in order of impact:
 - [x] Real file timestamps from the host (make, build caches). Everything
       shows boot time today.
       Imports carry the host's mtime (atime and ctime start there too), and files the program changes get real times.
-- [~] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
+- [x] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
-      `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice` and `tee` are missing.
-- [ ] `openat2`, `name_to_handle_at` (newer tools).
+      `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice`, `tee` and `vmsplice`: round 4, item 37.
+- [x] `openat2`, `name_to_handle_at` (newer tools).
+      `openat2`: round 3, item 23. `name_to_handle_at` resolves the path
+      and answers EOPNOTSUPP, as a filesystem without file handles does;
+      `open_by_handle_at` is privileged (`file_handles`).
 - [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
 - [x] `MAP_SHARED` mappings of writable files, `msync`.
       They map the file's own pages. A live mount's files still map as copies: a writable shared mapping of one, or changing one mapped shared, is reported as unimplemented.
 - [x] Executing files the program wrote.
-- [ ] Large imports without copying everything into RAM: read-only
-      virtio-blk/virtio-fs, loaded lazily (big runtimes, datasets).
+- [x] Large imports without copying everything into RAM (big runtimes,
+      datasets): lazy imports (`import_lazy`, `--mount HOST:GUEST:lazy`,
+      round 2, item 12), served by the host over hostfs. Not virtio-blk or
+      virtio-fs: more devices would break invariant 7.
 
 ## /proc, /sys, /dev
 
@@ -391,15 +553,21 @@ Left, in order of impact:
 - [x] `/sys/devices/system/cpu/{online,possible}` (glibc `get_nprocs`),
       `/sys/kernel/mm/transparent_hugepage/*` (Go probes it),
       `/sys/fs/cgroup/*` (cgroup v2 limits for Go/Java/Node).
-- [ ] `/dev/tty`, `/dev/pts`, pseudo-terminals (`openpty`, termios,
+- [x] `/dev/tty`, `/dev/pts`, pseudo-terminals (`openpty`, termios,
       `TIOCGWINSZ`). Interactive REPLs, shells, `less`, progress bars.
+      `tty.rs`, `syscall/tty.rs`; the `pty` fixture (`pseudo_terminals`)
+      and `an_interactive_shell_on_a_pty` in runtimes.rs.
 
 ## Users, environment, host config
 
 - [x] Synthesize `/etc/passwd` and `/etc/group` with the sandbox user (unless
       imported). Python `getpass.getuser()` raises; Node `os.userInfo()` and
       `os.homedir()` throw; `ls -l` and `id` show numbers.
-- [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
+- [x] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
+      `SandboxBuilder::default_env`, `--default-env`, `default_env` in
+      manifests, MCP's `run` and Python: each unless it's set, `HOME` from
+      /etc/passwd (`a_default_environment_on_request`). Images get
+      Docker's `HOME` and `HOSTNAME` anyway (round 4).
 - [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
       A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
 - [~] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
@@ -407,7 +575,12 @@ Left, in order of impact:
       `/etc/hosts` and `/etc/resolv.conf` are generated unless imported. Alpine's
       runtimes bring their own CA bundle (`ca-certificates`); there's no option yet
       to pass in the host's.
-- [ ] Configurable hostname.
+- [x] Configurable hostname: `SandboxBuilder::hostname`, `--hostname`,
+      `hostname` in manifests, MCP's `run` and Python (`Image::hostname`;
+      uname, /etc/hostname, /etc/hosts, /proc/sys/kernel/hostname, and an
+      image's `HOSTNAME`), `grix` by default (`a_host_name_of_its_own`).
+      Images don't carry one, as Docker's don't. `sethostname` stays
+      privileged.
 
 ## Networking (`net`)
 
@@ -428,15 +601,18 @@ Left, in order of impact:
 - [x] DNS through a host resolver (A and AAAA; other types get empty answers).
 - [x] Loopback (127.0.0.1, `::1`, 10.0.2.15) inside the sandbox, so a server
       and its client in the same sandbox work without the host.
-- [ ] Forwarded connections reach a listener whatever address it bound
-      (Docker-like), not only 0.0.0.0. Decide whether that should be stricter.
+- [x] Forwarded connections reach a listener whatever address it bound
+      (Docker-like), not only 0.0.0.0. Decided: one on the guest's
+      address (10.0.2.15) or all of them, never one bound to loopback only,
+      as Linux and Docker's published ports do (`inet.rs`, `Incoming`).
 - [x] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
       `os.networkInterfaces()` throws today.
       No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
 - [x] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
       abstract names, datagrams and seqpackets, `SO_PEERCRED`, `SCM_RIGHTS`.
-      Left: `SO_PASSCRED`/`SCM_CREDENTIALS` on receive; a descriptor passed
-      through its own socket stays open (Linux collects those cycles).
+      `SO_PASSCRED`/`SCM_CREDENTIALS` on messages and streams. Left: a
+      descriptor passed through its own socket stays open (Linux collects
+      those cycles).
 - [x] A fast host transport. virtio-console (port 1 of a
       `virtio-serial-device`) carries the framed channel. Networking adds
       `link` messages there.
@@ -449,7 +625,9 @@ Left, in order of impact:
       virtio-console moves frames through shared 4 KiB buffers: about 50 MB/s out and 30 MB/s in with HVF. A slow host reader blocks the writing thread only (EAGAIN with `O_NONBLOCK`, epoll readiness), never the whole VM.
 - [x] Output size limits with truncation reported.
       `max_output` (64 MiB per stream by default): the program keeps running, and the rest is dropped and reported.
-- [ ] Interactive TTY mode (`grix run -t`).
+- [x] Interactive TTY mode (`grix run -t`, `SandboxBuilder::tty`): the
+      program's stdio is /dev/pts/0, the console its master (`tty::pump`,
+      `wire::Input::Resize`); `tty_mode`. Not yet over MCP or Python.
 
 ## Memory
 
@@ -461,28 +639,77 @@ Left, in order of impact:
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
 - [~] `mincore`; accept the remaining `madvise` advice values.
       `mincore` works.
-- [ ] Free empty page-table pages on munmap.
+- [x] Free empty page-table pages on munmap. `PageTable::prune`, after
+      `arch::flush_tables` (TLBI VAE1IS on arm64, every level; INVLPG or a
+      CR3 load on x86_64). A page touched in each of 2000 2 MiB regions
+      left 8 MB of tables behind; now MemFree comes all the way back
+      (`many_mappings`). MAP_FIXED over a mapping keeps them.
 - [x] Bound kernel memory a program can tie up. Pipe buffers, netlink
       replies, /proc contents, queued RT signals, mappings and inotify
       watches all hit an errno before the heap runs out (kmem.rs).
-- [ ] `find_free` (mmap without a hint) is O(n) in the number of mappings.
+- [x] `find_free` (mmap without a hint) is O(n) in the number of mappings.
+      It starts at `AddressSpace::free_hint` unless a stretch above it
+      might fit (`free_hole`: Linux 2.6's free_area_cache and
+      cached_hole_size); removing a mapping above the hint raises it.
+      With 20000 mappings the last thousand mmaps took 41 ms (the first
+      thousand 0.9 ms); now 0.27 ms both (`manymaps` fixture).
 
 ## Binary compatibility
 
 - [x] Report the syscall number for unknown syscalls. Today the event says
       only "unsupported unknown".
 - [x] glibc dynamic executables (Debian/Ubuntu arm64): see round 2, item 9.
-- [ ] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
-- [ ] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
-      and ignore, or implement.
+- [x] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
+      `HWCAP_CPUID`: round 3, item 28. `AT_MINSIGSTKSZ` is the signal
+      frame's size (`sigframe::max_size`); on arm64 ID_AA64ISAR1's plain
+      instructions (JSCVT, FCMA, LRCPC, FRINTTS, SB, BF16, DGH, I8MM) and
+      ISAR0's SM3, SM4, FHM, TS and RNDR show now, in HWCAP, HWCAP2 and
+      /proc/cpuinfo alike (`id_registers_from_user_mode`,
+      `auxv_hwcap2_and_minsigstksz`). x86_64's HWCAP2 is 0 (no
+      FSGSBASE).
+- [x] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): both
+      work (round 4, item 34; AGENTS.md).
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
+      `futex_waitv` is done (`WaitOn::FutexV`, the `futexv` fixture).
 - [x] x86_64 programs, through a user-mode translator in the arm64 guest
       (`--x86-64`: qemu-x86_64; box64 untested; binfmt_misc-style). x86_64
       Alpine busybox and CPython run.
-- [ ] A native x86_64 kernel (and grix-vmm on x86 KVM), for x86 hosts and
-      full speed there.
+- [x] A native x86_64 kernel (and grix-vmm on x86 KVM), for x86 hosts and
+      full speed there: `kernel/src/arch/x86_64`, `vm_x86.rs`, `x86.yml`
+      (round 2, item 19).
+
+## Hardening
+
+- [x] Review of 0.0.38..0.0.46 (`hardening.c`, and the tests from
+      `page_table_entries_cost_no_heap` on in `guest.rs`): page table
+      entries cost no heap, zombies keep only their leader's task entry,
+      tee and splice on one file, reading holes costs no heap, epoll
+      registrations are charged, IPv6's ways to what IPv4 refuses,
+      `--no-outside-links` on hosts that fold names, magic links with
+      O_NOFOLLOW, `Pipe::creds` for bytes that are there, `/proc/self/mem`
+      across execve, exchanges counted in `id_bytes`, and Landlock's rules
+      paying for the nodes they keep.
+- [x] Review of 0.0.52 (`wakeups.c`, `read_only_copies` in `filelocks.c`,
+      `kstack picked`): what a process's end changes reaches every waiter
+      before anyone decides what can run (`sched::settle`), so a timer
+      ending a child isn't a deadlock and a sleeper isn't left behind a
+      spinning thread; a CPU's timer is the CPU's (`sched::timer_changed`),
+      so whoever wakes a thread in another process gives it a slice to
+      wait for; `mprotect` leaves a shared file's read-only copies
+      read-only; x86_64 handles every vector it took around `hlt`; and a
+      stack overflow is seen after a signal frame is pushed, not after.
+- [ ] `rv048 extremes` (`review/0.0.48-proofs`) hung once, on arm64 at 2
+      CPUs, and hasn't since (6600 runs of 0.0.52): not explained by the
+      lost wake-ups above, which need another thread to keep running. It
+      has a 1 ns periodic timerfd armed, 64 fatal timers and a child
+      spinning; look there, and in grix-vmm's wait for the virtual timer.
+- [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
+      unlike `fc00::/7`: a default-deny there would break programs that
+      reach a LAN, so it's documented rather than changed.
+- [ ] `timer.rs` and the kernel's `hostfs.rs` have had only a light
+      security read.
 
 ## Performance and scale
 
@@ -491,7 +718,10 @@ Left, in order of impact:
       kernel lock; on grix-vmm (HVF, KVM) and QEMU.
 - [x] SMP for several processes at once (each CPU runs a thread of any
       process).
-- [ ] Finer locking than one kernel lock.
+- [~] Finer locking than one kernel lock. Round 2, item 17 made the big
+      lock cheap (skipping descheduled waiters, per-CPU process slots, a
+      filesystem lock that knows its holder, flushes only where needed).
+      Left: phase 2, a reader/writer lock with per-process check-out.
 - [x] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s

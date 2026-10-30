@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::file;
 use crate::errno::*;
-use crate::fd::{FileKind, FileRef, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY};
+use crate::fd::{FileKind, FileRef, O_APPEND};
 use crate::ipc;
 use crate::kmem::Charge;
 use crate::mm::PAGE_SIZE;
@@ -261,6 +261,9 @@ pub fn complete_polls(p: &mut Process) {
 /// io_submit(ctx, nr, iocbpp): the number of requests submitted, or the
 /// first one's error if none was.
 pub fn io_submit(p: &mut Process, id: u64, nr: u64, iocbpp: u64) -> SysResult {
+    // A poll completes at the process's next call, which mustn't be a
+    // fast one (`fast::calls_allowed`).
+    crate::fast::changed();
     if (nr as i64) < 0 {
         return Err(EINVAL);
     }
@@ -317,8 +320,7 @@ fn submit_one(p: &mut Process, i: usize, iocb: u64) -> Result<(), Errno> {
             }
             let at = {
                 let f = file.lock();
-                let mode = f.flags & O_ACCMODE;
-                if f.path_only || mode == if write { O_RDONLY } else { O_WRONLY } {
+                if !if write { f.writable() } else { f.readable() } {
                     return Err(EBADF);
                 }
                 file::seekable(&f).then_some(offset)

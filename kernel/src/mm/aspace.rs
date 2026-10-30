@@ -4,7 +4,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use grix_abi::stats::Limit;
 use spin::Mutex;
 
@@ -12,7 +12,7 @@ use super::paging::{self, ADDR_MASK, PageTable, Prot};
 use super::{PAGE_SIZE, frame, p2v, page_down};
 use crate::arch;
 use crate::errno::*;
-use crate::fs::{Content, Ino};
+use crate::fs::{Content, Ino, Stale};
 
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = crate::arch::USER_TOP;
@@ -38,6 +38,10 @@ pub const MAX_VMAS: usize = 32768;
 /// per-process limit alone doesn't bound kernel memory.
 pub const MAX_VMAS_TOTAL: usize = 65536;
 static VMAS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// A mapping's share of the heap, charged to `kmem`: B-tree nodes are half
+/// empty after the splits that make most mappings.
+const VMA_COST: u64 = 2 * (core::mem::size_of::<Vma>() + 8) as u64;
 pub const MMAP_BOTTOM: u64 = 1 << 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,47 +126,30 @@ pub struct Sysv {
 
 /// The pages of a MAP_SHARED anonymous mapping (or a System V segment),
 /// made as they're first touched. Holds a reference to each (every
-/// mapping holds its own). Their addresses are kept in chunks of
-/// `SHARED_CHUNK` (2 MiB of the mapping each), charged to the kernel
-/// memory budget: a program can touch a lot of shared memory.
+/// mapping holds its own). Their addresses are in a `PageIndex`, in
+/// frames: a program can touch as much shared memory as RAM.
 #[derive(Debug, Default)]
-pub struct SharedPages(Mutex<SharedChunks>);
-
-const SHARED_CHUNK: usize = 512;
-/// A chunk's page that has no frame yet.
-const NO_FRAME: u64 = u64::MAX;
-
-#[derive(Debug, Default)]
-struct SharedChunks {
-    chunks: BTreeMap<u64, alloc::boxed::Box<[u64; SHARED_CHUNK]>>,
-    charge: crate::kmem::Charge,
-}
+pub struct SharedPages(Mutex<super::pageindex::PageIndex>);
 
 impl SharedPages {
     /// Page `idx`'s frame, made if it has none.
     fn frame(&self, idx: u64) -> Result<u64, FaultError> {
-        let mut s = self.0.lock();
-        let (chunk, i) = (idx / SHARED_CHUNK as u64, (idx % SHARED_CHUNK as u64) as usize);
-        if !s.chunks.contains_key(&chunk) {
-            let bytes = s.charge.bytes() + (SHARED_CHUNK * 8) as u64;
-            s.charge.resize(bytes).map_err(|_| FaultError::OutOfMemory)?;
-            s.chunks.insert(chunk, alloc::boxed::Box::new([NO_FRAME; SHARED_CHUNK]));
+        let mut pages = self.0.lock();
+        if let Some(pa) = pages.get(idx) {
+            return Ok(pa);
         }
-        let slot = &mut s.chunks.get_mut(&chunk).unwrap()[i];
-        if *slot == NO_FRAME {
-            *slot = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+        let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+        if pages.insert(idx, pa).is_none() {
+            frame::free(pa);
+            return Err(FaultError::OutOfMemory);
         }
-        Ok(*slot)
+        Ok(pa)
     }
 }
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
-        for chunk in self.0.get_mut().chunks.values() {
-            for &pa in chunk.iter().filter(|&&pa| pa != NO_FRAME) {
-                frame::free(pa);
-            }
-        }
+        self.0.get_mut().remove_from(0, &mut frame::free);
     }
 }
 
@@ -253,6 +240,74 @@ impl Span {
     }
 }
 
+/// The most frames (`Gather`) and tables (`unmap`) wait for one flush.
+const GATHER: usize = 256;
+const GATHER_TABLES: usize = 64;
+
+/// Pages whose entries were cleared, on their way to being freed: never
+/// before the flush of those entries, and every `GATHER` of them that
+/// happens. Page table entries can far outnumber frames (one file mapped
+/// many times side by side), and page tables outnumber nothing on the
+/// heap: however many there are, what's held here stays this size.
+struct Gather {
+    root: u64,
+    span: Span,
+    pages: [u64; GATHER],
+    n: usize,
+}
+
+impl Gather {
+    fn new(root: u64) -> Self {
+        Gather { root, span: Span::new(), pages: [0; GATHER], n: 0 }
+    }
+
+    /// `pa`, mapped at `va` by an entry that's clear already: the flush
+    /// and free may be now.
+    fn add(&mut self, va: u64, pa: u64) {
+        self.span.add(va);
+        self.pages[self.n] = pa;
+        self.n += 1;
+        if self.n == GATHER {
+            self.finish();
+        }
+    }
+
+    /// Other CPUs may still have the pages in their TLBs until this.
+    fn finish(&mut self) {
+        let span = core::mem::replace(&mut self.span, Span::new());
+        if span.lo < span.hi {
+            arch::flush_tlb(self.root, span.lo, span.hi);
+        }
+        for &pa in &self.pages[..self.n] {
+            frame::free(pa);
+        }
+        self.n = 0;
+    }
+}
+
+/// Free the pages in `[start, end)` of `pt` (`AddressSpace::discard`).
+fn discard_in(pt: &mut PageTable, start: u64, end: u64) {
+    let mut gather = Gather::new(pt.root);
+    pt.for_each_mapped(start, end, |va, pte| unsafe {
+        // Cleared first: adding it may flush and free the batch, and until
+        // it's cleared any CPU's next touch of it would map it again.
+        let pa = *pte & ADDR_MASK;
+        *pte = 0;
+        gather.add(va, pa);
+    });
+    gather.finish();
+}
+
+/// `tables` (and an address each covered) are out of `root`'s page tables.
+fn free_tables(root: u64, tables: &[u64], vas: &[u64]) {
+    if !tables.is_empty() {
+        arch::flush_tables(root, vas);
+        for &table in tables {
+            frame::free(table);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultError {
     /// No mapping, or the mapping forbids this access.
@@ -265,16 +320,28 @@ pub enum FaultError {
 }
 
 pub struct AddressSpace {
+    /// This address space and no other, ever (/proc/<pid>/mem's).
+    pub id: u64,
     pub pt: PageTable,
     vmas: BTreeMap<u64, Vma>,
     /// How many of `vmas` are counted in VMAS_TOTAL.
     counted: usize,
+    /// And charged, at `VMA_COST` each.
+    charge: crate::kmem::Charge,
     pub brk_start: u64,
     pub brk: u64,
     /// The stack is [STACK_TOP - stack_size, STACK_TOP); mmap allocates
     /// top-down from `mmap_top`, a gap below it.
     stack_size: u64,
     mmap_top: u64,
+    /// Where `find_free` starts looking, so mmap without a hint doesn't
+    /// pass every mapping each time (Linux 2.6's free_area_cache and
+    /// cached_hole_size): no free stretch between `free_hint` and
+    /// `mmap_top` is longer than `free_hole`, so a longer one is below
+    /// `free_hint` or nowhere. Removing a mapping that reaches above
+    /// `free_hint` raises it past the space freed (`carve`).
+    free_hint: u64,
+    free_hole: u64,
 }
 
 impl Drop for AddressSpace {
@@ -292,13 +359,17 @@ impl Drop for AddressSpace {
 impl AddressSpace {
     pub fn new() -> Option<Self> {
         let mut a = Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pt: PageTable::new()?,
             vmas: BTreeMap::new(),
             counted: 0,
+            charge: Default::default(),
             brk_start: 0,
             brk: 0,
             stack_size: 0,
             mmap_top: 0,
+            free_hint: 0,
+            free_hole: 0,
         };
         a.set_stack(STACK_SIZE);
         Some(a)
@@ -308,6 +379,8 @@ impl AddressSpace {
     pub fn set_stack(&mut self, size: u64) {
         self.stack_size = size;
         self.mmap_top = STACK_TOP - size - STACK_GAP;
+        // Look from the top again.
+        (self.free_hint, self.free_hole) = (self.mmap_top, 0);
     }
 
     /// The stack's lowest address.
@@ -321,19 +394,29 @@ impl AddressSpace {
         end <= self.stack_bottom() - STACK_GUARD
     }
 
-    /// Bring VMAS_TOTAL up to date after the mappings changed.
+    /// Bring VMAS_TOTAL up to date after the mappings changed. (`has_room`
+    /// looked at the budget first. What it didn't, a few more than it
+    /// checked for, stays uncharged until the next change.)
     fn recount(&mut self) {
         let n = self.vmas.len();
         VMAS_TOTAL.fetch_add(n, Ordering::Relaxed);
         VMAS_TOTAL.fetch_sub(self.counted, Ordering::Relaxed);
         self.counted = n;
+        let _ = self.charge.resize(n as u64 * VMA_COST);
+    }
+
+    /// Room for `more` mappings in all address spaces and in the kernel's
+    /// memory?
+    fn total_room(more: usize) -> bool {
+        VMAS_TOTAL.load(Ordering::Relaxed) + more <= MAX_VMAS_TOTAL
+            && crate::kmem::available() >= more as u64 * VMA_COST
     }
 
     /// A copy for a forked child: the same mappings, sharing every page.
     /// Writable pages become read-only in both, and the first write to one
     /// copies it (`fault`'s copy-on-write).
     pub fn fork(&mut self) -> Result<AddressSpace, Errno> {
-        if VMAS_TOTAL.load(Ordering::Relaxed) + self.vmas.len() > MAX_VMAS_TOTAL {
+        if !Self::total_room(self.vmas.len()) {
             crate::stats::hit(Limit::Mappings);
             return Err(ENOMEM);
         }
@@ -464,7 +547,7 @@ impl AddressSpace {
 
     /// Room for `more` mappings (an operation that may split some)?
     pub fn has_room(&self, more: usize) -> Result<(), Errno> {
-        if self.vmas.len() + more > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + more > MAX_VMAS_TOTAL {
+        if self.vmas.len() + more > MAX_VMAS || !Self::total_room(more) {
             crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {
@@ -482,7 +565,7 @@ impl AddressSpace {
             overlapping.iter().filter(|v| v.start < start).count() + overlapping.iter().filter(|v| v.end > end).count();
         let after = self.vmas.len() - overlapping.len() + edges + if keep { overlapping.len() } else { 0 } + added;
         let growth = after.saturating_sub(self.vmas.len());
-        if growth > 0 && (after > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + growth > MAX_VMAS_TOTAL) {
+        if growth > 0 && (after > MAX_VMAS || !Self::total_room(growth)) {
             crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {
@@ -509,21 +592,34 @@ impl AddressSpace {
         start < end && end <= USER_TOP && self.vmas.range(..end).next_back().is_none_or(|(_, v)| v.end <= start)
     }
 
-    /// Highest free `len`-byte range below `mmap_top`.
-    pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut end = self.mmap_top;
-        for (_, v) in self.vmas.range(..self.mmap_top).rev() {
-            if v.end <= end && end - v.end >= len {
-                return Some(end - len);
+    /// Highest free `len`-byte range below `mmap_top`: from `free_hint`
+    /// unless a stretch above it might be long enough.
+    pub fn find_free(&mut self, len: u64) -> Option<u64> {
+        let (mut end, mut hole) =
+            if len > self.free_hole { (self.free_hint, self.free_hole) } else { (self.mmap_top, 0) };
+        let mut found = None;
+        for (_, v) in self.vmas.range(..end).rev() {
+            if v.end <= end {
+                if end - v.end >= len {
+                    found = Some(end - len);
+                    break;
+                }
+                hole = hole.max(end - v.end);
             }
             end = end.min(v.start);
         }
-        (end >= MMAP_BOTTOM + len).then(|| end - len)
+        let at = found.or_else(|| (end >= MMAP_BOTTOM + len).then(|| end - len))?;
+        // The next look starts above what it's given (a caller may not map
+        // it after all), and every stretch it passed was shorter than `len`.
+        (self.free_hint, self.free_hole) = (at + len, hole);
+        Some(at)
     }
 
     /// Insert a mapping, replacing anything already in its range (MAP_FIXED semantics).
     pub fn map(&mut self, vma: Vma) {
-        self.unmap(vma.start, vma.end);
+        // (Its tables stay: it's about to use them.)
+        self.carve(vma.start, vma.end);
+        self.discard(vma.start, vma.end);
         self.vmas.insert(vma.start, vma);
         self.recount();
     }
@@ -531,6 +627,12 @@ impl AddressSpace {
     /// Remove `[start, end)` from the VMA set without touching pages.
     /// Returns the removed pieces in ascending order.
     fn carve(&mut self, start: u64, end: u64) -> Vec<Vma> {
+        // Space freed above `free_hint`: past it, to where the next mapping
+        // up begins (`find_free`).
+        if end > self.free_hint {
+            let next = self.vmas.range(end..).next().map_or(self.mmap_top, |(&s, _)| s);
+            self.free_hint = self.free_hint.max(next.min(self.mmap_top));
+        }
         let keys: Vec<u64> = self.vmas.range(..end).rev().take_while(|(_, v)| v.end > start).map(|(k, _)| *k).collect();
         let mut removed = Vec::with_capacity(keys.len());
         for k in keys.into_iter().rev() {
@@ -546,28 +648,29 @@ impl AddressSpace {
         removed
     }
 
-    /// munmap: drop mappings and free their pages.
+    /// munmap: drop mappings and free their pages, and the page tables
+    /// that map nothing now.
     pub fn unmap(&mut self, start: u64, end: u64) {
         self.carve(start, end);
         self.discard(start, end);
+        let root = self.pt.root;
+        let (mut tables, mut vas, mut n) = ([0; GATHER_TABLES], [0; GATHER_TABLES], 0);
+        self.pt.prune(start, end, &mut |table, va| {
+            (tables[n], vas[n]) = (table, va);
+            n += 1;
+            if n == GATHER_TABLES {
+                free_tables(root, &tables, &vas);
+                n = 0;
+            }
+        });
+        free_tables(root, &tables[..n], &vas[..n]);
         self.recount();
     }
 
     /// Free the pages in `[start, end)` but keep the VMAs; the next access
     /// faults in fresh zero (or file) contents. MADV_DONTNEED semantics.
     pub fn discard(&mut self, start: u64, end: u64) {
-        let mut freed = Vec::new();
-        let mut span = Span::new();
-        self.pt.for_each_mapped(start, end, |va, pte| unsafe {
-            freed.push(*pte & ADDR_MASK);
-            span.add(va);
-            *pte = 0;
-        });
-        // Other CPUs may still have the pages in their TLBs until this.
-        self.flush(span);
-        for pa in freed {
-            frame::free(pa);
-        }
+        discard_in(&mut self.pt, start, end);
     }
 
     /// Does `[start, end)` overlap a MAP_SHARED file mapping that only
@@ -590,23 +693,21 @@ impl AddressSpace {
         })
     }
 
-    /// Pages that got a frame since this address space's shared mappings
-    /// took read-only copies of them ((file id, page index), from
-    /// `fs::take_stale`): the copies go, and the next access maps the frame.
-    pub fn zap_stale(&mut self, stale: &[(usize, u64)]) {
-        let mut pages = Vec::new();
+    /// Pages (from `fs::take_stale`) that this address space's shared
+    /// mappings may hold read-only copies of, one of which got a frame:
+    /// they go, and the next access maps the frame, or a copy again.
+    pub fn zap_stale(&mut self, stale: &Stale) {
         for v in self.vmas.values() {
             let Backing::SharedFile { data, offset, .. } = &v.backing else { continue };
             let id = data.lock().id();
-            for &(file, idx) in stale {
-                let at = idx * PAGE_SIZE;
-                if file == id && at >= *offset && at - offset < v.end - v.start {
-                    pages.push(v.start + (at - offset));
+            let mapped = offset.saturating_add(v.end - v.start);
+            for (first, end) in stale.of(id) {
+                let lo = first.saturating_mul(PAGE_SIZE).max(*offset);
+                let hi = end.saturating_mul(PAGE_SIZE).min(mapped);
+                if lo < hi {
+                    discard_in(&mut self.pt, v.start + (lo - offset), v.start + (hi - offset));
                 }
             }
-        }
-        for va in pages {
-            self.discard(va, va + PAGE_SIZE);
         }
     }
 
@@ -614,19 +715,12 @@ impl AddressSpace {
     /// space's shared mappings of it (they fault with SIGBUS from now on).
     pub fn zap_file(&mut self, data: &Content, len: u64) {
         let keep = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let ranges: Vec<(u64, u64)> = self
-            .vmas
-            .values()
-            .filter_map(|v| match &v.backing {
-                Backing::SharedFile { data: d, offset, .. } if Arc::ptr_eq(d, data) => {
-                    let from = v.start + keep.saturating_sub(*offset);
-                    (from < v.end).then_some((from, v.end))
-                }
-                _ => None,
-            })
-            .collect();
-        for (s, e) in ranges {
-            self.discard(s, e);
+        for v in self.vmas.values() {
+            if let Backing::SharedFile { data: d, offset, .. } = &v.backing
+                && Arc::ptr_eq(d, data)
+            {
+                discard_in(&mut self.pt, v.start + keep.saturating_sub(*offset), v.end);
+            }
         }
     }
 
@@ -653,10 +747,16 @@ impl AddressSpace {
             piece.prot = prot;
             // A page shared with a forked process stays read-only until
             // it's written (and copied); shared memory is meant to be shared.
+            // So does what a shared file's mapping has read-only: it may be
+            // a copy of a hole (`fault`), and a write must fault to reach
+            // the file's own frame. On the way through PROT_NONE too, whose
+            // entries look writable.
             let cow = prot.write && !piece.shared_pages();
+            let file = matches!(piece.backing, Backing::SharedFile { .. });
             self.pt.for_each_mapped(piece.start, piece.end, |va, pte| unsafe {
                 let pa = *pte & ADDR_MASK;
-                let new = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
+                let keep = cow && frame::is_shared(pa) || file && !paging::writable(*pte);
+                let new = if keep { paging::read_only(pa | flags) } else { pa | flags };
                 if new != *pte {
                     changed.add(va);
                 }
@@ -714,36 +814,58 @@ impl AddressSpace {
     /// mapping `new_len` long.
     fn move_to(&mut self, vma: &Vma, old: u64, old_len: u64, new_len: u64, new: u64) -> Result<u64, Errno> {
         let old_end = old + old_len;
-        // Move existing pages rather than copying them.
-        let mut pages = Vec::new();
-        self.pt.for_each_mapped(old, old_end, |va, pte| unsafe {
-            pages.push((va - old, *pte));
-            *pte = 0;
-        });
         self.carve(old, old_end);
         let mut moved = vma.slice(old, old_end);
         moved.start = new;
         moved.end = new + new_len;
         self.vmas.insert(new, moved);
         self.recount();
+        // Existing pages move rather than being copied. An entry with
+        // nowhere to go (no frame for a table) is lost with its page,
+        // which the mapping no longer covers.
+        let mut gather = Gather::new(self.pt.root);
+        let mut lost = false;
+        let moved = self.pt.move_entries(old, old_end, new, &mut |va, pte| {
+            gather.add(va, pte & ADDR_MASK);
+            lost = true;
+        });
+        gather.finish();
         // The new slots were unmapped (no TLB holds them); the old entries
         // must go from every TLB, whatever happens to the new ones.
-        let moved = !pages.is_empty();
-        let mut result = Ok(new);
-        for (off, pte) in pages {
-            if self.pt.map(new + off, pte & ADDR_MASK, pte & !ADDR_MASK).is_none() {
-                result = Err(ENOMEM);
-                break;
-            }
-        }
         if moved {
             arch::flush_tlb(self.pt.root, old, old_end);
         }
-        result
+        if lost { Err(ENOMEM) } else { Ok(new) }
     }
 
     /// Resolve a fault: an unmapped page, or a write to one shared
     /// copy-on-write.
+    /// `fault`, if it's one a CPU may handle without the kernel lock
+    /// (`fast::fault`): a page of anonymous memory or of an imported file
+    /// that isn't mapped yet, or is mapped and allowed (another CPU's fault
+    /// got there first). That fills an empty entry, which no TLB holds and
+    /// no other address space shares, from a new frame: nothing to flush,
+    /// no file to lock, nothing another process sees. Anything else, or
+    /// failing (out of memory), is left to `fault` under the lock. Returns
+    /// whether it was handled.
+    pub fn fast_fault(&mut self, va: u64, access: Access) -> bool {
+        let Some(vma) = self.find(va) else { return false };
+        if !vma.allows(access) || !matches!(vma.backing, Backing::Anon | Backing::File { .. }) {
+            return false;
+        }
+        if let Some(pte) = self.pt.lookup(page_down(va)) {
+            // A write to a page shared copy-on-write changes a present entry.
+            return access != Access::Write || paging::writable(pte);
+        }
+        // A page and up to three page tables: anything closer to the end of
+        // memory is the usual path's to refuse (and count, once).
+        let (total, used) = frame::usage();
+        if used + 4 > total {
+            return false;
+        }
+        self.fault(va, access).is_ok()
+    }
+
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), FaultError> {
         let page = page_down(va);
         let vma = self.find(va).ok_or(FaultError::Segv)?.clone();

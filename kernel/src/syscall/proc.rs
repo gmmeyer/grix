@@ -54,10 +54,11 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let mut procs = PROCS.lock();
     let (count, threads) = (procs.count(), crate::procs::threads());
-    if count >= MAX_PROCESSES || threads >= process::MAX_THREADS {
+    if count >= MAX_PROCESSES || threads >= process::threads_max() {
         crate::stats::hit(if count >= MAX_PROCESSES { Limit::Processes } else { Limit::Threads });
         return Err(EAGAIN);
     }
+    let charge = crate::kmem::Charge::new(process::THREAD_COST).map_err(|_| EAGAIN)?;
     let pid = process::new_tid();
     if flags & CLONE_PARENT_SETTID != 0 {
         write_u32(&mut p.aspace, args.parent_tid, pid)?;
@@ -66,6 +67,8 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let share =
         Share { files: flags & CLONE_FILES != 0, fs: flags & CLONE_FS != 0, sighand: flags & CLONE_SIGHAND != 0 };
     let mut c = p.fork(pid, aspace, share)?;
+    // Named as the thread that forked it.
+    c.name = p.thread_name(p.current);
     if flags & CLONE_CLEAR_SIGHAND != 0 {
         // clone3: handled signals start out default in the child (ignored
         // ones stay ignored), as after an exec.
@@ -90,6 +93,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         None
     };
     let mut t = Thread::new(pid);
+    t.charge = charge;
     t.regs = *tf;
     t.regs.set_return(0);
     if args.stack != 0 {
@@ -101,11 +105,17 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.sigmask = parent_thread.sigmask;
     t.altstack = parent_thread.altstack;
     t.seccomp = parent_thread.seccomp.clone();
+    t.landlock = parent_thread.landlock.clone();
+    t.mempolicy = parent_thread.mempolicy;
+    c.landlocked = t.landlock.is_some();
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     if flags & CLONE_CHILD_SETTID != 0 {
         // In the child's memory: through its own mapping, unsharing the page.
-        c.aspace.activate();
-        let r = write_u32(&mut c.aspace, args.child_tid, pid);
+        let r = {
+            let mut a = c.aspace.access();
+            a.activate();
+            write_u32(&mut a, args.child_tid, pid)
+        };
         p.aspace.activate();
         if let Err(e) = r {
             if let Some(fd) = pidfd {
@@ -125,7 +135,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     crate::stats::forked();
     crate::stats::peak(Resource::Processes, count as u64 + 1);
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     drop(procs);
     {
         let mut fs = crate::fs::lock();
@@ -195,11 +205,13 @@ pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
     Ok(0)
 }
 
-/// The most argv + envp may hold (Linux allows a quarter of the stack).
-const MAX_ARGS: usize = 1 << 20;
-
 /// Read a NULL-terminated array of strings (argv, envp).
-fn read_strings(p: &mut Process, mut ptr: u64, total: &mut usize) -> Result<Vec<String>, Errno> {
+fn read_strings(
+    p: &mut Process,
+    mut ptr: u64,
+    total: &mut usize,
+    held: &mut crate::kmem::Charge,
+) -> Result<Vec<String>, Errno> {
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
@@ -209,13 +221,35 @@ fn read_strings(p: &mut Process, mut ptr: u64, total: &mut usize) -> Result<Vec<
         if s == 0 {
             return Ok(out);
         }
-        let arg = read_cstr(&mut p.aspace, s, MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
+        let arg = read_cstr(&mut p.aspace, s, process::MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
         *total += arg.len() + 1 + 8;
-        if *total > MAX_ARGS {
+        if *total > process::MAX_ARGS {
             return Err(E2BIG);
         }
+        // Megabytes of small strings, before `load_program` charges them.
+        held.resize(held.bytes() + arg.len() as u64 + process::ARG_OVERHEAD)?;
+        out.try_reserve(1).map_err(|_| ENOMEM)?;
         out.push(arg);
         ptr += 8;
+    }
+}
+
+/// The file open at `fd`, O_PATH or not, for execveat: EACCES for what
+/// isn't a regular file, as do_open_execat.
+fn open_program(p: &Process, fd: u64) -> Result<process::Start, Errno> {
+    if fd as i32 == crate::syscall::AT_FDCWD {
+        return Err(EACCES);
+    }
+    let file = p.fds.get_raw(fd)?;
+    let f = file.lock();
+    match (&f.kind, &f.content) {
+        (FileKind::Node(ino), Some(content)) => {
+            // A script's interpreter couldn't get at the file (Linux's
+            // BINPRM_FLAGS_PATH_INACCESSIBLE).
+            let reachable = !p.fds.cloexec(fd)?;
+            Ok(process::Start::File { ino: *ino, content: content.clone(), cwd: p.cwd(), reachable })
+        }
+        _ => Err(EACCES),
     }
 }
 
@@ -237,26 +271,31 @@ pub fn execve(
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let mut total = 0;
-    let argv = read_strings(p, argv, &mut total)?;
-    let envp = read_strings(p, envp, &mut total)?;
-    let (base, path) = if path.is_empty() {
+    let mut held = crate::kmem::Charge::default();
+    let argv = read_strings(p, argv, &mut total, &mut held)?;
+    let envp = read_strings(p, envp, &mut total, &mut held)?;
+    let program = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
         }
-        // fexecve: the file open at dirfd.
-        let ino = super::file::fd_node(p, dirfd)?;
-        (crate::fs::ROOT, crate::fs::lock().path_of(ino))
+        // fexecve: the file open at dirfd, whatever its name leads to now.
+        // Scripts get to their own text by /dev/fd/N (Linux's name for it).
+        let start = open_program(p, dirfd)?;
+        process::load_program(p, start, &alloc::format!("/dev/fd/{}", dirfd as i32), argv, envp).map_err(|e| e.errno)?
     } else {
-        (super::file::base_of(p, dirfd, &path)?, path)
-    };
-    let program = match process::load_program(p, base, &path, argv, envp) {
-        Ok(program) => program,
-        Err(e) => {
+        let base = super::file::base_of(p, dirfd, &path)?;
+        // O_NOFOLLOW's ELOOP, as do_open_execat.
+        let link =
+            |fs: &mut crate::fs::Fs| fs.lookup(base, &path, false).is_ok_and(|ino| fs.link_target(ino) != Err(EINVAL));
+        if flags & AT_SYMLINK_NOFOLLOW != 0 && link(&mut crate::fs::lock()) {
+            return Err(ELOOP);
+        }
+        process::load_program(p, process::Start::Path(base), &path, argv, envp).map_err(|e| {
             if e.errno == ENOENT {
                 p.missing_path(base, &path);
             }
-            return Err(e.errno);
-        }
+            e.errno
+        })?
     };
     // Other CPUs running threads of this process, in the address space
     // about to go, leave it first (see `smp`); the call then runs again.
@@ -285,9 +324,13 @@ pub fn execve(
     }
     p.runq.clear();
     p.futexes.clear();
+    crate::futex::forget(p.pid);
     // AIO contexts belong to the old address space (Linux's exit_aio).
     p.aio = Default::default();
     t.tid = p.pid;
+    crate::fs::tasks_reset(p.pid, p.pid);
+    // The process's name is the program's now (`install`).
+    t.name = [0; 16];
     t.clear_child_tid = 0;
     t.robust_list = 0;
     t.altstack = Default::default();
@@ -311,7 +354,7 @@ pub fn execve(
     // POSIX timers go; setitimer's survives.
     p.timers.posix.clear();
     crate::timer::resync(p);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     if let Some((ppid, tid)) = p.vfork_parent.take()
         && let Some(parent) = PROCS.lock().other_mut(ppid)
     {
@@ -506,14 +549,14 @@ pub fn pidfd_getfd(p: &mut Process, pidfd: u64, fd: u64, flags: u64) -> SysResul
     }
     let pid = pidfd_pid(p, pidfd)?;
     let file = if pid == p.pid {
-        p.fds.get(fd)?
+        p.fds.get_raw(fd)?
     } else {
         let procs = PROCS.lock();
         let q = procs.others.get(&pid).ok_or(ESRCH)?;
         if !crate::procs::may_inspect(p, q, true) {
             return Err(EPERM);
         }
-        q.fds.get(fd)?
+        q.fds.get_raw(fd)?
     };
     p.fds.alloc(FdEntry { file, cloexec: true }, 0)
 }

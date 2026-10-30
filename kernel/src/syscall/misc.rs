@@ -84,8 +84,17 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
                 }
             }
         }
-        nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
-        nr::setfsuid | nr::setfsgid => set_fs_id(p, n, name, a[0] as u32),
+        // Other threads' fast calls report the process's credentials.
+        nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => {
+            let r = set_ids(p, n, name, a);
+            crate::fast::changed();
+            r
+        }
+        nr::setfsuid | nr::setfsgid => {
+            let r = set_fs_id(p, n, name, a[0] as u32);
+            crate::fast::changed();
+            r
+        }
         nr::umask => {
             let old = p.fs.update(|f| core::mem::replace(&mut f.umask, a[0] as u32 & 0o777));
             Ok(old as u64)
@@ -129,8 +138,18 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             write_u64(&mut p.aspace, a[2], (1u64 << crate::smp::count()) - 1)?;
             Ok(8)
         }
-        nr::sched_setaffinity | nr::sched_setparam | nr::sched_setscheduler => Ok(0),
+        nr::sched_setaffinity => Ok(0),
+        nr::sched_setscheduler => sched_set(p, Some(a[1]), a[2]),
+        nr::sched_setparam => sched_set(p, None, a[1]),
         nr::sched_getscheduler => Ok(0),
+        // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE and SCHED_DEADLINE have
+        // only priority 0; SCHED_FIFO and SCHED_RR 1 to 99.
+        nr::sched_get_priority_max | nr::sched_get_priority_min => match a[0] as i32 {
+            0 | 3 | 5 | 6 => Ok(0),
+            1 | 2 if n == nr::sched_get_priority_max => Ok(99),
+            1 | 2 => Ok(1),
+            _ => Err(EINVAL),
+        },
         nr::sched_getparam => write_u32(&mut p.aspace, a[1], 0).map(|_| 0),
         nr::getpriority => Ok(20),
         nr::setpriority => Ok(0),
@@ -150,6 +169,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
+        nr::capset => capset(p, n, name, a[0], a[1]),
         nr::membarrier => membarrier(p, a[0], a[1]),
         nr::mincore => mincore(p, a[0], a[1], a[2]),
         // glibc probes rseq, and copes with ENOSYS.
@@ -193,8 +213,8 @@ fn clock_gettime(p: &mut Process, clock: u64, tp: u64) -> SysResult {
 
 fn uname(p: &mut Process, buf: u64) -> SysResult {
     let mut b = [0u8; 65 * 6];
-    use crate::procfs::{HOSTNAME, RELEASE, VERSION};
-    let fields = ["Linux", HOSTNAME, RELEASE, VERSION, crate::arch::PLATFORM, "(none)"];
+    use crate::procfs::{RELEASE, VERSION, hostname};
+    let fields = ["Linux", hostname(), RELEASE, VERSION, crate::arch::PLATFORM, "(none)"];
     for (i, f) in fields.iter().enumerate() {
         b[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
     }
@@ -284,6 +304,58 @@ fn set_fs_id(p: &mut Process, n: u32, name: &str, id: u32) -> SysResult {
     Ok(e as u64)
 }
 
+/// capset: no process has a capability (capget says so), so the only
+/// sets it may have are empty ones: dropping everything succeeds, as it
+/// does for an unprivileged Linux process (Chromium's zygote drops all of
+/// them before it forks), and asking for any is denied.
+fn capset(p: &mut Process, n: u32, name: &str, header: u64, data: u64) -> SysResult {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    let mut h = [0u8; 8];
+    copy_in(&mut p.aspace, header, &mut h)?;
+    let version = u32::from_le_bytes(h[..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(h[4..].try_into().unwrap());
+    let sets = match version {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            // As capget does: the version the kernel prefers.
+            write_u32(&mut p.aspace, header, V3)?;
+            return Err(EINVAL);
+        }
+    };
+    // Only the calling thread's own (Linux 2.6.25+).
+    if pid != 0 && pid as u32 != p.current {
+        return Err(EPERM);
+    }
+    // Effective, permitted and inheritable, 32 bits each, per set.
+    let mut d = [0u8; 24];
+    copy_in(&mut p.aspace, data, &mut d[..12 * sets])?;
+    if d.iter().any(|&b| b != 0) {
+        return p.deny(n, name, "privileged", "capabilities");
+    }
+    Ok(0)
+}
+
+/// sched_setscheduler (with a policy) and sched_setparam. Every thread
+/// is SCHED_OTHER: the normal policies' only priority, 0, changes nothing
+/// (the scheduler is round-robin anyway), and the real-time ones need
+/// CAP_SYS_NICE (or an RLIMIT_RTPRIO), which nothing has, as under Docker.
+fn sched_set(p: &mut Process, policy: Option<u64>, param: u64) -> SysResult {
+    const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+    let mut b = [0u8; 4];
+    copy_in(&mut p.aspace, param, &mut b)?;
+    let prio = i32::from_le_bytes(b);
+    let policy = policy.map_or(0, |n| n as u32 & !SCHED_RESET_ON_FORK) as i32;
+    match policy {
+        0 | 3 | 5 if prio == 0 => Ok(0),
+        1 | 2 if (1..=99).contains(&prio) => Err(EPERM),
+        6 => Err(EPERM),
+        _ => Err(EINVAL),
+    }
+}
+
 fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
     const PR_SET_PDEATHSIG: u64 = 1;
     const PR_GET_PDEATHSIG: u64 = 2;
@@ -310,17 +382,25 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
     const PR_CAP_AMBIENT_IS_SET: u64 = 1;
     const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
     const PR_SET_VMA: u64 = 0x53564d41;
-    match a[0] {
+    const PR_SET_MM: u64 = 35;
+    const PR_SVE_SET_VL: u64 = 50;
+    const PR_SVE_GET_VL: u64 = 51;
+    const PR_SME_SET_VL: u64 = 63;
+    const PR_SME_GET_VL: u64 = 64;
+    const PR_SET_PTRACER: u64 = 0x59616d61;
+    // An int, on Linux.
+    match a[0] as u32 as u64 {
         PR_SET_NAME => {
             let mut name = [0u8; 16];
             let s = read_cstr(&mut p.aspace, a[1], 4096).unwrap_or_default();
             let n = s.len().min(15);
             name[..n].copy_from_slice(&s.as_bytes()[..n]);
-            p.name = name;
+            // The calling thread's (the process's, for its main thread).
+            p.set_thread_name(p.current, name);
             Ok(0)
         }
         PR_GET_NAME => {
-            let name = p.name;
+            let name = p.thread_name(p.current);
             copy_out(&mut p.aspace, a[1], &name).map(|_| 0)
         }
         PR_GET_DUMPABLE => Ok(1),
@@ -357,6 +437,19 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
         PR_CAPBSET_DROP => Ok(0),
         PR_CAP_AMBIENT if a[1] == PR_CAP_AMBIENT_IS_SET || a[1] == PR_CAP_AMBIENT_CLEAR_ALL => Ok(0),
         PR_CAP_AMBIENT => Err(EPERM),
+        // Changing the memory map's fields (setproctitle's ARG_START, as
+        // some JDKs do) needs CAP_SYS_RESOURCE, which nothing has: Docker
+        // doesn't grant it either.
+        PR_SET_MM => Err(EPERM),
+        // No SVE or SME: Linux says EINVAL without them, as on x86_64.
+        PR_SVE_SET_VL | PR_SVE_GET_VL | PR_SME_SET_VL | PR_SME_GET_VL => Err(EINVAL),
+        // Yama's: there's no ptrace for anyone to be allowed.
+        PR_SET_PTRACER => Ok(0),
+        // Not a number any option could have (Linux's go up to about 80,
+        // and the magic ones above are ASCII tags): garbage, which Linux
+        // refuses too, as OpenSearch's seccomp self-test expects. An
+        // option grix doesn't know below that is reported.
+        n if n > 0xffff => Err(EINVAL),
         n => p.unimplemented(nr::prctl, "prctl", &alloc::format!("option {n}"), EINVAL),
     }
 }

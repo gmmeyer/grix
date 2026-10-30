@@ -129,6 +129,10 @@ secondary_entry_addr:
 empty_l0_addr:
     ldr     x0, =empty_l0
     ret
+.global boot_l1_addr
+boot_l1_addr:
+    ldr     x0, =boot_l1
+    ret
 .ltorg
 
 // return_to_frame(frame: x0) -> !: the frame becomes the stack's last, and

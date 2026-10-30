@@ -26,6 +26,7 @@ use spin::{Mutex, MutexGuard};
 use crate::console::klog;
 use crate::errno::*;
 use crate::hostfs;
+use crate::mm::pageindex::PageIndex;
 use crate::mm::{PAGE_SIZE, frame, p2v};
 use crate::procfs::{self, ProcFile};
 
@@ -93,14 +94,22 @@ pub enum Dev {
 static PAGES_USED: AtomicU64 = AtomicU64::new(0);
 static PAGES_LIMIT: AtomicU64 = AtomicU64::new(0);
 /// Kernel heap bytes (estimated) taken by nodes and names the program
-/// created. The heap is 32 MiB and an allocation failure there is a kernel
-/// panic, so this stays well below it.
+/// created. An allocation failure there is a kernel panic, so this stays
+/// well below the heap: 12 MiB of its first 32 MiB, and a share of what's
+/// added for RAM (`mm::init`). 12 MiB alone are 37,000 files, whatever the
+/// RAM, and `node_modules` can be more than that.
 static META_USED: AtomicU64 = AtomicU64::new(0);
-const META_LIMIT: u64 = 12 << 20;
+static META_LIMIT: AtomicU64 = AtomicU64::new(12 << 20);
 /// Estimated heap cost of a node (the boxed Node, its pin) and of a directory
 /// entry (B-tree slot), on top of the bytes of names and symlink targets.
 const NODE_COST: u64 = core::mem::size_of::<Node>() as u64 + 64;
 const ENTRY_COST: u64 = 64;
+/// A node of /proc, with a name of up to 16 bytes.
+pub const PROC_NODE_COST: u64 = NODE_COST + ENTRY_COST + 16;
+/// A thread's /proc/<pid>/task/<tid> and its files: paid for by the thread
+/// (`process::THREAD_COST`, from `kmem`), not the metadata budget, so
+/// threads don't crowd out files.
+pub const TASK_NODES_COST: u64 = (procfs::TASK_FILES.len() as u64 + 1) * PROC_NODE_COST;
 
 /// Limit written file data to `pages` pages of guest memory.
 pub fn set_limit(pages: u64) {
@@ -114,11 +123,16 @@ pub fn usage() -> (u64, u64) {
 
 /// (bytes of names and nodes in use, the limit)
 pub fn meta_usage() -> (u64, u64) {
-    (META_USED.load(Ordering::Relaxed), META_LIMIT)
+    (META_USED.load(Ordering::Relaxed), META_LIMIT.load(Ordering::Relaxed))
+}
+
+/// `bytes` more of the heap for names and nodes.
+pub fn grow_meta(bytes: u64) {
+    META_LIMIT.fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn charge(bytes: u64) -> Result<(), Errno> {
-    if META_USED.load(Ordering::Relaxed) + bytes > META_LIMIT {
+    if META_USED.load(Ordering::Relaxed) + bytes > META_LIMIT.load(Ordering::Relaxed) {
         crate::stats::hit(Limit::FileMetadata);
         return Err(ENOSPC);
     }
@@ -143,8 +157,9 @@ fn entry_cost(name: &str) -> u64 {
 /// page by frames holding written data. Bytes past both read as zero.
 pub struct FileData {
     base: &'static [u8],
-    /// Page index -> physical address of a frame owned by this file.
-    pages: BTreeMap<u64, u64>,
+    /// Page index -> physical address of a frame owned by this file. Its
+    /// nodes count as file data (`nodes`).
+    pages: PageIndex,
     len: u64,
     /// A live mount's file's MAP_SHARED mappings, which see a copy taken
     /// when each page faulted in (writes don't reach them).
@@ -155,9 +170,14 @@ pub struct FileData {
     live_maps: Vec<Weak<()>>,
     writable_maps: Vec<Weak<()>>,
     /// Pages a shared mapping read before the file had a frame for them:
-    /// it got a read-only copy, which must go once there's a frame
-    /// (`STALE`).
-    copied: alloc::collections::BTreeSet<u64>,
+    /// each got a read-only copy, which must go once there's a frame
+    /// (`STALE`). In frames, not on the heap: a program can read a hole a
+    /// page at a time and madvise the copies away, in a file as long as
+    /// it likes. The entries are just marks (`COPIED`).
+    copied: PageIndex,
+    /// Too many to mark, or no frame to do it with: which pages have
+    /// copies isn't known, so the next frame the file gets takes them all.
+    copied_unknown: bool,
     /// memfd seals (F_SEAL_*); `None` for files that can't be sealed.
     pub seals: Option<u32>,
     /// A live mount's file: the host's id for it. Its bytes are on the host
@@ -190,12 +210,13 @@ impl FileData {
     pub fn new(base: &'static [u8]) -> Content {
         Arc::new(Mutex::new(FileData {
             base,
-            pages: BTreeMap::new(),
+            pages: PageIndex::new(),
             len: base.len() as u64,
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
             writable_maps: Vec::new(),
-            copied: alloc::collections::BTreeSet::new(),
+            copied: PageIndex::new(),
+            copied_unknown: false,
             seals: None,
             remote: None,
             unlinked: false,
@@ -207,12 +228,13 @@ impl FileData {
     pub fn remote(id: u64, size: u64) -> Content {
         Arc::new(Mutex::new(FileData {
             base: &[],
-            pages: BTreeMap::new(),
+            pages: PageIndex::new(),
             len: size,
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
             writable_maps: Vec::new(),
-            copied: alloc::collections::BTreeSet::new(),
+            copied: PageIndex::new(),
+            copied_unknown: false,
             seals: None,
             remote: Some(id),
             unlinked: false,
@@ -298,7 +320,14 @@ impl FileData {
 
     /// A shared mapping took a read-only copy of page `idx`.
     pub fn copied_page(&mut self, idx: u64) {
-        self.copied.insert(idx);
+        if self.copied_unknown || self.copied.get(idx).is_some() {
+            return;
+        }
+        // Marks can do without memory better than the program can.
+        if self.copied.nodes() >= COPIED_NODES || self.copied.insert(idx, COPIED).is_none() {
+            self.copied.remove_from(0, &mut |_| {});
+            self.copied_unknown = true;
+        }
     }
 
     /// Is the file's memory mapped MAP_SHARED anywhere?
@@ -334,8 +363,8 @@ impl FileData {
             let (idx, in_page) = (pos / PAGE_SIZE, (pos % PAGE_SIZE) as usize);
             let k = (n - done).min(PAGE_SIZE as usize - in_page);
             let dst = &mut out[done..done + k];
-            match self.pages.get(&idx) {
-                Some(&pa) => dst.copy_from_slice(&page(pa)[in_page..in_page + k]),
+            match self.pages.get(idx) {
+                Some(pa) => dst.copy_from_slice(&page(pa)[in_page..in_page + k]),
                 None => {
                     let from = (pos as usize).min(self.base.len());
                     let avail = (self.base.len() - from).min(k);
@@ -366,19 +395,20 @@ impl FileData {
         if write && self.cow {
             self.make_local(u64::MAX).map_err(|_| FaultError::Io)?;
         }
-        match self.pages.get(&idx) {
-            Some(&pa) => Ok(Some(pa)),
+        match self.pages.get(idx) {
+            Some(pa) => Ok(Some(pa)),
             None if write => self.frame_of(idx).map(Some).map_err(|_| FaultError::Io),
             None => Ok(None),
         }
     }
 
     fn frame_of(&mut self, idx: u64) -> Result<u64, Errno> {
-        if let Some(&pa) = self.pages.get(&idx) {
+        if let Some(pa) = self.pages.get(idx) {
             return Ok(pa);
         }
+        // The page, and the index's nodes for it.
         let (used, limit) = usage();
-        if used >= limit {
+        if used + 1 + self.pages.nodes_needed(idx) > limit {
             crate::stats::hit(Limit::FileData);
             return Err(ENOSPC);
         }
@@ -389,10 +419,17 @@ impl FileData {
         let start = ((idx * PAGE_SIZE) as usize).min(self.base.len());
         let end = (start + PAGE_SIZE as usize).min(self.base.len());
         p[..end - start].copy_from_slice(&self.base[start..end]);
-        self.pages.insert(idx, pa);
-        if self.copied.remove(&idx) {
-            STALE.lock().push((self.id(), idx));
-            STALE_ANY.store(true, Ordering::Release);
+        let nodes = self.pages.nodes();
+        let inserted = self.pages.insert(idx, pa);
+        self.count_nodes(nodes);
+        if inserted.is_none() {
+            free_page(pa);
+            return Err(ENOSPC);
+        }
+        if core::mem::take(&mut self.copied_unknown) {
+            stale(self.id(), 0, u64::MAX);
+        } else if self.copied.remove(idx) {
+            stale(self.id(), idx, idx + 1);
         }
         Ok(pa)
     }
@@ -478,9 +515,7 @@ impl FileData {
                 Ok(())
             }
             Err(e) => {
-                for (_, pa) in core::mem::take(&mut self.pages) {
-                    free_page(pa);
-                }
+                self.free_pages(0);
                 (self.remote, self.len, self.cow) = (Some(id), old_len, true);
                 Err(e)
             }
@@ -494,13 +529,32 @@ impl FileData {
         }
     }
 
+    /// Free the pages from `keep` on.
+    fn free_pages(&mut self, keep: u64) {
+        let nodes = self.pages.nodes();
+        self.pages.remove_from(keep, &mut free_page);
+        self.count_nodes(nodes);
+    }
+
+    /// The index had `before` nodes: they're file data too, so a sparse
+    /// file's can't take more than the limit allows.
+    fn count_nodes(&self, before: u64) {
+        let now = self.pages.nodes();
+        if now > before {
+            let pages = PAGES_USED.fetch_add(now - before, Ordering::Relaxed) + now - before;
+            crate::stats::peak(Resource::FileData, pages * PAGE_SIZE);
+        } else {
+            PAGES_USED.fetch_sub(before - now, Ordering::Relaxed);
+        }
+    }
+
     /// Set the length. Growing adds zeros (without allocating); shrinking
     /// frees whole pages and zeroes the rest of the last one, so a later
     /// extension reads zeros.
     pub fn truncate(&mut self, len: u64) -> Result<(), Errno> {
         // (The mappings' copies past the end go with `zap_file`.)
         let keep = len.div_ceil(PAGE_SIZE);
-        let _ = self.copied.split_off(&keep);
+        self.copied.remove_from(keep, &mut |_| {});
         if let Some(id) = self.remote {
             if !self.cow {
                 hostfs::set_len(id, len)?;
@@ -512,11 +566,9 @@ impl FileData {
         }
         if len < self.len {
             let keep = len.div_ceil(PAGE_SIZE);
-            for (_, pa) in self.pages.split_off(&keep) {
-                free_page(pa);
-            }
+            self.free_pages(keep);
             if !len.is_multiple_of(PAGE_SIZE)
-                && let Some(&pa) = self.pages.get(&(len / PAGE_SIZE))
+                && let Some(pa) = self.pages.get(len / PAGE_SIZE)
             {
                 page_mut(pa)[(len % PAGE_SIZE) as usize..].fill(0);
             }
@@ -529,31 +581,73 @@ impl FileData {
 
 impl Drop for FileData {
     fn drop(&mut self) {
-        for &pa in self.pages.values() {
-            free_page(pa);
-        }
+        self.free_pages(0);
+        self.copied.remove_from(0, &mut |_| {});
         if let Some(id) = self.remote.filter(|_| self.unlinked) {
             hostfs::release(id);
         }
     }
 }
 
-/// Pages (file, index) that got a frame while shared mappings had
+/// What `FileData::copied` holds of a page.
+const COPIED: u64 = 1;
+/// The most frames `FileData::copied` takes: 8 GiB of a file's pages, if
+/// they're together.
+const COPIED_NODES: u64 = 4096;
+
+/// Spans of files' pages that got a frame while shared mappings had
 /// read-only copies of them: `procs::zap_stale` takes the copies out, so
-/// they fault onto the frame.
-static STALE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// they fault onto the frames. One span per file, and past `MAX_STALE`
+/// files, all of them: more goes than had to, which does no harm, as a
+/// mapping's pages can go any time and the next access brings them back.
+#[derive(Clone, Copy)]
+pub struct Stale {
+    spans: [(usize, u64, u64); MAX_STALE],
+    n: usize,
+    all: bool,
+}
+
+const MAX_STALE: usize = 32;
+
+impl Stale {
+    /// The pages (first, end) of file `id` whose copies go.
+    pub fn of(&self, id: usize) -> impl Iterator<Item = (u64, u64)> {
+        let all = self.all.then_some((0, u64::MAX));
+        let spans = self.spans[..self.n].iter().filter(move |s| !self.all && s.0 == id).map(|s| (s.1, s.2));
+        all.into_iter().chain(spans)
+    }
+}
+
+static STALE: Mutex<Stale> = Mutex::new(Stale { spans: [(0, 0, 0); MAX_STALE], n: 0, all: false });
 static STALE_ANY: AtomicBool = AtomicBool::new(false);
+
+fn stale(file: usize, first: u64, end: u64) {
+    let mut guard = STALE.lock();
+    let s = &mut *guard;
+    if let Some(span) = s.spans[..s.n].iter_mut().find(|span| span.0 == file) {
+        (span.1, span.2) = (span.1.min(first), span.2.max(end));
+    } else if s.n < MAX_STALE {
+        s.spans[s.n] = (file, first, end);
+        s.n += 1;
+    } else {
+        s.all = true;
+    }
+    STALE_ANY.store(true, Ordering::Release);
+}
 
 /// Has `take_stale` anything?
 pub fn stale_pending() -> bool {
     STALE_ANY.load(Ordering::Acquire)
 }
 
-pub fn take_stale() -> Vec<(usize, u64)> {
+pub fn take_stale() -> Option<Stale> {
     if !STALE_ANY.swap(false, Ordering::Acquire) {
-        return Vec::new();
+        return None;
     }
-    core::mem::take(&mut *STALE.lock())
+    let mut s = STALE.lock();
+    let taken = *s;
+    (s.n, s.all) = (0, false);
+    Some(taken)
 }
 
 fn page(pa: u64) -> &'static [u8] {
@@ -644,6 +738,9 @@ pub struct Node {
     pub ctime: u64,
     /// Extended attributes, by name (none for most nodes).
     xattrs: Option<Box<Xattrs>>,
+    /// A kernel node whose cost a thread holds (`TASK_NODES_COST`), not
+    /// the metadata budget.
+    prepaid: bool,
     /// Held by open descriptors and the working directory: an unlinked
     /// node's slot is only reused once nothing refers to it.
     pin: Arc<()>,
@@ -669,6 +766,7 @@ impl Node {
             mtime: time,
             ctime: time,
             xattrs: None,
+            prepaid: false,
             pin: Arc::new(()),
         }
     }
@@ -824,6 +922,10 @@ static FS: Mutex<Option<Fs>> = Mutex::new(None);
 enum Later {
     /// /proc/<pid> goes (`true`), or stays as a zombie's (`false`).
     Proc(u32, bool),
+    /// /proc/<pid>/task lists only this thread now (execve).
+    Tasks(u32, u32),
+    /// /proc/<pid>/task/<tid> comes (`true`) or goes.
+    Task(u32, u32, bool),
     /// /dev/pts/N goes (its master closed).
     PtsHide(u32),
 }
@@ -846,9 +948,23 @@ pub fn proc_gone(pid: u32) {
 }
 
 /// Process `pid` ended and is a zombie: its /proc/<pid> stays until it's
-/// reaped (`proc_gone`), as on Linux, with what a zombie still has.
+/// reaped (`proc_gone`), as on Linux, with what a zombie still has: of
+/// /proc/<pid>/task only the leader, as its threads, which paid for their
+/// nodes, are gone (the zombie holds what its last one paid).
 pub fn proc_zombie(pid: u32) {
     later(Later::Proc(pid, false));
+}
+
+/// Process `pid`'s only thread is now `tid` (execve): its /proc/<pid>/task
+/// follows (now, or once the filesystem is free).
+pub fn tasks_reset(pid: u32, tid: u32) {
+    later(Later::Tasks(pid, tid));
+}
+
+/// Process `pid` has a new thread `tid` (`true`), or one went: its
+/// /proc/<pid>/task follows (now, or once the filesystem is free).
+pub fn task_changed(pid: u32, tid: u32, added: bool) {
+    later(Later::Task(pid, tid, added));
 }
 
 /// Pseudo-terminal `index`'s master closed: /dev/pts/N goes (now, or once
@@ -937,6 +1053,7 @@ const NOBODY: usize = usize::MAX;
 /// same CPU (held further up the call stack) is a kernel bug that would
 /// otherwise hang.
 pub fn lock() -> FsGuard {
+    debug_assert!(!crate::fast::active(), "a fast entry took the filesystem lock");
     assert!(HOLDER.load(Ordering::Relaxed) != crate::smp::me(), "filesystem lock taken twice");
     let g = FS.lock();
     assert!(g.is_some(), "fs not initialised");
@@ -1150,19 +1267,25 @@ impl Fs {
             // Agent), and it shouldn't go to the host's resolver.
             let [a, b, c, d] = grix_abi::link::HOST_V4;
             let [e, f, g, h] = grix_abi::link::GUEST_V4;
-            let text = alloc::format!(
+            let mut text = alloc::format!(
                 "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{a}.{b}.{c}.{d}\t{}\n\
                  {e}.{f}.{g}.{h}\t{}\n",
                 grix_abi::link::HOST_NAME,
-                procfs::HOSTNAME
+                procfs::hostname()
             );
+            // Its IPv6 address too, as Docker writes it for a network with
+            // IPv6 (after the IPv4 one, which lookups of the name try first).
+            if crate::netlink::eth0() {
+                let ip = crate::netlink::ipv6_text(&grix_abi::link::GUEST_V6);
+                text.push_str(&alloc::format!("{ip}\t{}\n", procfs::hostname()));
+            }
             let ino = fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
             fs.nodes[ino].generated = true;
         }
         // And its name, which Docker images carry as an empty file too.
         if !mounted("/etc/hostname") && fs.placeholder("/etc/hostname") {
             let etc = fs.mkdir_p("/etc");
-            let text = alloc::format!("{}\n", procfs::HOSTNAME);
+            let text = alloc::format!("{}\n", procfs::hostname());
             let ino = fs.insert(etc, "hostname", Kind::File(FileData::new(leak(text))), 0o644);
             fs.nodes[ino].generated = true;
         }
@@ -1201,11 +1324,13 @@ impl Fs {
             self.pid_dirs.insert(pid, dir);
             self.dir_pids.insert(dir, pid);
             for &(name, file) in procfs::PID_FILES {
-                let perm = if procfs::private(file) { 0o400 } else { 0o444 };
+                let perm = procfs::perm(file);
                 self.add_node(dir, name, Kind::Proc(file), perm, owner)?;
             }
             let fd = self.add_node(dir, "fd", Kind::Dir(BTreeMap::new()), 0o500, owner)?;
             self.fd_dirs.insert(fd, pid);
+            let task = self.add_node(dir, "task", Kind::Dir(BTreeMap::new()), 0o555, owner)?;
+            self.task_add(task, pid, pid, owner)?;
             for (name, target) in [("exe", exe), ("cwd", cwd), ("root", "/")] {
                 self.add_node(dir, name, Kind::Symlink(target.into()), 0o777, owner)?;
             }
@@ -1216,13 +1341,99 @@ impl Fs {
         }
     }
 
+    /// /proc/<pid>/task/<tid>: what Linux shows of each thread
+    /// (`procfs::TASK_FILES`, made the thread's by `procfs::task_file`).
+    /// Threads are counted by the task directory's link count (Chromium's
+    /// single-thread check). The thread paid for these nodes
+    /// (`TASK_NODES_COST`).
+    fn task_add(&mut self, task: Ino, pid: u32, tid: u32, owner: (u32, u32)) -> Result<(), Errno> {
+        let dir = self.add_node_paid(task, &alloc::format!("{tid}"), Kind::Dir(BTreeMap::new()), 0o555, owner, true)?;
+        self.dir_pids.insert(dir, pid);
+        for &(name, file) in procfs::TASK_FILES {
+            let perm = procfs::perm(file);
+            self.add_node_paid(dir, name, Kind::Proc(procfs::task_file(file, tid)), perm, owner, true)?;
+        }
+        Ok(())
+    }
+
+    /// /proc/<pid>/task.
+    fn task_dir(&self, pid: u32) -> Option<(Ino, (u32, u32))> {
+        let dir = *self.pid_dirs.get(&pid)?;
+        let task = self.child(dir, "task")?;
+        Some((task, (self.nodes[task].uid, self.nodes[task].gid)))
+    }
+
+    /// Take `name` (`child`) out of directory `dir`, giving back what it was
+    /// charged.
+    fn unlink_kernel_node(&mut self, dir: Ino, name: &str, child: Ino) {
+        self.dir_pids.remove(&child);
+        self.remove_tree(child);
+        if let Kind::Dir(children) = &mut self.nodes[dir].kind {
+            children.remove(name);
+        }
+        if !self.nodes[child].prepaid {
+            release(entry_cost(name));
+        }
+        self.drop_name(child);
+    }
+
+    /// Make /proc/<pid>/task list only `tids`.
+    fn tasks_set(&mut self, pid: u32, tids: &[u32]) {
+        let Some((task, owner)) = self.task_dir(pid) else { return };
+        let Kind::Dir(children) = &self.nodes[task].kind else { return };
+        let shown: Vec<(String, Ino)> = children.iter().map(|(n, &i)| (n.clone(), i)).collect();
+        for (name, child) in shown {
+            if !name.parse().is_ok_and(|tid: u32| tids.contains(&tid)) {
+                self.unlink_kernel_node(task, &name, child);
+            }
+        }
+        for &tid in tids {
+            if self.child(task, &alloc::format!("{tid}")).is_none() {
+                let _ = self.task_add(task, pid, tid, owner);
+            }
+        }
+    }
+
+    /// /proc/<pid>/task/<tid> appears.
+    fn task_show(&mut self, pid: u32, tid: u32) {
+        let Some((task, owner)) = self.task_dir(pid) else { return };
+        if self.child(task, &alloc::format!("{tid}")).is_none() {
+            let _ = self.task_add(task, pid, tid, owner);
+        }
+    }
+
+    /// /proc/<pid>/task/<tid> goes.
+    fn task_hide(&mut self, pid: u32, tid: u32) {
+        let Some((task, _)) = self.task_dir(pid) else { return };
+        let name = alloc::format!("{tid}");
+        if let Some(child) = self.child(task, &name) {
+            self.unlink_kernel_node(task, &name, child);
+        }
+    }
+
     /// A node of the kernel's own (in /proc), counted against the metadata
     /// budget, in a slot that's reused once it's gone.
     fn add_node(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, owner: (u32, u32)) -> Result<Ino, Errno> {
+        self.add_node_paid(dir, name, kind, perm, owner, false)
+    }
+
+    /// The same, or (`prepaid`) one whose cost someone else holds.
+    fn add_node_paid(
+        &mut self,
+        dir: Ino,
+        name: &str,
+        kind: Kind,
+        perm: u32,
+        owner: (u32, u32),
+        prepaid: bool,
+    ) -> Result<Ino, Errno> {
         let mut node = Node::new(kind, perm, owner, dir, name, crate::time::realtime_ns());
         node.system = true;
+        node.prepaid = prepaid;
         self.reclaim();
-        charge(node.cost() + entry_cost(name))?;
+        if !prepaid {
+            charge(node.cost() + entry_cost(name))?;
+        }
         let ino = self.alloc_node(node);
         if let Kind::Dir(children) = &mut self.nodes[dir].kind {
             children.insert(name.into(), ino);
@@ -1258,10 +1469,14 @@ impl Fs {
             match what {
                 Later::Proc(pid, true) => self.proc_remove(pid),
                 Later::Proc(pid, false) => {
+                    self.tasks_set(pid, &[pid]);
                     if let Some(&dir) = self.pid_dirs.get(&pid) {
                         self.zombie_dirs.insert(dir);
                     }
                 }
+                Later::Tasks(pid, tid) => self.tasks_set(pid, &[tid]),
+                Later::Task(pid, tid, true) => self.task_show(pid, tid),
+                Later::Task(pid, tid, false) => self.task_hide(pid, tid),
                 Later::PtsHide(index) => self.pts_hide(index),
             }
         }
@@ -1285,8 +1500,11 @@ impl Fs {
         let Kind::Dir(children) = &mut self.nodes[dir].kind else { return };
         for (name, child) in core::mem::take(children) {
             self.fd_dirs.remove(&child);
+            self.dir_pids.remove(&child);
             self.remove_tree(child);
-            release(entry_cost(&name));
+            if !self.nodes[child].prepaid {
+                release(entry_cost(&name));
+            }
             self.drop_name(child);
         }
     }
@@ -1498,16 +1716,20 @@ impl Fs {
     /// `lookup`, as openat2's `resolve` allows.
     pub fn lookup_in(&mut self, start: Ino, path: &str, follow_last: bool, scope: &Scope) -> Result<Ino, Errno> {
         let mut links = 0;
-        self.walk(start, path, follow_last, &mut links, scope)
+        self.walk(start, path, follow_last, false, &mut links, scope)
     }
 
     /// `links` counts every symlink followed in the whole lookup, so a chain
     /// of links that each expand into several more can't make it exponential.
+    /// `onward`: the path goes on after this: what ends it is a directory
+    /// on the way, so a descriptor there is gone through (`through_fd`),
+    /// not named, as `Fs::fd_link` has it when a path ends there.
     fn walk(
         &mut self,
         start: Ino,
         path: &str,
         follow_last: bool,
+        onward: bool,
         links: &mut u32,
         scope: &Scope,
     ) -> Result<Ino, Errno> {
@@ -1538,6 +1760,10 @@ impl Fs {
                     }
                     cur = self.nodes[cur].parent
                 }
+                // /proc/<pid>/fd/N/...: a magic link, on the way somewhere.
+                name if (!last || onward) && self.fd_dir_pid(cur).is_some() => {
+                    cur = self.through_fd(cur, name, links, scope)?;
+                }
                 name => {
                     let child =
                         self.find_child(cur, name)?.ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
@@ -1550,7 +1776,7 @@ impl Fs {
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        cur = self.follow(cur, child, links, scope)?;
+                        cur = self.follow(cur, child, !last || onward, links, scope)?;
                         continue;
                     }
                     cur = child;
@@ -1567,7 +1793,7 @@ impl Fs {
     /// allow: no symlinks at all (ELOOP), no magic ones (ELOOP), none
     /// leaving the mount (EXDEV), and in a scoped lookup no magic ones
     /// (EXDEV, "not currently safe").
-    fn follow(&mut self, dir: Ino, link: Ino, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
+    fn follow(&mut self, dir: Ino, link: Ino, onward: bool, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
         if scope.has(RESOLVE_NO_SYMLINKS) {
             return Err(ELOOP);
         }
@@ -1580,7 +1806,7 @@ impl Fs {
                 return Err(EXDEV);
             }
             // A magic link jumps to what it names, wherever that is.
-            let to = self.walk(dir, &target, true, links, &Scope::NONE)?;
+            let to = self.walk(dir, &target, true, onward, links, &Scope::NONE)?;
             if scope.has(RESOLVE_NO_XDEV) && self.mount_of(to) != self.mount_of(dir) {
                 return Err(EXDEV);
             }
@@ -1593,7 +1819,28 @@ impl Fs {
                 return Err(EXDEV);
             }
         }
-        self.walk(dir, &target, true, links, scope)
+        self.walk(dir, &target, true, onward, links, scope)
+    }
+
+    /// What entry `name` of /proc/<pid>/fd directory `dir` has open, to go
+    /// on from, with `follow`'s rules for a magic link.
+    fn through_fd(&mut self, dir: Ino, name: &str, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
+        if scope.has(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) {
+            return Err(ELOOP);
+        }
+        if scope.has(RESOLVE_SCOPED) {
+            return Err(EXDEV);
+        }
+        *links += 1;
+        if *links > MAX_SYMLINKS {
+            return Err(ELOOP);
+        }
+        let pid = self.fd_dir_pid(dir).ok_or(ENOENT)?;
+        let to = crate::fd::walked_node(pid, name.parse().map_err(|_| ENOENT)?)?;
+        if scope.has(RESOLVE_NO_XDEV) && self.mount_of(to) != self.mount_of(dir) {
+            return Err(EXDEV);
+        }
+        Ok(to)
     }
 
     /// Where an absolute path starts: EXDEV beneath a directory, which it
@@ -1655,7 +1902,7 @@ impl Fs {
         let trimmed = path.trim_end_matches('/');
         let (dir, name) = match trimmed.rsplit_once('/') {
             Some(("", name)) => (self.root_of(scope)?, name),
-            Some((dir, name)) => (self.lookup_in(start, dir, true, scope)?, name),
+            Some((dir, name)) => (self.walk(start, dir, true, true, &mut 0, scope)?, name),
             None if trimmed.is_empty() => (self.root_of(scope)?, ""),
             None => (start, trimmed),
         };
@@ -1881,7 +2128,9 @@ impl Fs {
                 continue;
             }
             self.orphans.swap_remove(i);
-            release(self.nodes[ino].cost());
+            if !self.nodes[ino].prepaid {
+                release(self.nodes[ino].cost());
+            }
             // Dropping the node drops its contents (unlinked files have none
             // left by now) and its name.
             *self.nodes[ino] = Node::new(Kind::Unlinked { data: Weak::new(), linkable: false }, 0, (0, 0), ROOT, "", 0);
@@ -2053,11 +2302,11 @@ impl Fs {
             self.copy_up(dir)?;
             self.copy_up(ino)?;
         }
-        // Live mounts don't do hard links (EPERM, as on Linux for a
-        // filesystem that can't), and nothing links across a mount.
+        // Within one live mount the host makes the link; nothing links
+        // across a mount.
         match (self.nodes[ino].remote.as_ref(), self.nodes[dir].remote.as_ref()) {
             (None, None) => {}
-            (Some(a), Some(b)) if a.mount == b.mount => return Err(EPERM),
+            (Some(a), Some(b)) if a.mount == b.mount => return self.link_remote(ino, dir, name, uid, gid),
             _ => return Err(EXDEV),
         }
         if self.nodes[dir].nlink == 0 {
@@ -2090,6 +2339,48 @@ impl Fs {
         let n = &mut self.nodes[ino];
         n.nlink += 1;
         n.ctime = now;
+        self.touch_dir(dir);
+        Ok(())
+    }
+
+    /// `link` within a live mount: the host links the file (never what a
+    /// link points at), and the new name is a node of its own, as a
+    /// listing would bring it (another id: the host keeps one per name).
+    fn link_remote(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (did, mount, writable) = (r.id, r.mount, r.writable);
+        let id = self.nodes[ino].remote.as_deref().unwrap().id;
+        if !writable {
+            return Err(EROFS);
+        }
+        if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.may_change(dir, None, uid, gid)?;
+        let target = match &self.nodes[ino].kind {
+            Kind::Symlink(t) => t.clone(),
+            _ => String::new(),
+        };
+        let (cid, attr) = match hostfs::link(id, did, name) {
+            Ok(made) => made,
+            Err(e) => {
+                // Made on the host since the last listing, perhaps.
+                if e == EEXIST
+                    && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+                {
+                    r.listed_at = 0;
+                }
+                return Err(e);
+            }
+        };
+        let e = hostfs::Entry { name: name.into(), id: cid, attr, target };
+        if self.new_remote(dir, &e, mount, writable).is_err()
+            && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+        {
+            // The host has it; the next listing brings it in.
+            r.listed_at = 0;
+        }
+        self.nodes[ino].ctime = crate::time::realtime_ns();
         self.touch_dir(dir);
         Ok(())
     }
@@ -2164,7 +2455,22 @@ impl Fs {
                 return Err(EROFS);
             }
             if exchange {
-                return Err(EINVAL);
+                // Both names stay, each on what the other was.
+                let dst = dst.ok_or(ENOENT)?;
+                if dst == src {
+                    return Ok(());
+                }
+                hostfs::rename(oid, oname, nid, nname, false, true)?;
+                for (dir, name, ino) in [(odir, oname, dst), (ndir, nname, src)] {
+                    let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
+                    children.insert(name.into(), ino);
+                    (self.nodes[ino].parent, self.nodes[ino].name) = (dir, name.into());
+                }
+                let now = crate::time::realtime_ns();
+                (self.nodes[src].ctime, self.nodes[dst].ctime) = (now, now);
+                self.touch_dir(odir);
+                self.touch_dir(ndir);
+                return Ok(());
             }
             match dst {
                 Some(_) if noreplace => return Err(EEXIST),
@@ -2177,7 +2483,7 @@ impl Fs {
                 None => {}
             }
             charge(entry_cost(nname))?;
-            if let Err(e) = hostfs::rename(oid, oname, nid, nname, noreplace) {
+            if let Err(e) = hostfs::rename(oid, oname, nid, nname, noreplace, false) {
                 release(entry_cost(nname));
                 return Err(e);
             }
@@ -2596,6 +2902,37 @@ impl Fs {
     /// written, once copied up.)
     pub fn read_only(&self, ino: Ino) -> bool {
         self.nodes[ino].remote.as_ref().is_some_and(|r| !r.writable && !self.lazy[r.mount])
+    }
+
+    /// The directory `path` (from `start`) found `ino` in, for Landlock,
+    /// which goes by the way a file was reached: `Node::parent` is its
+    /// first name's, and that name may be gone. Reached through a symlink
+    /// its first name is all that's known, and if that's gone the root.
+    /// (Each name on a live mount is a node of its own.)
+    pub fn found_in(&mut self, ino: Ino, start: Ino, path: &str, scope: &Scope) -> Ino {
+        let n = &self.nodes[ino];
+        let parent = n.parent;
+        if self.is_dir(ino) || n.remote.is_some() || n.nlink == 0 {
+            return parent;
+        }
+        let first = self.child(parent, &n.name) == Some(ino);
+        if first && n.nlink <= 1 {
+            return parent;
+        }
+        if let Ok((dir, name)) = self.lookup_parent_in(start, path, scope)
+            && self.child_of(dir, &name) == Some(ino)
+        {
+            return dir;
+        }
+        if first { parent } else { ROOT }
+    }
+
+    /// Are `a` and `b` on different mounts, as a link or rename between
+    /// them can't be (EXDEV)? A lazy import's nodes are the sandbox's by
+    /// then.
+    pub fn crosses_mount(&self, a: Ino, b: Ino) -> bool {
+        let mount = |ino: Ino| self.nodes[ino].remote.as_ref().filter(|r| !self.lazy[r.mount]).map(|r| r.mount);
+        mount(a) != mount(b)
     }
 
     /// Is `ino` still the host's, in a lazy import?

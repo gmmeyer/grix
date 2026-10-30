@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use grix_abi::image::{IMAGE_BASE, Image, MAX_ENTRIES, MAX_RAM, RAM_BASE};
+use grix_abi::image::{IMAGE_BASE, Image, LOW_RAM, MAX_ENTRIES, MAX_RAM, RAM_BASE};
 use grix_abi::machine;
 use grix_abi::policy::{Capability, DenyAction, Policy};
 use grix_abi::stats::Stats as GuestStats;
@@ -510,6 +510,10 @@ pub struct SandboxBuilder {
     x86_64: Option<String>,
     /// TTY mode's terminal size (rows, columns).
     tty: Option<(u16, u16)>,
+    /// The sandbox's host name, if not `grix_abi::HOSTNAME`.
+    hostname: Option<String>,
+    /// Fill in a default environment (`default_env`) at `build`.
+    default_env: bool,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -546,6 +550,8 @@ impl Default for SandboxBuilder {
             cpus: std::env::var("GRIX_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(1),
             x86_64: None,
             tty: None,
+            hostname: None,
+            default_env: false,
             command: Vec::new(),
         }
     }
@@ -601,9 +607,41 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set `key` to `value` in the program's environment, in place of
+    /// any value it had (the image's, or an earlier call's).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push((key.into(), value.into()));
+        let key = key.into();
+        self.env.retain(|(k, _)| *k != key);
+        self.env.push((key, value.into()));
         self
+    }
+
+    /// Start the program with what a shell's login would give it, for
+    /// whatever the environment doesn't have by `build`: `HOME` (the
+    /// user's, from /etc/passwd), `PATH` (Docker's default), `LANG`
+    /// (`C.UTF-8`) and `TMPDIR` (`/tmp`). Without it the program gets only
+    /// what it's given (and an image's own environment).
+    pub fn default_env(mut self) -> Self {
+        self.default_env = true;
+        self
+    }
+
+    /// The sandbox's host name (`grix` unless given), as uname, /etc/hostname,
+    /// /etc/hosts and /proc/sys/kernel/hostname show it: 1 to 64 letters,
+    /// digits, `-` and `.`. An image's `HOSTNAME` (Docker's) follows it.
+    pub fn hostname(mut self, name: &str) -> Result<Self> {
+        if !grix_abi::valid_hostname(name) {
+            bail!(
+                "host name {name:?} must be 1 to {} letters, digits, '-' and '.', not starting with '-' or '.'",
+                grix_abi::MAX_HOSTNAME
+            );
+        }
+        let old = self.hostname.as_deref().unwrap_or(grix_abi::HOSTNAME);
+        if self.env.iter().any(|(k, v)| k == "HOSTNAME" && v == old) {
+            self = self.env("HOSTNAME", name);
+        }
+        self.hostname = Some(name.into());
+        Ok(self)
     }
 
     pub fn cwd(mut self, dir: impl Into<String>) -> Self {
@@ -1012,6 +1050,12 @@ impl SandboxBuilder {
         if let Some(user) = &image.config.user {
             (self.uid, self.gid) = crate::container::resolve_user(user, &image.files)?;
         }
+        // What Docker puts in a container's environment unless the image
+        // sets it (the image's own environment comes after this).
+        let home = crate::container::home_dir(self.uid, &image.files);
+        self = self.env("HOME", home);
+        let hostname = self.hostname.clone().unwrap_or_else(|| grix_abi::HOSTNAME.into());
+        self = self.env("HOSTNAME", hostname);
         self.kernel = image.kernel_path()?;
         Ok(self)
     }
@@ -1097,6 +1141,21 @@ impl SandboxBuilder {
     }
 
     pub fn build(mut self) -> Result<Sandbox> {
+        if self.default_env {
+            // The home /etc/passwd gives the user: the imported one, or
+            // the one the kernel writes (root's, or grix's).
+            let home = match (self.files.contains_key("/etc/passwd"), self.uid) {
+                (true, uid) => crate::container::home_dir(uid, &self.files),
+                (false, 0) => "/root".into(),
+                (false, _) => "/home/grix".into(),
+            };
+            let path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+            for (key, value) in [("HOME", home.as_str()), ("PATH", path), ("LANG", "C.UTF-8"), ("TMPDIR", "/tmp")] {
+                if !self.env.iter().any(|(k, _)| k == key) {
+                    self.env.push((key.into(), value.into()));
+                }
+            }
+        }
         // `arch` after `image`: the image's programs and kernel are another's.
         if let Some(image) = self.image_arch.filter(|&a| a != self.arch) {
             bail!("the image is for {image}, and --arch asks for {}: an image runs on its own architecture", self.arch);
@@ -1133,13 +1192,15 @@ impl SandboxBuilder {
         if self.files.len() > MAX_ENTRIES {
             bail!("{} files, directories and links imported: at most {MAX_ENTRIES} fit", self.files.len());
         }
-        let ram = self.memory_mb << 20;
-        let needed = RESERVED_LOW + image::imported_bytes(&self.files) + MIN_FREE;
+        let ram = self.memory_mb.saturating_mul(1 << 20);
+        let imported = image::imported_bytes(&self.files);
+        check_imports_fit(imported, "imports")?;
+        let needed = RESERVED_LOW + imported + MIN_FREE;
         if ram < needed {
             bail!(
                 "memory_mb = {} is too small for {} MiB of imports (need at least {} MiB)",
                 self.memory_mb,
-                image::imported_bytes(&self.files) >> 20,
+                imported >> 20,
                 needed.div_ceil(1 << 20)
             );
         }
@@ -1151,6 +1212,20 @@ impl SandboxBuilder {
         }
         Ok(Sandbox { cfg: self })
     }
+}
+
+/// The boot image holds what's imported, and must fit below 4 GiB of guest
+/// memory however much RAM there is (`image::LOW_RAM`).
+fn check_imports_fit(imported: u64, what: &str) -> Result<()> {
+    if RESERVED_LOW + imported > LOW_RAM {
+        bail!(
+            "{} MiB of {what}: they're in the boot image, which must fit below 4 GiB of guest memory, so at most \
+             {} MiB can be (mount big directories live instead)",
+            imported >> 20,
+            (LOW_RAM - RESERVED_LOW) >> 20
+        );
+    }
+    Ok(())
 }
 
 /// A reusable sandbox configuration. Each [`run`](Sandbox::run) boots a fresh VM.
@@ -1236,6 +1311,7 @@ impl Sandbox {
                  (mount a smaller directory)"
             );
         }
+        check_imports_fit(imported, "imports and mounts")?;
         let needed = RESERVED_LOW + imported + MIN_FREE;
         if cfg.memory_mb << 20 < needed {
             bail!(
@@ -1284,6 +1360,7 @@ impl Sandbox {
             cpus: cfg.cpus,
             x86_64: cfg.x86_64.as_deref().unwrap_or(""),
             tty: cfg.tty,
+            hostname: cfg.hostname.as_deref().unwrap_or(grix_abi::HOSTNAME),
         }
         .encode();
         let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
@@ -1416,7 +1493,7 @@ impl Sandbox {
             base64::engine::general_purpose::STANDARD.encode(fs_state)
         };
         crate::snapshot::finish(&mut keep, &settings)?;
-        crate::at::rename(cleanup.0.as_raw_fd(), &cleanup.1, cleanup.0.as_raw_fd(), &name, false)
+        crate::at::rename(cleanup.0.as_raw_fd(), &cleanup.1, cleanup.0.as_raw_fd(), &name, false, false)
             .with_context(|| format!("writing {}", path.display()))?;
         std::mem::forget(cleanup);
         crate::Snapshot::open(path)

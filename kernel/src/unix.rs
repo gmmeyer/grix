@@ -100,7 +100,7 @@ impl Addr {
 }
 
 /// Who is at the other end (SO_PEERCRED).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cred {
     pub pid: u32,
     pub uid: u32,
@@ -127,6 +127,20 @@ pub struct StreamInfo {
     pub local: Option<Name>,
     pub peer: Option<Name>,
     pub peer_cred: Cred,
+    /// SO_PASSCRED: reads come with their writers' credentials, and stop
+    /// where the writer changes (`Pipe::creds`).
+    pub passcred: bool,
+}
+
+/// A connected AF_UNIX stream pair: its pipes keep who wrote what.
+pub fn stream_pair() -> (SocketEnd, SocketEnd) {
+    let (a, b) = ipc::socketpair();
+    for end in [&a, &b] {
+        if let Some(rx) = &end.rx {
+            rx.pipe.lock().creds = Some(Default::default());
+        }
+    }
+    (a, b)
 }
 
 /// Descriptors in flight (SCM_RIGHTS).
@@ -174,6 +188,8 @@ pub struct Msg {
     pub data: Vec<u8>,
     pub from: Option<Name>,
     pub rights: Option<Rights>,
+    /// Who sent it (SCM_CREDENTIALS, for a receiver with SO_PASSCRED).
+    pub cred: Cred,
 }
 
 /// A connection waiting to be accepted.
@@ -213,6 +229,8 @@ pub struct Sock {
     pub cred: Cred,
     /// Its peer's, once connected.
     pub peer_cred: Option<Cred>,
+    /// SO_PASSCRED: messages come with their senders' credentials.
+    pub passcred: bool,
     pub version: u64,
 }
 
@@ -272,7 +290,7 @@ impl Msg {
 
 impl Sock {
     pub fn new(ty: u64, state: State, cred: Cred) -> SockRef {
-        Arc::new(Mutex::new(Sock { ty, name: None, state, cred, peer_cred: None, version: 0 }))
+        Arc::new(Mutex::new(Sock { ty, name: None, state, cred, peer_cred: None, passcred: false, version: 0 }))
     }
 
     /// An empty message queue (a datagram socket, a seqpacket end).
@@ -448,16 +466,18 @@ pub fn message_pair(ty: u64, a: Cred, b: Cred) -> (SockRef, SockRef) {
 /// queued for accept. EAGAIN if the queue is full.
 pub fn connect_stream(listener: &SockRef, me: Option<Name>, cred: Cred) -> Result<(SocketEnd, StreamInfo), Errno> {
     let mut l = listener.lock();
-    let (target, lcred) = (l.name.clone(), l.cred);
+    let (target, lcred, passcred) = (l.name.clone(), l.cred, l.passcred);
     let State::Listening { backlog, queue } = &mut l.state else { return Err(ECONNREFUSED) };
     if queue.len() >= *backlog {
         return Err(EAGAIN);
     }
     let slot = Slot::take().ok_or(EAGAIN)?;
-    let (mut ours, mut theirs) = ipc::socketpair();
-    let mine = StreamInfo { local: me.clone(), peer: target.clone(), peer_cred: lcred };
+    let (mut ours, mut theirs) = stream_pair();
+    let mine = StreamInfo { local: me.clone(), peer: target.clone(), peer_cred: lcred, passcred: false };
     ours.unix = Some(alloc::boxed::Box::new(mine.clone()));
-    theirs.unix = Some(alloc::boxed::Box::new(StreamInfo { local: target, peer: me, peer_cred: cred }));
+    // The accepted socket has the listener's SO_PASSCRED, as Linux's
+    // unix_sock_inherit_flags.
+    theirs.unix = Some(alloc::boxed::Box::new(StreamInfo { local: target, peer: me, peer_cred: cred, passcred }));
     queue.push_back((Incoming::Stream(theirs), slot));
     l.touch();
     Ok((ours, mine))
@@ -467,7 +487,7 @@ pub fn connect_stream(listener: &SockRef, me: Option<Name>, cred: Cred) -> Resul
 /// sockets, one queued for accept.
 pub fn connect_packet(listener: &SockRef, me: Option<Name>, cred: Cred) -> Result<SockRef, Errno> {
     let mut l = listener.lock();
-    let (target, lcred) = (l.name.clone(), l.cred);
+    let (target, lcred, passcred) = (l.name.clone(), l.cred, l.passcred);
     let State::Listening { backlog, queue } = &mut l.state else { return Err(ECONNREFUSED) };
     if queue.len() >= *backlog {
         return Err(EAGAIN);
@@ -476,6 +496,7 @@ pub fn connect_packet(listener: &SockRef, me: Option<Name>, cred: Cred) -> Resul
     let (ours, theirs) = message_pair(SOCK_SEQPACKET, cred, lcred);
     ours.lock().name = me;
     theirs.lock().name = target;
+    theirs.lock().passcred = passcred;
     queue.push_back((Incoming::Packet(theirs), slot));
     l.touch();
     Ok(ours)
