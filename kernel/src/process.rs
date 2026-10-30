@@ -3,6 +3,7 @@
 //! its slot of `PROCESS` (`running`); the others, and zombies, are in
 //! `procs::PROCS`.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -368,10 +369,10 @@ const N: usize = grix_abi::machine::MAX_CPUS as usize;
 /// The process each CPU in the kernel runs, by CPU: `smp::lock` takes it
 /// out of `procs::PROCS` and `smp::unlock` puts it back, so between
 /// kernel entries every slot is empty.
-pub static PROCESS: [Mutex<Option<Process>>; N] = [const { Mutex::new(None) }; N];
+pub static PROCESS: [Mutex<Option<Box<Process>>>; N] = [const { Mutex::new(None) }; N];
 
 /// This CPU's slot of `PROCESS`.
-pub fn running() -> &'static Mutex<Option<Process>> {
+pub fn running() -> &'static Mutex<Option<Box<Process>>> {
     &PROCESS[crate::smp::me()]
 }
 
@@ -836,7 +837,7 @@ pub fn start(img: Image<'static>) -> ! {
     p.slice_start = crate::time::monotonic_ns();
     // The kernel is ours while the other CPUs start (they wait for it).
     crate::smp::lock();
-    *running().lock() = Some(p);
+    *running().lock() = Some(Box::new(p));
     arch::irq::init(gicr);
     crate::smp::start(cpus);
     console::start(stdin);

@@ -5,6 +5,7 @@
 //!
 //! Lock order: a `PROCESS` slot, then `PROCS`.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,8 +33,10 @@ pub struct Zombie {
 }
 
 pub struct Procs {
-    /// Every live process except the running one.
-    pub others: BTreeMap<u32, Process>,
+    /// Every live process except the running one. Boxed: a process moves
+    /// in and out on every kernel entry (`smp::lock`), and a B-tree keeps
+    /// its values inline, shifting them about.
+    pub others: BTreeMap<u32, Box<Process>>,
     pub zombies: BTreeMap<u32, Zombie>,
 }
 
@@ -105,7 +108,17 @@ impl Procs {
         if cur.pid == pid {
             return (!cur.dead).then_some(cur);
         }
-        self.others.get_mut(&pid)
+        self.other_mut(pid)
+    }
+
+    /// Live process `pid`, if it isn't the running one.
+    pub fn other_mut(&mut self, pid: u32) -> Option<&mut Process> {
+        self.others.get_mut(&pid).map(|q| &mut **q)
+    }
+
+    /// Every live process but the running one.
+    pub fn others_mut(&mut self) -> impl Iterator<Item = &mut Process> {
+        self.others.values_mut().map(|q| &mut **q)
     }
 
     /// Every live process: the running one first. Only with the kernel to
@@ -117,7 +130,7 @@ impl Procs {
     /// `all`, from a CPU that may have no process (`cur`: its own, if any).
     pub fn each<'a>(&'a mut self, cur: Option<&'a mut Process>) -> impl Iterator<Item = &'a mut Process> {
         debug_assert!(crate::smp::exclusive(), "another CPU has a process checked out");
-        cur.into_iter().filter(|p| !p.dead).chain(self.others.values_mut())
+        cur.into_iter().filter(|p| !p.dead).chain(self.others_mut())
     }
 }
 
@@ -158,7 +171,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     {
         crate::tty::disassociate(cur.as_deref_mut(), procs, &tty, pid, true);
     }
-    for q in procs.others.values_mut().chain(cur.as_deref_mut()) {
+    for q in procs.others_mut().chain(cur.as_deref_mut()) {
         if q.ppid == pid {
             q.ppid = INIT;
         }
@@ -172,7 +185,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     if let Some((vpid, tid)) = dead.vfork_parent.take() {
         let caller = match cur.as_deref_mut() {
             Some(c) if c.pid == vpid => Some(c),
-            _ => procs.others.get_mut(&vpid),
+            _ => procs.other_mut(vpid),
         };
         if let Some(caller) = caller {
             caller.wake(tid, Some(pid as u64));
@@ -180,7 +193,8 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     }
     let parent = match cur {
         Some(c) if c.pid == ppid => Some(c),
-        _ => procs.others.get_mut(&ppid),
+        // Not `other_mut`: `zombies` is borrowed below.
+        _ => procs.others.get_mut(&ppid).map(|q| &mut **q),
     };
     // Orphans belong to init, which outlives everything.
     let Some(parent) = parent else {
@@ -229,7 +243,7 @@ pub fn reap_others(mut cur: Option<&mut Process>, procs: &mut Procs) {
         for (ppid, info) in notices {
             let parent = match cur.as_deref_mut() {
                 Some(c) if c.pid == ppid => Some(c),
-                _ => procs.others.get_mut(&ppid),
+                _ => procs.other_mut(ppid),
             };
             if let Some(parent) = parent
                 && parent.action(SIGCHLD).flags & SA_NOCLDSTOP == 0

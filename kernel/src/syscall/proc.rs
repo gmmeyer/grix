@@ -120,7 +120,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         c.vfork_parent = Some((p.pid, p.current));
     }
     let owner = (c.uid, c.gid);
-    procs.others.insert(pid, c);
+    procs.others.insert(pid, alloc::boxed::Box::new(c));
     crate::procs::born();
     crate::stats::forked();
     crate::stats::peak(Resource::Processes, count as u64 + 1);
@@ -313,7 +313,7 @@ pub fn execve(
     crate::timer::resync(p);
     p.timer_dirty = true;
     if let Some((ppid, tid)) = p.vfork_parent.take()
-        && let Some(parent) = PROCS.lock().others.get_mut(&ppid)
+        && let Some(parent) = PROCS.lock().other_mut(ppid)
     {
         parent.wake(tid, Some(p.pid as u64));
     }
@@ -371,7 +371,7 @@ fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<O
         return Ok(Some(r));
     }
     let mut children = zombie.is_some();
-    for q in procs.others.values_mut().filter(|q| q.ppid == me && which.matches(q.pid, q.pgid)) {
+    for q in procs.others_mut().filter(|q| q.ppid == me && which.matches(q.pid, q.pgid)) {
         children = true;
         let status = match q.job_report {
             Some(JobReport::Stopped(sig)) if options & WUNTRACED != 0 => 0x7f | (sig as i32) << 8,

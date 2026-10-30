@@ -325,8 +325,9 @@ is likely descheduled; it takes a new ticket when it runs): FIFO hands
 off as a futex ping-pong wants, and a descheduled waiter doesn't stall
 everyone. What runs in parallel is user code: each CPU runs
 a thread of any process. Between kernel entries every process is in
-`procs::PROCS`; `smp::lock` moves the one this CPU runs into this CPU's
-slot of `PROCESS` (and `CURRENT_PID`, /proc/self, is per CPU too) and
+`procs::PROCS`; `smp::lock` moves the one this CPU runs (boxed: a
+pointer) into this CPU's slot of `PROCESS` (and `CURRENT_PID`,
+/proc/self, is per CPU too) and
 `smp::unlock` puts it back (a finished-off one goes then, out of TTBR0
 first), so kernel code still sees "the running process" and "the
 others", and a process in `PROCS` may be running on another CPU. Under

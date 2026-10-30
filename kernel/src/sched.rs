@@ -30,11 +30,11 @@ pub const SLICE_NS: u64 = 10_000_000;
 /// nothing to run, the CPU is left with no thread (`running` false) and its
 /// timer set for what comes next: `smp::finish` waits for it, then calls
 /// this again.
-pub fn schedule(slot: &mut Option<Process>, tf: &mut TrapFrame) {
+pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFrame) {
     let mut procs = PROCS.lock();
     let mut was = None;
     let mut alone = true;
-    if let Some(p) = slot.as_mut() {
+    if let Some(p) = slot.as_deref_mut() {
         p.resched = false;
         let prev = p.current;
         was = p.running.then_some((p.pid, prev));
@@ -71,15 +71,15 @@ pub fn schedule(slot: &mut Option<Process>, tf: &mut TrapFrame) {
             crate::ipc::changed();
         }
     }
-    procs::reap_others(slot.as_mut(), &mut procs);
+    procs::reap_others(slot.as_deref_mut(), &mut procs);
     // A timer interrupt that brought an idle CPU here (`irq` takes its own).
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
-    if !poll(slot.as_mut(), &mut procs) && timer {
+    if !poll(slot.as_deref_mut(), &mut procs) && timer {
         smp::note(smp::Stat::TimerIdle, 1);
     }
     // Others may have ended just now too (a timer's signal, the host's).
-    procs::reap_others(slot.as_mut(), &mut procs);
-    if let Some(p) = slot.as_mut() {
+    procs::reap_others(slot.as_deref_mut(), &mut procs);
+    if let Some(p) = slot.as_deref_mut() {
         // The process may have ended just now (a timer's signal, the host's).
         if p.exit_status.is_some() && !p.dead && alone {
             procs::finalize(p, None, &mut procs);
@@ -91,8 +91,8 @@ pub fn schedule(slot: &mut Option<Process>, tf: &mut TrapFrame) {
         }
     }
     crate::stats::tasks(procs.count(), procs::threads());
-    let Some(next) = pick(slot.as_ref(), &procs, alone) else {
-        idle(slot.as_mut(), &mut procs);
+    let Some(next) = pick(slot.as_deref(), &procs, alone) else {
+        idle(slot.as_deref_mut(), &mut procs);
         return;
     };
     if slot.as_ref().is_none_or(|p| p.pid != next) {
@@ -150,7 +150,7 @@ pub fn runnable(q: &Process) -> bool {
 
 /// Another process has threads waiting to run.
 pub fn others_wait(procs: &Procs) -> bool {
-    procs.others.values().any(runnable)
+    procs.others.values().any(|q| runnable(q))
 }
 
 /// Everything due, in every process: timers, I/O waiters, expired
@@ -211,7 +211,7 @@ pub fn wake_io_everywhere(p: &mut Process) {
     procs::reap_others(Some(&mut *p), &mut procs);
     crate::fasync::deliver(Some(&mut *p), &mut procs);
     let mut woke = false;
-    for q in procs.others.values_mut() {
+    for q in procs.others_mut() {
         woke |= q.wake_io_waiters();
     }
     if woke {
