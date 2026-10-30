@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <linux/aio_abi.h>
 #include <linux/openat2.h>
 #include <netinet/in.h>
@@ -43,6 +44,10 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
 
 #define CHECK(c)                                                                  \
     do {                                                                          \
@@ -952,6 +957,52 @@ static void t_execperm(void) {
     CHECK(waitpid(c, &status, 0) == c && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void as_user(void (*f)(void)) {
+    fflush(stdout);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        f();
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(c, &status, 0) == c && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static void in_group(void) {
+    gid_t groups[] = {3000};
+    CHECK(setgroups(1, groups) == 0 && setgid(2000) == 0 && setuid(2000) == 0);
+    CHECK(open("/tmp/f", O_RDONLY) >= 0 && access("/tmp/f", R_OK) == 0);
+    FAILS(open("/tmp/f", O_WRONLY), EACCES);
+    FAILS(access("/tmp/f", W_OK), EACCES);
+    // One of its groups, and no other.
+    CHECK(chown("/tmp/own", -1, 3000) == 0);
+    FAILS(chown("/tmp/own", -1, 4000), EPERM);
+}
+
+static void not_in_group(void) {
+    CHECK(setgroups(0, 0) == 0 && setgid(2000) == 0 && setuid(2000) == 0);
+    FAILS(open("/tmp/f", O_RDONLY), EACCES);
+    FAILS(access("/tmp/f", R_OK), EACCES);
+}
+
+// access asks for the real ids, AT_EACCESS and open for the effective.
+static void other_effective(void) {
+    CHECK(setgroups(0, 0) == 0 && setgid(2000) == 0 && setresuid(2000, 2001, 2000) == 0);
+    CHECK(access("/tmp/own", R_OK) == 0);
+    FAILS(syscall(SYS_faccessat2, AT_FDCWD, "/tmp/own", R_OK, AT_EACCESS), EACCES);
+    FAILS(open("/tmp/own", O_RDONLY), EACCES);
+}
+
+static void t_groupperm(void) {
+    CHECK(getuid() == 0);
+    int f = open("/tmp/f", O_CREAT | O_WRONLY, 0640), own = open("/tmp/own", O_CREAT | O_WRONLY, 0400);
+    CHECK(f >= 0 && own >= 0 && fchown(f, 0, 3000) == 0 && fchown(own, 2000, 2000) == 0);
+    as_user(in_group);
+    as_user(not_in_group);
+    as_user(other_effective);
+}
+
 // ---- /proc/self/fd/N/name
 
 static void fdpath_jailed(void) {
@@ -1213,7 +1264,7 @@ int main(int argc, char **argv) {
     struct { const char *name; void (*f)(void); } tests[] = {
         {"mode3", t_mode3}, {"opath", t_opath}, {"race", t_race}, {"heap", t_heap}, {"timers", t_timers},
         {"epoll", t_epoll}, {"argv", t_argv}, {"tabs", t_tabs}, {"ptsperm", t_ptsperm}, {"sigioperm", t_sigioperm},
-        {"execperm", t_execperm},
+        {"execperm", t_execperm}, {"groupperm", t_groupperm},
         {"fasync", t_fasync}, {"timerfd", t_timerfd}, {"fexec", t_fexec}, {"fdpath", t_fdpath},
         {"altstack", t_altstack}, {"rules", t_rules},
     };

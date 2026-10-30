@@ -72,7 +72,7 @@ fn resolve(p: &mut Process, addr: u64, len: u64) -> Result<SockRef, Errno> {
             let mut fs = fs::lock();
             let ino = fs.lookup(base, &path, true)?;
             let Kind::Socket(id) = fs.node(ino).kind else { return Err(ECONNREFUSED) };
-            if !fs.permits(ino, p.uid, p.gid, MAY_WRITE) {
+            if !fs.permits(ino, p.who(), MAY_WRITE) {
                 return Err(EACCES);
             }
             drop(fs);
@@ -145,7 +145,7 @@ pub fn bind(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResult {
             {
                 d.check(&fs, dir, crate::landlock::MAKE_SOCK)?;
             }
-            match fs.create(dir, &leaf, Kind::Socket(id), perm, p.uid, p.gid) {
+            match fs.create(dir, &leaf, Kind::Socket(id), perm, p.who()) {
                 Ok(_) => {}
                 Err(EEXIST) => return Err(EADDRINUSE),
                 Err(e) => return Err(e),

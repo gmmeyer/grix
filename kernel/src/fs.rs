@@ -666,16 +666,31 @@ fn free_page(pa: u64) {
     PAGES_USED.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// Who a check is for: the ids that count, and new files get.
+#[derive(Clone, Copy)]
+pub struct Who<'a> {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: &'a [u32],
+}
+
+impl Who<'_> {
+    /// Linux's in_group_p: the group, or a supplementary one.
+    pub fn in_group(&self, group: u32) -> bool {
+        self.gid == group || self.groups.contains(&group)
+    }
+}
+
 /// Unix permission check (`MAY_*` bits) of a node with `mode`, owned by
-/// `owner`/`group`, for `uid`/`gid`. Root passes, except for executing a
-/// file with no execute bit at all.
-pub fn mode_permits(mode: u32, owner: u32, group: u32, is_dir: bool, uid: u32, gid: u32, want: u32) -> bool {
-    if uid == 0 {
+/// `owner`/`group`, for `who`. Root passes, except for executing a file
+/// with no execute bit at all.
+pub fn mode_permits(mode: u32, owner: u32, group: u32, is_dir: bool, who: Who, want: u32) -> bool {
+    if who.uid == 0 {
         return want & MAY_EXEC == 0 || mode & 0o111 != 0 || is_dir;
     }
-    let bits = if uid == owner {
+    let bits = if who.uid == owner {
         mode >> 6
-    } else if gid == group {
+    } else if who.in_group(group) {
         mode >> 3
     } else {
         mode
@@ -2038,15 +2053,15 @@ impl Fs {
     // ------------------------------------------------------------ permissions and changes
 
     /// Unix permission check for the sandbox user (`MAY_*` bits).
-    pub fn permits(&self, ino: Ino, uid: u32, gid: u32, want: u32) -> bool {
+    pub fn permits(&self, ino: Ino, who: Who, want: u32) -> bool {
         let n = &self.nodes[ino];
-        mode_permits(n.perm, n.uid, n.gid, self.is_dir(ino), uid, gid, want)
+        mode_permits(n.perm, n.uid, n.gid, self.is_dir(ino), who, want)
     }
 
-    /// May `uid` add or remove names in `dir`? Sticky directories (like
+    /// May `who` add or remove names in `dir`? Sticky directories (like
     /// /tmp) also require owning the entry or the directory to remove it.
-    fn may_change(&self, dir: Ino, victim: Option<Ino>, uid: u32, gid: u32) -> Result<(), Errno> {
-        if self.nodes[dir].system || !self.permits(dir, uid, gid, MAY_WRITE | MAY_EXEC) {
+    fn may_change(&self, dir: Ino, victim: Option<Ino>, who: Who) -> Result<(), Errno> {
+        if self.nodes[dir].system || !self.permits(dir, who, MAY_WRITE | MAY_EXEC) {
             return Err(EACCES);
         }
         if victim.is_some_and(|v| self.nodes[v].mount_point) {
@@ -2054,9 +2069,9 @@ impl Fs {
         }
         if let Some(v) = victim
             && self.nodes[dir].perm & S_ISVTX != 0
-            && uid != 0
-            && uid != self.nodes[v].uid
-            && uid != self.nodes[dir].uid
+            && who.uid != 0
+            && who.uid != self.nodes[v].uid
+            && who.uid != self.nodes[dir].uid
         {
             return Err(EPERM);
         }
@@ -2154,7 +2169,7 @@ impl Fs {
     }
 
     /// Create `name` in `dir`, owned by `uid`/`gid`. `name` must be new.
-    pub fn create(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
+    pub fn create(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, who: Who) -> Result<Ino, Errno> {
         if self.nodes[dir].nlink == 0 {
             return Err(ENOENT); // the directory was removed
         }
@@ -2164,17 +2179,17 @@ impl Fs {
             if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
                 return Err(EEXIST);
             }
-            self.may_change(dir, None, uid, gid)?;
+            self.may_change(dir, None, who)?;
             self.copy_up(dir)?;
         }
         if self.nodes[dir].remote.is_some() {
-            return self.create_remote(dir, name, kind, perm, uid, gid);
+            return self.create_remote(dir, name, kind, perm, who);
         }
         if name.is_empty() || name == "." || name == ".." || self.child(dir, name).is_some() {
             return Err(EEXIST);
         }
-        self.may_change(dir, None, uid, gid)?;
-        let mut node = Node::new(kind, perm, (uid, gid), dir, name, crate::time::realtime_ns());
+        self.may_change(dir, None, who)?;
+        let mut node = Node::new(kind, perm, (who.uid, who.gid), dir, name, crate::time::realtime_ns());
         node.changed = true;
         self.reclaim();
         charge(node.cost() + entry_cost(name))?;
@@ -2187,15 +2202,15 @@ impl Fs {
 
     /// An unnamed file in `dir` (O_TMPFILE). It goes away when its last
     /// descriptor closes, unless linkat gives it a name.
-    pub fn create_unnamed(&mut self, dir: Ino, perm: u32, uid: u32, gid: u32) -> Result<(Ino, Content), Errno> {
+    pub fn create_unnamed(&mut self, dir: Ino, perm: u32, who: Who) -> Result<(Ino, Content), Errno> {
         // As on Linux for a filesystem that can't do O_TMPFILE.
         if self.nodes[dir].remote.is_some() {
             return Err(EOPNOTSUPP);
         }
-        self.may_change(dir, None, uid, gid)?;
+        self.may_change(dir, None, who)?;
         let content = FileData::new(&[]);
         let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: true };
-        let mut node = Node::new(kind, perm, (uid, gid), dir, "", crate::time::realtime_ns());
+        let mut node = Node::new(kind, perm, (who.uid, who.gid), dir, "", crate::time::realtime_ns());
         (node.nlink, node.changed) = (0, true);
         self.reclaim();
         charge(node.cost())?;
@@ -2207,13 +2222,13 @@ impl Fs {
     /// memfd_create: an anonymous file that only ever lives in descriptors.
     /// It isn't in the tree, so it needs no directory permission (or
     /// `fs_write`), but its pages and node count against the same limits.
-    pub fn create_memfd(&mut self, name: &str, seals: u32, uid: u32, gid: u32) -> Result<(Ino, Content), Errno> {
+    pub fn create_memfd(&mut self, name: &str, seals: u32, who: Who) -> Result<(Ino, Content), Errno> {
         let content = FileData::new(&[]);
         content.lock().seals = Some(seals);
         let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: false };
         // /proc/self/fd shows it as Linux does.
         let label = alloc::format!("memfd:{name} (deleted)");
-        let mut node = Node::new(kind, 0o777, (uid, gid), ROOT, &label, crate::time::realtime_ns());
+        let mut node = Node::new(kind, 0o777, (who.uid, who.gid), ROOT, &label, crate::time::realtime_ns());
         (node.nlink, node.changed) = (0, true);
         self.reclaim();
         charge(node.cost() + label.len() as u64)?;
@@ -2242,7 +2257,7 @@ impl Fs {
     }
 
     /// unlink / rmdir `name` in `dir`.
-    pub fn remove(&mut self, dir: Ino, name: &str, rmdir: bool, uid: u32, gid: u32) -> Result<(), Errno> {
+    pub fn remove(&mut self, dir: Ino, name: &str, rmdir: bool, who: Who) -> Result<(), Errno> {
         if self.is_lazy(dir) {
             let ino = self.find_child(dir, name)?.ok_or(ENOENT)?;
             match (self.is_dir(ino), rmdir) {
@@ -2250,7 +2265,7 @@ impl Fs {
                 (false, true) => return Err(ENOTDIR),
                 _ => {}
             }
-            self.may_change(dir, Some(ino), uid, gid)?;
+            self.may_change(dir, Some(ino), who)?;
             if rmdir && self.is_lazy(ino) && !self.lazy_dir_empty(ino)? {
                 return Err(ENOTEMPTY);
             }
@@ -2271,7 +2286,7 @@ impl Fs {
             (_, true) => return Err(ENOTDIR),
             (_, false) => {}
         }
-        self.may_change(dir, Some(ino), uid, gid)?;
+        self.may_change(dir, Some(ino), who)?;
         if let Some((id, writable)) = remote {
             if !writable {
                 return Err(EROFS);
@@ -2290,7 +2305,7 @@ impl Fs {
     }
 
     /// Give `ino` (not a directory) another name.
-    pub fn link(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+    pub fn link(&mut self, ino: Ino, dir: Ino, name: &str, who: Who) -> Result<(), Errno> {
         if self.is_dir(ino) {
             return Err(EPERM);
         }
@@ -2298,7 +2313,7 @@ impl Fs {
             if self.find_child(dir, name)?.is_some() {
                 return Err(EEXIST);
             }
-            self.may_change(dir, None, uid, gid)?;
+            self.may_change(dir, None, who)?;
             self.copy_up(dir)?;
             self.copy_up(ino)?;
         }
@@ -2306,7 +2321,7 @@ impl Fs {
         // across a mount.
         match (self.nodes[ino].remote.as_ref(), self.nodes[dir].remote.as_ref()) {
             (None, None) => {}
-            (Some(a), Some(b)) if a.mount == b.mount => return self.link_remote(ino, dir, name, uid, gid),
+            (Some(a), Some(b)) if a.mount == b.mount => return self.link_remote(ino, dir, name, who),
             _ => return Err(EXDEV),
         }
         if self.nodes[dir].nlink == 0 {
@@ -2318,7 +2333,7 @@ impl Fs {
         if self.nodes[ino].system {
             return Err(EPERM);
         }
-        self.may_change(dir, None, uid, gid)?;
+        self.may_change(dir, None, who)?;
         let revive = match &self.nodes[ino].kind {
             // An O_TMPFILE file getting its first name. Other unlinked files
             // stay gone, as on Linux.
@@ -2346,7 +2361,7 @@ impl Fs {
     /// `link` within a live mount: the host links the file (never what a
     /// link points at), and the new name is a node of its own, as a
     /// listing would bring it (another id: the host keeps one per name).
-    fn link_remote(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+    fn link_remote(&mut self, ino: Ino, dir: Ino, name: &str, who: Who) -> Result<(), Errno> {
         let r = self.nodes[dir].remote.as_deref().unwrap();
         let (did, mount, writable) = (r.id, r.mount, r.writable);
         let id = self.nodes[ino].remote.as_deref().unwrap().id;
@@ -2356,7 +2371,7 @@ impl Fs {
         if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
             return Err(EEXIST);
         }
-        self.may_change(dir, None, uid, gid)?;
+        self.may_change(dir, None, who)?;
         let target = match &self.nodes[ino].kind {
             Kind::Symlink(t) => t.clone(),
             _ => String::new(),
@@ -2395,15 +2410,14 @@ impl Fs {
         nname: &str,
         noreplace: bool,
         exchange: bool,
-        uid: u32,
-        gid: u32,
+        who: Who,
     ) -> Result<(), Errno> {
         if self.is_lazy(odir) || self.is_lazy(ndir) {
             let src = self.find_child(odir, oname)?.ok_or(ENOENT)?;
             let _src = self.pin(src);
             let dst = self.find_child(ndir, nname)?;
-            self.may_change(odir, Some(src), uid, gid)?;
-            self.may_change(ndir, dst, uid, gid)?;
+            self.may_change(odir, Some(src), who)?;
+            self.may_change(ndir, dst, who)?;
             // Replacing a lazy import's directory: only an empty one.
             if let Some(d) = dst.filter(|&d| self.is_dir(d) && self.is_lazy(d))
                 && self.is_dir(src)
@@ -2433,8 +2447,8 @@ impl Fs {
             (Some(a), Some(b)) if a.mount == b.mount => Some((a.id, b.id, a.writable)),
             _ => return Err(EXDEV),
         };
-        self.may_change(odir, Some(src), uid, gid)?;
-        self.may_change(ndir, dst, uid, gid)?;
+        self.may_change(odir, Some(src), who)?;
+        self.may_change(ndir, dst, who)?;
         // A directory can't move into itself or its own subtree.
         for (moving, into) in [(Some(src), ndir), (dst.filter(|_| exchange), odir)] {
             if let Some(m) = moving.filter(|&m| self.is_dir(m)) {
@@ -2844,7 +2858,7 @@ impl Fs {
         self.remote_files.retain(|_, w| w.strong_count() > 0);
     }
 
-    fn create_remote(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, uid: u32, gid: u32) -> Result<Ino, Errno> {
+    fn create_remote(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, who: Who) -> Result<Ino, Errno> {
         let r = self.nodes[dir].remote.as_deref().unwrap();
         let (id, mount, writable) = (r.id, r.mount, r.writable);
         if !writable {
@@ -2853,7 +2867,7 @@ impl Fs {
         if name.is_empty() || name == "." || name == ".." {
             return Err(EEXIST);
         }
-        self.may_change(dir, None, uid, gid)?;
+        self.may_change(dir, None, who)?;
         let (ty, target) = match &kind {
             Kind::File(_) => (FileType::File, ""),
             Kind::Dir(_) => (FileType::Dir, ""),

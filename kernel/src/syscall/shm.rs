@@ -90,10 +90,10 @@ impl Segment {
         if p.uid == 0 {
             return true;
         }
-        let in_group = |g: u32| p.gid == g || p.ids.groups.contains(&g);
+        let who = p.who();
         let shift = if p.uid == self.uid || p.uid == self.cuid {
             6
-        } else if in_group(self.gid) || in_group(self.cgid) {
+        } else if who.in_group(self.gid) || who.in_group(self.cgid) {
             3
         } else {
             0

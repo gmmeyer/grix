@@ -727,6 +727,11 @@ impl Process {
         self.runq.push_back(tid);
     }
 
+    /// The ids that count for a permission check.
+    pub fn who(&self) -> fs::Who<'_> {
+        fs::Who { uid: self.uid, gid: self.gid, groups: &self.ids.groups }
+    }
+
     /// Stop a thread's wait (leaving its futex queue) without making it runnable.
     pub fn cancel_wait(&mut self, tid: u32) -> Option<Wait> {
         let t = self.threads.get_mut(&tid)?;
@@ -1064,7 +1069,7 @@ pub fn load_program(
     let landlock = crate::landlock::domain(p);
     let (exe, ino, src, argv) = {
         let mut fs = fs::lock();
-        resolve_interpreters(&mut fs, landlock.as_deref(), (p.uid, p.gid), start, path, argv)?
+        resolve_interpreters(&mut fs, landlock.as_deref(), p.who(), start, path, argv)?
     };
     let bytes: u64 = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
     // What they hold on the heap (`Process::argv`, the name): an empty
@@ -1214,7 +1219,7 @@ fn may_execute(
 fn resolve_interpreters(
     fs: &mut fs::Fs,
     landlock: Option<&crate::landlock::Domain>,
-    (uid, gid): (u32, u32),
+    who: fs::Who,
     start: Start,
     path: &str,
     mut argv: Vec<String>,
@@ -1238,7 +1243,7 @@ fn resolve_interpreters(
         let Some(content) = content else {
             return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file")));
         };
-        if !fs.permits(ino, uid, gid, fs::MAY_EXEC) {
+        if !fs.permits(ino, who, fs::MAY_EXEC) {
             return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable")));
         }
         let src = elf::Source::of(&content);

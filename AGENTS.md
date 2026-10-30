@@ -320,9 +320,10 @@ signal dispositions before `finalize` lets them go). CLONE_PARENT makes
 the caller's parent the child's, with the caller's exit signal: that
 parent reaps the zombie, and a vfork caller isn't always the parent
 (`vfork_parent`). New namespaces are denied, by clone and by unshare. Credentials: `Process::uid`/`gid` are the effective ids
-(permission checks, new files); `Process::ids` keeps the real and saved
-ones and supplementary groups, changed by Linux's rules (uid 0 may set
-anything). They only matter inside the guest filesystem: root bypasses
+(permission checks, new files, `Process::who` with the groups);
+`Process::ids` keeps the real and saved ones and supplementary groups,
+changed by Linux's rules (uid 0 may set anything). They only matter
+inside the guest filesystem: root bypasses
 mode bits but not `Node::system`, and nothing honours setuid bits, so
 keep it that way rather than giving uid 0 anything else.
 

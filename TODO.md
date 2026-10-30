@@ -309,8 +309,10 @@ makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
 
 Left, none of it a way out of the sandbox:
 
-- [ ] Permission checks know one group: `mode_permits` doesn't look at
-      supplementary groups (`Ids::groups`).
+- [ ] A path's directories aren't searched by anyone's permission: only
+      the last component is checked (`MAY_EXEC` on the way down isn't).
+- [ ] An image's user gets no supplementary groups from its `/etc/group`,
+      as Docker's does; `initgroups` in the program works.
 - [ ] `/proc/self/fd/N` opens the same open file (no new access mode, no
       new offset, no permission check); Linux's is a new open.
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:

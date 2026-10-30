@@ -396,7 +396,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             if !fs.is_dir(dir) {
                 return Err(ENOTDIR);
             }
-            let (ino, content) = fs.create_unnamed(dir, perm, p.uid, p.gid)?;
+            let (ino, content) = fs.create_unnamed(dir, perm, p.who())?;
             // Opened as a file in `dir`.
             let denied = match &landlock {
                 Some(d) => landlock::open_access(d, &fs, ino, dir, acc)?,
@@ -498,7 +498,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         // Linux's may_open: read and write as `open`'s mode asks.
         let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
         match &fs.node(ino).kind {
-            Kind::Dev(_) if !fs.permits(ino, p.uid, p.gid, want) => return Err(EACCES),
+            Kind::Dev(_) if !fs.permits(ino, p.who(), want) => return Err(EACCES),
             &Kind::Dev(d @ (Dev::Ptmx | Dev::Pts(_) | Dev::Tty)) => {
                 let denied = landlock_open(&fs)?;
                 let file = super::tty::open_dev(p, &mut fs, d, ino, flags)?;
@@ -526,7 +526,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             // Reading a directory needs read permission, as on Linux; a live
             // mount's must be one the host can list, too.
             Kind::Dir(_) => {
-                if !fs.permits(ino, p.uid, p.gid, MAY_READ) {
+                if !fs.permits(ino, p.who(), MAY_READ) {
                     return Err(EACCES);
                 }
                 landlock_open(&fs)?;
@@ -541,7 +541,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             // Linux's mem_open without ptrace_may_access(ATTACH).
             Kind::Proc(ProcFile::Mem) if proc_pid.is_some() => return Err(EACCES),
             Kind::Proc(ProcFile::Mem) => {
-                if !fs.permits(ino, p.uid, p.gid, want) {
+                if !fs.permits(ino, p.who(), want) {
                     return Err(EACCES);
                 }
                 landlock_open(&fs)?;
@@ -552,7 +552,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             }
             // A thread's name, for its owner (0644).
             Kind::Proc(f) if writes && procfs::writable(*f) => {
-                if !fs.permits(ino, p.uid, p.gid, want) {
+                if !fs.permits(ino, p.who(), want) {
                     return Err(EACCES);
                 }
                 landlock_open(&fs)?;
@@ -600,7 +600,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             need_write(p, n, path)?;
         }
         let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
-        if !fs::lock().permits(ino, p.uid, p.gid, want) {
+        if !fs::lock().permits(ino, p.who(), want) {
             return Err(EACCES);
         }
     }
@@ -644,7 +644,7 @@ fn open_fifo(p: &mut Process, ino: Ino, flags: u32, cloexec: bool) -> SysResult 
         _ => return Err(EINVAL),
     };
     let mut fs = fs::lock();
-    if !fs.permits(ino, p.uid, p.gid, want) {
+    if !fs.permits(ino, p.who(), want) {
         return Err(EACCES);
     }
     let pin = fs.pin(ino);
@@ -732,7 +732,7 @@ fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32, sc
     {
         d.check(&fs, dir, landlock::MAKE_REG)?;
     }
-    fs.create(dir, &name, Kind::File(FileData::new(&[])), perm, p.uid, p.gid)
+    fs.create(dir, &name, Kind::File(FileData::new(&[])), perm, p.who())
 }
 
 /// fsync/fdatasync: a live mount's file is synced on the host; everything
@@ -1646,6 +1646,7 @@ pub fn faccessat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64, flags: u64)
     const R_OK: u64 = 4;
     const W_OK: u64 = 2;
     const X_OK: u64 = 1;
+    const AT_EACCESS: u64 = 0x200;
     let st = path_stat(p, dirfd, pathp, flags)?;
     if mode & !(R_OK | W_OK | X_OK) != 0 {
         return Err(EINVAL);
@@ -1656,7 +1657,12 @@ pub fn faccessat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64, flags: u64)
         return Err(EROFS);
     }
     let is_dir = st.mode & 0o170000 == fs::S_IFDIR;
-    if !fs::mode_permits(st.mode, st.uid, st.gid, is_dir, p.uid, p.gid, mode as u32) {
+    // The real ids, unless AT_EACCESS: "may whoever started me do this?"
+    let who = match flags & AT_EACCESS {
+        0 => fs::Who { uid: p.ids.ruid, gid: p.ids.rgid, groups: &p.ids.groups },
+        _ => p.who(),
+    };
+    if !fs::mode_permits(st.mode, st.uid, st.gid, is_dir, who, mode as u32) {
         return Err(EACCES);
     }
     Ok(0)
@@ -1844,7 +1850,7 @@ pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
     need_write_in(p, nr::mkdirat, Some(dir), &path)?;
     landlock::check(p, dir, landlock::MAKE_DIR)?;
     let perm = mode as u32 & 0o1777 & !p.umask();
-    fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
+    fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.who()).map(|_| 0)
 }
 
 /// mknod: named pipes and regular files. Device nodes would reach
@@ -1872,7 +1878,7 @@ pub fn mknodat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
     {
         d.check(&fs, dir, landlock::make_access(&kind))?;
     }
-    fs.create(dir, &name, kind, perm, p.uid, p.gid).map(|_| 0)
+    fs.create(dir, &name, kind, perm, p.who()).map(|_| 0)
 }
 
 pub fn unlinkat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult {
@@ -1901,7 +1907,7 @@ pub fn unlinkat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResul
     {
         d.check(&fs, dir, if rmdir { landlock::REMOVE_DIR } else { landlock::REMOVE_FILE })?;
     }
-    fs.remove(dir, &name, rmdir, p.uid, p.gid).map(|_| 0)
+    fs.remove(dir, &name, rmdir, p.who()).map(|_| 0)
 }
 
 pub fn renameat2(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u64, flags: u64) -> SysResult {
@@ -1935,7 +1941,7 @@ pub fn renameat2(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp:
             d.check_refer(&fs, src, odir, ndir, dst, true, exchange)?;
         }
     }
-    fs.rename(odir, &oname, ndir, &nname, noreplace, exchange, p.uid, p.gid).map(|_| 0)
+    fs.rename(odir, &oname, ndir, &nname, noreplace, exchange, p.who()).map(|_| 0)
 }
 
 pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u64, flags: u64) -> SysResult {
@@ -1960,7 +1966,7 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
         let odir = fs.found_in(src, obase, &opath, &fs::Scope::NONE);
         d.check_refer(&fs, src, odir, dir, None, false, false)?;
     }
-    fs.link(src, dir, &name, p.uid, p.gid).map(|_| 0)
+    fs.link(src, dir, &name, p.who()).map(|_| 0)
 }
 
 pub fn symlinkat(p: &mut Process, targetp: u64, dirfd: u64, pathp: u64) -> SysResult {
@@ -1976,7 +1982,7 @@ pub fn symlinkat(p: &mut Process, targetp: u64, dirfd: u64, pathp: u64) -> SysRe
     {
         d.check(&fs, dir, landlock::MAKE_SYM)?;
     }
-    fs.create(dir, &name, Kind::Symlink(target), 0o777, p.uid, p.gid).map(|_| 0)
+    fs.create(dir, &name, Kind::Symlink(target), 0o777, p.who()).map(|_| 0)
 }
 
 /// Set a regular file's length, as truncate/ftruncate do.
@@ -2014,7 +2020,7 @@ pub fn truncate(p: &mut Process, pathp: u64, len: u64) -> SysResult {
     if fs.is_dir(ino) {
         return Err(EISDIR);
     }
-    if !fs.permits(ino, p.uid, p.gid, MAY_WRITE) {
+    if !fs.permits(ino, p.who(), MAY_WRITE) {
         return Err(EACCES);
     }
     if let Some(d) = landlock::domain_changing(p, &fs, ino) {
@@ -2108,14 +2114,15 @@ pub fn fchmodat2(p: &mut Process, dirfd: u64, pathp: u64, mode: u64, flags: u64)
 }
 
 /// chown: without privileges a program can only "change" a file it owns to
-/// its own uid and its own group, as on Linux. -1 leaves an id alone.
+/// its own uid and one of its groups, as on Linux. -1 leaves an id alone.
 fn set_owner(p: &mut Process, ino: Ino, uid: u64, gid: u64) -> SysResult {
     let (uid, gid) = (uid as u32, gid as u32);
     let mut fs = fs::lock();
     let n = fs.node(ino);
     let new_uid = if uid == u32::MAX { n.uid } else { uid };
     let new_gid = if gid == u32::MAX { n.gid } else { gid };
-    if n.system || (p.uid != 0 && (n.uid != p.uid || new_uid != n.uid || (new_gid != n.gid && new_gid != p.gid))) {
+    let group_ok = new_gid == n.gid || p.who().in_group(new_gid);
+    if n.system || (p.uid != 0 && (n.uid != p.uid || new_uid != n.uid || !group_ok)) {
         return Err(EPERM);
     }
     // A lazy import's node becomes the sandbox's. A live mount's files
@@ -2184,7 +2191,7 @@ pub fn utimensat(p: &mut Process, dirfd: u64, pathp: u64, times: u64, flags: u64
     }
     let owner = p.uid == 0 || fs.node(ino).uid == p.uid;
     // Setting explicit times needs ownership; "now" also works with write permission.
-    if !owner && (explicit || !fs.permits(ino, p.uid, p.gid, MAY_WRITE)) {
+    if !owner && (explicit || !fs.permits(ino, p.who(), MAY_WRITE)) {
         return Err(if explicit { EPERM } else { EACCES });
     }
     fs.set_attr(ino, None, set[0], set[1]).map(|_| 0)
@@ -2681,7 +2688,7 @@ pub fn memfd_create(p: &mut Process, namep: u64, flags: u64) -> SysResult {
     }
     let sealable = flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0;
     let seals = if sealable { 0 } else { fs::F_SEAL_SEAL };
-    let (ino, content) = fs::lock().create_memfd(&name, seals, p.uid, p.gid)?;
+    let (ino, content) = fs::lock().create_memfd(&name, seals, p.who())?;
     open_node(p, ino, Some(content), O_RDWR, flags & MFD_CLOEXEC != 0, 0)
 }
 
@@ -3337,7 +3344,7 @@ fn xattr_permission(p: &Process, fs: &fs::Fs, ino: Ino, ns: XattrNs, write: bool
             if write && dir && n.perm & fs::S_ISVTX != 0 && p.uid != 0 && p.uid != n.uid {
                 return Err(EPERM);
             }
-            if !fs.permits(ino, p.uid, p.gid, if write { MAY_WRITE } else { MAY_READ }) {
+            if !fs.permits(ino, p.who(), if write { MAY_WRITE } else { MAY_READ }) {
                 return Err(EACCES);
             }
             Ok(())
