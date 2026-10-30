@@ -309,6 +309,10 @@ let sandbox = Sandbox::builder()
   fixture has it).
 - `forward_listener` takes a `TcpListener` you bound (port 0 to let the OS
   pick), for tests; `forward_udp_socket` a `UdpSocket`.
+- A forwarded TCP port reaches a server listening on all addresses
+  (`0.0.0.0`, `::`) or the sandbox's own (10.0.2.15), not one bound to
+  `127.0.0.1` only, as with Docker's published ports: such a server is
+  reachable only from inside the sandbox.
 - A forwarded UDP port's datagrams go to the socket bound at the guest
   port (on any address or 10.0.2.15). `recvfrom` shows each sender's own
   address, except the host's loopback (127.0.0.1, `::1`), which is

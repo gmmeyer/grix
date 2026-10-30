@@ -880,8 +880,10 @@ pub fn from_host(payload: &[u8]) {
         }
         ToGuest::Incoming { id, port, peer, peer_port } => {
             let local = SockAddr::v4(link::GUEST_V4, port);
-            // Forwarded to the port, whatever address it listens on.
-            let listener = Listener::find(local).or_else(|| listeners_on(port).into_iter().next());
+            // From outside: to a listener on the guest's own address or
+            // all of them, not one bound to loopback only, which Linux
+            // (and Docker's published ports) keep from outside too.
+            let listener = Listener::find(local);
             let made = Conn::new(id, ConnState::Open, local, SockAddr { addr: peer, port: peer_port });
             match (listener, made.and_then(Conn::register), Slot::take()) {
                 // A refused Conn says Close as it's dropped.

@@ -183,7 +183,9 @@ flows as `Data` messages with credit-based flow control (`link::WINDOW` per
 connection each way; stdin uses the same scheme). Connections to the
 guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
-as `Incoming`. UDP (`inet::Udp`): a query to port 53 goes to the host's
+as `Incoming`, for a listener on the guest's address or all of them,
+never one bound to loopback only (as on Linux, and Docker's published
+ports). UDP (`inet::Udp`): a query to port 53 goes to the host's
 resolver; a datagram to the guest's own address to the socket bound there
 (`deliver_local`); any other through the host (`ToHost::UdpSend`), to
 destinations the host allowed (`UdpAllow`, asked once per destination:

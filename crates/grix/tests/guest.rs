@@ -218,6 +218,47 @@ fn image_placeholders_for_hosts_and_resolv_conf() {
     assert_eq!(out.stdout_str(), "grix is 10.9.9.9\n");
 }
 
+/// A forwarded port reaches a listener on the guest's address (or all of
+/// them), never one bound to loopback only, as on Linux and with Docker's
+/// published ports.
+#[test]
+fn forwarded_ports_skip_loopback_only_listeners() {
+    use std::io::{Read, Write};
+    let (lo, served) =
+        (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let (lo_port, served_port) = (lo.local_addr().unwrap().port(), served.local_addr().unwrap().port());
+    let sb = with("inet")
+        .allow(Capability::Net)
+        .forward_listener(lo, 8000)
+        .unwrap()
+        .forward_listener(served, 8001)
+        .unwrap()
+        .build()
+        .unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/bin/inet", "server-pair", "8000", "8001"]).unwrap());
+    let started = std::time::Instant::now();
+    let mut c = loop {
+        assert!(started.elapsed() < Duration::from_secs(30), "the server never answered");
+        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", served_port)) else { continue };
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reply = [0u8; 5];
+        if c.write_all(b"ping\n").is_ok() && c.read_exact(&mut reply).is_ok() && &reply == b"pong\n" {
+            break c;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Turned away: the guest closes it at once, unread.
+    let mut lo = std::net::TcpStream::connect(("127.0.0.1", lo_port)).unwrap();
+    lo.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 8];
+    assert!(matches!(lo.read(&mut buf), Ok(0) | Err(_)));
+    c.write_all(b"done\n").unwrap();
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "served one; loopback-only: nothing\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn serving_through_a_forwarded_port() {
     use std::io::{BufRead, Write};

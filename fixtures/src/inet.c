@@ -277,8 +277,41 @@ static int server(int port) {
     return 0;
 }
 
+// Forwarded ports: a listener bound to loopback only isn't reachable from
+// outside; one on the guest's own address is. The host connects to the
+// loopback one (and is turned away) while this one's client waits, then
+// says "done".
+static int server_pair(int lo_port, int port) {
+    int lo = socket(AF_INET, SOCK_STREAM, 0), g = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(lo_port)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lo, (struct sockaddr *)&a, sizeof a) == 0 && listen(lo, 8) == 0);
+    a.sin_port = htons(port);
+    CHECK(inet_pton(AF_INET, "10.0.2.15", &a.sin_addr) == 1);
+    CHECK(bind(g, (struct sockaddr *)&a, sizeof a) == 0 && listen(g, 8) == 0);
+    int c = accept(g, 0, 0);
+    CHECK(c >= 0);
+    char line[64];
+    int got = 0;
+    while (got < (int)sizeof line - 1 && (got == 0 || line[got - 1] != '\n')) {
+        ssize_t n = read(c, line + got, 1);
+        CHECK(n == 1);
+        got++;
+    }
+    CHECK(write(c, "pong\n", 5) == 5);
+    // The host's connection to the loopback-only port has been turned
+    // away by now (it saw the close before it said "done").
+    char done[5];
+    CHECK(read(c, done, 5) == 5 && memcmp(done, "done\n", 5) == 0);
+    CHECK(fcntl(lo, F_SETFL, O_NONBLOCK) == 0);
+    CHECK(accept(lo, 0, 0) < 0 && errno == EAGAIN);
+    printf("served one; loopback-only: nothing\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "resolve") == 0) return resolve(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "server-pair") == 0) return server_pair(atoi(argv[2]), atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "server") == 0) return server(atoi(argv[2]));
     if (argc != 4 || strcmp(argv[1], "client") != 0) return 2;
     int port = atoi(argv[2]), closed = atoi(argv[3]);
