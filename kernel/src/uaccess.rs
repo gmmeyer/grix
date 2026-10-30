@@ -71,6 +71,12 @@ pub fn update_u32(a: &mut AddressSpace, addr: u64, f: impl Fn(u32) -> u32) -> Re
 /// Read a NUL-terminated string. Non-UTF-8 strings cannot name anything in
 /// our filesystem, so they are reported as ENOENT.
 pub fn read_cstr(a: &mut AddressSpace, addr: u64, max: usize) -> Result<String, Errno> {
+    String::from_utf8(read_cbytes(a, addr, max)?).map_err(|_| ENOENT)
+}
+
+/// A NUL-terminated string's bytes, whatever they are; ENAMETOOLONG if
+/// there are `max` or more.
+pub fn read_cbytes(a: &mut AddressSpace, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
     let mut out = Vec::new();
     let mut p = addr;
     loop {
@@ -79,7 +85,7 @@ pub fn read_cstr(a: &mut AddressSpace, addr: u64, max: usize) -> Result<String, 
         while p < page_end {
             let b = arch::user_access(|| unsafe { *(p as *const u8) });
             if b == 0 {
-                return String::from_utf8(out).map_err(|_| ENOENT);
+                return Ok(out);
             }
             out.push(b);
             p += 1;

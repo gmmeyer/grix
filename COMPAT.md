@@ -66,7 +66,7 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | rsync | 3.2.7 | `debian:bookworm` + apt | `rsync -a` of a tree | p w | works | `openat2` was unimplemented (reported); rsync fell back to `openat`. | Fixed: `openat2` |
 | vim | 9.0 | `debian:bookworm` + apt | `vim -Es`: edit and write a file | w | works | | |
 | bash, zsh | 5.2.15, 5.9 | `debian:bookworm` + apt | arrays, loops | — | works | | |
-| busybox, coreutils, findutils | Alpine's, Debian's | several | `mkdir -p`, `cp -a`, `find`, `xargs` | p w | works | `mkdir -p /tmp/w` without `fs_write` stopped at `mkdir("/")`: EPERM where Linux says EEXIST. `cp -a` can't copy xattrs (unimplemented, reported). | Fixed: `mkdir` EEXIST. Left: xattrs |
+| busybox, coreutils, findutils | Alpine's, Debian's | several | `mkdir -p`, `cp -a`, `find`, `xargs` | p w | works | `mkdir -p /tmp/w` without `fs_write` stopped at `mkdir("/")`: EPERM where Linux says EEXIST. `cp -a` couldn't copy xattrs (unimplemented, reported). | Fixed: `mkdir` EEXIST, xattrs |
 | supervisord | 4.2.5 | `debian:bookworm` + apt | two programs, autorestart, `supervisorctl` over its Unix socket, shutdown | t p w | works | | |
 | cron | 3.0pl1 (Debian) | `debian:bookworm` + apt | a `/etc/cron.d` job every minute | t p w | works | `prctl(27)` and an audit netlink socket are unimplemented (reported); cron goes on. | |
 
@@ -108,6 +108,7 @@ In this series (each with its check in `popular.c`):
 | shared memory budget | Shared memory's page list is charged to the kernel memory budget (it could fill the kernel heap) | anything with big `MAP_SHARED` or System V memory |
 | `openat2` | openat2 and its RESOLVE_* flags | rsync |
 | `RLIMIT_NOFILE` | Up to 65536 descriptors | Redis (`maxclients` 10000), busy servers |
+| xattrs | Extended attributes | `cp -a`, `tar --xattrs`, `setcap` |
 
 Already in 0.0.31 and the Datadog series (0.0.32), found here too:
 `/proc/<pid>/auxv` (Caddy, Traefik), connecting to 0.0.0.0 and `::` as
@@ -119,16 +120,15 @@ images from registries, run on their own machine).
 
 In order of impact (details in TODO.md, "Round 3"):
 
-1. **xattrs** (`cp -a`, `tar --xattrs`, `setcap` metadata).
-2. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
+1. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
    `io_getevents`, ...: requests complete as they're submitted).
    **io_uring** stays ENOSYS, on purpose and unreported (programs probe it): it is a
    second way into every operation (each would need its own gate), and
    Docker's default seccomp profile blocks it too, so programs (MariaDB,
    nginx, libuv) are used to falling back to AIO or plain calls.
-3. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
+2. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
    mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
-4. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
+3. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
    of `ID_AA64*`, `MIDR_EL1`, `MPIDR_EL1`, `REVIDR_EL1` emulated as
    Linux's `HWCAP_CPUID`, sanitized to what HWCAP advertises).
 

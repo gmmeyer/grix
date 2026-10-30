@@ -145,7 +145,10 @@ Left, in order of impact:
     each slot charged to kmem (fork copies only up to the last open
     one, and fails with ENOMEM past the budget), and the global
     open-file cap is still the bound (ENFILE).
-25. [ ] **xattrs** (`cp -a`, `tar --xattrs`): unsupported `setxattr`.
+25. [x] **xattrs**: `user.*`, and `trusted.*`/`security.*` for root, on
+    the sandbox's nodes, charged to `META_LIMIT`. Left: on live mounts
+    (EOPNOTSUPP; the host's would need hostfs messages), in exports,
+    POSIX ACLs (`system.posix_acl_*`, EOPNOTSUPP).
 26. [x] **Linux AIO**: `io_setup`, `io_destroy`, `io_submit` (pread,
     pwrite, preadv, pwritev, fsync, fdsync, poll), `io_cancel`,
     `io_getevents`, `io_pgetevents`. Reads, writes and syncs complete as
@@ -329,8 +332,8 @@ Left, in order of impact:
 - [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
-- [x] xattrs (`getxattr`/`listxattr`/…): answer ENODATA/ENOTSUP.
-      Coreutils `ls -la` currently hits an "unknown" syscall.
+- [x] xattrs (`getxattr`/`listxattr`/…): kept on the sandbox's nodes
+      (round 3, 25).
 - [~] `inotify`. Node `fs.watch`, webpack, watchdog.
       Events for live mounts' changes, the host's and the program's (which
       arrive just after the call that made them, not before it returns).

@@ -424,6 +424,16 @@ moment is the program waiting at its terminal (`tty::waiting_on`).
 Anything new that lives on the host side of a run needs the same
 treatment.
 
+Extended attributes (`Node::xattrs`, `syscall/file.rs`'s `setxattr`
+and the rest): kept on the sandbox's nodes, names and values charged to
+`META_LIMIT` (ENOSPC). A lazy import's node shows none of the host's
+and is copied up to take one; a live mount's, and /dev, /proc and /sys,
+keep none (EOPNOTSUPP). Exports don't carry them to the host; snapshots
+keep them, as the rest of the tree. The namespaces' rules are
+`xattr_permission`'s (Linux's, with uid 0 for every capability), and
+nothing honours them: `security.capability` is a value, as setuid bits
+are only bits.
+
 Shared file mappings and locks: a MAP_SHARED mapping of a file in the
 sandbox maps the file's own frames (`Backing::SharedFile`; the file and
 each mapping hold a reference; a read of a page without a frame maps a
@@ -593,8 +603,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
 10. **The kernel heap is small (32 MiB) and running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
     fails with an errno first:
-    - File data counts pages (`fs::set_limit`), and nodes and names count
-      against `META_LIMIT` (ENOSPC).
+    - File data counts pages (`fs::set_limit`), and nodes, names and
+      extended attributes count against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files, network receive windows, DNS answers, inotify events) take a
       `kmem::Charge`.

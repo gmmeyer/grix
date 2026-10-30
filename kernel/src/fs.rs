@@ -637,6 +637,8 @@ pub struct Node {
     pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
+    /// Extended attributes, by name (none for most nodes).
+    xattrs: Option<Box<Xattrs>>,
     /// Held by open descriptors and the working directory: an unlinked
     /// node's slot is only reused once nothing refers to it.
     pin: Arc<()>,
@@ -661,6 +663,7 @@ impl Node {
             atime: time,
             mtime: time,
             ctime: time,
+            xattrs: None,
             pin: Arc::new(()),
         }
     }
@@ -668,8 +671,37 @@ impl Node {
     /// Heap bytes counted against the metadata budget, besides its names.
     fn cost(&self) -> u64 {
         let remote = if self.remote.is_some() { REMOTE_COST } else { 0 };
-        NODE_COST + remote + if let Kind::Symlink(t) = &self.kind { t.len() as u64 } else { 0 }
+        let xattrs = self.xattrs.as_ref().map_or(0, |x| x.iter().map(|(k, v)| xattr_cost(k, v.len())).sum());
+        NODE_COST + remote + xattrs + if let Kind::Symlink(t) = &self.kind { t.len() as u64 } else { 0 }
     }
+}
+
+type Xattrs = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// Linux's limits on extended attributes (include/uapi/linux/limits.h).
+pub const XATTR_NAME_MAX: usize = 255;
+pub const XATTR_SIZE_MAX: usize = 65536;
+pub const XATTR_LIST_MAX: usize = 65536;
+/// setxattr's flags.
+pub const XATTR_CREATE: u32 = 1;
+pub const XATTR_REPLACE: u32 = 2;
+
+/// An attribute's share of the metadata budget: its name and value, and
+/// the map's entry around them.
+fn xattr_cost(name: &[u8], len: usize) -> u64 {
+    64 + name.len() as u64 + len as u64
+}
+
+/// Where a node's extended attributes are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum XattrHome {
+    /// The sandbox's node holds them.
+    Here,
+    /// A lazy import's node not yet the sandbox's: none (the host's
+    /// aren't imported); setting one copies it up.
+    Lazy,
+    /// A live mount's (the host's), or /dev, /proc and /sys: EOPNOTSUPP.
+    None,
 }
 
 /// A node of a live mount.
@@ -2605,6 +2637,69 @@ impl Fs {
         if mode.is_some() || atime.is_some() || mtime.is_some() {
             self.changed(ino);
         }
+        Ok(())
+    }
+
+    /// Where `ino`'s extended attributes are (see `XattrHome`).
+    pub fn xattr_home(&self, ino: Ino) -> XattrHome {
+        let n = &self.nodes[ino];
+        if n.system {
+            XattrHome::None
+        } else if self.is_lazy(ino) {
+            XattrHome::Lazy
+        } else if n.remote.is_some() {
+            XattrHome::None
+        } else {
+            XattrHome::Here
+        }
+    }
+
+    /// The value of attribute `name` (ENODATA if there's none).
+    pub fn xattr(&self, ino: Ino, name: &[u8]) -> Result<&[u8], Errno> {
+        let x = self.nodes[ino].xattrs.as_ref().and_then(|x| x.get(name));
+        x.map(Vec::as_slice).ok_or(ENODATA)
+    }
+
+    /// The names of `ino`'s attributes, in order.
+    pub fn xattr_names(&self, ino: Ino) -> impl Iterator<Item = &[u8]> {
+        self.nodes[ino].xattrs.iter().flat_map(|x| x.keys()).map(Vec::as_slice)
+    }
+
+    /// Set attribute `name` (XATTR_CREATE: only a new one, EEXIST;
+    /// XATTR_REPLACE: only an existing one, ENODATA), charged to the
+    /// metadata budget (ENOSPC). A lazy import's node becomes the
+    /// sandbox's first.
+    pub fn set_xattr(&mut self, ino: Ino, name: &[u8], value: Vec<u8>, flags: u32) -> Result<(), Errno> {
+        let old = self.nodes[ino].xattrs.as_ref().and_then(|x| x.get(name)).map(Vec::len);
+        match old {
+            Some(_) if flags & XATTR_CREATE != 0 => return Err(EEXIST),
+            None if flags & XATTR_REPLACE != 0 => return Err(ENODATA),
+            _ => {}
+        }
+        self.copy_up(ino)?;
+        if self.nodes[ino].remote.is_some() {
+            return Err(EOPNOTSUPP);
+        }
+        let (was, now) = (old.map_or(0, |l| xattr_cost(name, l)), xattr_cost(name, value.len()));
+        if now > was {
+            charge(now - was)?;
+        } else {
+            release(was - now);
+        }
+        self.nodes[ino].xattrs.get_or_insert_default().insert(name.to_vec(), value);
+        self.changed(ino);
+        Ok(())
+    }
+
+    /// Remove attribute `name` (ENODATA if there's none).
+    pub fn remove_xattr(&mut self, ino: Ino, name: &[u8]) -> Result<(), Errno> {
+        let x = self.nodes[ino].xattrs.as_mut().ok_or(ENODATA)?;
+        let value = x.remove(name).ok_or(ENODATA)?;
+        if x.is_empty() {
+            self.nodes[ino].xattrs = None;
+        }
+        release(xattr_cost(name, value.len()));
+        self.changed(ino);
         Ok(())
     }
 

@@ -205,8 +205,8 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::close_range => file::close_range(p, a[0], a[1], a[2]),
         nr::statfs => file::statfs(p, a[0], a[1]),
         nr::fstatfs => file::fstatfs(p, a[0], a[1]),
-        nr::getxattr | nr::lgetxattr | nr::fgetxattr => file::xattr_query(p, n, a[0], false),
-        nr::listxattr | nr::llistxattr | nr::flistxattr => file::xattr_query(p, n, a[0], true),
+        nr::getxattr | nr::lgetxattr | nr::fgetxattr => file::getxattr(p, n, a[0], a[1], a[2], a[3]),
+        nr::listxattr | nr::llistxattr | nr::flistxattr => file::listxattr(p, n, a[0], a[1], a[2]),
         nr::inotify_init1 => file::inotify_init1(p, a[0]),
         nr::inotify_add_watch => file::inotify_add_watch(p, a[0], a[1], a[2]),
         nr::inotify_rm_watch => file::inotify_rm_watch(p, a[0], a[1]),
@@ -228,9 +228,8 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::fchown => file::fchown(p, a[0], a[1], a[2]),
         nr::fchownat => file::fchownat(p, a[0], a[1], a[2], a[3], a[4]),
         nr::utimensat => file::utimensat(p, a[0], a[1], a[2], a[3]),
-        nr::setxattr | nr::lsetxattr | nr::fsetxattr | nr::removexattr | nr::lremovexattr | nr::fremovexattr => {
-            p.unimplemented(n, name, "extended attributes", EOPNOTSUPP)
-        }
+        nr::setxattr | nr::lsetxattr | nr::fsetxattr => file::setxattr(p, n, a[0], a[1], a[2], a[3], a[4]),
+        nr::removexattr | nr::lremovexattr | nr::fremovexattr => file::removexattr(p, n, a[0], a[1]),
         nr::sendfile => file::sendfile(p, a[0], a[1], a[2], a[3]),
         nr::memfd_create => file::memfd_create(p, a[0], a[1]),
         nr::signalfd4 => file::signalfd4(p, a[0], a[1], a[2], a[3]),

@@ -2880,20 +2880,192 @@ pub fn fstatfs(p: &mut Process, fd: u64, buf: u64) -> SysResult {
     copy_out(&mut p.aspace, buf, &b).map(|_| 0)
 }
 
-/// getxattr/lgetxattr/fgetxattr and listxattr/llistxattr/flistxattr: files
-/// exist but carry no extended attributes.
-pub fn xattr_query(p: &mut Process, n: u32, target: u64, list: bool) -> SysResult {
-    match n {
-        nr::fgetxattr | nr::flistxattr => {
-            p.fds.get(target)?;
-        }
-        _ => {
-            let path = read_cstr(&mut p.aspace, target, PATH_MAX)?;
-            let follow = !matches!(n, nr::lgetxattr | nr::llistxattr);
-            resolve(p, AT_FDCWD as u64, &path, follow)?;
+/// The xattr namespaces Linux knows (fs/xattr.c's handlers).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XattrNs {
+    User,
+    Trusted,
+    Security,
+    System,
+}
+
+/// An attribute's name: at most XATTR_NAME_MAX bytes, none is ERANGE.
+fn xattr_name(p: &mut Process, namep: u64) -> Result<(Vec<u8>, XattrNs), Errno> {
+    let name = read_cbytes(&mut p.aspace, namep, fs::XATTR_NAME_MAX + 1).map_err(|e| match e {
+        ENAMETOOLONG => ERANGE,
+        e => e,
+    })?;
+    if name.is_empty() {
+        return Err(ERANGE);
+    }
+    // xattr_resolve_name: a namespace's prefix and something after it.
+    let spaces: [(&[u8], XattrNs); 4] = [
+        (b"user.", XattrNs::User),
+        (b"trusted.", XattrNs::Trusted),
+        (b"security.", XattrNs::Security),
+        (b"system.", XattrNs::System),
+    ];
+    for (prefix, ns) in spaces {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return if rest.is_empty() { Err(EINVAL) } else { Ok((name, ns)) };
         }
     }
-    if list { Ok(0) } else { Err(ENODATA) }
+    Err(EOPNOTSUPP)
+}
+
+/// The node an xattr call is about: a path, followed unless it's an l*
+/// call, or a descriptor's file (EBADF for O_PATH, as fdget; EOPNOTSUPP
+/// for pipes, sockets and the like, which keep none).
+fn xattr_node(p: &mut Process, n: u32, target: u64) -> Result<Ino, Errno> {
+    match n {
+        nr::fgetxattr | nr::flistxattr | nr::fsetxattr | nr::fremovexattr => {
+            let file = p.fds.get(target)?;
+            let f = file.lock();
+            if f.path_only {
+                return Err(EBADF);
+            }
+            match &f.kind {
+                FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(FifoFile { ino, .. }) => Ok(*ino),
+                FileKind::Pty(end) => Ok(end.ino),
+                _ => Err(EOPNOTSUPP),
+            }
+        }
+        _ => {
+            let nofollow = matches!(n, nr::lgetxattr | nr::llistxattr | nr::lsetxattr | nr::lremovexattr);
+            at_node(p, AT_FDCWD as u64, target, if nofollow { AT_SYMLINK_NOFOLLOW } else { 0 })
+        }
+    }
+}
+
+/// May the caller read (or write) attribute `ns` of `ino`? fs/xattr.c's
+/// xattr_permission, with what the capability LSM adds for security.*
+/// (CAP_SYS_ADMIN; CAP_SETFCAP for security.capability): uid 0 is every
+/// capability here, and nothing else is. Neither is anything honoured:
+/// they're names and values, as setuid bits are.
+fn xattr_permission(p: &Process, fs: &fs::Fs, ino: Ino, ns: XattrNs, write: bool) -> Result<(), Errno> {
+    let n = fs.node(ino);
+    let refuse = if write { EPERM } else { ENODATA };
+    match ns {
+        // POSIX ACLs aren't kept.
+        XattrNs::System => Err(EOPNOTSUPP),
+        XattrNs::Security if write && p.uid != 0 => Err(EPERM),
+        XattrNs::Security => Ok(()),
+        XattrNs::Trusted if p.uid != 0 => Err(refuse),
+        XattrNs::Trusted => Ok(()),
+        XattrNs::User => {
+            // Only regular files and directories have them.
+            let dir = matches!(n.kind, Kind::Dir(_));
+            if !dir && !matches!(n.kind, Kind::File(_) | Kind::Unlinked { .. }) {
+                return Err(refuse);
+            }
+            // A sticky directory's, only its owner's (and root's).
+            if write && dir && n.perm & fs::S_ISVTX != 0 && p.uid != 0 && p.uid != n.uid {
+                return Err(EPERM);
+            }
+            if !fs.permits(ino, p.uid, p.gid, if write { MAY_WRITE } else { MAY_READ }) {
+                return Err(EACCES);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// setxattr, lsetxattr, fsetxattr.
+pub fn setxattr(p: &mut Process, n: u32, target: u64, namep: u64, valuep: u64, size: u64, flags: u64) -> SysResult {
+    // setxattr_copy: flags, the name and the value come first.
+    if flags & !((fs::XATTR_CREATE | fs::XATTR_REPLACE) as u64) != 0 {
+        return Err(EINVAL);
+    }
+    let (name, ns) = xattr_name(p, namep)?;
+    if size > fs::XATTR_SIZE_MAX as u64 {
+        return Err(E2BIG);
+    }
+    let _held = crate::kmem::Charge::new(size)?;
+    let mut value = alloc::vec![0u8; size as usize];
+    copy_in(&mut p.aspace, valuep, &mut value)?;
+    let ino = xattr_node(p, n, target)?;
+    let mut fs = fs::lock();
+    if fs.xattr_home(ino) == fs::XattrHome::None {
+        return Err(EOPNOTSUPP);
+    }
+    xattr_permission(p, &fs, ino, ns, true)?;
+    // cap_convert_nscap: a v2 or v3 vfs_cap_data, nothing else.
+    if name == b"security.capability" {
+        let rev = value.get(..4).map(|m| u32::from_le_bytes(m.try_into().unwrap()) & 0xff00_0000);
+        if !matches!((value.len(), rev), (20, Some(0x0200_0000)) | (24, Some(0x0300_0000))) {
+            return Err(EINVAL);
+        }
+    }
+    fs.set_xattr(ino, &name, value, flags as u32).map(|_| 0)
+}
+
+/// getxattr, lgetxattr, fgetxattr: the value's length, and the value if
+/// `size` has room for it (ERANGE if not; 0 asks only its length).
+pub fn getxattr(p: &mut Process, n: u32, target: u64, namep: u64, valuep: u64, size: u64) -> SysResult {
+    let ino = xattr_node(p, n, target)?;
+    let (name, ns) = xattr_name(p, namep)?;
+    let value = {
+        let fs = fs::lock();
+        match fs.xattr_home(ino) {
+            fs::XattrHome::None => return Err(EOPNOTSUPP),
+            fs::XattrHome::Lazy => return Err(ENODATA),
+            fs::XattrHome::Here => {}
+        }
+        xattr_permission(p, &fs, ino, ns, false)?;
+        fs.xattr(ino, &name)?.to_vec()
+    };
+    if size != 0 {
+        if value.len() as u64 > size {
+            return Err(ERANGE);
+        }
+        copy_out(&mut p.aspace, valuep, &value)?;
+    }
+    Ok(value.len() as u64)
+}
+
+/// listxattr, llistxattr, flistxattr: the names, each NUL-terminated, as
+/// for getxattr's value. trusted.* only for root, as Linux's
+/// simple_xattr_list; nodes that keep none list none.
+pub fn listxattr(p: &mut Process, n: u32, target: u64, listp: u64, size: u64) -> SysResult {
+    let ino = xattr_node(p, n, target)?;
+    let mut list = Vec::new();
+    {
+        let fs = fs::lock();
+        if fs.xattr_home(ino) == fs::XattrHome::Here {
+            for name in fs.xattr_names(ino) {
+                if p.uid == 0 || !name.starts_with(b"trusted.") {
+                    list.extend_from_slice(name);
+                    list.push(0);
+                }
+            }
+        }
+    }
+    if size != 0 {
+        if list.len() as u64 > size {
+            // More than any list may be: E2BIG, not "try a bigger buffer".
+            return Err(if size >= fs::XATTR_LIST_MAX as u64 { E2BIG } else { ERANGE });
+        }
+        copy_out(&mut p.aspace, listp, &list)?;
+    }
+    Ok(list.len() as u64)
+}
+
+/// removexattr, lremovexattr, fremovexattr.
+pub fn removexattr(p: &mut Process, n: u32, target: u64, namep: u64) -> SysResult {
+    let (name, ns) = xattr_name(p, namep)?;
+    let ino = xattr_node(p, n, target)?;
+    let mut fs = fs::lock();
+    match fs.xattr_home(ino) {
+        fs::XattrHome::None => return Err(EOPNOTSUPP),
+        // Removing what isn't there changes nothing: no copy-up.
+        fs::XattrHome::Lazy => {
+            xattr_permission(p, &fs, ino, ns, true)?;
+            return Err(ENODATA);
+        }
+        fs::XattrHome::Here => {}
+    }
+    xattr_permission(p, &fs, ino, ns, true)?;
+    fs.remove_xattr(ino, &name).map(|_| 0)
 }
 
 pub fn inotify_init1(p: &mut Process, flags: u64) -> SysResult {

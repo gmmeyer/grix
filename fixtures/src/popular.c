@@ -24,6 +24,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define CHECK(c) do { if (!(c)) { printf("FAILED: %s (line %d, errno %d)\n", #c, __LINE__, errno); return 1; } } while (0)
@@ -767,6 +768,145 @@ static int nofile(void) {
     return 0;
 }
 
+// cp -a and tar --xattrs keep extended attributes (and cp -a reported
+// setxattr as unimplemented).
+static int xattrs(void) {
+    CHECK(mkdir("/tmp/x", 0755) == 0 && mkdir("/tmp/x/d", 0755) == 0);
+    int fd = open("/tmp/x/f", O_RDWR | O_CREAT, 0644);
+    CHECK(fd >= 0 && symlink("f", "/tmp/x/l") == 0);
+    char v[256];
+    CHECK(setxattr("/tmp/x/f", "user.a", "one", 3, 0) == 0);
+    CHECK(setxattr("/tmp/x/f", "user.b", "", 0, 0) == 0);
+    CHECK(getxattr("/tmp/x/f", "user.a", NULL, 0) == 3);
+    CHECK(getxattr("/tmp/x/f", "user.a", v, sizeof v) == 3 && memcmp(v, "one", 3) == 0);
+    CHECK(getxattr("/tmp/x/f", "user.a", v, 2) == -1 && errno == ERANGE);
+    CHECK(getxattr("/tmp/x/f", "user.b", v, sizeof v) == 0);
+    CHECK(getxattr("/tmp/x/f", "user.c", v, sizeof v) == -1 && errno == ENODATA);
+    CHECK(listxattr("/tmp/x/f", NULL, 0) == 14);
+    CHECK(listxattr("/tmp/x/f", v, sizeof v) == 14 && memcmp(v, "user.a\0user.b\0", 14) == 0);
+    CHECK(listxattr("/tmp/x/f", v, 13) == -1 && errno == ERANGE);
+    // Create, replace, and flags that are neither.
+    CHECK(setxattr("/tmp/x/f", "user.a", "two", 3, XATTR_CREATE) == -1 && errno == EEXIST);
+    CHECK(setxattr("/tmp/x/f", "user.c", "x", 1, XATTR_REPLACE) == -1 && errno == ENODATA);
+    CHECK(setxattr("/tmp/x/f", "user.a", "two", 3, XATTR_REPLACE) == 0);
+    CHECK(fgetxattr(fd, "user.a", v, sizeof v) == 3 && memcmp(v, "two", 3) == 0);
+    CHECK(setxattr("/tmp/x/f", "user.a", "x", 1, 4) == -1 && errno == EINVAL);
+    // Names up to 255 bytes, values up to 64 KiB.
+    char name[300] = "user.";
+    memset(name + 5, 'n', 250);
+    CHECK(setxattr("/tmp/x/d", name, "", 0, 0) == 0);
+    name[255] = 'n';
+    CHECK(setxattr("/tmp/x/d", name, "", 0, 0) == -1 && errno == ERANGE);
+    CHECK(getxattr("/tmp/x/d", name, v, sizeof v) == -1 && errno == ERANGE);
+    CHECK(setxattr("/tmp/x/d", "", "", 0, 0) == -1 && errno == ERANGE);
+    static char big[65537];
+    CHECK(setxattr("/tmp/x/d", "user.big", big, 65536, 0) == 0);
+    CHECK(setxattr("/tmp/x/d", "user.big", big, 65537, 0) == -1 && errno == E2BIG);
+    CHECK(getxattr("/tmp/x/d", "user.big", big, sizeof big) == 65536);
+    CHECK(removexattr("/tmp/x/d", "user.big") == 0);
+    // Namespaces: unknown ones, a bare prefix, POSIX ACLs.
+    CHECK(setxattr("/tmp/x/f", "other.a", "", 0, 0) == -1 && errno == EOPNOTSUPP);
+    CHECK(setxattr("/tmp/x/f", "user.", "", 0, 0) == -1 && errno == EINVAL);
+    CHECK(setxattr("/tmp/x/f", "system.posix_acl_access", "", 0, 0) == -1 && errno == EOPNOTSUPP);
+    // trusted.* and security.* are root's to set; trusted.* to see.
+    CHECK(setxattr("/tmp/x/f", "trusted.a", "", 0, 0) == -1 && errno == EPERM);
+    CHECK(getxattr("/tmp/x/f", "trusted.a", v, sizeof v) == -1 && errno == ENODATA);
+    CHECK(setxattr("/tmp/x/f", "security.a", "", 0, 0) == -1 && errno == EPERM);
+    // user.* only on files and directories; links are followed, or not.
+    CHECK(lsetxattr("/tmp/x/l", "user.a", "", 0, 0) == -1 && errno == EPERM);
+    CHECK(lgetxattr("/tmp/x/l", "user.a", v, sizeof v) == -1 && errno == ENODATA);
+    CHECK(llistxattr("/tmp/x/l", v, sizeof v) == 0);
+    CHECK(getxattr("/tmp/x/l", "user.a", v, sizeof v) == 3);
+    // Permission to write the file, as for its contents.
+    CHECK(chmod("/tmp/x/f", 0444) == 0);
+    CHECK(setxattr("/tmp/x/f", "user.c", "", 0, 0) == -1 && errno == EACCES);
+    CHECK(chmod("/tmp/x/f", 0644) == 0);
+    // Removing; through descriptors; hard links share them.
+    CHECK(removexattr("/tmp/x/f", "user.b") == 0);
+    CHECK(removexattr("/tmp/x/f", "user.b") == -1 && errno == ENODATA);
+    CHECK(fsetxattr(fd, "user.fd", "y", 1, 0) == 0 && fremovexattr(fd, "user.fd") == 0);
+    CHECK(flistxattr(fd, v, sizeof v) == 7 && memcmp(v, "user.a\0", 7) == 0);
+    CHECK(link("/tmp/x/f", "/tmp/x/h") == 0 && getxattr("/tmp/x/h", "user.a", v, sizeof v) == 3);
+    int path = open("/tmp/x/f", O_PATH);
+    CHECK(fgetxattr(path, "user.a", v, sizeof v) == -1 && errno == EBADF);
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    CHECK(fsetxattr(pfd[0], "user.a", "", 0, 0) == -1 && errno == EOPNOTSUPP);
+    // /proc and /dev keep none.
+    CHECK(setxattr("/proc/self/status", "user.a", "", 0, 0) == -1 && errno == EOPNOTSUPP);
+    CHECK(listxattr("/proc/self/status", v, sizeof v) == 0);
+    CHECK(getxattr("/dev/null", "user.a", v, sizeof v) == -1 && errno == EOPNOTSUPP);
+    // They're charged to the filesystem's metadata: ENOSPC, not the
+    // kernel's heap, and the room comes back.
+    int n = 0;
+    for (; n < 4096; n++) {
+        snprintf(name, sizeof name, "user.%d", n);
+        if (setxattr("/tmp/x/d", name, big, 65536, 0) < 0) break;
+    }
+    CHECK(n < 4096 && errno == ENOSPC && n > 10);
+    for (int i = 0; i < n; i++) {
+        snprintf(name, sizeof name, "user.%d", i);
+        CHECK(removexattr("/tmp/x/d", name) == 0);
+    }
+    CHECK(setxattr("/tmp/x/d", "user.again", big, 65536, 0) == 0);
+    return 0;
+}
+
+// As root (Debian's image): trusted.* and security.capability too, on a
+// tree cp -a and tar copy (`xattrcopied` checks the copies).
+static const char cap[20] = {0, 0, 0, 2, 0, 4, 0, 0};  // v2: cap_net_bind_service (10)
+static int xattrset(void) {
+    CHECK(mkdir("/tmp/src", 0755) == 0);
+    int fd = open("/tmp/src/f", O_WRONLY | O_CREAT, 0755);
+    CHECK(fd >= 0 && write(fd, "data", 4) == 4 && close(fd) == 0);
+    CHECK(setxattr("/tmp/src/f", "user.mime_type", "text/plain", 10, 0) == 0);
+    CHECK(setxattr("/tmp/src/f", "trusted.t", "t", 1, 0) == 0);
+    CHECK(setxattr("/tmp/src/f", "security.capability", "short", 5, 0) == -1 && errno == EINVAL);
+    CHECK(setxattr("/tmp/src/f", "security.capability", cap, sizeof cap, 0) == 0);
+    CHECK(setxattr("/tmp/src", "user.dir", "d", 1, 0) == 0);
+    char v[128];
+    CHECK(listxattr("/tmp/src/f", v, sizeof v) == 45);
+    return 0;
+}
+
+static int copied(const char *dir) {
+    char path[64], v[32];
+    snprintf(path, sizeof path, "%s/f", dir);
+    CHECK(getxattr(path, "user.mime_type", v, sizeof v) == 10 && memcmp(v, "text/plain", 10) == 0);
+    CHECK(getxattr(path, "trusted.t", v, sizeof v) == 1 && v[0] == 't');
+    CHECK(getxattr(path, "security.capability", v, sizeof v) == 20 && memcmp(v, cap, 20) == 0);
+    CHECK(getxattr(dir, "user.dir", v, sizeof v) == 1 && v[0] == 'd');
+    return 0;
+}
+
+// Without fs_write: reading them, but not setting them.
+static int xattrro(void) {
+    char v[8];
+    CHECK(getxattr("/bin/popular", "user.a", v, sizeof v) == -1 && errno == ENODATA);
+    CHECK(setxattr("/bin/popular", "user.a", "", 0, 0) == -1 && errno == EPERM);
+    return 0;
+}
+
+// The host's directories: a lazy import's file shows none of the host's,
+// and setting one makes it the sandbox's; a live mount's keep none.
+static int xattrmounts(void) {
+    char v[8];
+    CHECK(getxattr("/lazy/a", "user.a", v, sizeof v) == -1 && errno == ENODATA);
+    CHECK(listxattr("/lazy/a", v, sizeof v) == 0);
+    CHECK(removexattr("/lazy/a", "user.a") == -1 && errno == ENODATA);
+    CHECK(setxattr("/lazy/a", "user.a", "1", 1, 0) == 0);
+    CHECK(getxattr("/lazy/a", "user.a", v, sizeof v) == 1 && v[0] == '1');
+    CHECK(slurp("/lazy/a") == 6 && strcmp(buf, "lazy!\n") == 0);
+    CHECK(setxattr("/live/a", "user.a", "1", 1, 0) == -1 && errno == EOPNOTSUPP);
+    CHECK(getxattr("/live/a", "user.a", v, sizeof v) == -1 && errno == EOPNOTSUPP);
+    CHECK(listxattr("/live/a", v, sizeof v) == 0);
+    return 0;
+}
+
+static int xattrcopied(void) {
+    return copied("/tmp/dst") || copied("/tmp/t/src");
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -787,6 +927,11 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "openat2") == 0) r = openat2_check();
         if (strcmp(argv[i], "openat2ro") == 0) r = openat2_ro();
         if (strcmp(argv[i], "nofile") == 0) r = nofile();
+        if (strcmp(argv[i], "xattrs") == 0) r = xattrs();
+        if (strcmp(argv[i], "xattrset") == 0) r = xattrset();
+        if (strcmp(argv[i], "xattrro") == 0) r = xattrro();
+        if (strcmp(argv[i], "xattrmounts") == 0) r = xattrmounts();
+        if (strcmp(argv[i], "xattrcopied") == 0) r = xattrcopied();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

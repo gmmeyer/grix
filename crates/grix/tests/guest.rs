@@ -1969,6 +1969,68 @@ fn more_than_1024_descriptors() {
 }
 
 #[test]
+fn extended_attributes() {
+    // Every namespace's rules, Linux's limits, and the metadata budget.
+    popular(with("popular").allow(Capability::FsWrite), &["xattrs"]);
+    // Setting them needs fs_write.
+    let out = run(with("popular"), &["/bin/popular", "xattrro"]);
+    assert_eq!(out.stdout_str(), "xattrro ok\n");
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied { syscall: "setxattr".into(), capability: "fs_write".into(), detail: "".into() }]
+    );
+}
+
+#[test]
+fn extended_attributes_on_host_directories() {
+    // A lazy import's file is copied up to take one; a live mount's take
+    // none (EOPNOTSUPP); the host's files don't change.
+    let host = temp_dir("xattrs");
+    let (lazy, live) = (host.join("lazy"), host.join("live"));
+    std::fs::create_dir_all(&lazy).unwrap();
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(lazy.join("a"), "lazy!\n").unwrap();
+    std::fs::write(live.join("a"), "live!\n").unwrap();
+    let b =
+        with("popular").allow(Capability::FsWrite).import_lazy(&lazy, "/lazy").unwrap().mount(&live, "/live").unwrap();
+    popular(b, &["xattrmounts"]);
+    assert_eq!(std::fs::read_to_string(lazy.join("a")).unwrap(), "lazy!\n");
+}
+
+#[test]
+fn extended_attributes_survive_cp_a_and_tar() {
+    // GNU cp -a and tar --xattrs, as root in Debian's image: user.*,
+    // trusted.* and security.capability.
+    let from = format!("from = \"oci:{}\"", fixture("oci/debian").display());
+    let mut g = grix::build::Grixfile::parse(&from).unwrap();
+    g.from_outside_context = true;
+    let options = grix::build::BuildOptions {
+        arch: None,
+        kernel: None,
+        on_output: &mut |_, _| {},
+        policy: Default::default(),
+        control: None,
+    };
+    let image = g.build(std::path::Path::new("."), options).unwrap();
+    let b = Sandbox::builder()
+        .image(&image)
+        .unwrap()
+        .timeout(Duration::from_secs(120))
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        // (Debian's /bin is a link to usr/bin.)
+        .import(fixture("popular"), "/usr/local/bin/popular")
+        .unwrap();
+    let script = "set -e; popular xattrset; cp -a /tmp/src /tmp/dst; mkdir /tmp/t; \
+                  tar --xattrs --xattrs-include='*' -cf /tmp/a.tar -C /tmp src; \
+                  tar --xattrs --xattrs-include='*' -xf /tmp/a.tar -C /tmp/t; popular xattrcopied";
+    let out = run(b, &["/bin/sh", "-c", script]);
+    assert_eq!(out.stdout_str(), "xattrset ok\nxattrcopied ok\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.iter().all(|e| matches!(e, GuestEvent::MissingPath { .. })), "{:?}", out.events);
+}
+
+#[test]
 fn arguments_and_environment_in_linux_order() {
     // libuv's process title (mongosh) measures the area by it.
     let out = run(with("popular").env("A", "1").env("BB", "22"), &["/bin/popular", "argvlayout", "x", "yy"]);
