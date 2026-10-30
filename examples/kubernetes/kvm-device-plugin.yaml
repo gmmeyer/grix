@@ -1,8 +1,13 @@
 # /dev/kvm for pods that ask for it, without KubeVirt: a device plugin
-# (squat/generic-device-plugin) on every node. Where a node has /dev/kvm it
-# offers `devic.es/kvm`, and a pod that has `devic.es/kvm: 1` in its limits
-# goes only to such a node and gets /dev/kvm (and nothing else of the
-# node's: it needn't be privileged). Nodes without KVM offer none.
+# (squat/generic-device-plugin) on every node, offering two resources:
+#
+#   devic.es/kvm-optional   on every node; the pod gets /dev/kvm if the node
+#                           has it, and grix emulates the machine if not
+#   devic.es/kvm            only on nodes with /dev/kvm, for pods that must
+#                           have it
+#
+# A pod with one of them in its limits (`devic.es/kvm-optional: 1`) gets
+# /dev/kvm and nothing else of the node's: it needn't be privileged.
 #
 #   kubectl apply -f kvm-device-plugin.yaml
 #   kubectl get nodes -o custom-columns=NODE:.metadata.name,KVM:.status.allocatable.devic\\.es/kvm
@@ -37,9 +42,9 @@ spec:
       containers:
       - name: kvm-device-plugin
         image: ghcr.io/squat/generic-device-plugin:0.2.0
+        # Any number of pods on a node can share /dev/kvm: count is how many.
         args:
         - --domain=devic.es
-        # Any number of pods on a node can share /dev/kvm: count is how many.
         - --device
         - |
           name: kvm
@@ -47,6 +52,17 @@ spec:
             - count: 1000
               paths:
                 - path: /dev/kvm
+        # The plugin offers a device only where one of its paths is there:
+        # /dev/null (every container has it anyway) always is.
+        - --device
+        - |
+          name: kvm-optional
+          groups:
+            - count: 1000
+              paths:
+                - path: /dev/null
+                - path: /dev/kvm
+                  optional: true
         resources:
           requests:
             cpu: 10m

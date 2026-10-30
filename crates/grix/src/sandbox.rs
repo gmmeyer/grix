@@ -306,11 +306,29 @@ fn default_accel_for(arch: Arch) -> &'static str {
         if cfg!(target_os = "macos") {
             return "hvf";
         }
-        if cfg!(target_os = "linux") && std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
+        if cfg!(target_os = "linux") && kvm_error(arch).is_none() {
             return "kvm";
         }
     }
     "tcg"
+}
+
+/// Why grix-vmm can't run `arch`'s guests on this host's KVM: opening
+/// /dev/kvm failed. None if KVM isn't what's missing (not Linux, or
+/// another architecture's guest, which only QEMU's emulator runs).
+pub(crate) fn kvm_error(arch: Arch) -> Option<std::io::Error> {
+    if !cfg!(target_os = "linux") || arch != Arch::host() {
+        return None;
+    }
+    std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").err()
+}
+
+/// Is `program` there to run: a path to a file, or a name on PATH.
+fn runnable(program: &Path) -> bool {
+    if program.components().count() > 1 {
+        return program.is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(program).is_file()))
 }
 
 fn default_accel() -> &'static str {
@@ -1064,6 +1082,18 @@ impl SandboxBuilder {
             Some(_) => format!("an {} machine in grix-vmm", self.arch),
             None => format!("an {} machine in {} ({})", self.arch, self.qemu.display(), self.accel),
         }
+    }
+
+    /// Why a run will emulate a machine this host could run natively, if
+    /// it will: grix fell back on QEMU's emulator (installed) because
+    /// /dev/kvm can't be opened, and this is that error. None when there's
+    /// KVM, when `GRIX_ACCEL` asked for QEMU, and for another
+    /// architecture's guest.
+    pub fn emulated_without_kvm(&self) -> Option<std::io::Error> {
+        if self.vmm.is_some() || self.accel != "tcg" || std::env::var_os("GRIX_ACCEL").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        kvm_error(self.arch).filter(|_| runnable(&self.qemu))
     }
 
     pub fn build(mut self) -> Result<Sandbox> {

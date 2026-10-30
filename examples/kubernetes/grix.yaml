@@ -5,11 +5,18 @@
 #   FROM grix
 #   COPY app.grix /app.grix
 #
-# It asks for /dev/kvm (kvm-device-plugin.yaml), so it goes to nodes with
-# KVM and runs in grix's own VMM. For nodes without KVM, build FROM
-# grix:emulated (docker build --target emulated -t grix:emulated .) and take
-# the devic.es/kvm limit out: grix then emulates the machine in QEMU, many
-# times slower, and the pod is the boundary to rely on.
+# It runs on KVM where the node has it and emulated (20-40x slower) where it
+# doesn't, picked when the pod starts: devic.es/kvm-optional (from
+# kvm-device-plugin.yaml) gives it the node's /dev/kvm if there is one.
+# Instead of that limit:
+#
+#   devic.es/kvm: 1     KVM or nothing: only nodes with KVM, so the pod
+#                       waits (Pending) where there are none.
+#   (no limit)          never KVM, and no device plugin needed (set
+#                       GRIX_ACCEL=tcg too: it's then no surprise, and grix
+#                       doesn't print a notice about it).
+#
+# Emulated, the pod is the boundary to rely on: QEMU's emulator isn't one.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -55,7 +62,7 @@ spec:
             memory: 768Mi
           limits:
             memory: 768Mi
-            devic.es/kvm: 1
+            devic.es/kvm-optional: 1
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

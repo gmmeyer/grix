@@ -739,6 +739,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     if args.verbose {
         eprintln!("grix: {}", b.machine());
     }
+    if !args.quiet {
+        note_emulation(&b);
+    }
     let control = RunControl::new();
     let sandbox = b.control(&control).build()?;
     let command = [&args.command, &manifest.command, &sandbox.command().to_vec()]
@@ -747,6 +750,17 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         .cloned()
         .context("no command given (pass it after `--`, or set `command` in the manifest or image)")?;
     Ok(Prepared { sandbox, command, exports, control })
+}
+
+/// Emulating for want of KVM costs a program 20-40x: say so, as a run
+/// that could have had KVM shouldn't be that slow unnoticed.
+fn note_emulation(b: &grix::SandboxBuilder) {
+    if let Some(e) = b.emulated_without_kvm() {
+        eprintln!(
+            "grix: no KVM (/dev/kvm: {e}), so QEMU emulates the machine, many times slower \
+             (GRIX_ACCEL=tcg asks for that without this notice)"
+        );
+    }
 }
 
 /// What a run did, for the user; the exit code. `live`: its events were
@@ -985,6 +999,7 @@ fn mcp(args: McpArgs) -> Result<i32> {
         eprintln!("grix: metrics at http://{}/metrics", metrics.serve(addr)?);
         config.metrics = Some(metrics);
     }
+    note_emulation(&Sandbox::builder());
     grix::mcp::serve(&config, std::io::stdin().lock(), std::io::stdout())?;
     Ok(0)
 }

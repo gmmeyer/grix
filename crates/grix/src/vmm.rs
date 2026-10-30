@@ -397,7 +397,7 @@ pub(crate) fn run(
             return format!("starting {}", vmm.display());
         }
         // QEMU is the fallback; say what would have made it unnecessary.
-        match kvm_error(cfg.arch) {
+        match crate::sandbox::kvm_error(cfg.arch) {
             Some(e) => {
                 // Missing or not allowed is what a container without it sees.
                 let hint = match e.kind() {
@@ -420,15 +420,6 @@ pub(crate) fn run(
     let uart = accept_uart(&listener, &mut child.0)?;
     drop(listener);
     run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
-}
-
-/// Why this host's KVM can't run `arch`'s guests in grix-vmm: opening
-/// /dev/kvm failed. None if KVM isn't what's missing.
-fn kvm_error(arch: crate::sandbox::Arch) -> Option<std::io::Error> {
-    if !cfg!(target_os = "linux") || arch != crate::sandbox::Arch::host() {
-        return None;
-    }
-    std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").err()
 }
 
 /// QEMU's command line for the machine.
