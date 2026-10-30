@@ -10,7 +10,8 @@
 //! What runs in parallel is user code: each CPU runs a thread of any
 //! process, several processes at once. Between kernel entries every
 //! process lives in `procs::PROCS`; the CPU that takes the lock moves the
-//! process it runs into `PROCESS` (`lock`) and puts it back (`unlock`),
+//! process it runs into its slot of `PROCESS` (`lock`) and puts it back
+//! (`unlock`),
 //! so the rest of the kernel still sees "the running process" and "the
 //! others". Each CPU keeps its own scheduling state (`Cpu`: process,
 //! thread, time slice), swapped into the `Process` fields the kernel uses
@@ -25,7 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use grix_abi::machine::MAX_CPUS;
 
 use crate::arch::{self, TrapFrame, irq};
-use crate::process::{PROCESS, Process};
+use crate::process::{self, Process};
 use crate::procs::PROCS;
 
 const N: usize = MAX_CPUS as usize;
@@ -182,7 +183,7 @@ pub fn enter(why: Stat) {
     lock();
 }
 
-/// Take the kernel, and make the process this CPU runs `PROCESS`, with
+/// Take the kernel, and make the process this CPU runs its `PROCESS`, with
 /// this CPU's scheduling state in it. A CPU with no thread gets some
 /// process to schedule from.
 pub fn lock() {
@@ -199,7 +200,7 @@ pub fn lock() {
     arch::tlb_sync();
     let me = me();
     let cpu = CPUS.lock()[me];
-    let mut guard = PROCESS.lock();
+    let mut guard = process::running().lock();
     let mut procs = PROCS.lock();
     if guard.is_none() {
         let pid = cpu.pid.filter(|pid| procs.others.contains_key(pid)).or_else(|| procs.others.keys().next().copied());
@@ -214,8 +215,17 @@ pub fn lock() {
         p.slice_start = cpu.slice_start;
         p.resched = cpu.resched || tid.is_none() && cpu.tid.is_some();
         p.timer_dirty = cpu.timer_dirty;
-        crate::process::set_current_pid(p.pid);
+        process::set_current_pid(p.pid);
     }
+    drop(procs);
+    drop(guard);
+    debug_assert!(checked_out_elsewhere(me) == 0, "a process checked out on another CPU");
+}
+
+/// How many CPUs other than `me` have a process in their slot of
+/// `PROCESS`. Under the kernel lock, none: only the holder has one.
+fn checked_out_elsewhere(me: usize) -> usize {
+    (0..N).filter(|&i| i != me && process::PROCESS[i].lock().is_some()).count()
 }
 
 /// Keep this CPU's scheduling state, put its process back with the others
@@ -225,7 +235,8 @@ pub fn unlock() {
     let me = me();
     {
         let mut cpus = CPUS.lock();
-        let taken = PROCESS.lock().take();
+        let taken = process::running().lock().take();
+        debug_assert!(checked_out_elsewhere(me) == 0, "a process checked out on another CPU");
         let mut procs = PROCS.lock();
         if let Some(mut p) = taken {
             let c = &mut cpus[me];
@@ -444,7 +455,7 @@ pub fn finish(tf: &mut TrapFrame) {
     let mut look = true;
     loop {
         let picked = {
-            let mut guard = PROCESS.lock();
+            let mut guard = process::running().lock();
             let Some(p) = guard.as_mut() else { break };
             if p.running {
                 activate(p);
@@ -525,7 +536,7 @@ pub fn activated(root: u64) {
 /// Start the other CPUs (on CPU 0, before the program runs).
 pub fn start(cpus: u32) {
     COUNT.store(cpus.clamp(1, MAX_CPUS), Ordering::Relaxed);
-    CPUS.lock()[0].ttbr = PROCESS.lock().as_ref().map_or(0, |p| p.aspace.pt.root);
+    CPUS.lock()[0].ttbr = process::running().lock().as_ref().map_or(0, |p| p.aspace.pt.root);
     for cpu in 1..count() {
         let entry = arch::secondary_entry_phys();
         let stack = arch::stack_top(cpu as usize);
@@ -556,7 +567,7 @@ pub extern "C" fn secondary_main(frame: *mut TrapFrame) -> ! {
     };
     lock();
     // Nothing yet: wait for a thread, like any CPU that has none.
-    if let Some(p) = PROCESS.lock().as_mut() {
+    if let Some(p) = process::running().lock().as_mut() {
         p.running = false;
         p.current = NO_THREAD;
     }

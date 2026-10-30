@@ -3,16 +3,16 @@
 //! kernel stack: switching threads means saving the trapped user state into
 //! the old thread and loading the new thread's saved state into the trap
 //! frame before returning to EL0. Switching processes also swaps the
-//! running process's body in `PROCESS` with one from `procs::PROCS`, and
-//! the address space in TTBR0. With more CPUs each runs threads of any
-//! process (see `smp`).
+//! running process's body in this CPU's slot of `PROCESS` with one from
+//! `procs::PROCS`, and the address space in TTBR0. With more CPUs each runs
+//! threads of any process (see `smp`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::{self, TrapFrame, irq};
 use crate::console;
-use crate::process::{PROCESS, Process, WaitOn};
+use crate::process::{self, Process, WaitOn};
 use crate::procs::{self, PROCS, Procs};
 use crate::signal::SIGKILL;
 use crate::smp;
@@ -93,7 +93,7 @@ pub fn schedule(p: &mut Process, tf: &mut TrapFrame) {
     if next != p.pid {
         let mut body = procs.others.remove(&next).unwrap();
         core::mem::swap(p, &mut body);
-        crate::process::set_current_pid(p.pid);
+        process::set_current_pid(p.pid);
         p.aspace.activate();
         smp::activated(p.aspace.pt.root);
         // `body` is the process that was running: back with the others,
@@ -368,7 +368,7 @@ fn arm(own: Option<u64>, all: Option<u64>) {
 pub fn irq(tf: &mut TrapFrame) {
     let Some(id) = irq::ack() else { return };
     handle_interrupt(id);
-    let mut guard = PROCESS.lock();
+    let mut guard = process::running().lock();
     let p = guard.as_mut().expect("interrupt without a process");
     // Its thread ended while it ran (on another CPU's say): `smp::finish`
     // schedules.

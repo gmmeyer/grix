@@ -282,7 +282,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     });
     // The thread this CPU ran may have ended meanwhile (exit_group or
     // execve on another CPU): then there's nothing to handle for it.
-    let has_thread = process::PROCESS.lock().as_ref().is_some_and(|p| p.running);
+    let has_thread = process::running().lock().as_ref().is_some_and(|p| p.running);
     match kind {
         8 if has_thread => {
             el0_sync(tf);
@@ -342,7 +342,7 @@ fn el0_sync(tf: &mut TrapFrame) {
         EC_FP_EXC => (SIGFPE, FPE_FLTUNK, tf.elr, None, "floating point exception"),
         _ => (SIGILL, ILL_ILLOPC, tf.elr, None, "unhandled exception class"),
     };
-    let mut guard = process::PROCESS.lock();
+    let mut guard = process::running().lock();
     let p = guard.as_mut().expect("fault without a process");
     signal::fault(p, sig, code, signal::Fault { addr, pc: tf.elr, syndrome: esr }, why);
 }
@@ -475,7 +475,7 @@ fn emulate_mrs_trap(tf: &mut TrapFrame, esr: u64) -> bool {
 fn emulate_undefined_mrs(tf: &mut TrapFrame) -> bool {
     let mut b = [0u8; 4];
     {
-        let mut guard = process::PROCESS.lock();
+        let mut guard = process::running().lock();
         let Some(p) = guard.as_mut() else { return false };
         if crate::uaccess::copy_in(&mut p.aspace, tf.elr, &mut b).is_err() {
             return false;

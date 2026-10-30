@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::{self, TrapFrame};
 use crate::errno::*;
 use crate::mm::aspace::{AddressSpace, SIGPAGE};
-use crate::process::{JobReport, PROCESS, Process, SigAction, Thread, Wait, WaitOn};
+use crate::process::{JobReport, Process, SigAction, Thread, Wait, WaitOn};
 use crate::syscall::table::nr;
 use crate::time;
 use crate::uaccess::*;
@@ -635,7 +635,7 @@ const MAX_FRAMES: usize = 8;
 /// A process that has ended (or ends now, from a signal) never returns:
 /// something else runs instead, and gets its signals.
 pub fn return_to_user(tf: &mut TrapFrame) {
-    let mut guard = PROCESS.lock();
+    let mut guard = crate::process::running().lock();
     let Some(p) = guard.as_mut() else { return };
     loop {
         if (p.exit_status.is_some() || p.stopped) && p.running {

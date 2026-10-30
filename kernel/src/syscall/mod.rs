@@ -21,7 +21,7 @@ use grix_abi::policy::Capability;
 
 use crate::arch::TrapFrame;
 use crate::errno::*;
-use crate::process::{PROCESS, Process};
+use crate::process::{self, Process};
 use crate::sched;
 use crate::seccomp::Verdict;
 use table::{Gate, nr};
@@ -33,7 +33,7 @@ pub fn handle(tf: &mut TrapFrame) {
     crate::stats::syscall();
     let n = tf.syscall_nr();
     let a = tf.syscall_args();
-    let mut guard = PROCESS.lock();
+    let mut guard = process::running().lock();
     let p = guard.as_mut().expect("syscall without a process");
     // A rewound call is running again: no longer something a signal must
     // decide for (see `signal::return_to_user`).

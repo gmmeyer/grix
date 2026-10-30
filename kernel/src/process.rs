@@ -1,6 +1,7 @@
 //! A process: its threads, exec, faults, termination, and reporting of
-//! denied/unimplemented operations. The one running is in `PROCESS`; the
-//! others, and zombies, are in `procs::PROCS`.
+//! denied/unimplemented operations. The one a CPU in the kernel runs is in
+//! its slot of `PROCESS` (`running`); the others, and zombies, are in
+//! `procs::PROCS`.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
@@ -270,7 +271,7 @@ pub struct Process {
     /// Finished off: no threads or files left, just the address space still
     /// in TTBR0 until another process is switched in.
     pub dead: bool,
-    /// This is the process in `PROCESS`, on the CPU.
+    /// A thread of it is on the CPU whose slot of `PROCESS` it's in.
     pub running: bool,
     /// A vfork child: the parent thread waiting for it to exec or exit.
     pub vfork_parent: Option<(u32, u32)>,
@@ -362,17 +363,27 @@ pub enum JobReport {
     Continued,
 }
 
-pub static PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+const N: usize = grix_abi::machine::MAX_CPUS as usize;
 
-/// The pid of the process in `PROCESS` (what /proc/self is).
-static CURRENT_PID: AtomicU32 = AtomicU32::new(INIT);
+/// The process each CPU in the kernel runs, by CPU: `smp::lock` takes it
+/// out of `procs::PROCS` and `smp::unlock` puts it back, so between
+/// kernel entries every slot is empty.
+pub static PROCESS: [Mutex<Option<Process>>; N] = [const { Mutex::new(None) }; N];
+
+/// This CPU's slot of `PROCESS`.
+pub fn running() -> &'static Mutex<Option<Process>> {
+    &PROCESS[crate::smp::me()]
+}
+
+/// The pid of the process in each CPU's slot (what /proc/self is).
+static CURRENT_PID: [AtomicU32; N] = [const { AtomicU32::new(INIT) }; N];
 
 pub fn current_pid() -> u32 {
-    CURRENT_PID.load(Ordering::Relaxed)
+    CURRENT_PID[crate::smp::me()].load(Ordering::Relaxed)
 }
 
 pub fn set_current_pid(pid: u32) {
-    CURRENT_PID.store(pid, Ordering::Relaxed);
+    CURRENT_PID[crate::smp::me()].store(pid, Ordering::Relaxed);
 }
 
 /// What has been reported to the host already, for every process: each
@@ -715,7 +726,7 @@ pub fn finish(kind: ExitKind, code: i32) -> ! {
 /// Demand paging for a user translation fault.
 pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
     crate::stats::page_fault();
-    let mut guard = PROCESS.lock();
+    let mut guard = running().lock();
     let p = guard.as_mut().expect("fault without a process");
     match p.aspace.fault(far, access) {
         // A write that gave a page its frame: other mappings' copies of it
@@ -824,7 +835,7 @@ pub fn start(img: Image<'static>) -> ! {
     p.slice_start = crate::time::monotonic_ns();
     // The kernel is ours while the other CPUs start (they wait for it).
     crate::smp::lock();
-    *PROCESS.lock() = Some(p);
+    *running().lock() = Some(p);
     arch::irq::init(gicr);
     crate::smp::start(cpus);
     console::start(stdin);

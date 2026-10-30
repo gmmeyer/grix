@@ -1,8 +1,9 @@
 //! Every process but the running one, and zombies: what fork, wait4, kill
-//! and the scheduler share. The running process is in `process::PROCESS`;
-//! the scheduler swaps bodies between the two (`sched::schedule`).
+//! and the scheduler share. The process a CPU in the kernel runs is in
+//! that CPU's slot of `process::PROCESS`; the scheduler swaps bodies
+//! between the two (`sched::schedule`).
 //!
-//! Lock order: `PROCESS`, then `PROCS`.
+//! Lock order: a `PROCESS` slot, then `PROCS`.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;

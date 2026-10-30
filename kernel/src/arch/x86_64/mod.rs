@@ -365,9 +365,15 @@ pub const PLATFORM: &str = "x86_64";
 /// Linux's MINSIGSTKSZ.
 pub const MINSIGSTKSZ: u64 = 2048;
 
-/// This CPU's number: its local APIC's ID (the VMMs number CPUs 0..n).
+/// This CPU's number: its local APIC's ID (the VMMs number CPUs 0..n),
+/// kept in its `PerCpu` (`init_cpu`), as reading the APIC may be a VM exit
+/// and the kernel asks often.
 pub fn cpu_number() -> usize {
-    irq::lapic_id() as usize
+    let cpu: u64;
+    // SAFETY: GS is this CPU's `PerCpu` in the kernel (from `init_cpu`, the
+    // first thing each CPU does).
+    unsafe { asm!("mov {}, gs:[16]", out(reg) cpu, options(nostack, readonly, preserves_flags)) };
+    cpu as usize
 }
 
 /// Wait for an interrupt. `sti` takes effect after the next instruction, so
@@ -500,7 +506,7 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
     });
     // The thread this CPU ran may have ended meanwhile (exit_group or
     // execve on another CPU): then there's nothing to handle for it.
-    let has_thread = process::PROCESS.lock().as_ref().is_some_and(|p| p.running);
+    let has_thread = process::running().lock().as_ref().is_some_and(|p| p.running);
     match tf.vector {
         SYSCALL if has_thread => {
             syscall::handle(tf);
@@ -569,7 +575,7 @@ fn user_exception(tf: &mut TrapFrame) {
         12 => (SIGBUS, SI_KERNEL, 0, "stack segment fault"),
         _ => (SIGSEGV, SI_KERNEL, 0, "general protection fault"),
     };
-    let mut guard = process::PROCESS.lock();
+    let mut guard = process::running().lock();
     let p = guard.as_mut().expect("fault without a process");
     signal::fault(p, sig, code, signal::Fault { addr, pc: tf.rip, syndrome }, why);
 }
@@ -851,15 +857,17 @@ struct Idt([AtomicU64; 512]);
 static IDT: Idt = Idt([const { AtomicU64::new(0) }; 512]);
 
 /// What `syscall_entry` finds through GS: this CPU's kernel stack, and room
-/// for the user's rsp.
+/// for the user's rsp; and its number (`cpu_number`).
 #[repr(C)]
 pub(crate) struct PerCpu {
     kernel_rsp: AtomicU64,
     user_rsp: AtomicU64,
+    cpu: AtomicU64,
 }
 
-static PER_CPU: [PerCpu; MAX_CPUS] =
-    [const { PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0) } }; MAX_CPUS];
+static PER_CPU: [PerCpu; MAX_CPUS] = [const {
+    PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0), cpu: AtomicU64::new(0) }
+}; MAX_CPUS];
 
 /// Set the CPU up, before anything else: segments, traps, `syscall`, the
 /// FPU and the clock (boot.S calls it on CPU 0).
@@ -982,6 +990,7 @@ fn init_cpu(cpu: usize) {
     unsafe { load_cpu_tables(gdtr.as_ptr(), idtr.as_ptr(), TSS_SEL + 16 * cpu as u16) };
     let pc = &PER_CPU[cpu];
     pc.kernel_rsp.store(top, Ordering::Relaxed);
+    pc.cpu.store(cpu as u64, Ordering::Relaxed);
     // `syscall`: kernel CS/SS from STAR[47:32], user from [63:48] (+16 code,
     // +8 data), entry, and the flags cleared on entry.
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1 | (1 << 11)); // SCE, NXE
