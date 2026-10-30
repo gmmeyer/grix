@@ -119,6 +119,8 @@ pub struct Image<'a> {
     /// host: stdin carries what's typed, stdout what the terminal shows
     /// (and `wire::Input::Resize` its new size). Needs `stdin`.
     pub tty: Option<(u16, u16)>,
+    /// The sandbox's host name ([`crate::valid_hostname`]).
+    pub hostname: &'a str,
 }
 
 /// The hypervisor call (HVC, in SMCCC's OEM service range: Hypervisor.framework
@@ -216,6 +218,7 @@ impl<'a> Image<'a> {
         w.u8(self.tty.is_some() as u8);
         let (rows, cols) = self.tty.unwrap_or_default();
         w.u32(rows as u32 | (cols as u32) << 16);
+        w.str(self.hostname);
         let len = w.len() as u64;
         w.buf[8..16].copy_from_slice(&len.to_le_bytes());
         w.buf
@@ -284,6 +287,10 @@ impl<'a> Image<'a> {
         let has_tty = r.u8()? != 0;
         let size = r.u32()?;
         let tty = has_tty.then_some((size as u16, (size >> 16) as u16));
+        let hostname = r.str()?;
+        if !crate::valid_hostname(hostname) {
+            return Err(DecodeError);
+        }
         Ok(Image {
             ram_size: header.ram_size,
             gicr: header.gicr,
@@ -308,6 +315,7 @@ impl<'a> Image<'a> {
             cpus,
             x86_64,
             tty,
+            hostname,
         })
     }
 }
@@ -356,6 +364,7 @@ mod tests {
             cpus: 4,
             x86_64: "/usr/bin/qemu-x86_64",
             tty: Some((24, 80)),
+            hostname: "box-1.example",
         };
         let bytes = img.encode();
         let h = parse_header(&bytes).unwrap();
@@ -390,6 +399,7 @@ mod tests {
             cpus: 1,
             x86_64: "",
             tty: None,
+            hostname: crate::HOSTNAME,
         };
         let bytes = img.encode();
         assert!(Image::decode(&bytes[..bytes.len() - 1]).is_err());

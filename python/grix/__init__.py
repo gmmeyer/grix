@@ -154,6 +154,10 @@ class Sandbox:
     files: Mapping[str, Union[str, bytes]] = field(default_factory=dict)
     env: Mapping[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
+    #: The sandbox's host name (``grix`` by default).
+    hostname: Optional[str] = None
+    #: Give the program HOME, PATH, LANG and TMPDIR, unless ``env`` sets them.
+    default_env: bool = False
     capabilities: Sequence[str] = ()
     memory_mb: Optional[int] = None
     #: CPUs for the program's threads (1 by default).
@@ -185,6 +189,10 @@ class Sandbox:
             a += ["-e", f"{k}={v}"]
         if self.cwd:
             a += ["--cwd", self.cwd]
+        if self.hostname is not None:
+            a += ["--hostname", self.hostname]
+        if self.default_env:
+            a += ["--default-env"]
         for c in self.capabilities:
             a += ["-a", c]
         if self.memory_mb:
@@ -220,6 +228,8 @@ class Sandbox:
             "files": files,
             "env": list(self.env.items()),
             "cwd": self.cwd,
+            "hostname": self.hostname,
+            "default_env": bool(self.default_env),
             "capabilities": list(self.capabilities),
             "memory_mb": num(self.memory_mb or None, int),
             "cpus": num(self.cpus or None, int),

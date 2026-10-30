@@ -34,6 +34,8 @@ struct Config {
     files: Vec<(String, Vec<u8>, u32)>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
+    hostname: Option<String>,
+    default_env: bool,
     capabilities: Vec<String>,
     memory_mb: Option<u64>,
     cpus: Option<u32>,
@@ -71,6 +73,12 @@ impl Config {
         }
         if let Some(cwd) = &self.cwd {
             b = b.cwd(cwd);
+        }
+        if let Some(name) = &self.hostname {
+            b = b.hostname(name)?;
+        }
+        if self.default_env {
+            b = b.default_env();
         }
         for name in &self.capabilities {
             b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);

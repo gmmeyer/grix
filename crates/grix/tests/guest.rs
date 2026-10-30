@@ -81,6 +81,56 @@ fn environment_is_empty_unless_given() {
 }
 
 #[test]
+fn a_default_environment_on_request() {
+    // HOME, PATH, LANG and TMPDIR, unless they're given; nothing else.
+    let busybox = || Sandbox::builder().import(fixture("alpine/bin/busybox.static"), "/bin/busybox").unwrap();
+    let out = run(busybox().default_env().env("LANG", "en_US.UTF-8"), &["/bin/busybox", "env"]);
+    let stdout = out.stdout_str();
+    let mut env: Vec<&str> = stdout.lines().collect();
+    env.sort();
+    assert_eq!(
+        env,
+        [
+            "HOME=/home/grix",
+            "LANG=en_US.UTF-8",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TMPDIR=/tmp"
+        ]
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // An imported /etc/passwd's home.
+    let passwd = "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000::/srv/app:/bin/sh\n";
+    let b = busybox().file("/etc/passwd", passwd, 0o644).unwrap().default_env();
+    let out = run(b, &["/bin/busybox", "sh", "-c", "echo $HOME $TMPDIR"]);
+    assert_eq!(out.stdout_str(), "/srv/app /tmp\n");
+}
+
+#[test]
+fn a_host_name_of_its_own() {
+    // uname, /etc/hostname, /etc/hosts and /proc/sys/kernel/hostname all
+    // say the name given; grix by default.
+    let script = "/bin/busybox hostname; /bin/busybox uname -n; /bin/busybox cat /etc/hostname \
+                  /proc/sys/kernel/hostname; /bin/busybox grep -c \"10.0.2.15\t$(/bin/busybox hostname)$\" /etc/hosts";
+    let busybox = || {
+        Sandbox::builder()
+            .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+            .unwrap()
+            .allow(Capability::Process)
+    };
+    let out = run(busybox().hostname("build-7.example").unwrap(), &["/bin/busybox", "sh", "-c", script]);
+    assert_eq!(out.stdout_str(), "build-7.example\n".repeat(4) + "1\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let out = run(busybox(), &["/bin/busybox", "sh", "-c", script]);
+    assert_eq!(out.stdout_str(), "grix\n".repeat(4) + "1\n");
+    for bad in ["", "-x", ".x", "a b", "a/b", "a\nb", &"x".repeat(65)] {
+        assert!(busybox().hostname(bad).is_err(), "{bad:?}");
+    }
+    assert!(busybox().hostname(&"x".repeat(64)).is_ok());
+}
+
+#[test]
 fn static_pie_executable() {
     let b = Sandbox::builder().import(fixture("hello-pie"), "/bin/hello").unwrap();
     let out = run(b, &["/bin/hello", "pie"]);

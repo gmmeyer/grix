@@ -214,6 +214,12 @@ struct RunArgs {
     /// Working directory inside the sandbox.
     #[arg(long)]
     cwd: Option<String>,
+    /// The sandbox's host name (default grix).
+    #[arg(long)]
+    hostname: Option<String>,
+    /// Give the program HOME, PATH, LANG and TMPDIR, unless they're set.
+    #[arg(long)]
+    default_env: bool,
     /// Guest memory in MiB.
     #[arg(long)]
     mem: Option<u64>,
@@ -718,6 +724,12 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     }
     if let Some(cwd) = &args.cwd {
         b = b.cwd(cwd);
+    }
+    if let Some(name) = &args.hostname {
+        b = b.hostname(name)?;
+    }
+    if args.default_env {
+        b = b.default_env();
     }
     if let Some(mb) = args.mem {
         b = b.memory_mb(mb);

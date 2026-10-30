@@ -178,6 +178,7 @@ impl Builder {
             cpus: spec.cpus,
             x86_64: "",
             tty: spec.tty,
+            hostname: grix_abi::HOSTNAME,
         }
         .encode())
     }

@@ -509,10 +509,11 @@ up without CAP_SYS_RESOURCE would do.
 - [x] Synthesize `/etc/passwd` and `/etc/group` with the sandbox user (unless
       imported). Python `getpass.getuser()` raises; Node `os.userInfo()` and
       `os.homedir()` throw; `ls -l` and `id` show numbers.
-- [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
-      Images get Docker's `HOME` and `HOSTNAME` (round 4) and their own
-      `Env`; a run without an image still starts with nothing but what it
-      was given.
+- [x] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
+      `SandboxBuilder::default_env`, `--default-env`, `default_env` in
+      manifests, MCP's `run` and Python: each unless it's set, `HOME` from
+      /etc/passwd (`a_default_environment_on_request`). Images get
+      Docker's `HOME` and `HOSTNAME` anyway (round 4).
 - [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
       A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
 - [~] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
@@ -520,8 +521,12 @@ up without CAP_SYS_RESOURCE would do.
       `/etc/hosts` and `/etc/resolv.conf` are generated unless imported. Alpine's
       runtimes bring their own CA bundle (`ca-certificates`); there's no option yet
       to pass in the host's.
-- [ ] Configurable hostname. It's always `grix` (`grix_abi::HOSTNAME`:
-      uname, /etc/hostname, /proc/sys/kernel/hostname, images' `HOSTNAME`).
+- [x] Configurable hostname: `SandboxBuilder::hostname`, `--hostname`,
+      `hostname` in manifests, MCP's `run` and Python (`Image::hostname`;
+      uname, /etc/hostname, /etc/hosts, /proc/sys/kernel/hostname, and an
+      image's `HOSTNAME`), `grix` by default (`a_host_name_of_its_own`).
+      Images don't carry one, as Docker's don't. `sethostname` stays
+      privileged.
 
 ## Networking (`net`)
 

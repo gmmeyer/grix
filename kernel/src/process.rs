@@ -896,6 +896,7 @@ pub fn start(img: Image<'static>) -> ! {
     let entries: &'static [grix_abi::image::Entry<'static>] = img.entries.leak();
     crate::export::init(&img.exports, &img.mounts, entries, img.export_budget);
     crate::inet::init(img.forwards.clone(), img.udp_forwards.clone());
+    crate::procfs::set_hostname(img.hostname);
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });
         klog!("exec {}: {}\n", img.exe, reason);

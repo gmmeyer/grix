@@ -497,6 +497,9 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                                         stay in the sandbox)."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                     "cwd": {"type": "string"},
+                    "hostname": {"type": "string", "description": "The sandbox's host name (default grix)."},
+                    "default_env": {"type": "boolean",
+                                    "description": "Give the program HOME, PATH, LANG and TMPDIR, unless env sets them."},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
                     "exports": {"type": "array", "items": {"type": "string"},
                                 "description": "Sandbox directories whose contents to return when the program ends."},
@@ -688,6 +691,12 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
     }
     if let Some(cwd) = args["cwd"].as_str() {
         b = b.cwd(cwd);
+    }
+    if let Some(name) = args["hostname"].as_str() {
+        b = b.hostname(name)?;
+    }
+    if args["default_env"].as_bool() == Some(true) {
+        b = b.default_env();
     }
     for name in strings(&args["capabilities"]) {
         let cap = Capability::from_name(&name).with_context(|| format!("unknown capability {name:?}"))?;

@@ -16,11 +16,25 @@ extern crate alloc;
 /// image, the wire format, `link` and `hostfs`. A grix image carries the
 /// kernel it was built with, and runs only with a host of the same
 /// version. Bump it with any change the other side couldn't read.
-pub const ABI_VERSION: u32 = 11;
+pub const ABI_VERSION: u32 = 12;
 
-/// The sandbox's host name (uname, /etc/hostname, and Docker's HOSTNAME
-/// in an image's environment).
+/// The sandbox's host name unless it's given one (`Image::hostname`):
+/// uname, /etc/hostname, /etc/hosts, /proc/sys/kernel/hostname, and
+/// Docker's HOSTNAME in an image's environment.
 pub const HOSTNAME: &str = "grix";
+
+/// The longest host name (Linux's `__NEW_UTS_LEN`).
+pub const MAX_HOSTNAME: usize = 64;
+
+/// A host name the sandbox may have: 1 to `MAX_HOSTNAME` bytes of
+/// letters, digits, `-` and `.` (RFC 1123's labels, which every
+/// resolver and /etc/hosts reader takes), not starting with `-` or `.`.
+pub fn valid_hostname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOSTNAME
+        && !name.starts_with(['-', '.'])
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
 
 /// The kernel says which ABI it speaks with these bytes in its binary
 /// (`MARK` then `ABI_VERSION`, little-endian), so a host can tell before

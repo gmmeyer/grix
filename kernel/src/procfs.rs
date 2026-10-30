@@ -17,7 +17,17 @@ use crate::process::{Ids, Process};
 use crate::procs::Zombie;
 use crate::time;
 
-pub const HOSTNAME: &str = grix_abi::HOSTNAME;
+/// The sandbox's host name, from the boot image (`set_hostname`).
+static HOSTNAME: spin::Once<String> = spin::Once::new();
+
+pub fn set_hostname(name: &str) {
+    HOSTNAME.call_once(|| String::from(name));
+}
+
+pub fn hostname() -> &'static str {
+    HOSTNAME.get().map_or(grix_abi::HOSTNAME, String::as_str)
+}
+
 pub const RELEASE: &str = "6.1.0-grix";
 pub const VERSION: &str = "#1 SMP grix";
 
@@ -65,6 +75,7 @@ pub enum ProcFile {
     Uptime,
     Loadavg,
     Version,
+    Hostname,
     RandomUuid,
     BootId,
     // /sys/fs/cgroup/...
@@ -156,7 +167,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/loadavg", ProcFile::Loadavg),
     ("/proc/version", ProcFile::Version),
     ("/proc/filesystems", ProcFile::Text("nodev\ttmpfs\nnodev\tproc\n")),
-    ("/proc/sys/kernel/hostname", ProcFile::Text("grix\n")),
+    ("/proc/sys/kernel/hostname", ProcFile::Hostname),
     ("/proc/sys/kernel/osrelease", ProcFile::Text("6.1.0-grix\n")),
     ("/proc/sys/kernel/ostype", ProcFile::Text("Linux\n")),
     ("/proc/sys/kernel/pid_max", ProcFile::Text("4194304\n")),
@@ -363,6 +374,9 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         }
         ProcFile::Version => {
             let _ = writeln!(s, "Linux version {RELEASE} (grix) {VERSION}");
+        }
+        ProcFile::Hostname => {
+            let _ = writeln!(s, "{}", hostname());
         }
         ProcFile::RandomUuid => uuid(&mut s, None),
         ProcFile::BootId => uuid(&mut s, Some(time::boot_id())),

@@ -57,6 +57,11 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # with job control, Ctrl-C and Ctrl-Z.
 ./target/release/grix run -t -a process -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -i
 
+# A host name of its own, and HOME, PATH, LANG and TMPDIR as a login would set them
+# (otherwise the program gets only the environment it's given).
+./target/release/grix run --hostname worker-1 --default-env -a process \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -c 'hostname; env'
+
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox cp /etc/passwd /out/

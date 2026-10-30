@@ -211,8 +211,8 @@ fn clock_gettime(p: &mut Process, clock: u64, tp: u64) -> SysResult {
 
 fn uname(p: &mut Process, buf: u64) -> SysResult {
     let mut b = [0u8; 65 * 6];
-    use crate::procfs::{HOSTNAME, RELEASE, VERSION};
-    let fields = ["Linux", HOSTNAME, RELEASE, VERSION, crate::arch::PLATFORM, "(none)"];
+    use crate::procfs::{RELEASE, VERSION, hostname};
+    let fields = ["Linux", hostname(), RELEASE, VERSION, crate::arch::PLATFORM, "(none)"];
     for (i, f) in fields.iter().enumerate() {
         b[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
     }
