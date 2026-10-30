@@ -141,10 +141,11 @@ fn is_unix(file: &FileRef) -> bool {
 pub fn connect(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
+        let raw = read_addr_bytes(p, addr, len)?;
         let mut of = file.lock();
         let nonblock = of.nonblocking();
         let FileKind::Inet(s) = &mut of.kind else { unreachable!() };
-        return inet_connect(p, s, nonblock, addr, len);
+        return inet_connect(p, s, nonblock, &raw);
     }
     match file.lock().kind {
         FileKind::Netlink(_) => return Ok(0),
@@ -176,11 +177,12 @@ fn is_netlink(file: &FileRef) -> bool {
 pub fn bind(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
+        let raw = read_addr_bytes(p, addr, len)?;
         return with_inet(p, fd, |p, s, _| {
             if !s.dgram {
-                crate::landlock::check_socket(p, s.v6, addr, len, true)?;
+                crate::landlock::check_socket(p, s.v6, &raw, true)?;
             }
-            inet_bind(p, s, addr, len)
+            inet_bind(s, &raw)
         })?;
     }
     if is_unix(&file) {
@@ -855,13 +857,19 @@ fn new_inet(p: &mut Process, domain: u64, ty: u64, proto: u64, flags: u32, cloex
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
-fn read_sockaddr(p: &mut Process, addr: u64, len: u64) -> Result<SockAddr, Errno> {
+/// A socket address as the program gave it. Read once: another thread can
+/// change it meanwhile, so what's checked must be what's used.
+fn read_addr_bytes(p: &mut Process, addr: u64, len: u64) -> Result<Vec<u8>, Errno> {
     if !(2..=128).contains(&len) {
         return Err(EINVAL);
     }
     let mut b = alloc::vec![0u8; len as usize];
     copy_in(&mut p.aspace, addr, &mut b)?;
-    SockAddr::decode(&b)
+    Ok(b)
+}
+
+fn read_sockaddr(p: &mut Process, addr: u64, len: u64) -> Result<SockAddr, Errno> {
+    SockAddr::decode(&read_addr_bytes(p, addr, len)?)
 }
 
 /// Run `f` on the AF_INET socket at `fd`.
@@ -877,8 +885,8 @@ fn is_inet(file: &FileRef) -> bool {
     matches!(file.lock().kind, FileKind::Inet(_))
 }
 
-fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
-    let a = read_sockaddr(p, addr, len)?;
+fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
+    let a = SockAddr::decode(raw)?;
     if !s.dgram && (s.bound.is_some() || !matches!(s.state, State::Idle)) {
         return Err(EINVAL);
     }
@@ -982,30 +990,26 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
     Ok(nfd)
 }
 
-fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u64) -> SysResult {
-    if s.dgram && len >= 2 {
-        let mut family = [0u8; 2];
-        copy_in(&mut p.aspace, addr, &mut family)?;
-        if u16::from_le_bytes(family) == AF_UNSPEC {
-            // Disconnect, forgetting the address connect chose (glibc's
-            // getaddrinfo sorts its answers this way with one socket).
-            s.peer = None;
-            let u = udp_of(s);
-            let mut u = u.lock();
-            u.peer = None;
-            if !s.addr_bound {
-                let any = if s.v6 { Addr::V6([0; 16]) } else { Addr::V4([0; 4]) };
-                for a in [s.bound.as_mut(), u.local.as_mut()].into_iter().flatten() {
-                    a.addr = any;
-                }
+fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, raw: &[u8]) -> SysResult {
+    if s.dgram && u16::from_le_bytes([raw[0], raw[1]]) == AF_UNSPEC {
+        // Disconnect, forgetting the address connect chose (glibc's
+        // getaddrinfo sorts its answers this way with one socket).
+        s.peer = None;
+        let u = udp_of(s);
+        let mut u = u.lock();
+        u.peer = None;
+        if !s.addr_bound {
+            let any = if s.v6 { Addr::V6([0; 16]) } else { Addr::V4([0; 4]) };
+            for a in [s.bound.as_mut(), u.local.as_mut()].into_iter().flatten() {
+                a.addr = any;
             }
-            return Ok(0);
         }
+        return Ok(0);
     }
     if !s.dgram {
-        crate::landlock::check_socket(p, s.v6, addr, len, false)?;
+        crate::landlock::check_socket(p, s.v6, raw, false)?;
     }
-    let to = read_sockaddr(p, addr, len)?.or_loopback();
+    let to = SockAddr::decode(raw)?.or_loopback();
     if s.dgram {
         // Nothing is sent: resolvers and "what's my address" code connect a
         // UDP socket just to see the route. From now on datagrams come only

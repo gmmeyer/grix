@@ -625,16 +625,17 @@ pub fn restrict_self(p: &mut Process, fd: u64, flags: u64) -> SysResult {
 /// current_check_access_socket checks it before the network stack sees
 /// it: Ok(None) when Landlock has nothing to say (another family, or a
 /// disconnect).
-fn socket_port(p: &mut Process, v6: bool, addr: u64, len: u64, bind: bool) -> Result<Option<u16>, Errno> {
+fn socket_port(v6: bool, addr: &[u8], bind: bool) -> Result<Option<u16>, Errno> {
     const AF_UNSPEC: u16 = 0;
     const AF_INET: u16 = 2;
     const AF_INET6: u16 = 10;
+    let len = addr.len();
     if len < 2 {
         return Err(EINVAL);
     }
     let mut raw = [0u8; 24];
-    let n = (len as usize).min(24);
-    copy_in(&mut p.aspace, addr, &mut raw[..n])?;
+    let n = len.min(24);
+    raw[..n].copy_from_slice(&addr[..n]);
     let family = u16::from_le_bytes([raw[0], raw[1]]);
     let port = u16::from_be_bytes([raw[2], raw[3]]);
     match family {
@@ -663,14 +664,15 @@ fn socket_port(p: &mut Process, v6: bool, addr: u64, len: u64, bind: bool) -> Re
     Ok(Some(port))
 }
 
-/// A TCP socket's bind (`bind`) or connect to the address at `addr`.
-pub fn check_socket(p: &mut Process, v6: bool, addr: u64, len: u64, bind: bool) -> Result<(), Errno> {
+/// A TCP socket's bind (`bind`) or connect to `addr`, the address as the
+/// program gave it: the one copy the call goes on to use.
+pub fn check_socket(p: &Process, v6: bool, addr: &[u8], bind: bool) -> Result<(), Errno> {
     let Some(d) = domain(p) else { return Ok(()) };
     let access = if bind { BIND_TCP } else { CONNECT_TCP };
     if d.init(access, true).1 == 0 {
         return Ok(());
     }
-    match socket_port(p, v6, addr, len, bind)? {
+    match socket_port(v6, addr, bind)? {
         Some(port) if !d.net_allowed(port, access) => Err(EACCES),
         _ => Ok(()),
     }

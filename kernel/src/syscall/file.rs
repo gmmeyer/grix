@@ -177,13 +177,18 @@ fn with_other<T>(p: &Process, pid: u32, f: impl FnOnce(&Process) -> Result<T, Er
 /// The node a path names, for calls that take (dirfd, path, AT_* flags).
 fn at_node(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> Result<Ino, Errno> {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
+    named_node(p, dirfd, &path, flags)
+}
+
+/// `at_node`, for a path already read.
+fn named_node(p: &mut Process, dirfd: u64, path: &str, flags: u64) -> Result<Ino, Errno> {
     if path.is_empty() {
         return if flags & AT_EMPTY_PATH != 0 { fd_node(p, dirfd) } else { Err(ENOENT) };
     }
-    if let Some(fd) = procfs::fd_path(&path) {
+    if let Some(fd) = procfs::fd_path(path) {
         return fd_node(p, fd);
     }
-    match resolve_named(p, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)? {
+    match resolve_named(p, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)? {
         Named::Node(ino) => Ok(ino),
         Named::Fd(pid, fd) if pid == p.pid => fd_node(p, fd),
         Named::Fd(pid, fd) => with_other(p, pid, |q| fd_node(q, fd).map_err(|_| ENOENT)),
@@ -1893,9 +1898,9 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
         return Err(EINVAL);
     }
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
-    let src = at_node(p, odirfd, opathp, (flags & AT_EMPTY_PATH) | follow)?;
-    let _pin = fs::lock().pin(src);
     let opath = read_cstr(&mut p.aspace, opathp, PATH_MAX)?;
+    let src = named_node(p, odirfd, &opath, (flags & AT_EMPTY_PATH) | follow)?;
+    let _pin = fs::lock().pin(src);
     // (An empty path is the descriptor's: `found_in` gives its parent.)
     let obase = if opath.is_empty() { ROOT } else { base_of(p, odirfd, &opath)? };
     let npath = read_cstr(&mut p.aspace, npathp, PATH_MAX)?;
