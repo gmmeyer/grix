@@ -105,6 +105,21 @@ int main(void) {
     CHECK(tee(f, b[1], 10, 0) == -1 && errno == EINVAL);
     CHECK(tee(a[0], b[1], 10, SPLICE_F_NONBLOCK) == -1 && errno == EAGAIN);
 
+    // A pipe's capacity (ClickHouse asks): bigger up to pipe-max-size,
+    // never smaller than what it holds.
+    CHECK(fcntl(a[0], F_GETPIPE_SZ) == 65536);
+    CHECK(fcntl(a[1], F_SETPIPE_SZ, 100) == 4096 && fcntl(a[0], F_GETPIPE_SZ) == 4096);
+    fcntl(a[1], F_SETFL, O_NONBLOCK);
+    CHECK(write(a[1], buf, 5000) == 4096);
+    CHECK(fcntl(a[1], F_SETPIPE_SZ, 1 << 20) == 1 << 20);
+    CHECK(write(a[1], buf, 60000) == 60000 && read(a[0], buf, sizeof buf) == 64096);
+    CHECK(fcntl(a[1], F_SETPIPE_SZ, 2 << 20) == -1 && errno == EPERM);
+    CHECK(write(a[1], buf, 8192) == 8192);
+    CHECK(fcntl(a[1], F_SETPIPE_SZ, 4096) == -1 && errno == EBUSY);
+    CHECK(read(a[0], buf, sizeof buf) == 8192);
+    CHECK(fcntl(f, F_GETPIPE_SZ) == -1 && errno == EBADF);
+    fcntl(a[1], F_SETFL, 0);
+
     // vmsplice: buffers into a pipe, or out of one.
     struct iovec iov[2] = {{"ab", 2}, {"cd", 2}};
     CHECK(vmsplice(a[1], iov, 2, 0) == 4);

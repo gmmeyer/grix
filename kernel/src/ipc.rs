@@ -26,6 +26,9 @@ pub fn generation() -> u64 {
 
 /// Linux's default pipe capacity.
 pub const PIPE_CAPACITY: usize = 64 * 1024;
+/// The most F_SETPIPE_SZ gives without CAP_SYS_RESOURCE (Linux's
+/// /proc/sys/fs/pipe-max-size).
+pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
 /// Writes up to this size are atomic.
 pub const PIPE_BUF: usize = 4096;
 
@@ -33,6 +36,9 @@ pub struct Pipe {
     /// Its heap allocation is charged to the kernel memory budget (`charge`).
     pub buf: VecDeque<u8>,
     charge: crate::kmem::Charge,
+    /// How much it holds (F_SETPIPE_SZ): the bytes it takes are charged
+    /// as they're written, not here.
+    pub capacity: usize,
     pub readers: usize,
     pub writers: usize,
     /// Bumped on every state change (for edge-triggered epoll).
@@ -57,7 +63,7 @@ pub const MAX_CRED_RUNS: usize = 256;
 
 impl Pipe {
     pub fn space(&self) -> usize {
-        PIPE_CAPACITY - self.buf.len()
+        self.capacity.saturating_sub(self.buf.len())
     }
 
     /// Could a write add anything now? (Room in the pipe, and in memory.)
@@ -152,6 +158,7 @@ fn new_pipe(readers: usize, writers: usize) -> Arc<Mutex<Pipe>> {
     Arc::new(Mutex::new(Pipe {
         buf: VecDeque::new(),
         charge: crate::kmem::Charge::default(),
+        capacity: PIPE_CAPACITY,
         readers,
         writers,
         version: 0,

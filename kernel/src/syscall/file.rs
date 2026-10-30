@@ -2369,6 +2369,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETOWN_EX: u64 = 15;
     const F_GETOWN_EX: u64 = 16;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
     const F_ADD_SEALS: u64 = 1033;
     const F_GET_SEALS: u64 = 1034;
     match cmd {
@@ -2397,6 +2399,35 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         F_SETOWN | F_GETOWN | F_SETSIG | F_GETSIG | F_SETOWN_EX | F_GETOWN_EX => owner(p, fd, cmd, arg),
         F_GETLK | F_SETLK | F_SETLKW | 36..=38 => record_lock(p, fd, cmd, arg),
+        // A pipe's capacity (Linux's pipe_fcntl): a power of two pages,
+        // at most pipe-max-size, and no less than what it holds.
+        F_SETPIPE_SZ | F_GETPIPE_SZ => {
+            let file = p.fds.get(fd)?;
+            let f = file.lock();
+            let end = match &f.kind {
+                FileKind::Pipe(end) => end,
+                FileKind::Fifo(FifoFile { read: Some(end), .. }) | FileKind::Fifo(FifoFile { write: Some(end), .. }) => {
+                    end
+                }
+                _ => return Err(EBADF),
+            };
+            let mut pipe = end.pipe.lock();
+            if cmd == F_GETPIPE_SZ {
+                return Ok(pipe.capacity as u64);
+            }
+            let want = (arg as u32 as usize).max(4096);
+            let size = want.checked_next_power_of_two().ok_or(EINVAL)?;
+            // (Nobody has CAP_SYS_RESOURCE, uid 0 included.)
+            if size > ipc::PIPE_MAX_SIZE {
+                return Err(EPERM);
+            }
+            if size < pipe.buf.len() {
+                return Err(EBUSY);
+            }
+            pipe.capacity = size;
+            pipe.touch();
+            Ok(size as u64)
+        }
         // memfd seals: only sealable files (memfds) have them.
         F_ADD_SEALS | F_GET_SEALS => {
             let file = p.fds.get(fd)?;
