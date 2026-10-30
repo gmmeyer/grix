@@ -746,13 +746,14 @@ fn images_built_from_oci_images() {
     let dir = temp_dir("image");
     std::fs::write(dir.join("hello.sh"), "echo \"$GREETING from $(cat /etc/alpine-release) in $PWD\"\n").unwrap();
     std::fs::copy(fixture("procperm"), dir.join("procperm")).unwrap();
+    std::fs::copy(fixture("hardening2"), dir.join("hardening2")).unwrap();
     let grixfile = format!(
         r#"
 from = "oci:{}"
 command = ["/bin/sh", "/app/hello.sh"]
 cwd = "/app"
 capabilities = ["process"]
-run = ["echo built > /app/stamp", "rm /etc/motd", "echo $HOME > /app/home"]
+run = ["echo built > /app/stamp", "rm /etc/motd", "echo $HOME > /app/home", "cp /bin/hardening2 /app/mine", "chmod 700 /app/mine"]
 
 [env]
 GREETING = "hi"
@@ -764,6 +765,10 @@ guest = "/app/hello.sh"
 [[copy]]
 host = "procperm"
 guest = "/bin/procperm"
+
+[[copy]]
+host = "hardening2"
+guest = "/bin/hardening2"
 
 [[file]]
 guest = "/app/note"
@@ -824,6 +829,15 @@ content = "a note"
     assert_eq!(out.stdout_str(), "procperm ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+    // Root can be anyone: another uid's terminal isn't everyone's,
+    // O_ASYNC's signals are as F_SETOWN's caller's ids allow, and execute
+    // permission is whoever's it is.
+    for name in ["ptsperm", "sigioperm", "execperm"] {
+        let out = sb.run(&["/bin/hardening2", name]).unwrap();
+        assert_eq!(out.stdout_str(), format!("{name} ok\n"), "{}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     let out = sb.run(&["uname", "-m"]).unwrap();
     assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
     // Docker's HOME (root's, from the image's /etc/passwd, for build
@@ -2554,6 +2568,136 @@ fn landlock_rulesets() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+// ---------------------------------------------------------------- a review's findings
+
+/// `fixtures/src/hardening2.c`'s subcommand `name`, which must say it's ok.
+fn hardening2(b: SandboxBuilder, name: &str) -> RunOutput {
+    let b = b.allow(Capability::Process).allow(Capability::Threads).allow(Capability::Net).allow(Capability::FsWrite);
+    let out = run(b, &["/bin/hardening2", name]);
+    assert!(
+        out.stdout_str().ends_with(&format!("{name} ok\n")),
+        "{:?} {:?}\n{}",
+        out.status,
+        out.events,
+        out.stdout_str()
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    out
+}
+
+#[test]
+fn access_mode_3_reads_and_writes_nothing() {
+    // It asks Landlock for no rights at open, as on Linux, so nothing that
+    // reads or writes may take it.
+    let out = hardening2(with("hardening2"), "mode3");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn o_path_descriptors_only_name_things() {
+    let out = hardening2(with("hardening2"), "opath");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn socket_addresses_are_read_once() {
+    // A thread flips the port Landlock doesn't allow in and out while
+    // connect and bind look at it. It takes a second CPU to win.
+    let out = hardening2(with("hardening2").cpus(4), "race");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn every_budget_full_at_once() {
+    // Timers and mappings in 120 processes, full pipes, a full filesystem:
+    // an errno for each, and no kernel panic (`run` checks).
+    let out = hardening2(with("hardening2"), "heap");
+    let stats = out.guest_stats.unwrap();
+    for l in [Limit::Timers, Limit::Mappings, Limit::FileMetadata] {
+        assert!(stats.hits(l) > 0, "{l:?}: {stats:?}");
+    }
+    let kmem = stats.usage(Resource::KernelMemory);
+    assert!(kmem.peak <= kmem.limit, "{kmem:?}");
+}
+
+#[test]
+fn timers_have_a_limit_for_all_processes() {
+    let out = hardening2(with("hardening2"), "timers");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert!(out.guest_stats.unwrap().hits(Limit::Timers) > 0);
+}
+
+#[test]
+fn epoll_interest_lists_are_charged() {
+    let out = hardening2(with("hardening2"), "epoll");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert!(out.guest_stats.unwrap().hits(Limit::KernelMemory) > 0);
+}
+
+#[test]
+fn empty_arguments_are_charged_for_what_they_take() {
+    // 115,000 empty strings hold 6 MiB of the heap in 115 KiB of bytes, in
+    // every process that holds them.
+    let out = hardening2(with("hardening2"), "argv");
+    assert!(out.guest_stats.unwrap().hits(Limit::KernelMemory) > 0);
+}
+
+#[test]
+fn erasing_a_tab_is_as_wide_as_the_tab() {
+    // At most 8 columns, from what's on the line, whatever column output
+    // has reached, and quickly.
+    let out = hardening2(with("hardening2"), "tabs");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn fasync_to_init_takes_its_own_choice() {
+    // A child choosing F_SETSIG's signal for a file init owns is a child
+    // signalling init, which handles none of them.
+    let out = hardening2(with("hardening2"), "fasync");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn a_passed_timerfd_keeps_its_deadline() {
+    // Its only other holder gone, the reader blocks: not a deadlock.
+    let out = hardening2(with("hardening2"), "timerfd");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn fexecve_runs_the_file() {
+    // Unlinked, or with something else at its name, O_PATH or not, a
+    // script, and Landlock's EXECUTE on the file.
+    let out = hardening2(with("hardening2"), "fexec");
+    assert_eq!(out.stdout_str(), "ran plain\nran o_path\nran unlinked\nran unlinked_o_path\nran jailed\nfexec ok\n");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn paths_go_through_a_descriptor() {
+    let out = hardening2(with("hardening2"), "fdpath");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn the_alternate_stack_ends_where_it_ends() {
+    // What doesn't fit ends the program, as a fault, and writes nothing.
+    let out = hardening2(with("hardening2"), "altstack");
+    assert!(!out.events.is_empty());
+    for e in &out.events {
+        let GuestEvent::Fault { signal, detail, .. } = e else { panic!("{e:?}") };
+        assert_eq!(*signal, 11, "{detail}");
+        assert!(detail.contains("no room for a signal frame"), "{detail}");
+    }
+}
+
+#[test]
+fn a_full_ruleset_can_be_enforced() {
+    let out = hardening2(with("hardening2"), "rules");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn landlock_comes_after_the_policy() {
     // The policy's gate first: without fs_write, mkdir is denied (EPERM,
@@ -3454,6 +3598,52 @@ fn snapshots_with_live_mounts() {
     assert_eq!(out.stdout_str(), "A2\nB\ndone\n");
     assert!(out.stderr_str().contains("Read-only"), "{}", out.stderr_str());
     assert_eq!(std::fs::read_to_string(work.join("out.txt")).unwrap(), "one\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshots_of_what_a_live_mount_has_been_through() {
+    // A file moved into a newer directory (its parent's id is the later
+    // one) and a removed directory whose file went on the host first (an
+    // id with no parent): the snapshot's mount state has to load.
+    let dir = temp_dir("mountstate");
+    let work = dir.join("work");
+    std::fs::create_dir_all(work.join("gone")).unwrap();
+    std::fs::write(work.join("gone/f"), "f\n").unwrap();
+    let b = Sandbox::builder()
+        .cpus(1)
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .mount(&work, "/work")
+        .unwrap()
+        .timeout(Duration::from_secs(30));
+    if b.vmm_path().is_none() {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let host = work.clone();
+    let ready = dir.join("work/ready");
+    let remover = std::thread::spawn(move || {
+        for _ in 0..3000 {
+            if ready.exists() {
+                std::fs::remove_file(host.join("gone/f")).unwrap();
+                std::fs::write(host.join("removed"), "").unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let script = "cd /work; echo old > a; /bin/busybox mkdir z; /bin/busybox mv a z/a; /bin/busybox cat gone/f; \
+                  /bin/busybox touch ready; \
+                  while ! /bin/busybox test -e removed; do /bin/busybox sleep 0.01; done; \
+                  /bin/busybox rmdir gone; read line; /bin/busybox cat z/a; echo \"$line\" > z/b; echo done";
+    let snap = b.build().unwrap().snapshot(&["/bin/busybox", "sh", "-c", script], dir.join("s.snap")).unwrap();
+    remover.join().unwrap();
+    let out = snap.clone().mount(&work, "/work").unwrap().run("one\n").unwrap();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.stdout_str(), "old\ndone\n");
+    assert_eq!(std::fs::read_to_string(work.join("z/b")).unwrap(), "one\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

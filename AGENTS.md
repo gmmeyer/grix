@@ -22,7 +22,8 @@ make check       # clippy for host and kernel
   `cargo test` at the root does **not** rebuild it, so after changing kernel code
   run `make kernel` (or `make test`) before the end-to-end tests.
 - End-to-end tests live in `crates/grix/tests/guest.rs` (C fixtures, busybox)
-  and `crates/grix/tests/runtimes.rs` (Python, Node). They need
+  and `crates/grix/tests/runtimes.rs` (Python, Node); `hostfds.rs` is alone
+  in a process, as it lowers the process's descriptor limit. They need
   `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
   built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
   are never skipped.
@@ -271,8 +272,10 @@ IN_Q_OVERFLOW), which queues them on the matching watches (each event
 charged, `MAX_QUEUED` per instance) and marks what changed for fetching
 again (`fs::host_changed`, applied when the filesystem is next free).
 The host bounds what it keeps (`hostfs::MAX_WATCHES`; on macOS entries
-and descriptors) and a round of changes (`watch::MAX_BATCH`, then an
-overflow), and sends as the guest takes them, within a quarter of the
+and descriptors: a share of RLIMIT_NOFILE, `watch::fd_budget`, for every
+watcher in the process, past which files are polled and a node goes
+unwatched, the guest told by an overflow), and a round of changes
+(`watch::MAX_BATCH`, then an overflow, kept to as it's made), and sends as the guest takes them, within a quarter of the
 outbox (`Outbox::send_notice`: stats requests and datagrams still fit),
 so its own kernel's queue holds the rest. A restored snapshot's host watches nothing:
 `inotify::rewatch` asks again for every node and queues an overflow,
@@ -349,7 +352,9 @@ returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when
 `ipc::changed()` bumps the I/O generation, blocked I/O syscalls re-execute
 from the `svc` (ELR − 4) with their original deadline (`restart_deadline`).
-Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too:
+Timers (`timer.rs`: setitimer, POSIX timers, timerfds) are deadlines too
+(a process's, but a timerfd's its file's: `timer::TIMER_FDS`, as the file
+outlives whoever made it, over fork and SCM_RIGHTS):
 the scheduler programs the CPU timer for the earliest one and calls
 `timer::fire` from the timer interrupt and the idle loop. With more
 CPUs one keeps everyone's deadlines (`sched::KEEPER`, a CPU running a
@@ -543,7 +548,8 @@ action, continues it. `job_report` is for wait's WUNTRACED/WCONTINUED;
 
 Terminals (`tty.rs`, `syscall/tty.rs`): a `Tty` is a pseudo-terminal
 pair, its line discipline Linux's N_TTY (`receive` for what the master
-writes, `out` for OPOST). It doesn't touch processes: it returns the
+writes, `out` for OPOST). Its column wraps, as n_tty's: only its low bits
+are used (`erase_tab`), so what a program writes can't make an echo long. It doesn't touch processes: it returns the
 signals to send, and the caller sends them (`signal_group`). /dev/ptmx
 makes one (at most `MAX_PTYS`, each charged its buffers), /dev/pts/N is
 shown while the master is open (`Fs::pts_show`, the node kept for reuse),
@@ -567,9 +573,8 @@ call has to run to make it. A filter can only take away: what it
 refuses isn't a denial and isn't reported, but a kill is (a `Fault`).
 TRAP leaves the registers as they were and forces SIGSYS
 (`signal::force`: fatal if blocked or ignored) with `si_syscall`,
-`si_arch` and the data in `si_errno`. Landlock, the other way a
-program restricts itself, answers EOPNOTSUPP to every call (Linux with
-it disabled at boot), unreported; TODO.md item 34 has the design.
+`si_arch` and the data in `si_errno`. Landlock (below) is the other
+way a program restricts itself.
 Programs are checked as Linux's `bpf_check_classic` and
 `seccomp_check_filter` check them (only forward jumps, so a run ends within its length). TSYNC writes the
 other threads' state directly: one running on another CPU is in user
@@ -605,7 +610,11 @@ read-only mount EROFS (`landlock::domain_changing`). What matters after the open
 made any other way has them). A new way to make, remove, open, execute
 or move a node, or to bind or connect a TCP socket, needs its check.
 `/proc/self/fd/N` isn't re-checked: it's the same open file here
-(`procfs::fd_path`), not a new open. `landlock::may_inspect` keeps a
+(`procfs::fd_path`), not a new open. A path going on through it
+(`/proc/self/fd/N/name`) is an ordinary walk from that directory
+(`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
+only, from `FdTable::walking`), checked as any other. execveat of a
+descriptor runs the file (`process::Start::File`), and is checked as one. `landlock::may_inspect` keeps a
 domain out of processes outside it, as Linux's ptrace hook.
 
 Linux AIO (`syscall/aio.rs`): a context is a ring in the program's
@@ -739,14 +748,18 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       extended attributes count against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files, network receive windows, DNS answers, inotify events) take a
-      `kmem::Charge`.
+      `kmem::Charge`. A buffer of tens of KiB is allocated fallibly
+      (`try_reserve`): a budget with room says nothing of holes.
     - A live mount's nodes count against `META_LIMIT` like the program's
       own; when it's full, `Fs::evict` forgets idle ones (the host still
       has them) before anything fails.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
-      all processes), queued real-time signals, inotify watches, POSIX
-      timers, threads (all processes, `process::threads_max`, and each
-      charged `THREAD_COST` to `kmem`), descriptors (RLIMIT_NOFILE, at
+      all processes, each charged `VMA_COST` to `kmem`), queued real-time
+      signals, inotify watches, POSIX timers (`timer::MAX_POSIX_TIMERS`
+      for scans of a process's, `MAX_TIMERS_TOTAL` in all, each charged
+      to `kmem`; EAGAIN), threads (all processes,
+      `process::threads_max`, and each charged `THREAD_COST` to `kmem`,
+      a pending signal of each kind included), descriptors (RLIMIT_NOFILE, at
       most `fd::MAX_FDS`; a table's slots take a `kmem::Charge`, so
       fork's copies are budgeted too), open files
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
@@ -758,15 +771,19 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
       `kmem`; ENOMEM), Landlock rules (`landlock::MAX_RULES` in all
-      rulesets and domains, each charged to `kmem` with the node it
-      keeps, which may be a thread's that's gone; ENOMEM) and layers
-      (`landlock::MAX_LAYERS` per thread; E2BIG). Epoll registrations
-      are charged to `kmem` (`fd::Epoll::add`; ENOSPC, Linux's
-      max_user_watches), as one file can be under every descriptor in
-      every instance. AIO contexts count the events they ask for
-      against `aio::AIO_MAX_NR` (EAGAIN, Linux's aio-max-nr), and each
-      context and waiting poll is charged to `kmem`. argv and environment copies take a
-      `kmem::Charge`.
+      rulesets and domains, each charged to `kmem`, and `MAX_KEPT` nodes
+      kept, each charged once however many tables hold the rule, as it
+      may be a thread's that's gone; ENOMEM) and layers (`landlock::MAX_LAYERS` per thread;
+      E2BIG). Epoll registrations are charged to `kmem`
+      (`fd::Epoll::add`; ENOSPC, Linux's max_user_watches), as one file
+      can be under every descriptor in every instance, and so are the
+      destinations a UDP socket has asked the host about. AIO contexts
+      count the events they ask for against `aio::AIO_MAX_NR` (EAGAIN,
+      Linux's aio-max-nr), and each context and waiting poll is charged
+      to `kmem`. argv and environment copies take a `kmem::Charge`, each
+      string for what its `String` holds, not only its bytes, and the
+      program's name with them. Reports to the host are kept (`REPORTED`)
+      as `MAX_REPORTS` of `MAX_REPORT_BYTES`.
 
     Limits must be global, not per object: a program can open many objects,
     and fork copies whatever is per process. A list made for a call stops
@@ -798,6 +815,22 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     can't be opened, one inherited across fork reads EIO, and after
     execve one reads and writes nothing (`AddressSpace::id`, as Linux's
     holds the mm it was opened on).
+14. **What's checked is what's used.** User memory can change between two
+    reads (another thread, another CPU), so a value a check looks at is
+    copied in once and everything after uses that copy: a socket address
+    (`net::read_addr_bytes`, then `landlock::check_socket` and the
+    connect), a path string, a signal frame, a seccomp program. Never call
+    `read_cstr` twice for one pointer in one call, and hand a helper the
+    bytes rather than the pointer. (`file::read_only_target` reads a path
+    the handler reads again: only to choose between two refusals.)
+15. **A descriptor's rights are `OpenFile`'s to say.** `FdTable::get` is
+    Linux's fdget: EBADF for an O_PATH descriptor. `get_raw` (fdget_raw)
+    is only for what uses a descriptor as a name: dirfds, fstat, fstatfs,
+    fchdir, dup, close, the fcntls `check_fcntl_cmd` allows, SCM_RIGHTS,
+    pidfd_getfd, execveat, a Landlock rule's parent. May it read or write?
+    `OpenFile::readable` and `writable` (FMODE_READ and FMODE_WRITE) say,
+    and nothing else looks at `O_ACCMODE`: mode 3 is neither, and asks
+    Landlock for no rights at open.
 
 ## Adding a syscall
 

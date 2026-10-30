@@ -297,6 +297,28 @@ Also found in the re-runs: Chromium writes `/proc/<pid>/oom_score_adj`
 for its renderers (EACCES, logged): a per-process value that may only go
 up without CAP_SYS_RESOURCE would do.
 
+### A second security review (of 0.0.48)
+
+Done (`fixtures/src/hardening2.c`, a test each in `guest.rs`, and
+`tests/hostfds.rs`): POSIX timers, mappings, argv and UDP verdict tables
+charged (timers and argv each panicked the heap); access mode 3 and O_PATH as Linux's FMODE_* and fdget;
+socket addresses and paths read once; `/proc/self/fd/N/name`; fexecve of
+the file; TIOCGPTPEER and a full ruleset under Landlock; device nodes'
+permissions; `sigio_perm`; the tab eraser; timerfds that outlive their
+makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
+
+Left, none of it a way out of the sandbox:
+
+- [ ] Permission checks know one group: `mode_permits` doesn't look at
+      supplementary groups (`Ids::groups`).
+- [ ] `/proc/self/fd/N` opens the same open file (no new access mode, no
+      new offset, no permission check); Linux's is a new open.
+- [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
+      another process's are ENOENT past their own name.
+- [ ] The ELF interpreter (`PT_INTERP`) needs no execute permission.
+- [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
+      stays unwatched until the guest watches it again.
+
 ## Agent integrations
 
 - [x] MCP server (`grix mcp`): `run` and `build_image` tools, confined to
@@ -637,9 +659,8 @@ up without CAP_SYS_RESOURCE would do.
       /proc/cpuinfo alike (`id_registers_from_user_mode`,
       `auxv_hwcap2_and_minsigstksz`). x86_64's HWCAP2 is 0 (no
       FSGSBASE).
-- [~] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
-      and ignore, or implement. seccomp filters work; Landlock is
-      EOPNOTSUPP (round 4, item 34, with the design).
+- [x] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): both
+      work (round 4, item 34; AGENTS.md).
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
