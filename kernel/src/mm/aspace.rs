@@ -851,6 +851,12 @@ impl AddressSpace {
             // A write to a page shared copy-on-write changes a present entry.
             return access != Access::Write || paging::writable(pte);
         }
+        // A page and up to three page tables: anything closer to the end of
+        // memory is the usual path's to refuse (and count, once).
+        let (total, used) = frame::usage();
+        if used + 4 > total {
+            return false;
+        }
         self.fault(va, access).is_ok()
     }
 

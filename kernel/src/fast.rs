@@ -192,7 +192,11 @@ pub fn fault(va: u64, access: Access) -> bool {
     let Some(mm) = here().mm.as_ref() else { return false };
     mark(true);
     smp::fast_enter();
-    mm.lock();
+    if !mm.lock_fast() {
+        smp::fast_leave();
+        mark(false);
+        return false;
+    }
     // Flushes of this address space happen with its gate held: any this
     // CPU missed (in the kernel, it couldn't take their IPI) are done now.
     arch::tlb_sync();

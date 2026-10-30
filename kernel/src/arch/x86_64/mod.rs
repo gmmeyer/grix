@@ -516,6 +516,9 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
         _ => false,
     };
     if fast {
+        // As on the way out of the usual path: `syscall` at the top of
+        // user space leaves a non-canonical return address.
+        sanitize(tf);
         return;
     }
     crate::smp::enter(match tf.vector {

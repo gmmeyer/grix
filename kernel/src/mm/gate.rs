@@ -14,7 +14,7 @@
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::aspace::AddressSpace;
 
@@ -42,6 +42,9 @@ pub struct Mm(Arc<Inner>, u64);
 pub struct Inner {
     /// The CPU holding the gate, or `FREE`.
     holder: AtomicUsize,
+    /// The kernel lock's holder waits for it (`lock`): fast entries leave
+    /// it be (`lock_fast`), so a stream of them can't keep it waiting.
+    wanted: AtomicBool,
     aspace: UnsafeCell<AddressSpace>,
 }
 
@@ -53,7 +56,14 @@ impl Mm {
     /// An address space nobody holds yet.
     pub fn new(aspace: AddressSpace) -> Mm {
         let root = aspace.pt.root;
-        Mm(Arc::new(Inner { holder: AtomicUsize::new(FREE), aspace: UnsafeCell::new(aspace) }), root)
+        Mm(
+            Arc::new(Inner {
+                holder: AtomicUsize::new(FREE),
+                wanted: AtomicBool::new(false),
+                aspace: UnsafeCell::new(aspace),
+            }),
+            root,
+        )
     }
 
     /// One held by this CPU (a process it has checked out).
@@ -105,14 +115,40 @@ impl Mm {
 }
 
 impl Inner {
+    /// For the kernel lock's holder (the only one that waits here, so
+    /// `wanted` is its alone).
     pub fn lock(&self) {
         let me = crate::smp::me();
         debug_assert!(self.holder.load(Ordering::Relaxed) != me, "address space gate taken twice on CPU {me}");
-        while self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self.holder.compare_exchange(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            self.wanted.store(true, Ordering::Relaxed);
+            while self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
+            self.wanted.store(false, Ordering::Relaxed);
+        }
+        self.taken(me);
+    }
+
+    /// For a fast entry: false (not taken) if the kernel lock's holder
+    /// wants it, then or while this waits.
+    pub fn lock_fast(&self) -> bool {
+        let me = crate::smp::me();
+        loop {
+            if self.wanted.load(Ordering::Relaxed) {
+                return false;
+            }
+            if self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                self.taken(me);
+                return true;
+            }
             core::hint::spin_loop();
         }
+    }
+
+    fn taken(&self, _me: usize) {
         #[cfg(debug_assertions)]
-        HELD[me].fetch_add(1, Ordering::Relaxed);
+        HELD[_me].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn unlock(&self) {
@@ -169,8 +205,9 @@ pub struct Guard<'a> {
 impl Deref for Guard<'_> {
     type Target = AddressSpace;
     fn deref(&self) -> &AddressSpace {
+        debug_assert!(self.inner.held(), "address space used without its gate");
         // SAFETY: held (by this guard, or this CPU's checked-out process).
-        unsafe { self.inner.get() }
+        unsafe { &*self.inner.aspace.get() }
     }
 }
 

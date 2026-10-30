@@ -3854,6 +3854,10 @@ fn escape_attempts_are_contained() {
     assert_eq!(esc(&["/bin/escape", "rsp"]).status, ExitStatus::Exited(0));
     assert_eq!(esc(&["/bin/escape", "rsp-kernel"]).status, ExitStatus::Exited(0));
     assert!(matches!(esc(&["/bin/escape", "rsp-use"]).status, ExitStatus::Signaled(11)));
+    // One that returns past the top of user space: rip not canonical.
+    let out = esc(&["/bin/escape", "rip-top"]);
+    assert_eq!(out.status, ExitStatus::Signaled(11), "{}", out.kernel_log);
+    assert!(out.stdout_str().is_empty(), "{}", out.stdout_str());
     // 32-bit compatibility mode through the GDT: there's no 32-bit code
     // segment to enter it by, so the far return faults to the program (a
     // #GP; under QEMU's TCG with SMAP, a page fault, as it reads the far

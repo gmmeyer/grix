@@ -306,27 +306,35 @@ static int fast(long cpus) {
     for (int i = 0; i < n; i++) CHECK(pthread_create(&t[i], 0, yields, 0) == 0);
     for (int i = 0; i < n; i++) pthread_join(t[i], 0);
     // Each of those calls in turn, while a sibling installs a filter that
-    // refuses it on every thread.
-    CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+    // refuses it on every thread: in a child of its own each time, which
+    // starts with no filter (one would keep every call off the fast path).
     long calls[] = {SYS_getpid, SYS_getppid, SYS_gettid, SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; i++) {
-        asked_nr = calls[i];
-        atomic_store(&changed, 0);
-        CHECK(pthread_create(&t[0], 0, asks, 0) == 0);
-        // Busy, not asleep: a timer waking this thread could preempt the
-        // asking one, and its next run would start from a fresh snapshot.
-        for (double t0 = now(); now() - t0 < 0.01;) {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+            asked_nr = calls[i];
+            CHECK(pthread_create(&t[0], 0, asks, 0) == 0);
+            // Busy, not asleep: a timer waking this thread could preempt
+            // the asking one, whose next run would start from a fresh
+            // snapshot.
+            for (double t0 = now(); now() - t0 < 0.01;) {
+            }
+            struct sock_filter filter[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, calls[i], 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog prog = {sizeof filter / sizeof filter[0], filter};
+            CHECK(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0);
+            atomic_store(&changed, 1);
+            pthread_join(t[0], 0);
+            _exit(0);
         }
-        struct sock_filter filter[] = {
-            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, calls[i], 0, 1),
-            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
-            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        };
-        struct sock_fprog prog = {sizeof filter / sizeof filter[0], filter};
-        CHECK(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0);
-        atomic_store(&changed, 1);
-        pthread_join(t[0], 0);
+        int status;
+        CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     printf("fast ok\n");
     return 0;
