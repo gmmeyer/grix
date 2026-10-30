@@ -660,7 +660,8 @@ up without CAP_SYS_RESOURCE would do.
       registrations are charged, IPv6's ways to what IPv4 refuses,
       `--no-outside-links` on hosts that fold names, magic links with
       O_NOFOLLOW, `Pipe::creds` for bytes that are there, `/proc/self/mem`
-      across execve, exchanges counted in `id_bytes`.
+      across execve, exchanges counted in `id_bytes`, and Landlock's rules
+      paying for the nodes they keep.
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.

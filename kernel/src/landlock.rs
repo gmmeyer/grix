@@ -93,8 +93,10 @@ pub const MAX_LAYERS: usize = 16;
 /// global.
 const MAX_RULES: usize = 32 * 1024;
 static RULES: AtomicUsize = AtomicUsize::new(0);
-/// A rule's share of the heap: its B-tree entry, grants and pin.
-const RULE_COST: u64 = 128;
+/// A rule's share of the heap: its B-tree entry, grants and pin, and the
+/// node the pin keeps. A /proc/<pid>/task node's thread stops paying for
+/// it when it goes, and a rule can outlive that.
+const RULE_COST: u64 = 128 + fs::PROC_NODE_COST;
 /// Ids for layers (`scope_le`), never reused.
 static NEXT_LAYER: AtomicU64 = AtomicU64::new(1);
 

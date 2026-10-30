@@ -3,6 +3,7 @@
 // check. A kernel bug shows as a panic or a hang, not as this program's
 // output. Run as /bin/hardening <what> [args].
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -533,6 +534,101 @@ static int do_procmem_after(int fd) {
     return 0;
 }
 
+// A Landlock rule keeps its node. A thread pays for its /proc/<pid>/task
+// nodes only while it lives, so rules on them keep nodes nothing pays for,
+// unless the rules do. Then every budget filled at once: what's charged
+// has to fit in the heap, with these nodes among it.
+static int gate[2];
+
+static void *until_told(void *arg) {
+    char c;
+    (void)arg;
+    read(gate[0], &c, 1);
+    return NULL;
+}
+
+static int rules_on_thread(int ruleset, pid_t tid, long *rules) {
+    struct { unsigned long long allowed; int parent; } __attribute__((packed)) rule = {1 << 2, -1};
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        rule.parent = openat(dirfd(d), e->d_name, O_PATH | O_NOFOLLOW);
+        if (rule.parent < 0) continue;
+        long r = syscall(SYS_landlock_add_rule, ruleset, 1, &rule, 0);
+        int err = errno;
+        close(rule.parent);
+        if (r) {
+            closedir(d);
+            return err == ENOMEM ? -1 : -2;
+        }
+        ++*rules;
+    }
+    closedir(d);
+    return 0;
+}
+
+static pid_t my_tid(void) { return syscall(SYS_gettid); }
+
+static void *report_tid(void *arg) {
+    *(volatile pid_t *)arg = my_tid();
+    return until_told(NULL);
+}
+
+static int do_pinned(long most) {
+    struct { unsigned long long fs, net; } attr = {1 << 2, 0};
+    int ruleset = syscall(SYS_landlock_create_ruleset, &attr, sizeof attr, 0);
+    CHECK(ruleset >= 0);
+    CHECK(pipe(gate) == 0);
+    long rules = 0;
+    int stop = 0;
+    while (rules < most && !stop) {
+        enum { N = 64 };
+        pthread_t t[N];
+        volatile pid_t tids[N];
+        memset((void *)tids, 0, sizeof tids);
+        for (int i = 0; i < N; i++) CHECK(pthread_create(&t[i], NULL, report_tid, (void *)&tids[i]) == 0);
+        for (int i = 0; i < N; i++) while (!tids[i]) sched_yield();
+        for (int i = 0; i < N && !stop; i++) {
+            int r = rules_on_thread(ruleset, tids[i], &rules);
+            CHECK(r != -2);
+            stop = r < 0;
+        }
+        char go[N] = {0};
+        CHECK(write(gate[1], go, N) == N);
+        for (int i = 0; i < N; i++) CHECK(pthread_join(t[i], NULL) == 0);
+    }
+    printf("%ld rules on threads that are gone\n", rules);
+    // The metadata budget.
+    long files = 0;
+    for (;; files++) {
+        char name[64];
+        snprintf(name, sizeof name, "/tmp/%ld", files);
+        int fd = open(name, O_CREAT | O_WRONLY, 0600);
+        if (fd < 0) break;
+        close(fd);
+    }
+    // The kernel's own.
+    struct rlimit rl = {65536, 65536};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    static char chunk[1 << 20];
+    long pipes = 0;
+    for (;;) {
+        int fd[2];
+        if (pipe(fd)) break;
+        fcntl(fd[1], F_SETFL, O_NONBLOCK);
+        fcntl(fd[1], F_SETPIPE_SZ, 1 << 20);
+        long w = write(fd[1], chunk, sizeof chunk);
+        if (w <= 0) break;
+        pipes++;
+    }
+    printf("budgets held: %s\n", files > 100 && pipes > 1 ? "full" : "not full");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *what = argc > 1 ? argv[1] : "";
     long a = argc > 2 ? atol(argv[2]) : 0, b = argc > 3 ? atol(argv[3]) : 0;
@@ -552,6 +648,7 @@ int main(int argc, char **argv) {
     if (!strcmp(what, "creds")) return do_creds();
     if (!strcmp(what, "xattrs")) return do_xattrs(a ? a : 5000);
     if (!strcmp(what, "procmem")) return do_procmem();
+    if (!strcmp(what, "pinned")) return do_pinned(a ? a : 40000);
     if (!strcmp(what, "procmem-after")) return do_procmem_after(a);
     printf("usage\n");
     return 2;

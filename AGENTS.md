@@ -758,7 +758,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
       `kmem`; ENOMEM), Landlock rules (`landlock::MAX_RULES` in all
-      rulesets and domains, each charged to `kmem`; ENOMEM) and layers
+      rulesets and domains, each charged to `kmem` with the node it
+      keeps, which may be a thread's that's gone; ENOMEM) and layers
       (`landlock::MAX_LAYERS` per thread; E2BIG). Epoll registrations
       are charged to `kmem` (`fd::Epoll::add`; ENOSPC, Linux's
       max_user_watches), as one file can be under every descriptor in

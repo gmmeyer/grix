@@ -4235,3 +4235,16 @@ fn stream_writers_are_only_those_who_wrote() {
 fn proc_self_mem_stays_with_its_program() {
     hardened(with("hardening").allow(Capability::Process), &["procmem"], "the old memory is gone");
 }
+
+/// A Landlock rule keeps its node, and a thread stops paying for its
+/// /proc/<pid>/task nodes when it goes: the rule pays. With as many as there
+/// may be and every budget full, what's charged still fits in the heap.
+#[test]
+fn landlock_rules_pay_for_the_nodes_they_keep() {
+    let b = with("hardening")
+        .allow(Capability::Threads)
+        .allow(Capability::FsWrite)
+        .memory_mb(256)
+        .timeout(Duration::from_secs(180));
+    hardened(b, &["pinned", "40000"], "budgets held: full");
+}

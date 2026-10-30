@@ -102,10 +102,12 @@ const META_LIMIT: u64 = 12 << 20;
 /// entry (B-tree slot), on top of the bytes of names and symlink targets.
 const NODE_COST: u64 = core::mem::size_of::<Node>() as u64 + 64;
 const ENTRY_COST: u64 = 64;
-/// A thread's /proc/<pid>/task/<tid> and its files, with names of up to 16
-/// bytes: paid for by the thread (`process::THREAD_COST`, from `kmem`),
-/// not the metadata budget, so threads don't crowd out files.
-pub const TASK_NODES_COST: u64 = (procfs::TASK_FILES.len() as u64 + 1) * (NODE_COST + ENTRY_COST + 16);
+/// A node of /proc, with a name of up to 16 bytes.
+pub const PROC_NODE_COST: u64 = NODE_COST + ENTRY_COST + 16;
+/// A thread's /proc/<pid>/task/<tid> and its files: paid for by the thread
+/// (`process::THREAD_COST`, from `kmem`), not the metadata budget, so
+/// threads don't crowd out files.
+pub const TASK_NODES_COST: u64 = (procfs::TASK_FILES.len() as u64 + 1) * PROC_NODE_COST;
 
 /// Limit written file data to `pages` pages of guest memory.
 pub fn set_limit(pages: u64) {

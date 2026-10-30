@@ -1894,6 +1894,7 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
     let obase = if opath.is_empty() { ROOT } else { base_of(p, odirfd, &opath)? };
     let npath = read_cstr(&mut p.aspace, npathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, ndirfd, &npath)?;
+    let _dpin = fs::lock().pin(dir);
     let mut fs = fs::lock();
     if let Some(d) = landlock::domain_changing(p, &fs, dir)
         && fs.child_of(dir, &name).is_none()
