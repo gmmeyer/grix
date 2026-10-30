@@ -11,7 +11,7 @@ use alloc::vec;
 use super::{FpState, TrapFrame, USER_CS, USER_RFLAGS, USER_SS};
 use crate::errno::*;
 use crate::mm::aspace::AddressSpace;
-use crate::signal::Fault;
+use crate::signal::{AltStack, Fault};
 use crate::uaccess::{copy_in, copy_out};
 
 // Offsets from the frame's start.
@@ -117,8 +117,15 @@ pub fn max_size() -> u64 {
 }
 
 /// Write a frame for a handler below `top` (sp, or the top of the
-/// alternate stack), with `tf`'s registers: its address.
-pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context) -> Result<u64, Errno> {
+/// alternate stack, which it must then fit `within`), with `tf`'s
+/// registers: its address.
+pub fn push_frame(
+    a: &mut AddressSpace,
+    tf: &TrapFrame,
+    top: u64,
+    within: Option<AltStack>,
+    ctx: &Context,
+) -> Result<u64, Errno> {
     // On the stack it was using, past its red zone.
     let top = if top == tf.rsp { top.checked_sub(RED_ZONE).ok_or(EFAULT)? } else { top };
     let xsize = super::xsave_size();
@@ -126,6 +133,9 @@ pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context)
     let fp_at = top.checked_sub(fp_size as u64).ok_or(EFAULT)? & !63;
     // As if a return address had been pushed: a function's entry alignment.
     let frame = (fp_at.checked_sub(FRAME_SIZE as u64).ok_or(EFAULT)? & !15).checked_sub(8).ok_or(EFAULT)?;
+    if within.is_some_and(|alt| !alt.holds(frame)) {
+        return Err(EFAULT);
+    }
 
     let mut fp = FpState::default();
     super::save_fp(&mut fp);

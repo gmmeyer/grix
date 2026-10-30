@@ -234,7 +234,13 @@ impl AltStack {
     /// Linux's on_sig_stack: with SS_AUTODISARM we can only be on the stack
     /// if the program re-armed it while running on it, so assume we're not.
     pub fn contains(&self, sp: u64) -> bool {
-        self.flags & SS_AUTODISARM == 0 && sp > self.sp && sp - self.sp <= self.size
+        self.flags & SS_AUTODISARM == 0 && self.holds(sp)
+    }
+
+    /// Linux's __on_sig_stack, SS_AUTODISARM or not: is a frame at `sp`
+    /// on the stack?
+    pub fn holds(&self, sp: u64) -> bool {
+        sp > self.sp && sp - self.sp <= self.size
     }
 
     /// The state sigaltstack reports (sas_ss_flags).
@@ -731,7 +737,11 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
     let t = p.threads.get_mut(&p.current).unwrap();
     let sp = tf.sp();
     let alt = t.altstack;
-    let top = if act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0 { alt.sp.wrapping_add(alt.size) } else { sp };
+    let entering = act.flags & SA_ONSTACK != 0 && alt.state(sp) == 0;
+    let top = if entering { alt.sp.wrapping_add(alt.size) } else { sp };
+    // On the alternate stack a frame must fit (x86's get_sigframe, for
+    // both: 2048 bytes are MINSIGSTKSZ, and AVX-512's frame is 3.5 KiB).
+    let within = (entering || alt.contains(sp)).then_some(alt);
     let restorer = if act.flags & SA_RESTORER != 0 { act.restorer } else { SIGPAGE };
     let ctx = arch::sigframe::Context {
         info: info.bytes(),
@@ -740,7 +750,7 @@ fn push_frame(p: &mut Process, tf: &mut TrapFrame, info: &SigInfo, act: &SigActi
         fault: info.fault,
         restorer,
     };
-    let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, &ctx)?;
+    let frame = arch::sigframe::push_frame(&mut p.aspace, tf, top, within, &ctx)?;
 
     let t = p.threads.get_mut(&p.current).unwrap();
     t.saved_sigmask = None;

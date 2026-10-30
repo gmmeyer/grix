@@ -7,7 +7,7 @@ use alloc::vec;
 use super::{FpState, TrapFrame};
 use crate::errno::*;
 use crate::mm::aspace::AddressSpace;
-use crate::signal::Fault;
+use crate::signal::{AltStack, Fault};
 use crate::uaccess::{copy_in, copy_out};
 
 // struct rt_sigframe { siginfo info; ucontext uc; } followed by a frame
@@ -79,10 +79,20 @@ pub fn max_size() -> u64 {
 }
 
 /// Write a frame for a handler below `top` (sp, or the top of the
-/// alternate stack), with `tf`'s registers: its address.
-pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context) -> Result<u64, Errno> {
+/// alternate stack, which it must then fit `within`), with `tf`'s
+/// registers: its address.
+pub fn push_frame(
+    a: &mut AddressSpace,
+    tf: &TrapFrame,
+    top: u64,
+    within: Option<AltStack>,
+    ctx: &Context,
+) -> Result<u64, Errno> {
     let record = top.checked_sub(16).ok_or(EFAULT)? & !15;
     let frame = record.checked_sub(FRAME_SIZE as u64).ok_or(EFAULT)?;
+    if within.is_some_and(|alt| !alt.holds(frame)) {
+        return Err(EFAULT);
+    }
 
     let mut b = vec![0u8; FRAME_SIZE + 16];
     b[..UC].copy_from_slice(&ctx.info);
