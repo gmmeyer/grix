@@ -8,6 +8,60 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
+## What's left (after 0.0.60)
+
+Each is written up in its section below; this is the order. No known way
+out of the sandbox, and no hang anyone can reproduce.
+
+To decide (each is a choice already made and documented, to keep or
+change):
+
+- `fc00::/7` is refused by default, while RFC 1918 stays reachable.
+- Alibaba's and Azure's metadata addresses are refused.
+- `--no-outside-links` is stricter than it was.
+- `O_PATH|O_NOFOLLOW` with `RESOLVE_*` is ELOOP, stricter than Linux.
+
+Robustness, first:
+
+1. The forwarded-port test in `runtimes.rs` still counts anything that
+   connects: tools on a developer's machine probe new ports, as the C
+   fixtures now allow for.
+2. A writable live mount's listing has no cap on the host, `Create`
+   makes the file when ids have run out, and `watch.rs`'s `os::wait` and
+   kqueue side have had no security read.
+3. `rv048 extremes`: one hang at 0.0.48, none in 32,000 runs since.
+   Only worth more with a new idea, or if it comes back.
+4. Tests that have never failed: `hostfds` (macOS only) and `ptsperm`,
+   `sigioperm` and `execperm` haven't been run on an unfixed kernel.
+
+Linux behaviour:
+
+5. An image's files keep their owners, then directories' search
+   permission, in that order; then an image's user's supplementary
+   groups. Nothing surveyed needs them yet: wait for a program that does.
+6. Live mounts: hard links within a mount, RENAME_EXCHANGE, O_TMPFILE,
+   and a file the host replaces while it's open.
+7. inotify for the guest's own changes elsewhere, a node left unwatched
+   on macOS, `TZ` from the host, `madvise`'s last advice values, stack
+   growth and guard pages, newer syscalls as programs ask for them.
+8. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
+9. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
+   another process's table under the filesystem's lock.
+
+Bigger:
+
+10. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+    shared between processes.
+11. Finer locking: phase 2, a reader/writer lock with per-process
+    check-out.
+12. Faster live-mount round trips, multi-architecture images, and the
+    rest of `/proc/grix/smp`'s counters.
+13. An outside security review (round 2, item 20).
+
+By design, not left: eBPF and Linux capabilities (DATADOG.md: the agent
+runs and its intake accepts data, system-probe's eBPF features don't),
+and io_uring.
+
 ## Next up
 
 Order: small kernel-only items first, then the ones that need host
@@ -320,7 +374,9 @@ Left, none of it a way out of the sandbox:
 - [ ] An image's user gets no supplementary groups from its `/etc/group`,
       as Docker's does; `initgroups` in the program works.
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
-      another process's are ENOENT past their own name.
+      another process's are ENOENT past their own name. Few tools go
+      there, and it means another process's table under the filesystem's
+      lock (`FdTable::walking`).
 - [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
       stays unwatched until the guest watches it again.
 
@@ -703,13 +759,17 @@ Left, none of it a way out of the sandbox:
       read-only; x86_64 handles every vector it took around `hlt`; and a
       stack overflow is seen after a signal frame is pushed, not after.
 - [ ] `rv048 extremes` (`review/0.0.48-proofs`) hung once, on arm64 at 2
-      CPUs, and hasn't since (6600 runs of 0.0.52): not explained by the
+      CPUs, and hasn't since (9,600 runs of 0.0.52 and 0.0.54, 22,551 of
+      0.0.57): not explained by the
       lost wake-ups above, which need another thread to keep running. It
       has a 1 ns periodic timerfd armed, 64 fatal timers and a child
       spinning; look there, and in grix-vmm's wait for the virtual timer.
       (0.0.57's timerfd livelock needs O_ASYNC, which that run hadn't. A
       kick landing just before `wfi` doesn't lose it, with 200 µs added
       there; and 22,551 runs of 0.0.57 at 2 CPUs didn't hang.)
+- [ ] `crates/grix/tests/runtimes.rs`'s forwarded-port test counts
+      whoever connects first (the C fixtures take only their own client:
+      tools on a developer's machine probe new ports).
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.
