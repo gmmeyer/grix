@@ -4,7 +4,7 @@
 #   web/build.sh            # everything (QEMU-wasm only if it isn't built yet)
 #   node web/serve.mjs      # then http://localhost:8080/ (with COOP/COEP)
 #
-# Needs the kernel and fixtures built (`make kernel fixtures`), Rust's
+# Needs the fixtures built (`make fixtures`), Rust's
 # wasm32-unknown-unknown target, Docker (QEMU-wasm builds in emscripten's
 # image, about 15 minutes the first time) and npm (xterm.js).
 set -euo pipefail
@@ -54,7 +54,10 @@ if [ ! -f "$DIST/qemu-system-aarch64.wasm" ] || [ "${REBUILD_QEMU:-}" = 1 ]; the
     "
 fi
 
-# The kernel, without its debug info (a tenth the size).
+# The kernel, without its debug info (a tenth the size). It's a cargo
+# workspace of its own, so nothing else here would rebuild it, and a page
+# would go out with whatever kernel was last built.
+make kernel
 python3 -I web/tools/strip-elf.py "$KERNEL" "$DIST/grix-kernel"
 
 # The host's side: grix-web.
@@ -66,7 +69,8 @@ cp target/wasm32-unknown-unknown/release/grix_web.wasm "$DIST/"
 cp web/grix.js web/tar.js web/grix-example.js web/site.css web/index.html web/smoke.html web/robots.txt "$DIST/"
 rm -rf "$DIST/demos" "$DIST/blog"
 cp -r web/demos web/blog "$DIST/"
-# grix's icon (web/tools/icon.py draws it), at the root where browsers look.
+# grix's icon (web/tools/icon.py draws it), at the root where browsers look,
+# and the cards shared links show (web/tools/card.html).
 cp web/icons/* "$DIST/"
 
 # Cloudflare Pages (and Netlify) take headers from _headers: isolation for
