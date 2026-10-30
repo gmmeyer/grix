@@ -525,8 +525,9 @@ grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threa
 - To run the machine in grix-vmm, the container needs `/dev/kvm` (`docker
   run --device /dev/kvm`). Without it, grix emulates the machine in QEMU,
   which the `Dockerfile`'s `emulated` target adds (`docker build --target
-  emulated -t grix:emulated .`). That runs anywhere, but CPU-bound code is
-  about 10–25× slower, and QEMU doesn't count its emulator as a security
+  emulated -t grix:emulated .`). That runs anywhere, and boots as quickly,
+  but programs run 20–40× slower than natively (a Python loop 20×,
+  Node's startup 30×), and QEMU doesn't count its emulator as a security
   boundary, so the container is the boundary to rely on. `grix run -v`
   prints which one a run uses: `an x86_64 machine in grix-vmm`, or `in
   qemu-system-x86_64 (tcg)`.
