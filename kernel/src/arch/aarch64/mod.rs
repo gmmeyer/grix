@@ -688,8 +688,8 @@ pub fn flush_tlb(_root: u64, start: u64, end: u64) {
     // SAFETY: TLB maintenance; the page tables were written first.
     unsafe { asm!("dsb ishst") };
     for va in (start..end).step_by(4096) {
-        // Last level only (the tables above it don't change while the
-        // address space lives), ASID 0 in bits 63:48.
+        // Last level only (a table above it goes only through
+        // `flush_tables`), ASID 0 in bits 63:48.
         unsafe { asm!("tlbi vale1is, {}", in(reg) (va >> 12) & ((1 << 44) - 1)) };
     }
     unsafe { asm!("dsb ish", "isb") };

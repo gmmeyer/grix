@@ -233,7 +233,9 @@ A NETLINK_KOBJECT_UEVENT socket (`Netlink::uevent`) hears nothing.
 
 Live mounts (`hostfs.rs` in the kernel and in `crates/grix/src`, messages
 in `crates/abi/src/hostfs.rs`): directories the host serves while the
-program runs. Their nodes carry `Node::remote` (the host's id), and their
+program runs. A read-only one is EROFS for every change, before the
+policy's `fs_write` gate (`file::read_only_target`). A hard link's new
+name is a node of its own (the host has an id per name). Their nodes carry `Node::remote` (the host's id), and their
 files' `FileData` reads and writes go to the host. A directory's entries
 are fetched on first use and kept for `hostfs::FRESH_NS` (`Fs::ensure`).
 Under memory pressure `Fs::evict` forgets idle directories' entries. A
@@ -421,7 +423,9 @@ made writable: a CPU still holding it read-only would fault on the
 kernel's own write there; free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
-(`publish_barrier`). User memory other threads use at the same time is
+(`publish_barrier`). munmap also frees page tables that map nothing now
+(`PageTable::prune`); a table goes only through `arch::flush_tables`,
+which arm64 needs because `flush_tlb` drops last-level entries only. User memory other threads use at the same time is
 updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:

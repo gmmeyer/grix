@@ -376,6 +376,19 @@ up without CAP_SYS_RESOURCE would do.
       `CLONE_INTO_CGROUP` (reported). Threads with their own descriptor table or
       working directory: `CLONE_THREAD` without `CLONE_FILES`/`CLONE_FS` (they
       share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more threads (reported).
+      Few programs need it (glibc's and musl's posix_spawn use
+      `CLONE_VM|CLONE_VFORK`, which works; LinuxThreads-era code and some
+      runtimes' helper processes don't), and it's large, so it waits.
+      What it would take: `Process::aspace` a handle to one
+      `AddressSpace` (as `Process::fs` is a `Shared<FsInfo>`), through its
+      ~300 uses; freed with its last sharer, never while active (invariant
+      13 then holds as it does for threads); futex queues keyed by the
+      address space, not the process, so a wake reaches every sharer's
+      waiters; flushes are by root already (x86's `ROOTS`), but
+      `smp::alone` and execve's unsharing must take sharers into account
+      (execve gives the caller a fresh space, as vfork's child gets);
+      `/proc/<pid>/maps` and the mapping budgets (`MAX_VMAS_TOTAL`) count
+      a shared space once.
 - [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
       `/proc/self` is the caller's. Another process's descriptors need its user (or root).
 - [x] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
