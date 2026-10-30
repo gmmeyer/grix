@@ -16,6 +16,7 @@
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int ifd;
@@ -124,6 +125,29 @@ static void until(int wd, const char *name, const char *want) {
     }
 }
 
+// Until `name` has something in it, for at most 30 s (then `show` says what
+// it has). IN_CREATE comes between the host making a file and writing it,
+// with no IN_MODIFY here to say when that's done, and how long the guest
+// takes to read it against how long the host takes to write it is a race.
+static void written(const char *name) {
+    char p[512], b[1];
+    path(p, name);
+    struct timespec start, now, pause = {0, 1000000};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    do {
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            struct stat st;
+            ssize_t n = read(fd, b, sizeof b);
+            int full = n > 0 && fstat(fd, &st) == 0 && st.st_size > 0;
+            close(fd);
+            if (full) return;
+        }
+        nanosleep(&pause, 0);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (now.tv_sec - start.tv_sec < 30);
+}
+
 // Watched before a snapshot, and after it's restored.
 static int snap(void) {
     int wd = inotify_add_watch(ifd, dir, IN_CREATE);
@@ -136,6 +160,7 @@ static int snap(void) {
     ready(1);
     expect(wd, IN_CREATE, "new.txt");
     printf("IN_CREATE new.txt\n");
+    written("new.txt");
     show("new.txt");
     return 0;
 }

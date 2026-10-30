@@ -3824,6 +3824,7 @@ fn snapshots_of_what_a_live_mount_has_been_through() {
 
 #[test]
 fn snapshots_keep_inotify_watches_on_live_mounts() {
+    use std::io::Write;
     // Watched before the snapshot: each restored run asks its host to
     // watch again (and says what happened meanwhile was missed).
     let dir = temp_dir("watchsnap");
@@ -3842,7 +3843,11 @@ fn snapshots_keep_inotify_watches_on_live_mounts() {
         let changes = std::thread::spawn(move || {
             for _ in 0..6000 {
                 if host.join("ctl/1").exists() {
-                    std::fs::write(host.join("w/new.txt"), format!("run {run}\n")).unwrap();
+                    // Made and then written, as fs::write does, with the
+                    // guest told in between: it has to wait for the bytes.
+                    let mut file = std::fs::File::create(host.join("w/new.txt")).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                    file.write_all(format!("run {run}\n").as_bytes()).unwrap();
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
