@@ -6,6 +6,8 @@
 //            is privileged
 //   sleep    nanosleep across a stop and continue: no handler, so it
 //            goes on to its first deadline, as Linux's restart_syscall
+//   links    hard links and RENAME_EXCHANGE in /work (a live mount), and
+//            neither across into /tmp
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +18,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -110,6 +113,72 @@ static long now_ms(void) {
     return t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+static int put(const char *path, const char *s) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int r = write(fd, s, strlen(s)) == (ssize_t)strlen(s) ? 0 : -1;
+    close(fd);
+    return r;
+}
+
+static const char *get(const char *path) {
+    static char b[64];
+    memset(b, 0, sizeof b);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return "";
+    read(fd, b, sizeof b - 1);
+    close(fd);
+    return b;
+}
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_NOREPLACE 1
+#define RENAME_EXCHANGE 2
+#endif
+
+static int rename2(const char *a, const char *b, int flags) {
+    return syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, flags);
+}
+
+static int links(void) {
+    // Another name for a file: the same bytes through either, on the host
+    // too (the test looks), and it outlives the first.
+    CHECK(put("/work/a", "one\n") == 0);
+    CHECK(link("/work/a", "/work/hard") == 0);
+    CHECK(!strcmp(get("/work/hard"), "one\n"));
+    CHECK(put("/work/hard", "two\n") == 0);
+    CHECK(!strcmp(get("/work/a"), "two\n"));
+    CHECK(link("/work/a", "/work/hard") == -1 && errno == EEXIST);
+    CHECK(link("/work/sub", "/work/subhard") == -1 && errno == EPERM);
+    CHECK(link("/work/nothing", "/work/x") == -1 && errno == ENOENT);
+    // A link to a symbolic link is to the link.
+    CHECK(symlink("a", "/work/sym") == 0);
+    CHECK(linkat(AT_FDCWD, "/work/sym", AT_FDCWD, "/work/sym2", 0) == 0);
+    char t[16] = {0};
+    CHECK(readlink("/work/sym2", t, sizeof t) == 1 && t[0] == 'a');
+    // Not across mounts (/tmp is the sandbox's own).
+    CHECK(put("/tmp/local", "x") == 0);
+    CHECK(link("/tmp/local", "/work/local") == -1 && errno == EXDEV);
+    CHECK(link("/work/a", "/tmp/a") == -1 && errno == EXDEV);
+
+    // Two names swapped at once: a file and a directory too.
+    CHECK(put("/work/x", "x\n") == 0 && put("/work/y", "y\n") == 0);
+    CHECK(rename2("/work/x", "/work/y", RENAME_EXCHANGE) == 0);
+    CHECK(!strcmp(get("/work/x"), "y\n") && !strcmp(get("/work/y"), "x\n"));
+    CHECK(rename2("/work/x", "/work/sub", RENAME_EXCHANGE) == 0);
+    struct stat st;
+    CHECK(stat("/work/x", &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(!strcmp(get("/work/sub"), "y\n"));
+    CHECK(stat("/work/x/inside", &st) == 0);
+    CHECK(rename2("/work/x", "/work/sub", RENAME_EXCHANGE) == 0);
+    CHECK(rename2("/work/x", "/work/none", RENAME_EXCHANGE) == -1 && errno == ENOENT);
+    CHECK(rename2("/work/x", "/work/y", RENAME_EXCHANGE | RENAME_NOREPLACE) == -1 && errno == EINVAL);
+    CHECK(rename2("/work/x", "/tmp/local", RENAME_EXCHANGE) == -1 && errno == EXDEV);
+    // A directory can't go inside itself.
+    CHECK(rename2("/work/sub", "/work/sub/inside", RENAME_EXCHANGE) == -1 && errno == EINVAL);
+    return 0;
+}
+
 static int sleep_restart(void) {
     int p[2];
     CHECK(pipe(p) == 0);
@@ -150,6 +219,7 @@ int main(int argc, char **argv) {
         int r = !strcmp(argv[i], "auxv")      ? auxv()
                 : !strcmp(argv[i], "handles") ? handles()
                 : !strcmp(argv[i], "sleep")   ? sleep_restart()
+                : !strcmp(argv[i], "links")   ? links()
                                               : (printf("unknown check %s\n", argv[i]), 1);
         if (r) return r;
         printf("%s ok\n", argv[i]);

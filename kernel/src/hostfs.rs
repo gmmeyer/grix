@@ -195,8 +195,16 @@ pub fn remove(dir: u64, name: &str, is_dir: bool) -> Result<(), Errno> {
     done(&Request::Remove { dir, name, is_dir })
 }
 
-pub fn rename(from_dir: u64, from: &str, to_dir: u64, to: &str, noreplace: bool) -> Result<(), Errno> {
-    done(&Request::Rename { from_dir, from, to_dir, to, noreplace })
+pub fn rename(from_dir: u64, from: &str, to_dir: u64, to: &str, noreplace: bool, exchange: bool) -> Result<(), Errno> {
+    done(&Request::Rename { from_dir, from, to_dir, to, noreplace, exchange })
+}
+
+/// Another name for `id`: `name` in `dir` (its id, its attributes).
+pub fn link(id: u64, dir: u64, name: &str) -> Result<(u64, Attr), Errno> {
+    call(&Request::Link { id, dir, name }, |r| match r {
+        Reply::Created { id, attr } => Ok((id, attr)),
+        _ => unexpected(),
+    })
 }
 
 pub fn set_attr(id: u64, mode: Option<u32>, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<Attr, Errno> {

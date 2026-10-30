@@ -36,6 +36,7 @@ pub(crate) struct LiveMount {
 }
 
 // Linux errnos, as the guest wants them.
+const EPERM: u16 = 1;
 const EIO: u16 = 5;
 const ENOMEM: u16 = 12;
 const EXDEV: u16 = 18;
@@ -516,15 +517,28 @@ impl Server {
                 self.forget(dir, name);
                 ok(Reply::Done)
             }
-            Request::Rename { from_dir, from, to_dir, to, noreplace } => {
+            Request::Rename { from_dir, from, to_dir, to, noreplace, exchange } => {
                 self.writable(from_dir)?;
                 if self.mount_of(from_dir)? != self.mount_of(to_dir)? {
                     return Err(EXDEV);
                 }
                 let (cf, ct) = (cname(from)?, cname(to)?);
                 let (df, dt) = (self.dir(from_dir)?, self.dir(to_dir)?);
+                if exchange {
+                    rename(df.as_raw_fd(), &cf, dt.as_raw_fd(), &ct, false, true).map_err(err)?;
+                    // Each id now names what the other did.
+                    let a = self.by_name.remove(&(from_dir, from.to_string()));
+                    let b = self.by_name.remove(&(to_dir, to.to_string()));
+                    for (id, dir, name) in [(a, to_dir, to), (b, from_dir, from)] {
+                        if let Some(id) = id {
+                            self.nodes.insert(id, Node { parent: dir, name: name.to_string() });
+                            self.by_name.insert((dir, name.to_string()), id);
+                        }
+                    }
+                    return ok(Reply::Done);
+                }
                 let keep = if noreplace { None } else { self.open_to_keep(to_dir, to, dt.as_raw_fd(), &ct) };
-                rename(df.as_raw_fd(), &cf, dt.as_raw_fd(), &ct, noreplace).map_err(err)?;
+                rename(df.as_raw_fd(), &cf, dt.as_raw_fd(), &ct, noreplace, false).map_err(err)?;
                 self.keep(keep);
                 self.forget(to_dir, to);
                 if let Some(id) = self.by_name.remove(&(from_dir, from.to_string())) {
@@ -533,6 +547,24 @@ impl Server {
                     self.by_name.insert((to_dir, to.to_string()), id);
                 }
                 ok(Reply::Done)
+            }
+            Request::Link { id, dir, name } => {
+                self.writable(dir)?;
+                if self.mount_of(id)? != self.mount_of(dir)? {
+                    return Err(EXDEV);
+                }
+                // A mount's root is a directory: no links to those.
+                let (pd, pname) = self.parent(id)?.ok_or(EPERM)?;
+                let c = cname(name)?;
+                let d = self.dir(dir)?;
+                // SAFETY: linkat on descriptors we hold and checked names;
+                // without AT_SYMLINK_FOLLOW it links a link, not its target.
+                check(unsafe { libc::linkat(pd.as_raw_fd(), pname.as_ptr(), d.as_raw_fd(), c.as_ptr(), 0) })
+                    .map_err(err)?;
+                let attr = stat_at(d.as_raw_fd(), &c).map_err(err).and_then(|st| attr_of(&st).ok_or(EIO))?;
+                let id = self.id(dir, name)?;
+                self.saw(id, &attr);
+                ok(Reply::Created { id, attr })
             }
             Request::SetAttr { id, mode, atime_ns, mtime_ns } => {
                 self.writable(id)?;
@@ -978,12 +1010,55 @@ mod tests {
         req(&mut s, Request::Write { id, off: 0, append: false, data: b"abc" });
         let r = req(&mut s, Request::Write { id, off: 0, append: true, data: b"def" });
         assert_eq!(Reply::decode(&r).unwrap().1, Reply::Written { n: 3, size: 6 });
-        req(&mut s, Request::Rename { from_dir: 1, from: "n", to_dir: 1, to: "renamed", noreplace: true });
+        req(
+            &mut s,
+            Request::Rename { from_dir: 1, from: "n", to_dir: 1, to: "renamed", noreplace: true, exchange: false },
+        );
         assert_eq!(std::fs::read_to_string(root.join("m/renamed")).unwrap(), "abcdef");
         let r = req(&mut s, Request::Stat { id });
         assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(Attr { size: 6, .. })));
-        let r = req(&mut s, Request::Rename { from_dir: 1, from: "renamed", to_dir: 1, to: "a.txt", noreplace: true });
+        let r = req(
+            &mut s,
+            Request::Rename { from_dir: 1, from: "renamed", to_dir: 1, to: "a.txt", noreplace: true, exchange: false },
+        );
         assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Err(_)));
+        // Another name for it, made on the host, and the two swapped.
+        let r = req(&mut s, Request::Link { id, dir: 1, name: "hard" });
+        let (_, Reply::Created { id: hard, .. }) = Reply::decode(&r).unwrap() else { panic!() };
+        assert_ne!(hard, id);
+        assert_eq!(std::fs::read_to_string(root.join("m/hard")).unwrap(), "abcdef");
+        for bad in ["..", "a/b", ""] {
+            let r = req(&mut s, Request::Link { id, dir: 1, name: bad });
+            assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Err(_)), "{bad:?}");
+        }
+        // A link to a link is to the link, never what it points at.
+        let r = req(&mut s, Request::Link { id: link, dir: 1, name: "out2" });
+        assert!(matches!(
+            Reply::decode(&r).unwrap().1,
+            Reply::Created { attr: Attr { ty: FileType::Symlink, .. }, .. }
+        ));
+        assert_eq!(std::fs::read_link(root.join("m/out2")).unwrap(), root.join("secret"));
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(root.join("secret")).unwrap().nlink(), 1);
+        }
+        req(&mut s, Request::Remove { dir: 1, name: "out2", is_dir: false });
+        // Not a mount's root, a directory.
+        let r = req(&mut s, Request::Link { id: 1, dir: 1, name: "root" });
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EPERM));
+        let r = req(
+            &mut s,
+            Request::Rename { from_dir: 1, from: "renamed", to_dir: 1, to: "a.txt", noreplace: false, exchange: true },
+        );
+        assert_eq!(Reply::decode(&r).unwrap().1, Reply::Done);
+        assert_eq!(std::fs::read_to_string(root.join("m/a.txt")).unwrap(), "abcdef");
+        let r = req(&mut s, Request::Stat { id });
+        assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(Attr { size: 6, .. })));
+        req(
+            &mut s,
+            Request::Rename { from_dir: 1, from: "renamed", to_dir: 1, to: "a.txt", noreplace: false, exchange: true },
+        );
+        req(&mut s, Request::Remove { dir: 1, name: "hard", is_dir: false });
         req(&mut s, Request::Remove { dir: 1, name: "renamed", is_dir: false });
         assert!(!root.join("m/renamed").exists());
 

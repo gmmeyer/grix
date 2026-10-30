@@ -187,21 +187,35 @@ pub(crate) fn remove_at(dir: RawFd, name: &CStr, is_dir: bool) -> io::Result<()>
     check(unsafe { libc::unlinkat(dir, name.as_ptr(), flags) }).map(|_| ())
 }
 
-/// rename, or with `noreplace` fail if `to` exists.
-pub(crate) fn rename(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, noreplace: bool) -> io::Result<()> {
+/// rename, or with `noreplace` fail if `to` exists, or with `exchange`
+/// swap the two (Linux's RENAME_EXCHANGE, macOS's RENAME_SWAP).
+pub(crate) fn rename(
+    from_dir: RawFd,
+    from: &CStr,
+    to_dir: RawFd,
+    to: &CStr,
+    noreplace: bool,
+    exchange: bool,
+) -> io::Result<()> {
+    if noreplace && exchange {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     // SAFETY: renameat and its variants on descriptors we hold and checked
     // names; none follows a link in the last component.
-    let r = if !noreplace {
+    let r = if !noreplace && !exchange {
         unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) }
     } else {
         // The system call itself: musl has no wrapper for it.
         #[cfg(target_os = "linux")]
         let r = unsafe {
-            libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_NOREPLACE)
-                as libc::c_int
+            let flags = if exchange { libc::RENAME_EXCHANGE } else { libc::RENAME_NOREPLACE };
+            libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), flags) as libc::c_int
         };
         #[cfg(target_os = "macos")]
-        let r = unsafe { libc::renameatx_np(from_dir, from.as_ptr(), to_dir, to.as_ptr(), libc::RENAME_EXCL) };
+        let r = unsafe {
+            let flags = if exchange { libc::RENAME_SWAP } else { libc::RENAME_EXCL };
+            libc::renameatx_np(from_dir, from.as_ptr(), to_dir, to.as_ptr(), flags)
+        };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let r = {
             let _ = (from_dir, from, to_dir, to);

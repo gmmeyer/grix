@@ -1350,7 +1350,7 @@ fn live_mount_works_on_the_host_directory() {
         $b chmod 600 a.txt
         $b ln -s {outside} out
         echo through > out/secret 2>/dev/null; echo \"write through link: $?\"
-        $b ln a.txt hard 2>&1 | $b grep -o 'Operation not permitted'
+        $b ln a.txt hard && $b rm hard; echo \"hard link: $?\"
         $b mv /work /elsewhere 2>&1 | $b grep -o 'Resource busy'
         $b dd if=/dev/zero of=big bs=1k count=3000 2>/dev/null
         $b sha256sum big | $b cut -c1-16
@@ -1383,7 +1383,7 @@ fn live_mount_works_on_the_host_directory() {
     assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stderr_str(), out.kernel_log);
     assert_eq!(
         out.stdout_str(),
-        "hello\nwrite through link: 1\nOperation not permitted\nResource busy\n\
+        "hello\nwrite through link: 1\nhard link: 0\nResource busy\n\
          76ed5c9c326ba623\nkept\nPermission denied\nOperation not permitted\nhi from the host\n"
     );
     assert!(
@@ -1462,6 +1462,29 @@ fn read_only_mounts_without_fs_write() {
     assert_eq!(std::fs::read_to_string(host.join("a.txt")).unwrap(), "a\n");
     let names: Vec<_> = std::fs::read_dir(&host).unwrap().flatten().map(|e| e.file_name()).collect();
     assert_eq!(names.len(), 2, "{names:?}");
+    std::fs::remove_dir_all(&host).unwrap();
+}
+
+#[test]
+fn links_and_exchanges_in_a_live_mount() {
+    // Hard links and RENAME_EXCHANGE are made on the host, within the
+    // mount only (EXDEV otherwise), and never through a link.
+    use std::os::unix::fs::MetadataExt;
+    let host = temp_dir("mount-links");
+    std::fs::create_dir(host.join("sub")).unwrap();
+    std::fs::write(host.join("sub/inside"), "in\n").unwrap();
+    let b = with("newcalls").mount(&host, "/work").unwrap();
+    let out = run(b, &["/bin/newcalls", "links"]);
+    assert_eq!(out.stdout_str(), "links ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let (a, hard) = (std::fs::metadata(host.join("a")).unwrap(), std::fs::metadata(host.join("hard")).unwrap());
+    assert_eq!((a.ino(), a.nlink()), (hard.ino(), 2));
+    assert_eq!(std::fs::read_to_string(host.join("a")).unwrap(), "two\n");
+    assert_eq!(std::fs::read_link(host.join("sym2")).unwrap(), PathBuf::from("a"));
+    assert_eq!(std::fs::read_to_string(host.join("x")).unwrap(), "y\n");
+    assert_eq!(std::fs::read_to_string(host.join("sub/inside")).unwrap(), "in\n");
+    assert!(!host.join("local").exists());
     std::fs::remove_dir_all(&host).unwrap();
 }
 
@@ -2182,14 +2205,7 @@ fn many_mappings() {
     assert!(out.events.is_empty(), "{:?}", out.events);
     // The last thousand cost about what the first did (they took 40 times
     // as long passing every mapping).
-    let us: Vec<u64> = out
-        .stderr_str()
-        .lines()
-        .next()
-        .unwrap()
-        .split(' ')
-        .filter_map(|w| w.parse().ok())
-        .collect();
+    let us: Vec<u64> = out.stderr_str().lines().next().unwrap().split(' ').filter_map(|w| w.parse().ok()).collect();
     let [_, first, _, last] = us[..] else { panic!("{}", out.stderr_str()) };
     assert!(last < first * 5 + 2000, "{}", out.stderr_str());
 }

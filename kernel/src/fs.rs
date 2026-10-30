@@ -2201,11 +2201,11 @@ impl Fs {
             self.copy_up(dir)?;
             self.copy_up(ino)?;
         }
-        // Live mounts don't do hard links (EPERM, as on Linux for a
-        // filesystem that can't), and nothing links across a mount.
+        // Within one live mount the host makes the link; nothing links
+        // across a mount.
         match (self.nodes[ino].remote.as_ref(), self.nodes[dir].remote.as_ref()) {
             (None, None) => {}
-            (Some(a), Some(b)) if a.mount == b.mount => return Err(EPERM),
+            (Some(a), Some(b)) if a.mount == b.mount => return self.link_remote(ino, dir, name, uid, gid),
             _ => return Err(EXDEV),
         }
         if self.nodes[dir].nlink == 0 {
@@ -2238,6 +2238,48 @@ impl Fs {
         let n = &mut self.nodes[ino];
         n.nlink += 1;
         n.ctime = now;
+        self.touch_dir(dir);
+        Ok(())
+    }
+
+    /// `link` within a live mount: the host links the file (never what a
+    /// link points at), and the new name is a node of its own, as a
+    /// listing would bring it (another id: the host keeps one per name).
+    fn link_remote(&mut self, ino: Ino, dir: Ino, name: &str, uid: u32, gid: u32) -> Result<(), Errno> {
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (did, mount, writable) = (r.id, r.mount, r.writable);
+        let id = self.nodes[ino].remote.as_deref().unwrap().id;
+        if !writable {
+            return Err(EROFS);
+        }
+        if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.may_change(dir, None, uid, gid)?;
+        let target = match &self.nodes[ino].kind {
+            Kind::Symlink(t) => t.clone(),
+            _ => String::new(),
+        };
+        let (cid, attr) = match hostfs::link(id, did, name) {
+            Ok(made) => made,
+            Err(e) => {
+                // Made on the host since the last listing, perhaps.
+                if e == EEXIST
+                    && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+                {
+                    r.listed_at = 0;
+                }
+                return Err(e);
+            }
+        };
+        let e = hostfs::Entry { name: name.into(), id: cid, attr, target };
+        if self.new_remote(dir, &e, mount, writable).is_err()
+            && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+        {
+            // The host has it; the next listing brings it in.
+            r.listed_at = 0;
+        }
+        self.nodes[ino].ctime = crate::time::realtime_ns();
         self.touch_dir(dir);
         Ok(())
     }
@@ -2312,7 +2354,22 @@ impl Fs {
                 return Err(EROFS);
             }
             if exchange {
-                return Err(EINVAL);
+                // Both names stay, each on what the other was.
+                let dst = dst.ok_or(ENOENT)?;
+                if dst == src {
+                    return Ok(());
+                }
+                hostfs::rename(oid, oname, nid, nname, false, true)?;
+                for (dir, name, ino) in [(odir, oname, dst), (ndir, nname, src)] {
+                    let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
+                    children.insert(name.into(), ino);
+                    (self.nodes[ino].parent, self.nodes[ino].name) = (dir, name.into());
+                }
+                let now = crate::time::realtime_ns();
+                (self.nodes[src].ctime, self.nodes[dst].ctime) = (now, now);
+                self.touch_dir(odir);
+                self.touch_dir(ndir);
+                return Ok(());
             }
             match dst {
                 Some(_) if noreplace => return Err(EEXIST),
@@ -2325,7 +2382,7 @@ impl Fs {
                 None => {}
             }
             charge(entry_cost(nname))?;
-            if let Err(e) = hostfs::rename(oid, oname, nid, nname, noreplace) {
+            if let Err(e) = hostfs::rename(oid, oname, nid, nname, noreplace, false) {
                 release(entry_cost(nname));
                 return Err(e);
             }

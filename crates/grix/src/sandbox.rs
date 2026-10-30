@@ -1463,7 +1463,7 @@ impl Sandbox {
             base64::engine::general_purpose::STANDARD.encode(fs_state)
         };
         crate::snapshot::finish(&mut keep, &settings)?;
-        crate::at::rename(cleanup.0.as_raw_fd(), &cleanup.1, cleanup.0.as_raw_fd(), &name, false)
+        crate::at::rename(cleanup.0.as_raw_fd(), &cleanup.1, cleanup.0.as_raw_fd(), &name, false, false)
             .with_context(|| format!("writing {}", path.display()))?;
         std::mem::forget(cleanup);
         crate::Snapshot::open(path)
