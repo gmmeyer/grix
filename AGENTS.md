@@ -206,6 +206,12 @@ Restoring a snapshot forgets them. The guest is 10.0.2.15, the host's own loopba
 (`host.grix.internal`, only with an explicit rule), and the nameserver is
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.
+Interface listings (`netlink.rs`: netlink, the `SIOCGIF*` ioctls,
+`/proc/net/dev` and `route`; `procfs::ETH0_FILES` for
+`/sys/class/net/eth0`) show `lo`, and with `net` also `eth0`
+(10.0.2.15/24, a made-up MAC, the default route via 10.0.2.2), set at
+boot (`netlink::init`). It's no device: a description of what the
+proxy does, which still decides what sockets reach.
 
 Live mounts (`hostfs.rs` in the kernel and in `crates/grix/src`, messages
 in `crates/abi/src/hostfs.rs`): directories the host serves while the

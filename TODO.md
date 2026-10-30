@@ -185,6 +185,13 @@ Left, in order of impact:
 29. [ ] `/proc/sys/vm/overcommit_memory` says 0, so Redis warns that a
     background save may fail; what grix actually does (memory is only
     taken as it's touched) is closer to 1.
+30. [x] **A guest interface with `net`** (DATADOG.md: the Agent's "not
+    connected to the network"): `eth0`, 10.0.2.15/24, up, and the
+    default route via 10.0.2.2, in netlink (links, addresses, the main
+    table's routes), the interface ioctls, `/proc/net/dev`,
+    `/proc/net/route` and `/sys/class/net/eth0`. No device: the host's
+    proxy still carries and checks every connection. Left: an IPv6
+    address on it, counters.
 
 ## Agent integrations
 

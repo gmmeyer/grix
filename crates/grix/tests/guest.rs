@@ -300,6 +300,16 @@ fn network_interfaces_without_net() {
 }
 
 #[test]
+fn network_interfaces_with_net() {
+    // eth0 (10.0.2.15/24) and the default route through the host: no
+    // device, a description of what the host's proxy does.
+    let out = run(with("netif").allow(Capability::Net), &["/bin/netif", "eth0"]);
+    assert_eq!(out.stdout_str(), "netif eth0 ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn kill_on_deny() {
     let out = run(with("net").on_deny(DenyAction::Kill), &["/bin/net"]);
     assert_eq!(out.status, ExitStatus::Signaled(31));

@@ -1019,7 +1019,8 @@ impl Fs {
         fs.self_links[0] = fs.insert(proc, "self", Kind::Symlink("1".into()), 0o777);
         fs.self_links[1] = fs.insert(proc, "thread-self", Kind::Symlink("1".into()), 0o777);
         fs.insert(proc, "mounts", Kind::Symlink("self/mounts".into()), 0o777);
-        for &(path, file) in procfs::FILES {
+        let eth0 = if crate::netlink::eth0() { procfs::ETH0_FILES } else { &[] };
+        for &(path, file) in procfs::FILES.iter().chain(eth0) {
             let (dir, name) = path.rsplit_once('/').unwrap();
             let parent = fs.mkdir_p(dir);
             fs.insert(parent, name, Kind::Proc(file), 0o444);
@@ -1783,16 +1784,12 @@ impl Fs {
     /// before creating it).
     pub fn missing_is_import_gap(&mut self, base: Ino, path: &str) -> bool {
         // A live mount has whatever the host has: nothing there is missing;
-        // nor in /dev/pts or /proc/<pid>, whose entries come and go.
+        // nor in /dev, /proc and /sys, which are the kernel's (and reserved:
+        // no import can go there), whose entries come and go (/dev/pts,
+        // /proc/<pid>) or depend on the policy (/sys/class/net/eth0).
         let gap = |fs: &Fs, ino: Ino| {
             let n = &fs.nodes[ino];
-            !n.changed
-                && n.perm & S_ISVTX == 0
-                && n.remote.is_none()
-                && n.host_ino == 0
-                && ino != fs.pts_dir
-                && !fs.dir_pids.contains_key(&ino)
-                && !fs.fd_dirs.contains_key(&ino)
+            !n.system && !n.changed && n.perm & S_ISVTX == 0 && n.remote.is_none() && n.host_ino == 0
         };
         let mut p = path.trim_end_matches('/');
         loop {

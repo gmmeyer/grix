@@ -63,6 +63,9 @@ pub enum ProcFile {
     BootId,
     // /sys/fs/cgroup/...
     CgroupMemoryMax,
+    /// /proc/net/dev and /proc/net/route: the interfaces there are.
+    NetDev,
+    NetRoute,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
 }
@@ -140,15 +143,9 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/diskstats", ProcFile::Text("")),
     ("/proc/partitions", ProcFile::Text("major minor  #blocks  name\n\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),
-    // The only interface is lo (see netlink.rs).
-    (
-        "/proc/net/dev",
-        ProcFile::Text(
-            "Inter-|   Receive                                                |  Transmit\n \
-             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    \
-             lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
-        ),
-    ),
+    // lo, and eth0 with `net` (see netlink.rs).
+    ("/proc/net/dev", ProcFile::NetDev),
+    ("/proc/net/route", ProcFile::NetRoute),
     ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
     // lo as sysfs shows it (as netlink.rs describes it).
     ("/sys/class/net/lo/address", ProcFile::Text("00:00:00:00:00:00\n")),
@@ -169,6 +166,21 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/sys/fs/cgroup/memory.max", ProcFile::CgroupMemoryMax),
     ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
     ("/proc/grix/smp", ProcFile::SmpStats),
+];
+
+/// eth0 as sysfs shows it, with `net` (netlink.rs describes it). `flags`
+/// is the device's own (IFF_UP | IFF_BROADCAST | IFF_MULTICAST), without
+/// what the link adds.
+pub const ETH0_FILES: &[(&str, ProcFile)] = &[
+    ("/sys/class/net/eth0/address", ProcFile::Text("52:54:00:12:34:56\n")), // netlink::ETH0_MAC
+    ("/sys/class/net/eth0/addr_len", ProcFile::Text("6\n")),
+    ("/sys/class/net/eth0/broadcast", ProcFile::Text("ff:ff:ff:ff:ff:ff\n")),
+    ("/sys/class/net/eth0/carrier", ProcFile::Text("1\n")),
+    ("/sys/class/net/eth0/flags", ProcFile::Text("0x1003\n")),
+    ("/sys/class/net/eth0/ifindex", ProcFile::Text("2\n")),
+    ("/sys/class/net/eth0/mtu", ProcFile::Text("1500\n")),
+    ("/sys/class/net/eth0/operstate", ProcFile::Text("up\n")),
+    ("/sys/class/net/eth0/type", ProcFile::Text("1\n")),
 ];
 
 /// ENOMEM if it would take more kernel memory than buffers may.
@@ -300,6 +312,8 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
             let (total, _) = frame::stats();
             let _ = writeln!(s, "{}", total * 4096);
         }
+        ProcFile::NetDev => crate::netlink::proc_net_dev(&mut s),
+        ProcFile::NetRoute => crate::netlink::proc_net_route(&mut s),
     }
     Ok(s.into_bytes())
 }

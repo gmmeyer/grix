@@ -137,16 +137,13 @@ see below.
 
 ### Worth doing next
 
-- **Network interfaces.** The guest has only `lo`, by design
-  (`netlink.rs`). gohai's network metadata reports `not connected to the
-  network`, the process check finds no network ID, and the network check
-  has only `lo`. The guest does have an address, 10.0.2.15, which
-  `/etc/hosts` now uses. Showing an `eth0` with 10.0.2.15 (netlink,
-  `/proc/net/dev`, `SIOCGIFCONF`, `/sys/class/net/eth0`) would fix host
-  network metadata for the Agent and for anything else that asks "what's
-  my IP". It's a policy question, not a hard one: the interface would
-  have no device behind it, since traffic still goes through the host's
-  proxy.
+- **Network interfaces** (done since). Without `net` the guest has only
+  `lo`, and gohai's network metadata reported `not connected to the
+  network`, the process check found no network ID, and the network check
+  had only `lo`. With `net` the guest now shows `eth0`, 10.0.2.15/24 and
+  the default route via 10.0.2.2 (netlink, the interface ioctls,
+  `/proc/net/dev`, `/proc/net/route`, `/sys/class/net/eth0`), with no
+  device behind it: traffic still goes through the host's proxy.
 - **`splice` (76).** Go uses it for pipe and socket copies and falls back
   on ENOSYS, so the only cost is an `unsupported` event and a slower
   copy. A pipe-to-anything `splice` through a bounce buffer is moderate

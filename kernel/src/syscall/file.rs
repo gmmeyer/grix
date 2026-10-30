@@ -2485,16 +2485,17 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
         return write_u32(&mut p.aspace, arg, pid as u32).map(|_| 0);
     }
     if socket && req == SIOCGIFCONF {
-        // struct ifconf { int ifc_len; char *ifc_buf; }: one entry, for lo.
+        // struct ifconf { int ifc_len; char *ifc_buf; }: an entry for each
+        // interface, as many as fit.
         let len = read_u32(&mut p.aspace, arg)? as usize;
         let buf = read_u64(&mut p.aspace, arg + 8)?;
-        let entry = crate::netlink::ifconf_entry();
+        let entries = crate::netlink::ifconf_entries();
         // With no buffer, report the size needed.
-        let n = if buf == 0 || len >= entry.len() { entry.len() } else { 0 };
-        if buf != 0 && n > 0 {
-            copy_out(&mut p.aspace, buf, &entry)?;
+        let fit = if buf == 0 { entries.len() } else { entries.len().min(len / 40) };
+        if buf != 0 {
+            copy_out(&mut p.aspace, buf, entries[..fit].as_flattened())?;
         }
-        return write_u32(&mut p.aspace, arg, n as u32).map(|_| 0);
+        return write_u32(&mut p.aspace, arg, (fit * 40) as u32).map(|_| 0);
     }
     if socket && (0x8900..=0x89ff).contains(&req) {
         let mut ifr = [0u8; 40];

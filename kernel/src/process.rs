@@ -777,6 +777,8 @@ pub fn start(img: Image<'static>) -> ! {
         finish(ExitKind::Exited, code)
     };
     let cpus = img.cpus.clamp(1, grix_abi::machine::MAX_CPUS);
+    // With `net`, the guest has an interface to describe (/sys/class/net).
+    crate::netlink::init(img.policy.allows(grix_abi::policy::Capability::Net));
     let mut fs = fs::Fs::build(entries, &img.mounts, &img.live_mounts, (img.uid, img.gid), cpus);
     for m in &img.mounts {
         fs.mark_mount(m);

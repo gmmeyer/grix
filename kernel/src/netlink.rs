@@ -1,8 +1,13 @@
-//! A NETLINK_ROUTE socket that describes the sandbox's only network
-//! interface, `lo` (127.0.0.1/8 and ::1/128). That's what getifaddrs and
+//! A NETLINK_ROUTE socket that describes the sandbox's network interfaces:
+//! `lo` (127.0.0.1/8 and ::1/128), and with `net` also `eth0` (10.0.2.15/24,
+//! the default route via the host, 10.0.2.2). That's what getifaddrs and
 //! if_nameindex ask for (Node's os.networkInterfaces, Python's
-//! socket.if_nameindex, `ip addr`). It reveals nothing about the host, so it
-//! needs no capability. Requests to change interfaces get EPERM, as for an
+//! socket.if_nameindex, `ip addr`, `ip route`). It reveals nothing about the
+//! host, so it needs no capability. eth0 is no device: it describes the
+//! networking the host's proxy does for the guest's sockets (inet.rs), which
+//! still decides what they reach; programs that look for a non-loopback
+//! interface or a default route before they connect (the Datadog Agent)
+//! find one. Requests to change interfaces get EPERM, as for an
 //! unprivileged user; other queries get an empty dump.
 //!
 //! Requests are untrusted bytes: every header is bounds-checked, and replies
@@ -11,6 +16,8 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+use grix_abi::link;
 
 use crate::errno::*;
 use crate::ipc::{EPOLLIN, EPOLLOUT};
@@ -25,6 +32,8 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
@@ -47,6 +56,92 @@ const LO_INDEX: u32 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
 /// IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
 const LO_FLAGS: u32 = 0x1 | 0x8 | 0x40 | 0x1_0000;
+
+const ETH0_INDEX: u32 = 2;
+const ARPHRD_ETHER: u16 = 1;
+/// IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST | IFF_LOWER_UP
+const ETH0_FLAGS: u32 = 0x1 | 0x2 | 0x40 | 0x1000 | 0x1_0000;
+/// Made up, as QEMU's user networking's guest has (no frame ever has it).
+pub const ETH0_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+const ETH0_MTU: u32 = 1500;
+/// The guest's address, its /24 network and the host's.
+const ETH0_IP: [u8; 4] = link::GUEST_V4;
+const ETH0_MASK: [u8; 4] = [255, 255, 255, 0];
+const ETH0_NET: [u8; 4] = [ETH0_IP[0], ETH0_IP[1], ETH0_IP[2], 0];
+const ETH0_BROADCAST: [u8; 4] = [ETH0_IP[0], ETH0_IP[1], ETH0_IP[2], 255];
+const GATEWAY: [u8; 4] = link::HOST_V4;
+
+/// Is there an eth0 (the program has `net`)? Set once at boot.
+static HAS_ETH0: AtomicBool = AtomicBool::new(false);
+
+pub fn init(net: bool) {
+    HAS_ETH0.store(net, Ordering::Relaxed);
+}
+
+pub fn eth0() -> bool {
+    HAS_ETH0.load(Ordering::Relaxed)
+}
+
+/// An interface: what each listing says of it.
+struct Iface {
+    index: u32,
+    name: &'static [u8],
+    kind: u16,
+    flags: u32,
+    mac: [u8; 6],
+    broadcast: [u8; 6],
+    mtu: u32,
+    /// IFLA_OPERSTATE: unknown for lo, up for eth0.
+    oper: u8,
+    ip: [u8; 4],
+    mask: [u8; 4],
+    prefix: u8,
+    /// IPv4 broadcast address (0.0.0.0: none).
+    brd: [u8; 4],
+}
+
+const LO: Iface = Iface {
+    index: LO_INDEX,
+    name: b"lo",
+    kind: ARPHRD_LOOPBACK,
+    flags: LO_FLAGS,
+    mac: [0; 6],
+    broadcast: [0; 6],
+    mtu: 65536,
+    oper: 0,
+    ip: [127, 0, 0, 1],
+    mask: [255, 0, 0, 0],
+    prefix: 8,
+    brd: [0; 4],
+};
+
+const ETH0: Iface = Iface {
+    index: ETH0_INDEX,
+    name: b"eth0",
+    kind: ARPHRD_ETHER,
+    flags: ETH0_FLAGS,
+    mac: ETH0_MAC,
+    broadcast: [0xff; 6],
+    mtu: ETH0_MTU,
+    oper: 6, // IF_OPER_UP
+    ip: ETH0_IP,
+    mask: ETH0_MASK,
+    prefix: 24,
+    brd: ETH0_BROADCAST,
+};
+
+/// The interfaces there are, in index order.
+fn ifaces() -> &'static [Iface] {
+    if eth0() { &[LO, ETH0] } else { &[LO] }
+}
+
+fn by_index(index: u32) -> Option<&'static Iface> {
+    ifaces().iter().find(|i| i.index == index)
+}
+
+fn by_name(name: &[u8]) -> Option<&'static Iface> {
+    ifaces().iter().find(|i| i.name == name)
+}
 
 pub struct Netlink {
     /// Our port id (nl_pid).
@@ -104,7 +199,9 @@ impl Netlink {
         let dump = flags & NLM_F_DUMP != 0;
         let result = match ty {
             RTM_GETLINK if dump => {
-                self.link(out, seq, NLM_F_MULTI);
+                for i in ifaces() {
+                    self.link(out, seq, NLM_F_MULTI, i);
+                }
                 self.done(out, seq);
                 Ok(())
             }
@@ -113,26 +210,32 @@ impl Netlink {
                 let index = msg.get(HDR + 4..HDR + 8).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
                 let found = match (index, link_name(msg)) {
                     (0, None) => Err(EINVAL),
-                    (0, Some(name)) => {
-                        if name == b"lo" {
-                            Ok(())
-                        } else {
-                            Err(ENODEV)
-                        }
-                    }
-                    (LO_INDEX, _) => Ok(()),
-                    _ => Err(ENODEV),
+                    (0, Some(name)) => by_name(name).ok_or(ENODEV),
+                    (index, _) => by_index(index).ok_or(ENODEV),
                 };
-                found.map(|_| self.link(out, seq, 0))
+                found.map(|i| self.link(out, seq, 0, i))
             }
             RTM_GETADDR if dump => {
+                // By family, then interface, as Linux's dump goes.
                 if family == 0 || family == AF_INET {
-                    self.addr(out, seq, AF_INET, 8, &[127, 0, 0, 1]);
+                    for i in ifaces() {
+                        self.addr4(out, seq, i);
+                    }
                 }
                 if family == 0 || family == AF_INET6 {
                     let mut v6 = [0u8; 16];
                     v6[15] = 1;
-                    self.addr(out, seq, AF_INET6, 128, &v6);
+                    self.addr6(out, seq, &v6);
+                }
+                self.done(out, seq);
+                Ok(())
+            }
+            // The main table's routes: eth0's network, and the default one
+            // through the host.
+            RTM_GETROUTE if dump => {
+                if eth0() && (family == 0 || family == AF_INET) {
+                    self.route(out, seq, Some(GATEWAY));
+                    self.route(out, seq, None);
                 }
                 self.done(out, seq);
                 Ok(())
@@ -166,34 +269,81 @@ impl Netlink {
         out.resize(out.len().next_multiple_of(4), 0);
     }
 
-    fn link(&self, out: &mut Vec<u8>, seq: u32, flags: u16) {
+    fn link(&self, out: &mut Vec<u8>, seq: u32, flags: u16, i: &Iface) {
         // struct ifinfomsg: family, pad, type, index, flags, change.
         let mut b = Vec::new();
         b.extend_from_slice(&[0, 0]);
-        b.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-        b.extend_from_slice(&LO_INDEX.to_le_bytes());
-        b.extend_from_slice(&LO_FLAGS.to_le_bytes());
+        b.extend_from_slice(&i.kind.to_le_bytes());
+        b.extend_from_slice(&i.index.to_le_bytes());
+        b.extend_from_slice(&i.flags.to_le_bytes());
         b.extend_from_slice(&u32::MAX.to_le_bytes());
-        attr(&mut b, 3, b"lo\0"); // IFLA_IFNAME
-        attr(&mut b, 1, &[0; 6]); // IFLA_ADDRESS
-        attr(&mut b, 2, &[0; 6]); // IFLA_BROADCAST
-        attr(&mut b, 4, &65536u32.to_le_bytes()); // IFLA_MTU
-        attr(&mut b, 16, &[0]); // IFLA_OPERSTATE: unknown, as for lo
+        let mut name = [0u8; 8];
+        name[..i.name.len()].copy_from_slice(i.name);
+        attr(&mut b, 3, &name[..=i.name.len()]); // IFLA_IFNAME
+        attr(&mut b, 1, &i.mac); // IFLA_ADDRESS
+        attr(&mut b, 2, &i.broadcast); // IFLA_BROADCAST
+        attr(&mut b, 4, &i.mtu.to_le_bytes()); // IFLA_MTU
+        attr(&mut b, 16, &[i.oper]); // IFLA_OPERSTATE
         self.message(out, RTM_NEWLINK, flags, seq, &b);
     }
 
-    fn addr(&self, out: &mut Vec<u8>, seq: u32, family: u8, prefix: u8, ip: &[u8]) {
+    fn addr4(&self, out: &mut Vec<u8>, seq: u32, i: &Iface) {
+        const IFA_F_PERMANENT: u8 = 0x80;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
+        const RT_SCOPE_HOST: u8 = 254;
+        let scope = if i.index == LO_INDEX { RT_SCOPE_HOST } else { RT_SCOPE_UNIVERSE };
+        // struct ifaddrmsg: family, prefixlen, flags, scope, index.
+        let mut b = alloc::vec![AF_INET, i.prefix, IFA_F_PERMANENT, scope];
+        b.extend_from_slice(&i.index.to_le_bytes());
+        attr(&mut b, 1, &i.ip); // IFA_ADDRESS
+        attr(&mut b, 2, &i.ip); // IFA_LOCAL
+        if i.brd != [0; 4] {
+            attr(&mut b, 4, &i.brd); // IFA_BROADCAST
+        }
+        let mut label = [0u8; 8];
+        label[..i.name.len()].copy_from_slice(i.name);
+        attr(&mut b, 3, &label[..=i.name.len()]); // IFA_LABEL
+        self.message(out, RTM_NEWADDR, NLM_F_MULTI, seq, &b);
+    }
+
+    /// lo's IPv6 address (eth0 has none: the host's proxy is reached over
+    /// IPv4).
+    fn addr6(&self, out: &mut Vec<u8>, seq: u32, ip: &[u8; 16]) {
         const IFA_F_PERMANENT: u8 = 0x80;
         const RT_SCOPE_HOST: u8 = 254;
-        // struct ifaddrmsg: family, prefixlen, flags, scope, index.
-        let mut b = alloc::vec![family, prefix, IFA_F_PERMANENT, RT_SCOPE_HOST];
+        let mut b = alloc::vec![AF_INET6, 128, IFA_F_PERMANENT, RT_SCOPE_HOST];
         b.extend_from_slice(&LO_INDEX.to_le_bytes());
         attr(&mut b, 1, ip); // IFA_ADDRESS
-        if family == AF_INET {
-            attr(&mut b, 2, ip); // IFA_LOCAL
-            attr(&mut b, 3, b"lo\0"); // IFA_LABEL
-        }
         self.message(out, RTM_NEWADDR, NLM_F_MULTI, seq, &b);
+    }
+
+    /// A main-table route on eth0: its network (as the kernel adds for an
+    /// address), or the default one through `gateway`.
+    fn route(&self, out: &mut Vec<u8>, seq: u32, gateway: Option<[u8; 4]>) {
+        const RT_TABLE_MAIN: u8 = 254;
+        const RTPROT_KERNEL: u8 = 2;
+        const RTPROT_BOOT: u8 = 3;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
+        const RT_SCOPE_LINK: u8 = 253;
+        const RTN_UNICAST: u8 = 1;
+        // struct rtmsg: family, dst_len, src_len, tos, table, protocol,
+        // scope, type, flags.
+        let (dst_len, proto, scope) = match gateway {
+            Some(_) => (0, RTPROT_BOOT, RT_SCOPE_UNIVERSE),
+            None => (24, RTPROT_KERNEL, RT_SCOPE_LINK),
+        };
+        let mut b = alloc::vec![AF_INET, dst_len, 0, 0, RT_TABLE_MAIN, proto, scope, RTN_UNICAST];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        attr(&mut b, 15, &(RT_TABLE_MAIN as u32).to_le_bytes()); // RTA_TABLE
+        match gateway {
+            Some(gw) => attr(&mut b, 5, &gw), // RTA_GATEWAY
+            None => {
+                attr(&mut b, 1, &ETH0_NET); // RTA_DST
+                attr(&mut b, 7, &ETH0_IP); // RTA_PREFSRC
+            }
+        }
+        attr(&mut b, 4, &ETH0_INDEX.to_le_bytes()); // RTA_OIF
+        self.message(out, RTM_NEWROUTE, NLM_F_MULTI, seq, &b);
     }
 
     fn done(&self, out: &mut Vec<u8>, seq: u32) {
@@ -253,16 +403,60 @@ pub fn sockaddr(port: u32) -> [u8; 12] {
     b
 }
 
+// ---------------------------------------------------------------- /proc/net
+
+/// /proc/net/dev: each interface, with no counts kept.
+pub fn proc_net_dev(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    s.push_str(
+        "Inter-|   Receive                                                |  Transmit\n \
+         face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+    );
+    for i in ifaces() {
+        let name = core::str::from_utf8(i.name).unwrap_or("");
+        let _ = writeln!(
+            s,
+            "{name:>6}: {:7} {:7} {:4} {:4} {:4} {:5} {:10} {:9} {:8} {:7} {:4} {:4} {:4} {:5} {:7} {:10}",
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        );
+    }
+}
+
+/// /proc/net/route: the main table's IPv4 routes (none without eth0),
+/// each line padded to 127 characters as Linux's fib_route_seq_show
+/// pads them, addresses as the u32 in memory (little-endian).
+pub fn proc_net_route(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let line = |s: &mut alloc::string::String, text: &str| {
+        let _ = writeln!(s, "{text:<127}");
+    };
+    line(s, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT");
+    if !eth0() {
+        return;
+    }
+    const RTF_UP: u16 = 1;
+    const RTF_GATEWAY: u16 = 2;
+    let hex = |a: [u8; 4]| u32::from_le_bytes(a);
+    for (dst, gw, mask, flags) in
+        [([0; 4], GATEWAY, [0; 4], RTF_UP | RTF_GATEWAY), (ETH0_NET, [0; 4], ETH0_MASK, RTF_UP)]
+    {
+        let text =
+            alloc::format!("eth0\t{:08X}\t{:08X}\t{flags:04X}\t0\t0\t0\t{:08X}\t0\t0\t0", hex(dst), hex(gw), hex(mask));
+        line(s, &text);
+    }
+}
+
 // ---------------------------------------------------------------- interface ioctls
 
 /// The old interface ioctls on any socket (struct ifreq: a 16-byte name and
-/// a 24-byte union), as musl's if_nametoindex and busybox use them. Only
-/// `lo` exists; setting anything needs CAP_NET_ADMIN. `None` for requests
-/// this doesn't know.
+/// a 24-byte union), as musl's if_nametoindex and busybox use them, for
+/// the interfaces there are; setting anything needs CAP_NET_ADMIN. `None`
+/// for requests this doesn't know.
 pub fn ifreq_ioctl(req: u64, ifr: &mut [u8; 40]) -> Option<Result<(), Errno>> {
     const SIOCGIFNAME: u64 = 0x8910;
     const SIOCGIFFLAGS: u64 = 0x8913;
     const SIOCGIFADDR: u64 = 0x8915;
+    const SIOCGIFBRDADDR: u64 = 0x8919;
     const SIOCGIFNETMASK: u64 = 0x891b;
     const SIOCGIFMTU: u64 = 0x8921;
     const SIOCGIFHWADDR: u64 = 0x8927;
@@ -270,41 +464,53 @@ pub fn ifreq_ioctl(req: u64, ifr: &mut [u8; 40]) -> Option<Result<(), Errno>> {
     if !(0x8900..=0x89ff).contains(&req) {
         return None;
     }
-    let is_lo = ifr[..16].split(|&b| b == 0).next() == Some(b"lo");
+    let iface = by_name(ifr[..16].split(|&b| b == 0).next().unwrap_or(&[]));
     let data = &mut ifr[16..];
+    let sockaddr_in = |data: &mut [u8], ip: [u8; 4]| {
+        data.fill(0);
+        data[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        data[4..8].copy_from_slice(&ip);
+    };
     let result = match req {
         SIOCGIFNAME => {
-            if u32::from_le_bytes(data[..4].try_into().unwrap()) != LO_INDEX {
+            let Some(i) = by_index(u32::from_le_bytes(data[..4].try_into().unwrap())) else {
                 return Some(Err(ENODEV));
-            }
+            };
             ifr[..16].fill(0);
-            ifr[..2].copy_from_slice(b"lo");
+            ifr[..i.name.len()].copy_from_slice(i.name);
             Ok(())
         }
         // Everything else names the interface.
-        _ if !is_lo => Err(ENODEV),
+        _ if iface.is_none() => Err(ENODEV),
         SIOCGIFINDEX => {
-            data[..4].copy_from_slice(&LO_INDEX.to_le_bytes());
+            data[..4].copy_from_slice(&iface.unwrap().index.to_le_bytes());
             Ok(())
         }
         SIOCGIFFLAGS => {
-            data[..2].copy_from_slice(&(LO_FLAGS as u16).to_le_bytes());
+            data[..2].copy_from_slice(&(iface.unwrap().flags as u16).to_le_bytes());
             Ok(())
         }
         SIOCGIFMTU => {
-            data[..4].copy_from_slice(&65536u32.to_le_bytes());
+            data[..4].copy_from_slice(&iface.unwrap().mtu.to_le_bytes());
             Ok(())
         }
-        SIOCGIFADDR | SIOCGIFNETMASK => {
-            let ip = if req == SIOCGIFADDR { [127, 0, 0, 1] } else { [255, 0, 0, 0] };
-            data.fill(0);
-            data[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
-            data[4..8].copy_from_slice(&ip);
+        SIOCGIFADDR => {
+            sockaddr_in(data, iface.unwrap().ip);
+            Ok(())
+        }
+        SIOCGIFNETMASK => {
+            sockaddr_in(data, iface.unwrap().mask);
+            Ok(())
+        }
+        SIOCGIFBRDADDR => {
+            sockaddr_in(data, iface.unwrap().brd);
             Ok(())
         }
         SIOCGIFHWADDR => {
+            let i = iface.unwrap();
             data.fill(0);
-            data[..2].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            data[..2].copy_from_slice(&i.kind.to_le_bytes());
+            data[2..8].copy_from_slice(&i.mac);
             Ok(())
         }
         // SIOCSIFFLAGS, ADDR, DSTADDR, BRDADDR, NETMASK, METRIC, MTU, NAME,
@@ -315,11 +521,16 @@ pub fn ifreq_ioctl(req: u64, ifr: &mut [u8; 40]) -> Option<Result<(), Errno>> {
     Some(result)
 }
 
-/// SIOCGIFCONF's single entry: lo and its IPv4 address.
-pub fn ifconf_entry() -> [u8; 40] {
-    let mut e = [0u8; 40];
-    e[..2].copy_from_slice(b"lo");
-    e[16..18].copy_from_slice(&(AF_INET as u16).to_le_bytes());
-    e[20..24].copy_from_slice(&[127, 0, 0, 1]);
-    e
+/// SIOCGIFCONF's entries: each interface and its IPv4 address.
+pub fn ifconf_entries() -> Vec<[u8; 40]> {
+    ifaces()
+        .iter()
+        .map(|i| {
+            let mut e = [0u8; 40];
+            e[..i.name.len()].copy_from_slice(i.name);
+            e[16..18].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            e[20..24].copy_from_slice(&i.ip);
+            e
+        })
+        .collect()
 }
