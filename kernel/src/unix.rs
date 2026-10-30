@@ -174,6 +174,8 @@ pub struct Msg {
     pub data: Vec<u8>,
     pub from: Option<Name>,
     pub rights: Option<Rights>,
+    /// Who sent it (SCM_CREDENTIALS, for a receiver with SO_PASSCRED).
+    pub cred: Cred,
 }
 
 /// A connection waiting to be accepted.
@@ -213,6 +215,8 @@ pub struct Sock {
     pub cred: Cred,
     /// Its peer's, once connected.
     pub peer_cred: Option<Cred>,
+    /// SO_PASSCRED: messages come with their senders' credentials.
+    pub passcred: bool,
     pub version: u64,
 }
 
@@ -272,7 +276,7 @@ impl Msg {
 
 impl Sock {
     pub fn new(ty: u64, state: State, cred: Cred) -> SockRef {
-        Arc::new(Mutex::new(Sock { ty, name: None, state, cred, peer_cred: None, version: 0 }))
+        Arc::new(Mutex::new(Sock { ty, name: None, state, cred, peer_cred: None, passcred: false, version: 0 }))
     }
 
     /// An empty message queue (a datagram socket, a seqpacket end).

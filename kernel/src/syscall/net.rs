@@ -279,7 +279,7 @@ pub fn sendto(p: &mut Process, fd: u64, buf: u64, len: u64, flags: u64, addr: u6
     if let Some(sock) = super::unix::sock_of(&file) {
         let to = if addr != 0 { Some(super::unix::resolve_to(p, addr, addrlen)?) } else { None };
         let nonblock = file.lock().nonblocking();
-        return super::unix::send_msg(p, &sock, &[(buf, len)], flags, nonblock, to, None);
+        return super::unix::send_msg(p, &sock, &[(buf, len)], flags, nonblock, to, Default::default());
     }
     if is_unbound(&file) {
         return Err(if addr != 0 { EOPNOTSUPP } else { ENOTCONN });
@@ -391,7 +391,7 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
     if m.controllen != 0 && !unix {
         return p.unimplemented(nr::sendmsg, "sendmsg", "ancillary data on this socket", EOPNOTSUPP);
     }
-    let rights = if unix { super::unix::read_rights(p, m.control, m.controllen)? } else { None };
+    let control = if unix { super::unix::read_control(p, m.control, m.controllen)? } else { Default::default() };
     if let Some(sock) = super::unix::sock_of(&file) {
         let to = if m.name != 0 {
             let len = read_u32(&mut p.aspace, msg + 8)? as u64;
@@ -401,7 +401,7 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         };
         let bufs = iovecs(p, m.iov, m.iovlen)?;
         let nonblock = file.lock().nonblocking();
-        return super::unix::send_msg(p, &sock, &bufs, flags, nonblock, to, rights);
+        return super::unix::send_msg(p, &sock, &bufs, flags, nonblock, to, control);
     }
     if is_inet(&file) {
         let to = if m.name != 0 {
@@ -424,7 +424,8 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         return Err(EISCONN);
     }
     let mut total = 0;
-    let mut rights = rights;
+    // A stream's messages carry no credentials here.
+    let mut rights = control.rights;
     for (i, (base, len)) in iovecs(p, m.iov, m.iovlen)?.into_iter().enumerate() {
         // Only the first chunk may block, so a partial result is returned rather than lost.
         let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
@@ -535,7 +536,8 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         let nonblock = file.lock().nonblocking();
         let r = super::unix::recv_msg(p, &sock, &bufs, flags, nonblock)?;
         let truncated = r.full > r.n;
-        super::unix::finish_recvmsg(p, msg, m.name, r.from.as_ref(), r.rights, flags, truncated)?;
+        let anc = super::unix::Ancillary { rights: r.rights, cred: r.cred };
+        super::unix::finish_recvmsg(p, msg, m.name, r.from.as_ref(), anc, flags, truncated)?;
         return Ok(if flags & MSG_TRUNC != 0 { r.full } else { r.n });
     }
     if is_unbound(&file) {
@@ -559,7 +561,8 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         }
     }
     let peer = super::unix::names(&file, true).ok().flatten();
-    super::unix::finish_recvmsg(p, msg, m.name, peer.as_ref(), rights, flags, false)?;
+    let anc = super::unix::Ancillary { rights, cred: None };
+    super::unix::finish_recvmsg(p, msg, m.name, peer.as_ref(), anc, flags, false)?;
     Ok(total)
 }
 
@@ -639,6 +642,7 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
     const SO_ERROR: u64 = 4;
     const SO_SNDBUF: u64 = 7;
     const SO_RCVBUF: u64 = 8;
+    const SO_PASSCRED: u64 = 16;
     const SO_ACCEPTCONN: u64 = 30;
     const SO_DOMAIN: u64 = 39;
     if level != SOL_SOCKET {
@@ -652,6 +656,7 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
         SO_SNDBUF | SO_RCVBUF => ipc::PIPE_CAPACITY as u32,
         SO_DOMAIN if netlink => AF_NETLINK as u32,
         SO_DOMAIN => AF_UNIX as u32,
+        SO_PASSCRED => super::unix::sock_of(&file).is_some_and(|s| s.lock().passcred) as u32,
         _ => return Err(ENOPROTOOPT),
     };
     if read_u32(&mut p.aspace, len)? < 4 {
@@ -709,6 +714,27 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
     }
     if level != SOL_SOCKET && !(level == SOL_NETLINK && is_netlink(&file)) {
         return Err(ENOPROTOOPT);
+    }
+    const SO_PASSCRED: u64 = 16;
+    if level == SOL_SOCKET && name == SO_PASSCRED && !is_inet(&file) && !is_netlink(&file) {
+        if len < 4 {
+            return Err(EINVAL);
+        }
+        let on = read_u32(&mut p.aspace, val)? != 0;
+        // A message socket's messages carry their senders' credentials
+        // from now on; a stream's don't (yet).
+        match super::unix::sock_of(&file) {
+            Some(s) => s.lock().passcred = on,
+            None if on => {
+                let _ = p.unimplemented(
+                    nr::setsockopt,
+                    "setsockopt",
+                    "SO_PASSCRED on a stream, or a socket not yet connected",
+                    EINVAL,
+                );
+            }
+            None => {}
+        }
     }
     Ok(0)
 }

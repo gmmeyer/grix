@@ -2091,6 +2091,12 @@ fn proc_pid_task() {
 }
 
 #[test]
+fn credentials_with_messages() {
+    // SO_PASSCRED and SCM_CREDENTIALS: Chromium's zygote.
+    popular(with("popular").allow(Capability::Process), &["passcred"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

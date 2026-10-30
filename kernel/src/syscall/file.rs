@@ -901,7 +901,9 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             };
         }
         FileKind::Pty(end) => return super::tty::write(p, end, buf, count, nonblock),
-        FileKind::Unix(s) => return super::unix::send_msg(p, s, &[(buf, count)], 0, nonblock, None, None),
+        FileKind::Unix(s) => {
+            return super::unix::send_msg(p, s, &[(buf, count)], 0, nonblock, None, Default::default());
+        }
         FileKind::Socket(s) => {
             return match &s.tx {
                 Some(tx) => pipe_write(p, tx, Src::User(buf), count, nonblock, true),
@@ -1157,7 +1159,7 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
         let nonblock = file.lock().nonblocking() || extra & O_NONBLOCK != 0;
         let bufs = iovecs(p, iov, cnt)?;
         return if write {
-            super::unix::send_msg(p, &sock, &bufs, 0, nonblock, None, None)
+            super::unix::send_msg(p, &sock, &bufs, 0, nonblock, None, Default::default())
         } else {
             super::unix::recv_msg(p, &sock, &bufs, 0, nonblock).map(|r| r.n)
         };
@@ -1248,7 +1250,7 @@ pub(super) fn aio_rw(
     // in `vectored`.
     let r = if let Some(sock) = super::unix::sock_of(file) {
         if write {
-            super::unix::send_msg(p, &sock, &bufs, 0, true, None, None)
+            super::unix::send_msg(p, &sock, &bufs, 0, true, None, Default::default())
         } else {
             super::unix::recv_msg(p, &sock, &bufs, 0, true).map(|r| r.n)
         }

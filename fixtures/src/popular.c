@@ -1030,6 +1030,65 @@ static int tasks(void) {
     return 0;
 }
 
+// SO_PASSCRED: a message socket's messages come with SCM_CREDENTIALS, the
+// sender's (Chromium's zygote learns its children's pids so).
+static int recv_cred(int s, struct ucred *uc, char *data) {
+    char control[CMSG_SPACE(sizeof(struct ucred))];
+    struct iovec iov = {data, 16};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    ssize_t n = recvmsg(s, &m, 0);
+    if (n < 0) return -1;
+    data[n] = 0;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    if (!c) return 0;
+    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_CREDENTIALS || c->cmsg_len != CMSG_LEN(sizeof *uc)) return -1;
+    memcpy(uc, CMSG_DATA(c), sizeof *uc);
+    return 1;
+}
+
+static int passcred(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0);
+    int on = 1, v = -1;
+    socklen_t len = sizeof v;
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 0);
+    // Without it, no credentials.
+    struct ucred uc;
+    char data[17];
+    CHECK(write(sv[1], "a", 1) == 1);
+    CHECK(recv_cred(sv[0], &uc, data) == 0 && strcmp(data, "a") == 0);
+    CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    pid_t child = fork();
+    if (child == 0) _exit(write(sv[1], "ping", 4) == 4 ? 0 : 1);
+    CHECK(child > 0);
+    CHECK(recv_cred(sv[0], &uc, data) == 1 && strcmp(data, "ping") == 0);
+    CHECK(uc.pid == child && uc.uid == getuid() && uc.gid == getgid());
+    int st;
+    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    // A sender may say who it is, within its own ids.
+    struct ucred mine = {getpid(), getuid(), getgid()};
+    char control[CMSG_SPACE(sizeof mine)] = {0};
+    struct iovec iov = {"me", 2};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_CREDENTIALS;
+    c->cmsg_len = CMSG_LEN(sizeof mine);
+    memcpy(CMSG_DATA(c), &mine, sizeof mine);
+    CHECK(sendmsg(sv[1], &m, 0) == 2);
+    CHECK(recv_cred(sv[0], &uc, data) == 1 && uc.pid == getpid() && strcmp(data, "me") == 0);
+    // No room for them: cut off.
+    char small[8];
+    struct iovec iov2 = {data, 16};
+    struct msghdr m2 = {.msg_iov = &iov2, .msg_iovlen = 1, .msg_control = small, .msg_controllen = sizeof small};
+    CHECK(write(sv[1], "b", 1) == 1);
+    CHECK(recvmsg(sv[0], &m2, 0) == 1 && (m2.msg_flags & MSG_CTRUNC) && m2.msg_controllen == 0);
+    close(sv[0]);
+    close(sv[1]);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1060,6 +1119,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "numa") == 0) r = numa();
         if (strcmp(argv[i], "prctls") == 0) r = prctls();
         if (strcmp(argv[i], "tasks") == 0) r = tasks();
+        if (strcmp(argv[i], "passcred") == 0) r = passcred();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);
