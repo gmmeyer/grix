@@ -4173,8 +4173,12 @@ fn threads_run_in_parallel_on_more_cpus() {
     // machines share few cores (a 4-core CI runner: 0.5 to 1.2 then, 2.0
     // alone, with the one kernel lock), only that more than one CPU ran
     // them is checked, unless GRIX_STRICT_SPEEDUP says this runs alone.
+    // Nor is it emulation's to give (0.8 to 0.9 for x86 on arm64, with
+    // every CPU used).
+    let emulated = std::env::var("GRIX_ACCEL").is_ok_and(|a| a == "tcg")
+        || grix::Arch::from_env().name() != std::env::consts::ARCH;
     let strict = std::env::var_os("GRIX_STRICT_SPEEDUP").is_some()
-        || std::thread::available_parallelism().map_or(1, |n| n.get()) >= 8;
+        || (!emulated && std::thread::available_parallelism().map_or(1, |n| n.get()) >= 8);
     let mut seen = Vec::new();
     for cpus in [1, 4] {
         let tries = if cpus == 4 { 3 } else { 1 };

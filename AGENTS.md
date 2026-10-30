@@ -672,10 +672,8 @@ read-only mount EROFS (`landlock::domain_changing`). What matters after the open
 (`OpenFile::landlock_denied`, TRUNCATE and IOCTL_DEV, inverted so a file
 made any other way has them). A new way to make, remove, open, execute
 or move a node, or to bind or connect a TCP socket, needs its check.
-`/proc/self/fd/N` isn't re-checked: it's the same open file here
-(`procfs::fd_path`), not a new open, unless that can't do what's asked
-(an O_PATH descriptor can do nothing: `file::reopened`), which opens
-the file again, checked as any open. A path going on through it
+`/proc/self/fd/N` of a node opens it again (`procfs::fd_path`,
+`file::reopened`), checked as any open. A path going on through it
 (`/proc/self/fd/N/name`) is an ordinary walk from that directory
 (`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
 only, from `FdTable::walking`), checked as any other. execveat of a

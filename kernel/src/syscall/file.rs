@@ -360,8 +360,8 @@ pub fn openat2(p: &mut Process, dirfd: u64, pathp: u64, howp: u64, size: u64) ->
 fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, resolve: u64) -> SysResult {
     let acc = flags & O_ACCMODE;
     let cloexec = flags & O_CLOEXEC != 0;
-    // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file,
-    // or if that can't do what's asked, the file opened afresh (`reopened`).
+    // /proc/self/fd/N, /dev/stdin, ...: a file opened afresh (`reopened`),
+    // or another reference to one that isn't a node.
     // (With `resolve`, they're walked to, as anything else, and so are
     // they when they mustn't be followed: they're links.)
     let (mut again, mut kept) = (None, None);
@@ -683,19 +683,18 @@ fn open_fifo(p: &mut Process, ino: Ino, flags: u32, cloexec: bool) -> SysResult 
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
-/// The file to open afresh for `open(/proc/self/fd/N)` with `flags`, if
-/// the open file at N can't do what they ask: Linux's magic link always
-/// opens what it leads to, and an O_PATH descriptor can do nothing else
-/// (reopening one is what it's for: runc, systemd, libpathrs, and Python's
-/// `listdir` of the link), nor a write-only O_TMPFILE read. Any other is
-/// another reference to the open file, as sharing its offset shows.
-/// With the node, its contents, which is all that's left of an unlinked one.
+/// The file to open afresh for `open(/proc/self/fd/N)` with `flags`:
+/// Linux's magic link opens what it leads to, with an offset and access
+/// mode of its own and the checks of any open (reopening an O_PATH
+/// descriptor is what those are for: runc, systemd, libpathrs, and
+/// Python's `listdir` of the link). Anything not a node (a pipe, a
+/// terminal, a socket), or O_PATH asking for no more than a name, is
+/// another reference to the open file. With the node, its contents, which
+/// is all that's left of an unlinked one.
 fn reopened(file: &crate::fd::FileRef, flags: u32) -> Option<(Ino, Option<Content>)> {
     let f = file.lock();
     let FileKind::Node(ino) = f.kind else { return None };
-    let acc = flags & O_ACCMODE;
-    let short = f.path_only || (acc != O_WRONLY && !f.readable()) || (acc != O_RDONLY && !f.writable());
-    (flags & O_PATH == 0 && short).then(|| (ino, f.content.clone()))
+    (flags & O_PATH == 0).then(|| (ino, f.content.clone()))
 }
 
 fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool, denied: u16) -> SysResult {

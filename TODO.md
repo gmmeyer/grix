@@ -319,8 +319,6 @@ Left, none of it a way out of the sandbox:
       the last component is checked (`MAY_EXEC` on the way down isn't).
 - [ ] An image's user gets no supplementary groups from its `/etc/group`,
       as Docker's does; `initgroups` in the program works.
-- [ ] `/proc/self/fd/N` opens the same open file (no new access mode, no
-      new offset, no permission check); Linux's is a new open.
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
       another process's are ENOENT past their own name.
 - [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
@@ -709,7 +707,9 @@ Left, none of it a way out of the sandbox:
       lost wake-ups above, which need another thread to keep running. It
       has a 1 ns periodic timerfd armed, 64 fatal timers and a child
       spinning; look there, and in grix-vmm's wait for the virtual timer.
-      (0.0.57's timerfd livelock needs O_ASYNC, which that run hadn't.)
+      (0.0.57's timerfd livelock needs O_ASYNC, which that run hadn't. A
+      kick landing just before `wfi` doesn't lose it, with 200 µs added
+      there; and 22,551 runs of 0.0.57 at 2 CPUs didn't hang.)
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.

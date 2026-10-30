@@ -151,6 +151,19 @@ static int test_unlinked(void) {
     snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
     CHECK(linkat(AT_FDCWD, path, AT_FDCWD, "/tmp/back", AT_SYMLINK_FOLLOW) == -1 && errno == ENOENT);
     close(fd);
+    // /proc/self/fd/N opens the file again: an offset of its own, and the
+    // checks of any open.
+    fd = open("/tmp/again", O_CREAT | O_RDWR, 0644);
+    CHECK(fd >= 0 && write(fd, "abcdef", 6) == 6 && lseek(fd, 3, SEEK_SET) == 3);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    int again = open(path, O_RDONLY);
+    char c;
+    CHECK(again >= 0 && read(again, &c, 1) == 1 && c == 'a');
+    CHECK(read(fd, &c, 1) == 1 && c == 'd');
+    close(again);
+    CHECK(chmod("/tmp/again", 0400) == 0);
+    CHECK(open(path, O_RDWR) == -1 && errno == EACCES);
+    close(fd);
     return 0;
 }
 
