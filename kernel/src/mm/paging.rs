@@ -1,8 +1,6 @@
 //! 4-level, 4 KiB-granule page tables for user address spaces (the entries'
 //! format is `arch::pte`'s).
 
-use alloc::vec::Vec;
-
 use super::{PAGE_SIZE, frame, p2v};
 use crate::arch;
 
@@ -65,42 +63,14 @@ impl PageTable {
         Some(Self { root })
     }
 
-    /// Pointer to the level-3 entry for `va`, creating intermediate tables if asked.
-    fn walk(&mut self, va: u64, create: bool) -> Option<*mut u64> {
-        let mut table = self.root;
-        for level in 0..3 {
-            let idx = (va >> (39 - 9 * level)) & 511;
-            let e = entry(table, idx);
-            let v = unsafe { *e };
-            if v & VALID == 0 {
-                if !create {
-                    return None;
-                }
-                let next = frame::alloc()?;
-                // The zeroed table before the entry that points at it.
-                arch::publish_barrier();
-                unsafe { *e = pte::table(next) };
-                table = next;
-            } else {
-                table = v & ADDR_MASK;
-            }
-        }
-        Some(entry(table, (va >> 12) & 511))
-    }
-
     /// The valid leaf entry for `va`, if any.
     pub fn lookup(&mut self, va: u64) -> Option<u64> {
-        let e = unsafe { *self.walk(va, false)? };
+        let e = unsafe { *walk(self.root, va, false)? };
         (e & VALID != 0).then_some(e)
     }
 
     pub fn map(&mut self, va: u64, pa: u64, flags: u64) -> Option<()> {
-        let e = self.walk(va, true)?;
-        // The page's contents before the entry that maps it.
-        arch::publish_barrier();
-        unsafe { *e = (pa & ADDR_MASK) | flags };
-        arch::pte_barrier();
-        Some(())
+        map(self.root, va, pa, flags)
     }
 
     /// Call `f(pte)` for every valid leaf entry in `[start, end)`, only
@@ -112,15 +82,13 @@ impl PageTable {
     }
 
     /// Take out the tables under the root that cover part of `[start,
-    /// end)` and map nothing now, and return them ((table, an address it
-    /// covered)): the caller frees them once no TLB or walk cache can
-    /// lead to them (`arch::flush_tables`).
-    pub fn prune(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let mut gone = Vec::new();
+    /// end)` and map nothing now, passing each to `gone` (table, an
+    /// address it covered): the caller frees them once no TLB or walk
+    /// cache can lead to them (`arch::flush_tables`).
+    pub fn prune(&mut self, start: u64, end: u64, gone: &mut dyn FnMut(u64, u64)) {
         if start < end {
-            prune(self.root, 0, 0, start, end, &mut gone);
+            prune(self.root, 0, 0, start, end, gone);
         }
-        gone
     }
 
     /// Call `f(va, pte)` for every valid leaf entry in `[start, end)`,
@@ -130,6 +98,60 @@ impl PageTable {
             visit(self.root, 0, 0, start, end, &mut f);
         }
     }
+
+    /// Move every valid leaf entry in `[start, end)` to the same place
+    /// from `to`, a range apart from it with no entries of its own.
+    /// One that can't be put there (no frame for a table) is taken out and
+    /// passed to `lost`. Nothing is flushed. True if there were any.
+    pub fn move_entries(&mut self, start: u64, end: u64, to: u64, lost: &mut dyn FnMut(u64, u64)) -> bool {
+        let mut any = false;
+        if start < end {
+            let root = self.root;
+            // Tables may be added as this walks, for `to`, outside what it
+            // walks.
+            visit(root, 0, 0, start, end, &mut |va, e| {
+                any = true;
+                let old = unsafe { *e };
+                unsafe { *e = 0 };
+                if map(root, to + (va - start), old & ADDR_MASK, old & !ADDR_MASK).is_none() {
+                    lost(va, old);
+                }
+            });
+        }
+        any
+    }
+}
+
+/// Pointer to the level-3 entry for `va`, creating intermediate tables if asked.
+fn walk(root: u64, va: u64, create: bool) -> Option<*mut u64> {
+    let mut table = root;
+    for level in 0..3 {
+        let idx = (va >> (39 - 9 * level)) & 511;
+        let e = entry(table, idx);
+        let v = unsafe { *e };
+        if v & VALID == 0 {
+            if !create {
+                return None;
+            }
+            let next = frame::alloc()?;
+            // The zeroed table before the entry that points at it.
+            arch::publish_barrier();
+            unsafe { *e = pte::table(next) };
+            table = next;
+        } else {
+            table = v & ADDR_MASK;
+        }
+    }
+    Some(entry(table, (va >> 12) & 511))
+}
+
+fn map(root: u64, va: u64, pa: u64, flags: u64) -> Option<()> {
+    let e = walk(root, va, true)?;
+    // The page's contents before the entry that maps it.
+    arch::publish_barrier();
+    unsafe { *e = (pa & ADDR_MASK) | flags };
+    arch::pte_barrier();
+    Some(())
 }
 
 impl Drop for PageTable {
@@ -153,7 +175,7 @@ impl Drop for PageTable {
 }
 
 /// `PageTable::prune` below `table` (at `level`, covering from `base`).
-fn prune(table: u64, level: u32, base: u64, start: u64, end: u64, gone: &mut Vec<(u64, u64)>) {
+fn prune(table: u64, level: u32, base: u64, start: u64, end: u64, gone: &mut dyn FnMut(u64, u64)) {
     let shift = 39 - 9 * level;
     let span = 1u64 << shift;
     let lo = (start.max(base) - base) >> shift;
@@ -168,7 +190,7 @@ fn prune(table: u64, level: u32, base: u64, start: u64, end: u64, gone: &mut Vec
         prune(next, level + 1, va, start, end, gone);
         if (0..512).all(|i| unsafe { *entry(next, i) } & VALID == 0) {
             unsafe { *e = 0 };
-            gone.push((next, va));
+            gone(next, va);
         }
     }
 }

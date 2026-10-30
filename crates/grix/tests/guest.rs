@@ -4134,3 +4134,30 @@ fn the_cli_for_a_server() {
     }
     assert!(server.wait().unwrap().success());
 }
+
+/// /bin/hardening `what`, which must end well and say `says`, with nothing
+/// reported: a kernel that can't take it panics or hangs (`run` fails then).
+fn hardened(b: SandboxBuilder, argv: &[&str], says: &str) {
+    let argv: Vec<&str> = ["/bin/hardening"].iter().chain(argv).copied().collect();
+    let out = run(b, &argv);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}\n{}", out.stdout_str(), out.kernel_log);
+    assert!(out.stdout_str().contains(says), "{}", out.stdout_str());
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Page table entries can outnumber frames by as many mappings as a program
+/// makes of one file: none of what goes through them may be on the heap.
+/// (64 MiB mapped 140 times is 2.3 million entries, in 256 MiB of RAM.)
+#[test]
+fn page_table_entries_cost_no_heap() {
+    for how in ["munmap", "dontneed", "fixed", "exit", "fork", "kill", "exec"] {
+        let b = with("hardening").allow(Capability::Process).memory_mb(256).timeout(Duration::from_secs(300));
+        hardened(b, &["entries", how], &format!("{how} survived"));
+    }
+    // A page table for each of 100,000 pages, which munmap frees.
+    let b = with("hardening").memory_mb(2048).timeout(Duration::from_secs(120));
+    hardened(b, &["tables", "100000"], "tables survived");
+    // Moved a page at a time, wherever a mapping's entries are.
+    let b = with("hardening").memory_mb(1024).timeout(Duration::from_secs(120));
+    hardened(b, &["mremap", "256"], "moved 65536 pages");
+}

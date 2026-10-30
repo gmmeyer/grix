@@ -236,6 +236,69 @@ impl Span {
     }
 }
 
+/// The most frames (`Gather`) and tables (`unmap`) wait for one flush.
+const GATHER: usize = 256;
+const GATHER_TABLES: usize = 64;
+
+/// Pages whose entries were cleared, on their way to being freed: never
+/// before the flush of those entries, and every `GATHER` of them that
+/// happens. Page table entries can far outnumber frames (one file mapped
+/// many times side by side), and page tables outnumber nothing on the
+/// heap: however many there are, what's held here stays this size.
+struct Gather {
+    root: u64,
+    span: Span,
+    pages: [u64; GATHER],
+    n: usize,
+}
+
+impl Gather {
+    fn new(root: u64) -> Self {
+        Gather { root, span: Span::new(), pages: [0; GATHER], n: 0 }
+    }
+
+    fn add(&mut self, va: u64, pa: u64) {
+        self.span.add(va);
+        self.pages[self.n] = pa;
+        self.n += 1;
+        if self.n == GATHER {
+            self.finish();
+        }
+    }
+
+    /// Other CPUs may still have the pages in their TLBs until this.
+    fn finish(&mut self) {
+        let span = core::mem::replace(&mut self.span, Span::new());
+        if span.lo < span.hi {
+            arch::flush_tlb(self.root, span.lo, span.hi);
+        }
+        for &pa in &self.pages[..self.n] {
+            frame::free(pa);
+        }
+        self.n = 0;
+    }
+}
+
+/// Free the pages in `[start, end)` of `pt` (`AddressSpace::discard`).
+fn discard_in(pt: &mut PageTable, start: u64, end: u64) {
+    let mut gather = Gather::new(pt.root);
+    pt.for_each_mapped(start, end, |va, pte| unsafe {
+        gather.add(va, *pte & ADDR_MASK);
+        *pte = 0;
+    });
+    gather.finish();
+}
+
+/// `tables` (and an address each covered) are out of `root`'s page tables.
+fn free_tables(root: u64, tables: &[u64], vas: &[u64]) {
+    if !tables.is_empty() {
+        arch::flush_tables(root, vas);
+        for &table in tables {
+            frame::free(table);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultError {
     /// No mapping, or the mapping forbids this access.
@@ -565,32 +628,24 @@ impl AddressSpace {
     pub fn unmap(&mut self, start: u64, end: u64) {
         self.carve(start, end);
         self.discard(start, end);
-        let gone = self.pt.prune(start, end);
-        if !gone.is_empty() {
-            let vas: Vec<u64> = gone.iter().map(|&(_, va)| va).collect();
-            arch::flush_tables(self.pt.root, &vas);
-            for (table, _) in gone {
-                frame::free(table);
+        let root = self.pt.root;
+        let (mut tables, mut vas, mut n) = ([0; GATHER_TABLES], [0; GATHER_TABLES], 0);
+        self.pt.prune(start, end, &mut |table, va| {
+            (tables[n], vas[n]) = (table, va);
+            n += 1;
+            if n == GATHER_TABLES {
+                free_tables(root, &tables, &vas);
+                n = 0;
             }
-        }
+        });
+        free_tables(root, &tables[..n], &vas[..n]);
         self.recount();
     }
 
     /// Free the pages in `[start, end)` but keep the VMAs; the next access
     /// faults in fresh zero (or file) contents. MADV_DONTNEED semantics.
     pub fn discard(&mut self, start: u64, end: u64) {
-        let mut freed = Vec::new();
-        let mut span = Span::new();
-        self.pt.for_each_mapped(start, end, |va, pte| unsafe {
-            freed.push(*pte & ADDR_MASK);
-            span.add(va);
-            *pte = 0;
-        });
-        // Other CPUs may still have the pages in their TLBs until this.
-        self.flush(span);
-        for pa in freed {
-            frame::free(pa);
-        }
+        discard_in(&mut self.pt, start, end);
     }
 
     /// Does `[start, end)` overlap a MAP_SHARED file mapping that only
@@ -617,19 +672,16 @@ impl AddressSpace {
     /// took read-only copies of them ((file id, page index), from
     /// `fs::take_stale`): the copies go, and the next access maps the frame.
     pub fn zap_stale(&mut self, stale: &[(usize, u64)]) {
-        let mut pages = Vec::new();
         for v in self.vmas.values() {
             let Backing::SharedFile { data, offset, .. } = &v.backing else { continue };
             let id = data.lock().id();
             for &(file, idx) in stale {
                 let at = idx * PAGE_SIZE;
                 if file == id && at >= *offset && at - offset < v.end - v.start {
-                    pages.push(v.start + (at - offset));
+                    let va = v.start + (at - offset);
+                    discard_in(&mut self.pt, va, va + PAGE_SIZE);
                 }
             }
-        }
-        for va in pages {
-            self.discard(va, va + PAGE_SIZE);
         }
     }
 
@@ -637,19 +689,12 @@ impl AddressSpace {
     /// space's shared mappings of it (they fault with SIGBUS from now on).
     pub fn zap_file(&mut self, data: &Content, len: u64) {
         let keep = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let ranges: Vec<(u64, u64)> = self
-            .vmas
-            .values()
-            .filter_map(|v| match &v.backing {
-                Backing::SharedFile { data: d, offset, .. } if Arc::ptr_eq(d, data) => {
-                    let from = v.start + keep.saturating_sub(*offset);
-                    (from < v.end).then_some((from, v.end))
-                }
-                _ => None,
-            })
-            .collect();
-        for (s, e) in ranges {
-            self.discard(s, e);
+        for v in self.vmas.values() {
+            if let Backing::SharedFile { data: d, offset, .. } = &v.backing
+                && Arc::ptr_eq(d, data)
+            {
+                discard_in(&mut self.pt, v.start + keep.saturating_sub(*offset), v.end);
+            }
         }
     }
 
@@ -737,32 +782,28 @@ impl AddressSpace {
     /// mapping `new_len` long.
     fn move_to(&mut self, vma: &Vma, old: u64, old_len: u64, new_len: u64, new: u64) -> Result<u64, Errno> {
         let old_end = old + old_len;
-        // Move existing pages rather than copying them.
-        let mut pages = Vec::new();
-        self.pt.for_each_mapped(old, old_end, |va, pte| unsafe {
-            pages.push((va - old, *pte));
-            *pte = 0;
-        });
         self.carve(old, old_end);
         let mut moved = vma.slice(old, old_end);
         moved.start = new;
         moved.end = new + new_len;
         self.vmas.insert(new, moved);
         self.recount();
+        // Existing pages move rather than being copied. An entry with
+        // nowhere to go (no frame for a table) is lost with its page,
+        // which the mapping no longer covers.
+        let mut gather = Gather::new(self.pt.root);
+        let mut lost = false;
+        let moved = self.pt.move_entries(old, old_end, new, &mut |va, pte| {
+            gather.add(va, pte & ADDR_MASK);
+            lost = true;
+        });
+        gather.finish();
         // The new slots were unmapped (no TLB holds them); the old entries
         // must go from every TLB, whatever happens to the new ones.
-        let moved = !pages.is_empty();
-        let mut result = Ok(new);
-        for (off, pte) in pages {
-            if self.pt.map(new + off, pte & ADDR_MASK, pte & !ADDR_MASK).is_none() {
-                result = Err(ENOMEM);
-                break;
-            }
-        }
         if moved {
             arch::flush_tlb(self.pt.root, old, old_end);
         }
-        result
+        if lost { Err(ENOMEM) } else { Ok(new) }
     }
 
     /// Resolve a fault: an unmapped page, or a write to one shared
