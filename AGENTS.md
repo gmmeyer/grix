@@ -380,8 +380,8 @@ kernel writes (`vdso::publish`); the kernel's clock uses the same
 
 More CPUs (`smp.rs`, `Image::cpus`, `SandboxBuilder::cpus`): the kernel
 is still the single-CPU kernel, made safe by a big kernel lock that every
-exception takes (`smp::lock` in `trap_handler`) and gives back on the way
-to EL0 (`smp::finish`). It's a ticket lock whose turn a waiter skips
+exception but a fast one (below) takes (`smp::lock` in `trap_handler`)
+and gives back on the way to EL0 (`smp::finish`). It's a ticket lock whose turn a waiter skips
 when the lock has lain free and untaken for `SKIP_US` (that CPU's vCPU
 is likely descheduled; it takes a new ticket when it runs): FIFO hands
 off as a futex ping-pong wants, and a descheduled waiter doesn't stall
@@ -417,6 +417,32 @@ work to its next holder (`fs::later`); the process and thread counts are
 kept as they change (`procs::born`, `threads_gone`); a pipe is held
 across the copy to a reader as to a writer; a socket polls its peer
 without its own lock.
+Fast entries (`fast.rs`) take no kernel lock: page faults that fill an
+empty entry of anonymous memory or an imported file
+(`AddressSpace::fast_fault`), and getpid, getppid, gettid, get[e]uid,
+get[e]gid and a sched_yield with nothing queued anywhere. Each is tried
+in `trap_handler` before `smp::enter`, and anything it can't finish is
+left untouched for the usual path, which starts again from the
+exception. They use only the CPU's `fast::Snapshot` (set by `unlock`
+from the thread it runs, stale once `fast::changed` moves the
+generation on), the running process's address space under its gate, and
+atomics or leaf locks (frames, counters). Every address space has a gate
+(`mm::gate::Mm`, `Process::aspace`): the CPU that has the process checked
+out holds it (`smp::lock`/`unlock`, `sched::schedule`'s switch), a fast
+fault holds it, and code looking at another process's takes it
+(`q.aspace.access()`; `Deref` debug-asserts it's held). Rules for
+anything new there: decide from the snapshot or the address space alone;
+write nothing the lock covers (the process, `PROCS`, the filesystem,
+timers, wait queues, the console, other CPUs' state: debug-asserted for
+the lock, `fs::lock` and `Procs::each`); never flush a TLB or change a
+present entry (x86's catch-up relies on flushes happening under the
+lock); wait for nothing but a gate, and never wait for another CPU
+holding one (but in `flush_tlb`); and if what it reports can change
+while the thread runs on (another CPU's setuid, a parent's end, TSYNC),
+the change calls `fast::changed`. Pending signals, preemption and stops
+reach a CPU there as interrupts, taken on the way back to user mode.
+Lock order: kernel lock, a `PROCESS` slot, `PROCS`, gates (the running
+process's, then at most one more), the filesystem, a `FileData`.
 TLB flushes are of the pages that changed (`flush_tlb(root, start,
 end)`, through `AddressSpace::flush`) and instruction-cache invalidation
 is broadcast. Arm64's TLBIs are broadcast too, per page (`vale1is`;
@@ -424,9 +450,12 @@ every process is ASID 0, so it reaches all of them) or everything past
 `FLUSH_PAGES`. x86_64 has no broadcast invalidation: `flush_tlb` IPIs
 the CPUs with that root in CR3 (`ROOTS`; any other has none of its
 entries, as loading CR3 dropped them) and waits for each, except one in
-the kernel: IF is clear there and it may be waiting for the lock, so it
-catches up when it gets it (the flushes asked of it, `WANTED`, against
-those it did: `tlb_sync`), before it touches user memory. Flush only when an entry
+the kernel: IF is clear there and it may be waiting for the lock or a
+gate, so it catches up when it gets it (the flushes asked of it,
+`WANTED`, against those it did: `tlb_sync`), before it touches user
+memory. A fast fault counts as in the kernel (`smp::fast_enter`) and
+catches up once it has the gate, which every flush of that address space
+holds; a fast system call doesn't, and takes the IPI on its way out. Flush only when an entry
 that was there changed (no TLB holds an empty slot), but do flush one
 made writable: a CPU still holding it read-only would fault on the
 kernel's own write there; free pages
