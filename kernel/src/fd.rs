@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 
 use crate::errno::*;
 use crate::fs::{Content, Dev, Ino};
@@ -210,6 +210,21 @@ impl OpenFile {
 }
 
 pub type FileRef = Arc<Mutex<OpenFile>>;
+
+/// The locks of two different files (`a`'s guard first), always taken in
+/// the same order, so two CPUs with the pair the other way round can't
+/// each hold what the other wants. One file twice would wait for itself:
+/// a caller sees to that first.
+pub fn lock_pair<'a>(a: &'a FileRef, b: &'a FileRef) -> (MutexGuard<'a, OpenFile>, MutexGuard<'a, OpenFile>) {
+    debug_assert!(!Arc::ptr_eq(a, b), "one file locked twice");
+    if Arc::as_ptr(a) < Arc::as_ptr(b) {
+        let first = a.lock();
+        (first, b.lock())
+    } else {
+        let first = b.lock();
+        (a.lock(), first)
+    }
+}
 
 /// An epoll instance: the interest list, keyed by fd.
 #[derive(Default)]

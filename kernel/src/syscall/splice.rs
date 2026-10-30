@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use super::file::{Src, pipe_read, pipe_write, would_block, write_content_at};
 use crate::errno::*;
-use crate::fd::{FifoFile, FileKind, FileRef, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY, OpenFile};
+use crate::fd::{FifoFile, FileKind, FileRef, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY, OpenFile, lock_pair};
 use crate::inet::State;
 use crate::ipc::PipeEnd;
 use crate::process::Process;
@@ -195,7 +195,10 @@ fn files(p: &Process, fd_in: u64, fd_out: u64) -> Result<(FileRef, FileRef), Err
     let (fin, fout) = (p.fds.get(fd_in)?, p.fds.get(fd_out)?);
     let readable = |f: &OpenFile| !f.path_only && f.flags & O_ACCMODE != O_WRONLY;
     let writable = |f: &OpenFile| !f.path_only && f.flags & O_ACCMODE != O_RDONLY;
-    if !readable(&fin.lock()) || !writable(&fout.lock()) {
+    // (One statement each: they may be one file.)
+    let r = readable(&fin.lock());
+    let w = writable(&fout.lock());
+    if !r || !w {
         return Err(EBADF);
     }
     Ok((fin, fout))
@@ -209,7 +212,8 @@ pub fn splice(p: &mut Process, fd_in: u64, off_in: u64, fd_out: u64, off_out: u6
     if alloc::sync::Arc::ptr_eq(&fin, &fout) {
         return Err(EINVAL);
     }
-    let (in_pipe, out_pipe) = (is_pipe(&fin.lock()), is_pipe(&fout.lock()));
+    let in_pipe = is_pipe(&fin.lock());
+    let out_pipe = is_pipe(&fout.lock());
     if !in_pipe && !out_pipe {
         return Err(EINVAL);
     }
@@ -218,7 +222,7 @@ pub fn splice(p: &mut Process, fd_in: u64, off_in: u64, fd_out: u64, off_out: u6
     }
     if in_pipe && out_pipe {
         let same = {
-            let (a, b) = (fin.lock(), fout.lock());
+            let (a, b) = lock_pair(&fin, &fout);
             match (pipe_end(&a, false), pipe_end(&b, true)) {
                 (Some(x), Some(y)) => alloc::sync::Arc::ptr_eq(&x.pipe, &y.pipe),
                 _ => return Err(EBADF),
@@ -237,8 +241,7 @@ pub fn splice(p: &mut Process, fd_in: u64, off_in: u64, fd_out: u64, off_out: u6
     };
     let (oin, oout) = (read_off(p, off_in)?, read_off(p, off_out)?);
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    let mut i = fin.lock();
-    let mut o = fout.lock();
+    let (mut i, mut o) = lock_pair(&fin, &fout);
     // A file given an offset can't be one that appends (do_splice).
     if oout.is_some() && o.flags & O_APPEND != 0 {
         return Err(EINVAL);
@@ -297,15 +300,18 @@ pub fn tee(p: &mut Process, fd_in: u64, fd_out: u64, len: u64, flags: u64) -> Sy
     if flags & !SPLICE_FLAGS != 0 {
         return Err(EINVAL);
     }
+    if len == 0 {
+        return Ok(0);
+    }
     let (fin, fout) = files(p, fd_in, fd_out)?;
-    let i = fin.lock();
-    let mut o = fout.lock();
+    // One file can't be both ends, pipe or not (and it's one lock).
+    if alloc::sync::Arc::ptr_eq(&fin, &fout) {
+        return Err(EINVAL);
+    }
+    let (i, mut o) = lock_pair(&fin, &fout);
     let (Some(rx), Some(tx)) = (pipe_end(&i, false), pipe_end(&o, true)) else { return Err(EINVAL) };
     if alloc::sync::Arc::ptr_eq(&rx.pipe, &tx.pipe) {
         return Err(EINVAL);
-    }
-    if len == 0 {
-        return Ok(0);
     }
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     let data = match peek_pipe(rx, (len as usize).min(CHUNK)) {

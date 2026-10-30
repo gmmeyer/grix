@@ -4172,3 +4172,13 @@ fn zombies_keep_nothing_of_their_threads() {
     hardened(b, &["zombies", "40"], "survived 40 rounds");
 }
 
+/// tee(fd, fd) waited for its own lock, forever, on any file: one file is
+/// EINVAL (and for splice), and a pair of them is locked in one order, so
+/// two CPUs going opposite ways don't wait for each other.
+#[test]
+fn tee_and_splice_with_one_file_or_crossing() {
+    hardened(with("hardening").allow(Capability::FsWrite), &["tee"], "tee refused");
+    let b = with("hardening").allow(Capability::FsWrite).allow(Capability::Threads).cpus(4);
+    hardened(b.timeout(Duration::from_secs(180)), &["teecross", "20000"], "tee crossed 20000 times");
+}
+
