@@ -5,6 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Future of Software Engineering · grix</title>
 <meta name="description" content="Unikernels lost to containers. What happens when friction goes to zero?">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="grix">
+<meta property="og:title" content="The Future of Software Engineering">
+<meta property="og:description" content="Unikernels lost to containers. What happens when friction goes to zero?">
+<meta property="og:url" content="https://grixos.dev/blog/unikernels/">
+<meta property="og:image" content="https://grixos.dev/card-unikernels.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Future of Software Engineering. Unikernels lost to containers. What happens when friction goes to zero?">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -84,7 +94,7 @@
 
 <p>One reason that unikernels lost is that they strip out most of the observability from the operating system. They didn't have /proc, you usually couldn't use lsof or ps. I made sure /proc existed, so you could use these and other tools. I know that this makes it a little bigger, but it gets around one of the biggest issues unikernels had.</p>
 
-<p>In addition, you can observe grix from the host as a normal process. If you choose to run it in a container, it will also report any process (or container) metrics that you would normally expect. These small changes make this fairly usable as a sandbox operating system.</p>
+<p>In addition, you can observe grix from the host as a normal process. If you choose to run it in a container, you get the process (or container) metrics that you would normally expect. The one exception is memory: what the program frees stays resident in the VM until the run ends, so grix also serves its own Prometheus metrics that show what the program is using now. These small changes make this fairly usable as a sandbox operating system.</p>
 
 <h2>Limited Sandbox</h2>
 
@@ -113,6 +123,8 @@
 <p>I was going to put in a few code examples here, but I realized they aren't necessary. You aren't going to be writing the code anyway. So, instead, I've sprinkled a few demos of this through this. These aren't running on a server. I have compiled QEMU to WASM and the kernel is running on that in your browser.</p>
 
 <p>This is the future we're looking at. We need to rethink the fundamentals we have taken for granted. These choices got us through the last 15 years of SaaS hypergrowth. But we don't need to accept these choices anymore. They are limiting us. And we can do much better.</p>
+
+<p>If this is at all interesting to you, check out the <a href="https://grixos.dev/">website</a>, or check out the <a href="https://github.com/gmmeyer/grix">github repo</a> for more information.</p>
 </article>
 </main>
 <footer class="site-footer"><div class="wrap">

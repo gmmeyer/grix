@@ -71,7 +71,7 @@ Everything is static. What a reader downloads once (and then caches):
 | | size | gzipped |
 |---|---|---|
 | QEMU (`qemu-system-aarch64.wasm`) | 17.9 MB | 4.5 MB |
-| grix kernel (stripped) | 0.96 MB | 0.43 MB |
+| grix kernel (stripped) | 1.30 MB | 0.58 MB |
 | grix-web | 0.19 MB | |
 
 ## Which examples are worth embedding
