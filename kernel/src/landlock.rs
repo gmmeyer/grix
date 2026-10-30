@@ -90,13 +90,17 @@ const EAFNOSUPPORT: Errno = Errno(97);
 pub const MAX_LAYERS: usize = 16;
 /// Rules in every ruleset and domain together (each also charged to
 /// `kmem`): a program can fork and restrict each child, so the bound is
-/// global.
-const MAX_RULES: usize = 32 * 1024;
+/// global. A domain copies its ruleset's, and both count while the ruleset
+/// is open: a ruleset of every port there is has to fit twice.
+const MAX_RULES: usize = 256 * 1024;
+/// Nodes rules keep, in all of them together, each charged to `kmem`: so
+/// that rules on nodes don't take all of the budget.
+const MAX_KEPT: usize = 32 * 1024;
+static KEPT: AtomicUsize = AtomicUsize::new(0);
 static RULES: AtomicUsize = AtomicUsize::new(0);
-/// A rule's share of the heap: its B-tree entry, grants and pin, and the
-/// node the pin keeps. A /proc/<pid>/task node's thread stops paying for
-/// it when it goes, and a rule can outlive that.
-const RULE_COST: u64 = 128 + fs::PROC_NODE_COST;
+/// A rule's share of the heap, in each ruleset and domain that has it: its
+/// B-tree entry and grants.
+const RULE_COST: u64 = 128;
 /// Ids for layers (`scope_le`), never reused.
 static NEXT_LAYER: AtomicU64 = AtomicU64::new(1);
 
@@ -141,12 +145,39 @@ impl Drop for Held {
     }
 }
 
+/// The node a path rule keeps, shared by every table with that rule, so
+/// it's paid for once. A /proc/<pid>/task node's thread stops paying for
+/// it when it goes, and a rule can outlive that.
+struct Kept {
+    _pin: Arc<()>,
+    _charge: Charge,
+}
+
+impl Kept {
+    fn new(pin: Arc<()>) -> Result<Arc<Kept>, Errno> {
+        if KEPT.load(Ordering::Relaxed) >= MAX_KEPT {
+            crate::stats::hit(grix_abi::stats::Limit::KernelMemory);
+            return Err(ENOMEM);
+        }
+        let charge = Charge::new(fs::PROC_NODE_COST + core::mem::size_of::<Kept>() as u64 + 32)?;
+        // Under the kernel lock: check-then-add doesn't race.
+        KEPT.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Kept { _pin: pin, _charge: charge }))
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        KEPT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A ruleset being made (a `landlock-ruleset` descriptor's).
 pub struct Ruleset {
     handled_fs: u16,
     handled_net: u16,
     /// Path rules: what each node's rules grant, and the node pinned.
-    fs: BTreeMap<Ino, (u16, Arc<()>)>,
+    fs: BTreeMap<Ino, (u16, Arc<Kept>)>,
     net: BTreeMap<u16, u16>,
     held: Held,
 }
@@ -166,7 +197,7 @@ struct Layer {
 pub struct Domain {
     /// Oldest first.
     layers: Vec<Layer>,
-    fs: BTreeMap<Ino, (Grants, Arc<()>)>,
+    fs: BTreeMap<Ino, (Grants, Arc<Kept>)>,
     net: BTreeMap<u16, Grants>,
     _held: Held,
 }
@@ -550,8 +581,9 @@ pub fn add_rule(p: &mut Process, fd: u64, ty: u64, attr: u64, flags: u64) -> Sys
             let mut rs = rs.lock();
             let rs = &mut *rs;
             if !rs.fs.contains_key(&ino) {
+                let kept = Kept::new(fs.pin(ino))?;
                 rs.held.take(1)?;
-                rs.fs.insert(ino, (0, fs.pin(ino)));
+                rs.fs.insert(ino, (0, kept));
             }
             rs.fs.get_mut(&ino).unwrap().0 |= allowed;
             Ok(0)

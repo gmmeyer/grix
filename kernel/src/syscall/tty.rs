@@ -374,7 +374,16 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
             let flags = arg as u32;
             let index = tty.lock().index;
             let ino = fs::lock().pts_node(index).ok_or(EIO)?;
+            // An open like any other to Landlock (security_file_open).
+            let denied = match crate::landlock::domain(p) {
+                Some(d) => {
+                    let fs = fs::lock();
+                    crate::landlock::open_access(&d, &fs, ino, fs.node(ino).parent, flags & O_ACCMODE)?
+                }
+                None => 0,
+            };
             let file = open_slave(p, &tty, ino, flags)?;
+            file.lock().landlock_denied = denied;
             p.fds.alloc(FdEntry { file, cloexec: flags & O_CLOEXEC != 0 }, 0)
         }
         // Not terminals Linux's ptys answer for either: consoles, virtual
