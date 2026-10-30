@@ -148,6 +148,41 @@ pub fn note(stat: Stat, n: u64) {
     note_on(me(), stat, n);
 }
 
+/// What a kernel stack holds until it's first used: its high-water mark
+/// is the lowest word that isn't this (`stack_used`).
+const STACK_PAINT: u64 = 0x6b73_7461_636b_2121;
+
+/// Paint CPU `cpu`'s kernel stack below `limit` (its top for a CPU that
+/// hasn't started).
+fn paint_stack(cpu: usize, limit: u64) {
+    let mut at = arch::stack_bottom(cpu);
+    while at < limit {
+        // SAFETY: that CPU's stack, below anything in use there. Volatile:
+        // no call to memset, whose own frame could be below `limit`.
+        unsafe { (at as *mut u64).write_volatile(STACK_PAINT) };
+        at += 8;
+    }
+}
+
+/// Paint the rest of this CPU's stack (CPU 0's, which it boots on).
+#[inline(never)]
+pub fn paint_own_stack() {
+    let here = 0u64;
+    // Below this frame, and room for the loop's own.
+    paint_stack(me(), ((&raw const here) as u64 & !7) - 512);
+}
+
+/// The most of CPU `cpu`'s kernel stack used so far (bytes).
+pub fn stack_used(cpu: usize) -> u64 {
+    let (mut at, top) = (arch::stack_bottom(cpu), arch::stack_top(cpu));
+    // SAFETY: inside the stack, which is mapped; another CPU may be
+    // writing it, and only how deep it has ever gone matters.
+    while at < top && unsafe { (at as *const u64).read_volatile() } == STACK_PAINT {
+        at += 8;
+    }
+    top - at
+}
+
 /// /proc/grix/smp: a header, a line per CPU, and their sum.
 pub fn stats(s: &mut alloc::string::String) {
     use core::fmt::Write;
@@ -158,8 +193,9 @@ pub fn stats(s: &mut alloc::string::String) {
         }
         _ => v,
     };
-    let _ = writeln!(s, "cpu {}", STAT_NAMES.join(" "));
-    let mut all = [0u64; STATS];
+    // And the deepest each CPU's kernel stack has been (bytes).
+    let _ = writeln!(s, "cpu {} stack_max", STAT_NAMES.join(" "));
+    let (mut all, mut stack) = ([0u64; STATS], 0);
     for (cpu, counts) in COUNTS.iter().enumerate().take(count() as usize) {
         let _ = write!(s, "{cpu}");
         for (i, c) in counts.iter().enumerate() {
@@ -167,13 +203,15 @@ pub fn stats(s: &mut alloc::string::String) {
             all[i] = if i == Stat::LockWaitMax as usize { all[i].max(v) } else { all[i] + v };
             let _ = write!(s, " {}", shown(i, v));
         }
-        s.push('\n');
+        let used = stack_used(cpu);
+        stack = stack.max(used);
+        let _ = writeln!(s, " {used}");
     }
     let _ = write!(s, "all");
     for (i, &v) in all.iter().enumerate() {
         let _ = write!(s, " {}", shown(i, v));
     }
-    s.push('\n');
+    let _ = writeln!(s, " {stack}");
 }
 
 /// Take the kernel for an exception of kind `why` (`Stat::Syscall`,
@@ -547,6 +585,7 @@ pub fn start(cpus: u32) {
     for cpu in 1..count() {
         let entry = arch::secondary_entry_phys();
         let stack = arch::stack_top(cpu as usize);
+        paint_stack(cpu as usize, stack);
         let r = arch::start_cpu(cpu as usize, entry, stack);
         if r != 0 {
             crate::console::klog!("cpu {cpu} didn't start ({r})\n");

@@ -245,6 +245,11 @@ pub fn stack_top(cpu: usize) -> u64 {
     (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
 }
 
+/// The lowest address of CPU `cpu`'s kernel stack.
+pub fn stack_bottom(cpu: usize) -> u64 {
+    stack_top(cpu) - STACK_SIZE
+}
+
 /// Where a secondary CPU starts (physical): the trampoline's copy
 /// (boot.S), whose page is the startup IPI's vector.
 pub fn secondary_entry_phys() -> u64 {

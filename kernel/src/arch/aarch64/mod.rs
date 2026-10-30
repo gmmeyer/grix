@@ -116,6 +116,11 @@ pub fn stack_top(cpu: usize) -> u64 {
     (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
 }
 
+/// The lowest address of CPU `cpu`'s kernel stack.
+pub fn stack_bottom(cpu: usize) -> u64 {
+    stack_top(cpu) - STACK_SIZE
+}
+
 /// Where a secondary CPU starts (physical: its MMU is off).
 pub fn secondary_entry_phys() -> u64 {
     // .text.boot runs where it's loaded: its address is physical.
