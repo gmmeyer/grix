@@ -97,7 +97,7 @@ pub enum FileKind {
     PidFd(u32),
     /// /proc/<pid>/mem, for the process itself: reads and writes at its
     /// virtual addresses (the offset), through `uaccess`.
-    ProcMem(u32),
+    ProcMem(u32, u64),
     /// A Landlock ruleset being made (landlock.rs).
     Landlock(crate::landlock::RulesetRef),
 }
@@ -117,7 +117,7 @@ impl FileKind {
                 let (writable, version) = crate::console::output_state();
                 (if writable { EPOLLOUT } else { 0 }, version)
             }
-            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) | FileKind::ProcMem(_) => {
+            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) | FileKind::ProcMem(..) => {
                 (EPOLLIN | EPOLLOUT, 0)
             }
             FileKind::Inotify(n) => n.poll(),

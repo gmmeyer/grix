@@ -4,7 +4,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use grix_abi::stats::Limit;
 use spin::Mutex;
 
@@ -38,6 +38,7 @@ pub const MAX_VMAS: usize = 32768;
 /// per-process limit alone doesn't bound kernel memory.
 pub const MAX_VMAS_TOTAL: usize = 65536;
 static VMAS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub const MMAP_BOTTOM: u64 = 1 << 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +312,8 @@ pub enum FaultError {
 }
 
 pub struct AddressSpace {
+    /// This address space and no other, ever (/proc/<pid>/mem's).
+    pub id: u64,
     pub pt: PageTable,
     vmas: BTreeMap<u64, Vma>,
     /// How many of `vmas` are counted in VMAS_TOTAL.
@@ -346,6 +349,7 @@ impl Drop for AddressSpace {
 impl AddressSpace {
     pub fn new() -> Option<Self> {
         let mut a = Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pt: PageTable::new()?,
             vmas: BTreeMap::new(),
             counted: 0,

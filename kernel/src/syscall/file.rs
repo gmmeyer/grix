@@ -216,7 +216,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Inet(_)
         | FileKind::Unix(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
-        FileKind::ProcMem(_) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o600, 0),
+        FileKind::ProcMem(..) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o600, 0),
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_)
         | FileKind::Epoll(_)
@@ -347,8 +347,11 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
     let acc = flags & O_ACCMODE;
     let cloexec = flags & O_CLOEXEC != 0;
     // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file.
-    // (With `resolve`, they're walked to, as anything else.)
+    // (With `resolve`, they're walked to, as anything else, and so are
+    // they when they mustn't be followed: they're links.)
     if resolve == 0
+        && flags & O_NOFOLLOW == 0
+        && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL
         && let Some(fd) = procfs::fd_path(path)
     {
         let file = p.fds.get(fd).map_err(|_| ENOENT)?;
@@ -394,14 +397,20 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         && pid == p.pid
     {
         // It's a magic link, as Linux's /proc/<pid>/fd/N.
+        if excl {
+            return Err(EEXIST);
+        }
+        // Not followed, it's a link: ELOOP, whatever else is asked. O_PATH
+        // opens the link itself on Linux, where there's a node for it; here
+        // that would be what it leads to, past any RESOLVE_* asked for.
+        if !follow && (flags & O_PATH == 0 || resolve != 0) {
+            return Err(ELOOP);
+        }
         if follow && resolve & (fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS) != 0 {
             return Err(ELOOP);
         }
         if follow && resolve & (fs::RESOLVE_NO_XDEV | fs::RESOLVE_BENEATH | fs::RESOLVE_IN_ROOT) != 0 {
             return Err(EXDEV);
-        }
-        if excl {
-            return Err(EEXIST);
         }
         let file = p.fds.get(fd).map_err(|_| ENOENT)?;
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
@@ -506,7 +515,8 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
                 }
                 landlock_open(&fs)?;
                 drop(fs);
-                let file = new_file(FileKind::ProcMem(p.pid), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
+                let file =
+                    new_file(FileKind::ProcMem(p.pid, p.aspace.id), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
                 return p.fds.alloc(FdEntry { file, cloexec }, 0);
             }
             // A thread's name, for its owner (0644).
@@ -803,9 +813,9 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             crate::sched::deadlines_changed();
             copy_out(&mut p.aspace, buf, &ticks.to_le_bytes()).map(|_| 8)
         }
-        &FileKind::ProcMem(pid) => {
+        &FileKind::ProcMem(pid, mm) => {
             let addr = at.unwrap_or(f.offset);
-            let n = proc_mem(p, pid, addr, buf, count, false)?;
+            let n = proc_mem(p, (pid, mm), addr, buf, count, false)?;
             if at.is_none() {
                 f.offset = addr.wrapping_add(n);
             }
@@ -1010,9 +1020,9 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             }
             return Ok(n);
         }
-        &FileKind::ProcMem(pid) => {
+        &FileKind::ProcMem(pid, mm) => {
             let addr = at.unwrap_or(f.offset);
-            let n = proc_mem(p, pid, addr, buf, count, true)?;
+            let n = proc_mem(p, (pid, mm), addr, buf, count, true)?;
             if at.is_none() {
                 f.offset = addr.wrapping_add(n);
             }
@@ -1263,13 +1273,15 @@ pub(super) fn pipe_write_as(
     // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
     let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
     let writer = cred.unwrap_or_else(|| super::unix::sender(p));
-    if pipe.reserve(need) < need || !pipe.note_writer(writer) {
+    if pipe.reserve(need) < need || !pipe.writer_fits(writer) {
         drop(pipe);
         return would_block(p, nonblock);
     }
     let n = pipe.reserve(count as usize);
     let mut tmp = alloc::vec![0u8; n];
     src.read(p, 0, &mut tmp)?;
+    // Only once there are bytes (EFAULT, and nothing to say who wrote).
+    pipe.note_writer(writer);
     pipe.buf.extend(tmp);
     pipe.written += n as u64;
     pipe.touch();
@@ -1296,7 +1308,7 @@ pub fn pread(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRes
     let mut f = file.lock();
     match f.kind {
         FileKind::Node(_) | FileKind::Generated(_) if (off as i64) < 0 => Err(EINVAL),
-        FileKind::Node(_) | FileKind::Generated(_) | FileKind::ProcMem(_) => {
+        FileKind::Node(_) | FileKind::Generated(_) | FileKind::ProcMem(..) => {
             read_into(p, &mut f, buf, count, Some(off))
         }
         FileKind::Dev(..) => read_into(p, &mut f, buf, count, None),
@@ -1315,7 +1327,7 @@ pub fn pwrite(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRe
     let mut f = file.lock();
     match f.kind {
         FileKind::Node(_) if (off as i64) < 0 => Err(EINVAL),
-        FileKind::Node(_) | FileKind::ProcMem(_) => write_from(p, &mut f, buf, count, Some(off)),
+        FileKind::Node(_) | FileKind::ProcMem(..) => write_from(p, &mut f, buf, count, Some(off)),
         FileKind::Dev(..) => write_from(p, &mut f, buf, count, None),
         _ => Err(ESPIPE),
     }
@@ -1362,7 +1374,7 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
 fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Option<u64>, write: bool) -> SysResult {
     if at.is_some() {
         match f.kind {
-            FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..) | FileKind::ProcMem(_) => {}
+            FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..) | FileKind::ProcMem(..) => {}
             _ => return Err(ESPIPE),
         }
         if at.is_some_and(|o| (o as i64) < 0) {
@@ -1515,7 +1527,7 @@ pub fn lseek(p: &mut Process, fd: u64, off: u64, whence: u64) -> SysResult {
         (FileKind::Dev(..), _) => return Ok(0),
         // Any address, as Linux's mem_lseek (unsigned offsets): from the
         // start or from here, no end.
-        (FileKind::ProcMem(_), _) => {
+        (FileKind::ProcMem(..), _) => {
             f.offset = match whence {
                 0 => off,
                 1 => f.offset.wrapping_add(off),
@@ -3419,10 +3431,15 @@ pub fn inotify_rm_watch(p: &mut Process, fd: u64, wd: u64) -> SysResult {
 /// nothing was), as Linux's mem_rw. Only for the process itself: the
 /// descriptor of another (inherited across fork) can't reach its memory
 /// (invariant 13). Read-only mappings can't be written (Linux's
-/// FOLL_FORCE is a debugger's).
-fn proc_mem(p: &mut Process, pid: u32, addr: u64, buf: u64, count: u64, write: bool) -> SysResult {
-    if pid != p.pid {
+/// FOLL_FORCE is a debugger's). `of` is the process it was opened in and
+/// that process's memory then: once execve has replaced that, there's
+/// nothing to read or write (Linux's mem_rw, with mm_users at 0).
+fn proc_mem(p: &mut Process, of: (u32, u64), addr: u64, buf: u64, count: u64, write: bool) -> SysResult {
+    if of.0 != p.pid {
         return Err(EIO);
+    }
+    if of.1 != p.aspace.id {
+        return Ok(0);
     }
     let mut chunk = [0u8; CHUNK];
     let mut done = 0u64;

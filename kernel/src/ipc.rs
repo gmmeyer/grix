@@ -104,11 +104,10 @@ impl Pipe {
         changed();
     }
 
-    /// Bytes from `self.written` on come from `cred`: false if that's a
-    /// new run there's no room for.
-    pub fn note_writer(&mut self, cred: crate::unix::Cred) -> bool {
-        let at = self.written;
-        let Some(runs) = &mut self.creds else { return true };
+    /// May bytes from `cred` come next? False if that's a new run there's
+    /// no room for.
+    pub fn writer_fits(&mut self, cred: crate::unix::Cred) -> bool {
+        let Some(runs) = &self.creds else { return true };
         if runs.back().is_some_and(|&(_, c)| c == cred) {
             return true;
         }
@@ -116,11 +115,18 @@ impl Pipe {
             return false;
         }
         let bytes = ((runs.len() + 1) * core::mem::size_of::<(u64, crate::unix::Cred)>()) as u64;
-        if self.creds_charge.bytes() < bytes && self.creds_charge.resize(bytes.next_power_of_two()).is_err() {
-            return false;
+        self.creds_charge.bytes() >= bytes || self.creds_charge.resize(bytes.next_power_of_two()).is_ok()
+    }
+
+    /// Bytes from `self.written` on come from `cred`, which fit: a run is
+    /// for bytes that are there, as a writer's that failed could fill the
+    /// list with none, leaving both ends waiting.
+    pub fn note_writer(&mut self, cred: crate::unix::Cred) {
+        let at = self.written;
+        let Some(runs) = &mut self.creds else { return };
+        if !runs.back().is_some_and(|&(_, c)| c == cred) {
+            runs.push_back((at, cred));
         }
-        runs.push_back((at, cred));
-        true
     }
 
     /// Who wrote the byte at `self.read`, and where the next writer's

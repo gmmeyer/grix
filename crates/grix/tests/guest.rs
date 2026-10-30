@@ -4212,3 +4212,26 @@ fn xattr_lists_are_bounded() {
     let b = with("hardening").allow(Capability::FsWrite).timeout(Duration::from_secs(120));
     hardened(b, &["xattrs", "5000"], "lists refused");
 }
+
+/// O_NOFOLLOW on a magic link is ELOOP, as on any link, with or without
+/// RESOLVE_*: a descriptor isn't reached past what they forbid.
+#[test]
+fn magic_links_are_links() {
+    hardened(with("hardening"), &["magic"], "magic links refused");
+}
+
+/// A stream keeps who wrote what, a run per writer, at most 256: writes
+/// that failed, or said nothing, must not take one, or a stream with
+/// nothing in it would leave both ends waiting for ever.
+#[test]
+fn stream_writers_are_only_those_who_wrote() {
+    let b = with("hardening").allow(Capability::Process);
+    hardened(b, &["creds"], "stream still works");
+}
+
+/// /proc/self/mem is the memory it was opened on: after execve a descriptor
+/// that stayed open reads and writes nothing, as on Linux.
+#[test]
+fn proc_self_mem_stays_with_its_program() {
+    hardened(with("hardening").allow(Capability::Process), &["procmem"], "the old memory is gone");
+}

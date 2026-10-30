@@ -835,7 +835,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         }
         FileKind::Pty(end) => fs::lock().path_of(end.ino),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
-        FileKind::ProcMem(pid) => format!("/proc/{pid}/mem"),
+        FileKind::ProcMem(pid, _) => format!("/proc/{pid}/mem"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
         FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),
         FileKind::EventFd(_) => String::from("anon_inode:[eventfd]"),
