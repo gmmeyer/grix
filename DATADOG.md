@@ -122,6 +122,30 @@ and `CAP_SYS_PTRACE` aren't in its permitted set, as in an unprivileged
 container: dropping capabilities works (there are none), and only
 asking for one is denied.
 
+## On 0.0.53 (2026-10-30), with a placeholder key
+
+The security hardening of 0.0.49 to 0.0.51 changed a lot of what the
+Agent leans on (O_PATH, device permissions, `/proc/self/mem`, special
+addresses), so it ran again, as above, for two minutes, with the same
+DogStatsD packets and traces. **No real API key was available** for this
+run, so it shows everything but Datadog taking the data:
+
+- `agent health`: PASS, 18 healthy components. Every check `[OK]`, 21 in
+  all, as above; `limits_hit` empty.
+- DogStatsD counted UDP (300 packets) and the Unix socket (2); all five
+  traces got 200.
+- The forwarder reached the intake through the allow-list over TLS, and
+  every payload came back 403 (13 dropped, `series_v3` 8, `check_run_v1`
+  8, `intake` 4, `metadata_v1` 6, `process` 13): what a key that isn't
+  one gets, and no more than that. The `202 Accepted`s above weren't
+  seen again.
+- `splice` isn't reported any more. What's left is `bpf`, 169.254.169.254
+  and 100.100.100.200 (now refused as special addresses, not for being
+  off the allow-list), and `_grpc_config.localhost`.
+- system-probe no longer fails on `/proc/self/mem`: it reads the vDSO and
+  says "no note section found in vDSO ELF", as ours has no
+  `LINUX_VERSION_CODE` note. Without eBPF that costs nothing.
+
 ## What broke, and what was fixed
 
 In the order the Agent hit them:

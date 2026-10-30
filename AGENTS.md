@@ -326,9 +326,10 @@ Threads (`sched.rs`): each takes `process::THREAD_COST` from `kmem`
 for as long as it lives (its `Thread`, x86_64's FP box, its
 `/proc/<pid>/task/<tid>` nodes, which are `prepaid` and stay out of the
 metadata budget); `process::threads_max` is what the heap's share of
-RAM gives (`mm::init`: the heap is 32 MiB plus 1/16 of RAM, at most 128
-MiB more, from the top of the highest RAM region, half of that for
-`kmem`, half for fragmentation), and clone
+RAM gives (`mm::init`: the heap is 32 MiB plus 1/16 of what the boot
+image leaves of RAM, at most 128 MiB more, from the top of the highest
+RAM region, half of that for `kmem`, a quarter for files' names and
+nodes, the rest for fragmentation), and clone
 and fork fail with EAGAIN at either. A thread has its own name
 (`Thread::name`, zeros meaning the process's, `Process::name` being the
 main thread's), state and CPU time in its task directory, whose
@@ -646,7 +647,9 @@ read-only mount EROFS (`landlock::domain_changing`). What matters after the open
 made any other way has them). A new way to make, remove, open, execute
 or move a node, or to bind or connect a TCP socket, needs its check.
 `/proc/self/fd/N` isn't re-checked: it's the same open file here
-(`procfs::fd_path`), not a new open. A path going on through it
+(`procfs::fd_path`), not a new open, unless that can't do what's asked
+(an O_PATH descriptor can do nothing: `file::reopened`), which opens
+the file again, checked as any open. A path going on through it
 (`/proc/self/fd/N/name`) is an ordinary walk from that directory
 (`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
 only, from `FdTable::walking`), checked as any other. execveat of a
@@ -765,8 +768,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
-10. **The kernel heap is small (32 MiB, and 1/16 of RAM: `mm::init`) and
-    running out of it panics.**
+10. **The kernel heap is small (32 MiB, and 1/16 of the RAM the boot
+    image leaves: `mm::init`) and running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
     fails with an errno first. Nothing that grows with RAM goes on the
     heap: frame reference counts are RAM set aside below the boot image
@@ -781,7 +784,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     for: holes cost a program nothing (`FileData::copied`, in frames, and
     `STALE`, a fixed list of spans).
     - File data counts pages (`fs::set_limit`), and nodes, names and
-      extended attributes count against `META_LIMIT` (ENOSPC).
+      extended attributes count against `META_LIMIT` (ENOSPC), 12 MiB
+      and a quarter of what RAM adds to the heap.
     - Buffers held for a program (pipes, netlink replies, generated /proc
       files, network receive windows, DNS answers, inotify events) take a
       `kmem::Charge`. A buffer of tens of KiB is allocated fallibly
@@ -797,10 +801,13 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       `process::threads_max`, and each charged `THREAD_COST` to `kmem`,
       a pending signal of each kind included), descriptors (RLIMIT_NOFILE, at
       most `fd::MAX_FDS`; a table's slots take a `kmem::Charge`, so
-      fork's copies are budgeted too), open files
-      (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
-      zombies included), network connections (`inet::MAX_CONNS`),
-      connections waiting to be accepted (`inet::MAX_PENDING`),
+      fork's copies are budgeted too), open files (`fd::max_open_files`, in all processes, what
+      `kmem` pays for at `OPEN_FILE_COST` each; the first 4096 work
+      whether it can or not), processes (`MAX_PROCESSES`, zombies
+      included), network connections (`inet::MAX_CONNS`, each charged
+      its window), connections waiting to be accepted
+      (`inet::MAX_PENDING`, each charged `PENDING_COST`; listen's
+      backlog bounds nothing, as a full one has clients wait on Linux),
       pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers),
       file locks (`locks::MAX_LOCKS`), descriptors in flight over
       AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
