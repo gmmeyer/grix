@@ -463,11 +463,12 @@ kernel's own write there; free pages
 only after the flush, break before make when a mapping changes page, and
 order a new page's contents before the entry that publishes it
 (`publish_barrier`). munmap also frees page tables that map nothing now
-(`PageTable::prune`); a table goes only through `arch::flush_tables`,
-which arm64 needs because `flush_tlb` drops last-level entries only, and
-which on x86_64 also waits for CPUs in the kernel, which catch up as they
-spin for the lock (`tlb_sync`): a speculative walk from one that hadn't
-could reach a freed table. User memory other threads use at the same time is
+(`PageTable::prune`, with the gate, so no fast fault is walking them); a
+table goes only through `arch::flush_tables`, which arm64 needs because
+`flush_tlb` drops last-level entries only, and which on x86_64 also waits
+for CPUs in the kernel, which catch up as they spin for the lock or a
+gate (`tlb_sync`): a speculative walk from one that hadn't could reach a
+freed table. User memory other threads use at the same time is
 updated atomically (`uaccess::update_u32`, FUTEX_WAKE_OP). membarrier
 makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
