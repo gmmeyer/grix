@@ -107,6 +107,15 @@ fn regs(tf: &mut TrapFrame) -> [&mut u64; 18] {
     ]
 }
 
+/// The most stack a handler's frame takes (Linux's AT_MINSIGSTKSZ,
+/// `init_sigframe_size`): the FP state, 64-byte aligned, and the frame
+/// below it, 16-byte aligned less a return address's 8.
+pub fn max_size() -> u64 {
+    let xsize = super::xsave_size();
+    let fp_size = if xsize == 0 { FXSAVE_SIZE } else { xsize + 4 };
+    ((fp_size + 63 + FRAME_SIZE + 15 + 8) as u64).next_multiple_of(16)
+}
+
 /// Write a frame for a handler below `top` (sp, or the top of the
 /// alternate stack), with `tf`'s registers: its address.
 pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context) -> Result<u64, Errno> {

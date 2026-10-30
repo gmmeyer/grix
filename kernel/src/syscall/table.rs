@@ -253,6 +253,8 @@ syscalls! {
     243 recvmmsg Core; // acts on existing sockets, like recvmsg
     260 wait4 Cap(Process);
     261 prlimit64 Core;
+    264 name_to_handle_at Core; // EOPNOTSUPP: no file handles here (file.rs)
+    265 open_by_handle_at Privileged;
     268 setns Privileged;
     269 sendmmsg Core; // acts on existing sockets, like sendmsg
     270 process_vm_readv Privileged;
@@ -289,6 +291,7 @@ syscalls! {
     444 landlock_create_ruleset Core;
     445 landlock_add_rule Core;
     446 landlock_restrict_self Core;
+    449 futex_waitv Core;
     452 fchmodat2 Cap(FsWrite);
 }
 
@@ -560,6 +563,8 @@ syscalls! {
     298 perf_event_open Privileged;
     299 recvmmsg Core; // acts on existing sockets, like recvmsg
     302 prlimit64 Core;
+    303 name_to_handle_at Core; // EOPNOTSUPP: no file handles here (file.rs)
+    304 open_by_handle_at Privileged;
     307 sendmmsg Core; // acts on existing sockets, like sendmsg
     308 setns Privileged;
     309 getcpu Core;
@@ -597,5 +602,6 @@ syscalls! {
     444 landlock_create_ruleset Core;
     445 landlock_add_rule Core;
     446 landlock_restrict_self Core;
+    449 futex_waitv Core;
     452 fchmodat2 Cap(FsWrite);
 }

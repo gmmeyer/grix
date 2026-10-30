@@ -634,6 +634,13 @@ pub fn hwcap() -> u64 {
     cpuid(1, 0)[3] as u64
 }
 
+/// Linux AT_HWCAP2: HWCAP2_FSGSBASE only if the kernel turned on
+/// CR4.FSGSBASE, which this one doesn't (user mode sets its TLS with
+/// arch_prctl), and no RING3MWAIT.
+pub fn hwcap2() -> u64 {
+    0
+}
+
 pub fn set_user_page_table(root_pa: u64) {
     ROOTS[cpu_number() % MAX_CPUS].store(root_pa, Ordering::Relaxed);
     // SAFETY: a root with the kernel's half in it (`pte::new_root`).

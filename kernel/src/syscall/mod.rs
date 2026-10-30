@@ -231,6 +231,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         }
         nr::close_range => file::close_range(p, a[0], a[1], a[2]),
         nr::statfs => file::statfs(p, a[0], a[1]),
+        nr::name_to_handle_at => file::name_to_handle_at(p, a[0], a[1], a[4]),
         nr::fstatfs => file::fstatfs(p, a[0], a[1]),
         nr::getxattr | nr::lgetxattr | nr::fgetxattr => file::getxattr(p, n, a[0], a[1], a[2], a[3]),
         nr::listxattr | nr::llistxattr | nr::flistxattr => file::listxattr(p, n, a[0], a[1], a[2]),
@@ -323,6 +324,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
             Err(EBLOCKED)
         }
         nr::futex => thread::futex(p, a),
+        nr::futex_waitv => thread::futex_waitv(p, a[0], a[1], a[2], a[3], a[4]),
         nr::set_tid_address => thread::set_tid_address(p, a[0]),
         nr::set_robust_list => {
             p.cur().robust_list = a[0];

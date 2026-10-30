@@ -30,6 +30,7 @@ use spin::Mutex;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
 
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
@@ -1759,7 +1760,6 @@ pub fn renameat2(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp:
 }
 
 pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u64, flags: u64) -> SysResult {
-    const AT_SYMLINK_FOLLOW: u64 = 0x400;
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
@@ -3027,6 +3027,21 @@ pub fn statfs(p: &mut Process, pathp: u64, buf: u64) -> SysResult {
     resolve(p, AT_FDCWD as u64, &path, true)?;
     let b = statfs_bytes(p);
     copy_out(&mut p.aspace, buf, &b).map(|_| 0)
+}
+
+/// name_to_handle_at: no filesystem here has file handles, so once the
+/// path resolves it's EOPNOTSUPP, as Linux answers for a filesystem
+/// without export operations (tmpfs before 6.6, procfs, FUSE without
+/// them). Callers (systemd, `stat --cached`, overlay tools) fall back to
+/// the path. open_by_handle_at stays privileged (CAP_DAC_READ_SEARCH).
+pub fn name_to_handle_at(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult {
+    const AT_HANDLE_FID: u64 = 0x200;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 {
+        return Err(EINVAL);
+    }
+    let nofollow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
+    path_stat(p, dirfd, pathp, nofollow | flags & AT_EMPTY_PATH)?;
+    Err(EOPNOTSUPP)
 }
 
 pub fn fstatfs(p: &mut Process, fd: u64, buf: u64) -> SysResult {

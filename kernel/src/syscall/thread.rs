@@ -254,7 +254,10 @@ pub fn futex_wake(p: &mut Process, addr: u64, n: u32, bitset: u32) -> u32 {
         p.futexes.remove(&addr);
     }
     for &tid in &woken {
-        p.wake(tid, Some(0));
+        // A futex_waitv returns the index of the word that woke it.
+        let index =
+            p.threads.get(&tid).and_then(|t| t.futexv.as_ref()).and_then(|v| v.addrs.iter().position(|&a| a == addr));
+        p.wake(tid, Some(index.unwrap_or(0) as u64));
     }
     woken.len() as u32
 }
@@ -267,8 +270,13 @@ fn futex_requeue(p: &mut Process, from: u64, to: u64, n: u32) -> u32 {
         p.futexes.insert(from, q);
     }
     for &(tid, _) in &moved {
-        if let Some(w) = p.threads.get_mut(&tid).and_then(|t| t.wait.as_mut()) {
-            w.on = WaitOn::Futex(to);
+        let Some(t) = p.threads.get_mut(&tid) else { continue };
+        match (t.wait.as_mut(), t.futexv.as_mut()) {
+            (Some(w), Some(v)) if w.on == WaitOn::FutexV => {
+                v.addrs.iter_mut().filter(|a| **a == from).for_each(|a| *a = to);
+            }
+            (Some(w), _) => w.on = WaitOn::Futex(to),
+            _ => {}
         }
     }
     let count = moved.len() as u32;
@@ -376,4 +384,66 @@ pub fn futex(p: &mut Process, a: [u64; 6]) -> SysResult {
         6..=8 | 11..=13 => p.unimplemented(nr::futex, "futex", "priority-inheritance futexes", ENOSYS),
         _ => Err(ENOSYS),
     }
+}
+
+/// futex_waitv(2) (Linux 5.16, Wine and Proton's fsync): wait on up to
+/// 128 futex words at once, each with its expected value, until any is
+/// woken (the call returns its index) or the absolute deadline on
+/// `clock` passes. Each word is queued like a FUTEX_WAIT's, so every
+/// futex wake and requeue reaches it.
+pub fn futex_waitv(p: &mut Process, waiters: u64, count: u64, flags: u64, timeout: u64, clock: u64) -> SysResult {
+    /// FUTEX2_SIZE_U32, and FUTEX2_PRIVATE (FUTEX_PRIVATE_FLAG), the only
+    /// flags a waiter may have.
+    const SIZE_U32: u32 = 2;
+    const PRIVATE: u32 = 128;
+    const MAX: u64 = 128;
+    if flags != 0 || count == 0 || count > MAX {
+        return Err(EINVAL);
+    }
+    // Every word is checked before any value is: struct futex_waitv is
+    // { u64 val, u64 uaddr, u32 flags, u32 reserved }.
+    let mut words = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let mut w = [0u8; 24];
+        copy_in(&mut p.aspace, waiters + i * 24, &mut w)?;
+        let val = u64::from_le_bytes(w[0..8].try_into().unwrap());
+        let addr = u64::from_le_bytes(w[8..16].try_into().unwrap());
+        let wflags = u32::from_le_bytes(w[16..20].try_into().unwrap());
+        let reserved = u32::from_le_bytes(w[20..24].try_into().unwrap());
+        if reserved != 0 || wflags & !(SIZE_U32 | PRIVATE) != 0 || wflags & 3 != SIZE_U32 || addr % 4 != 0 {
+            return Err(EINVAL);
+        }
+        // The value is a u32's: anything above it can never match.
+        if val > u32::MAX as u64 {
+            return Err(EINVAL);
+        }
+        words.push((addr, val as u32));
+    }
+    let deadline = match timeout {
+        0 => None,
+        t => {
+            let ns = read_timespec_ns(&mut p.aspace, t)?;
+            match clock {
+                0 => Some(time::realtime_to_monotonic(ns)), // CLOCK_REALTIME
+                1 => Some(ns),                              // CLOCK_MONOTONIC
+                _ => return Err(EINVAL),
+            }
+        }
+    };
+    for &(addr, val) in &words {
+        if read_u32(&mut p.aspace, addr)? != val {
+            return Err(EAGAIN);
+        }
+    }
+    // One queue entry per distinct word: a word given twice wakes as its first.
+    let addrs: Vec<u64> = words.iter().map(|w| w.0).collect();
+    let charge = crate::kmem::Charge::new(addrs.len() as u64 * 16)?;
+    let tid = p.current;
+    for (i, &addr) in addrs.iter().enumerate() {
+        if !addrs[..i].contains(&addr) {
+            p.futexes.entry(addr).or_default().push_back((tid, u32::MAX));
+        }
+    }
+    p.cur().futexv = Some(process::FutexV { addrs, _charge: charge });
+    p.block(WaitOn::FutexV, deadline, Err(ETIMEDOUT))
 }

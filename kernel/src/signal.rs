@@ -551,6 +551,8 @@ fn restartable(regs: &TrapFrame) -> bool {
         nr::fcntl => matches!(regs.arg(1), 7 | 38),
         // FUTEX_WAIT / FUTEX_WAIT_BITSET without a timeout.
         nr::futex => matches!(regs.arg(1) & 127, 0 | 9) && regs.arg(3) == 0,
+        // Its deadline is absolute, so it restarts (futex_wait_multiple's -ERESTARTSYS).
+        nr::futex_waitv => true,
         _ => false,
     }
 }

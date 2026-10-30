@@ -71,6 +71,13 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
 
+/// The most stack a handler's frame takes (Linux's AT_MINSIGSTKSZ,
+/// `signal_minsigstksz`): the frame and its frame record, from a top
+/// aligned down to 16 bytes (Linux's 16 bytes of "max alignment padding").
+pub fn max_size() -> u64 {
+    (FRAME_SIZE + 16 + 16) as u64
+}
+
 /// Write a frame for a handler below `top` (sp, or the top of the
 /// alternate stack), with `tf`'s registers: its address.
 pub fn push_frame(a: &mut AddressSpace, tf: &TrapFrame, top: u64, ctx: &Context) -> Result<u64, Errno> {

@@ -433,15 +433,36 @@ pub fn hw_random() -> Option<u64> {
 }
 
 /// ID_AA64ISAR0_EL1's fields user mode sees: AES, SHA1, SHA2, CRC32,
-/// Atomic, RDM, SHA3 and DP, the ones `hwcap` turns into HWCAP bits (not
-/// RNDR, TS, FHM, SM3, SM4 or TLB, which it doesn't advertise).
-const ISAR0_VISIBLE: u64 = 0xf << 4 | 0xf << 8 | 0xf << 12 | 0xf << 16 | 0xf << 20 | 0xf << 28 | 0xf << 32 | 0xf << 44;
+/// Atomic, RDM, SHA3, SM3, SM4, DP, FHM, TS and RNDR, the ones `hwcap`
+/// and `hwcap2` turn into HWCAP bits (not TLB or TME, which need the
+/// kernel).
+const ISAR0_VISIBLE: [(u32, u64); 13] =
+    [(4, 2), (8, 1), (12, 2), (16, 1), (20, 2), (28, 1), (32, 1), (36, 1), (40, 1), (44, 1), (48, 1), (52, 2), (60, 1)];
+
+/// ID_AA64ISAR1_EL1's: JSCVT, FCMA, LRCPC, FRINTTS, SB, BF16, DGH and
+/// I8MM, plain instructions all (not DPB's cache maintenance, pointer
+/// authentication, which needs keys the kernel would keep, SPECRES, XS or
+/// LS64).
+const ISAR1_VISIBLE: [(u32, u64); 8] = [(12, 1), (16, 1), (20, 2), (32, 1), (36, 1), (44, 1), (48, 1), (52, 1)];
+
+/// `reg` with only the fields in `visible` (shift, highest value shown),
+/// each capped as Linux's ftr_bits cap a FTR_LOWER_SAFE field.
+fn visible_fields(reg: u64, visible: &[(u32, u64)]) -> u64 {
+    visible.iter().fold(0, |v, &(shift, max)| v | ((reg >> shift) & 0xf).min(max) << shift)
+}
 
 /// What user mode reads in ID_AA64ISAR0_EL1 (and HWCAP is made of).
 fn user_isar0() -> u64 {
     let v: u64;
     unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) v) };
-    v & ISAR0_VISIBLE
+    visible_fields(v, &ISAR0_VISIBLE)
+}
+
+/// What user mode reads in ID_AA64ISAR1_EL1.
+fn user_isar1() -> u64 {
+    let v: u64;
+    unsafe { asm!("mrs {}, id_aa64isar1_el1", out(reg) v) };
+    visible_fields(v, &ISAR1_VISIBLE)
 }
 
 /// What user mode reads in ID_AA64PFR0_EL1: FP and AdvSIMD, and EL0 and
@@ -474,6 +495,7 @@ fn user_id_register(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> Option<
         (4, 0) => Some(user_pfr0()),
         (5, 0) => Some(6),
         (6, 0) => Some(user_isar0()),
+        (6, 1) => Some(user_isar1()),
         (2..=7, _) => Some(0),
         _ => None,
     }
@@ -536,7 +558,7 @@ fn emulate_undefined_mrs(tf: &mut TrapFrame) -> bool {
 /// agree. Only plain unprivileged instructions are advertised (no SVE, no
 /// pointer auth), and HWCAP_CPUID: reading the ID registers is emulated.
 pub fn hwcap() -> u64 {
-    let (isar0, pfr0) = (user_isar0(), user_pfr0());
+    let (isar0, isar1, pfr0) = (user_isar0(), user_isar1(), user_pfr0());
     let field = |reg: u64, shift: u32| (reg >> shift) & 0xf;
     let mut cap = 0u64;
     let fp = field(pfr0, 16);
@@ -585,7 +607,42 @@ pub fn hwcap() -> u64 {
     if field(isar0, 44) >= 1 {
         cap |= 1 << 20; // ASIMDDP
     }
+    for (reg, shift, min, bit) in [
+        (isar0, 36, 1, 18), // SM3
+        (isar0, 40, 1, 19), // SM4
+        (isar0, 48, 1, 23), // ASIMDFHM
+        (isar0, 52, 1, 27), // FLAGM
+        (isar1, 12, 1, 13), // JSCVT
+        (isar1, 16, 1, 14), // FCMA
+        (isar1, 20, 1, 15), // LRCPC
+        (isar1, 20, 2, 26), // ILRCPC
+        (isar1, 36, 1, 29), // SB
+    ] {
+        if field(reg, shift) >= min {
+            cap |= 1 << bit;
+        }
+    }
     cap | 1 << 11 // CPUID
+}
+
+/// Linux AT_HWCAP2, from the same registers as `hwcap`.
+pub fn hwcap2() -> u64 {
+    let (isar0, isar1) = (user_isar0(), user_isar1());
+    let field = |reg: u64, shift: u32| (reg >> shift) & 0xf;
+    let mut cap = 0u64;
+    for (reg, shift, min, bit) in [
+        (isar0, 52, 2, 7),  // FLAGM2
+        (isar1, 32, 1, 8),  // FRINT
+        (isar1, 52, 1, 13), // I8MM
+        (isar1, 44, 1, 14), // BF16
+        (isar1, 48, 1, 15), // DGH
+        (isar0, 60, 1, 16), // RNG
+    ] {
+        if field(reg, shift) >= min {
+            cap |= 1 << bit;
+        }
+    }
+    cap
 }
 
 pub fn set_user_page_table(root_pa: u64) {
@@ -664,13 +721,39 @@ pub fn power_off() -> ! {
 /// /proc/cpuinfo, as Linux arm64 writes it, for `cpus` CPUs.
 pub fn cpuinfo(s: &mut alloc::string::String, cpus: u32) {
     use core::fmt::Write;
-    const NAMES: [&str; 22] = [
+    const NAMES: [&str; 30] = [
         "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp", "asimdhp", "cpuid",
-        "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4", "asimddp", "sha512",
+        "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4", "asimddp", "sha512", "sve", "asimdfhm",
+        "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
     ];
-    let hw = hwcap();
-    let features: alloc::vec::Vec<&str> =
-        NAMES.iter().enumerate().filter(|(i, _)| hw & (1 << i) != 0).map(|(_, n)| *n).collect();
+    // HWCAP2's, from bit 0 (Linux's hwcap_str goes on with them).
+    const NAMES2: [&str; 17] = [
+        "dcpodp",
+        "sve2",
+        "sveaes",
+        "svepmull",
+        "svebitperm",
+        "svesha3",
+        "svesm4",
+        "flagm2",
+        "frint",
+        "svei8mm",
+        "svef32mm",
+        "svef64mm",
+        "svebf16",
+        "i8mm",
+        "bf16",
+        "dgh",
+        "rng",
+    ];
+    let (hw, hw2) = (hwcap(), hwcap2());
+    let features: alloc::vec::Vec<&str> = NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| hw & (1 << i) != 0)
+        .chain(NAMES2.iter().enumerate().filter(|(i, _)| hw2 & (1 << i) != 0))
+        .map(|(_, n)| *n)
+        .collect();
     let midr = midr();
     let bogomips = counter_freq() * 2 / 10_000;
     for cpu in 0..cpus {

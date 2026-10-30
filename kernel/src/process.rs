@@ -78,6 +78,8 @@ pub struct SigAction {
 pub enum WaitOn {
     /// A futex word (user virtual address).
     Futex(u64),
+    /// Any of the futex words in `Thread::futexv` (futex_waitv).
+    FutexV,
     /// Only the deadline (nanosleep, poll timeouts).
     Sleep,
     /// I/O readiness (pipes, eventfds, epoll). The syscall is restarted from
@@ -177,6 +179,15 @@ pub struct Thread {
     pub name: [u8; 16],
     /// Its `THREAD_COST` (none for a placeholder that's replaced).
     pub charge: crate::kmem::Charge,
+    /// The futex words a futex_waitv waits on, in its order (a wake
+    /// returns the index of the word that woke it), while it waits.
+    pub futexv: Option<FutexV>,
+}
+
+/// futex_waitv's words, charged to kmem (up to 128 per thread).
+pub struct FutexV {
+    pub addrs: Vec<u64>,
+    pub _charge: crate::kmem::Charge,
 }
 
 impl Thread {
@@ -205,6 +216,7 @@ impl Thread {
             mempolicy: 0,
             name: [0; 16],
             charge: Default::default(),
+            futexv: None,
         }
     }
 }
@@ -698,13 +710,19 @@ impl Process {
 
     /// Stop a thread's wait (leaving its futex queue) without making it runnable.
     pub fn cancel_wait(&mut self, tid: u32) -> Option<Wait> {
-        let w = self.threads.get_mut(&tid)?.wait.take()?;
-        if let WaitOn::Futex(addr) = w.on
-            && let Some(q) = self.futexes.get_mut(&addr)
-        {
-            q.retain(|&(t, _)| t != tid);
-            if q.is_empty() {
-                self.futexes.remove(&addr);
+        let t = self.threads.get_mut(&tid)?;
+        let w = t.wait.take()?;
+        let addrs = match w.on {
+            WaitOn::Futex(addr) => alloc::vec![addr],
+            WaitOn::FutexV => t.futexv.take().map(|v| v.addrs).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for addr in addrs {
+            if let Some(q) = self.futexes.get_mut(&addr) {
+                q.retain(|&(t, _)| t != tid);
+                if q.is_empty() {
+                    self.futexes.remove(&addr);
+                }
             }
         }
         self.timer_dirty = true;
@@ -1034,22 +1052,23 @@ pub fn load_program(
     aspace.map(Vma { start: VDSO, end: VDSO + PAGE_SIZE, prot: Prot::RX, backing: Backing::KernelPage(vdso) });
 
     let auxv = [
-        (33, VDSO),              // AT_SYSINFO_EHDR
-        (3, loaded.phdr),        // AT_PHDR
-        (4, 56),                 // AT_PHENT
-        (5, loaded.phnum),       // AT_PHNUM
-        (6, 4096),               // AT_PAGESZ
-        (7, interp_base),        // AT_BASE
-        (8, 0),                  // AT_FLAGS
-        (9, loaded.entry),       // AT_ENTRY
-        (11, p.ids.ruid as u64), // AT_UID
-        (12, p.uid as u64),      // AT_EUID
-        (13, p.ids.rgid as u64), // AT_GID
-        (14, p.gid as u64),      // AT_EGID
-        (16, arch::hwcap()),     // AT_HWCAP
-        (17, 100),               // AT_CLKTCK
-        (23, 0),                 // AT_SECURE
-        (26, 0),                 // AT_HWCAP2
+        (33, VDSO),                       // AT_SYSINFO_EHDR
+        (3, loaded.phdr),                 // AT_PHDR
+        (4, 56),                          // AT_PHENT
+        (5, loaded.phnum),                // AT_PHNUM
+        (6, 4096),                        // AT_PAGESZ
+        (7, interp_base),                 // AT_BASE
+        (8, 0),                           // AT_FLAGS
+        (9, loaded.entry),                // AT_ENTRY
+        (11, p.ids.ruid as u64),          // AT_UID
+        (12, p.uid as u64),               // AT_EUID
+        (13, p.ids.rgid as u64),          // AT_GID
+        (14, p.gid as u64),               // AT_EGID
+        (16, arch::hwcap()),              // AT_HWCAP
+        (17, 100),                        // AT_CLKTCK
+        (23, 0),                          // AT_SECURE
+        (26, arch::hwcap2()),             // AT_HWCAP2
+        (51, arch::sigframe::max_size()), // AT_MINSIGSTKSZ
     ];
     // The stack is written through the new address space's own mapping.
     aspace.activate();

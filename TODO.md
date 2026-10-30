@@ -190,8 +190,9 @@ Left, in order of impact:
     instruction without it) is emulated as Linux's `emulate_mrs` does,
     with only the fields HWCAP advertises (HWCAP is made from the same
     values, and has `HWCAP_CPUID`); MIDR as /proc/cpuinfo shows it,
-    MPIDR as Linux's safe value. Left: more HWCAPs (ID_AA64ISAR1's
-    LRCPC, JSCVT, FCMA, ...; HWCAP2), which would show there too.
+    MPIDR as Linux's safe value. More HWCAPs and HWCAP2 since (see
+    Binary compatibility). Left: DPB (DC CVAP), pointer authentication,
+    SVE and SME, which need the kernel.
 29. [x] `/proc/sys/vm/overcommit_memory` says 1, Linux's "always
     overcommit", which is what grix does (memory is only taken as it's
     touched); Redis and Valkey no longer warn. `max_map_count` is the
@@ -465,9 +466,10 @@ up without CAP_SYS_RESOURCE would do.
 - [x] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
       `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice`, `tee` and `vmsplice`: round 4, item 37.
-- [~] `openat2`, `name_to_handle_at` (newer tools).
-      `openat2` is done (round 3, item 23). `name_to_handle_at` and
-      `open_by_handle_at` are missing.
+- [x] `openat2`, `name_to_handle_at` (newer tools).
+      `openat2`: round 3, item 23. `name_to_handle_at` resolves the path
+      and answers EOPNOTSUPP, as a filesystem without file handles does;
+      `open_by_handle_at` is privileged (`file_handles`).
 - [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
 - [x] `MAP_SHARED` mappings of writable files, `msync`.
@@ -584,17 +586,21 @@ up without CAP_SYS_RESOURCE would do.
 - [x] Report the syscall number for unknown syscalls. Today the event says
       only "unsupported unknown".
 - [x] glibc dynamic executables (Debian/Ubuntu arm64): see round 2, item 9.
-- [~] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
-      `HWCAP_CPUID` and the `mrs` emulation are done (round 3, item 28,
-      `id_registers_from_user_mode`). `AT_HWCAP2` is always 0 and
-      `AT_MINSIGSTKSZ` isn't given.
+- [x] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
+      `HWCAP_CPUID`: round 3, item 28. `AT_MINSIGSTKSZ` is the signal
+      frame's size (`sigframe::max_size`); on arm64 ID_AA64ISAR1's plain
+      instructions (JSCVT, FCMA, LRCPC, FRINTTS, SB, BF16, DGH, I8MM) and
+      ISAR0's SM3, SM4, FHM, TS and RNDR show now, in HWCAP, HWCAP2 and
+      /proc/cpuinfo alike (`id_registers_from_user_mode`,
+      `auxv_hwcap2_and_minsigstksz`). x86_64's HWCAP2 is 0 (no
+      FSGSBASE).
 - [~] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
       and ignore, or implement. seccomp filters work; Landlock is
       EOPNOTSUPP (round 4, item 34, with the design).
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
-      `futex_waitv` (Wine/Proton, newer glibc's tests) is missing.
+      `futex_waitv` is done (`WaitOn::FutexV`, the `futexv` fixture).
 - [x] x86_64 programs, through a user-mode translator in the arm64 guest
       (`--x86-64`: qemu-x86_64; box64 untested; binfmt_misc-style). x86_64
       Alpine busybox and CPython run.

@@ -2037,6 +2037,65 @@ fn id_registers_from_user_mode() {
 }
 
 #[test]
+fn futex_waitv_waits_on_several_words() {
+    // futex_waitv: the index of the word that woke it, requeues, absolute
+    // deadlines on either clock, EINTR from a handler, and EINVAL for
+    // what Linux refuses.
+    let out = run(with("futexv").allow(Capability::Threads), &["/bin/futexv"]);
+    assert_eq!(
+        out.stdout_str(),
+        "arguments ok\nwoken by word 2\nrequeued and woken\ninterrupted\nfutexv ok\n",
+        "{}",
+        out.kernel_log
+    );
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn auxv_hwcap2_and_minsigstksz() {
+    // AT_HWCAP2 (as the ID registers show it: see
+    // `id_registers_from_user_mode`) and AT_MINSIGSTKSZ, which a handler's
+    // frame fits.
+    let out = run(with("newcalls"), &["/bin/newcalls", "auxv"]);
+    assert_eq!(out.stdout_str(), "auxv ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn file_handles() {
+    // name_to_handle_at resolves the path, then says no filesystem here
+    // has handles (EOPNOTSUPP, quietly: callers fall back to paths);
+    // open_by_handle_at is privileged, and reported.
+    let out = run(with("newcalls"), &["/bin/newcalls", "handles"]);
+    assert_eq!(out.stdout_str(), "handles ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(
+        out.events,
+        [
+            GuestEvent::MissingPath { path: "/nope".into() },
+            GuestEvent::Denied {
+                syscall: "open_by_handle_at".into(),
+                capability: "privileged".into(),
+                detail: "".into()
+            }
+        ]
+    );
+}
+
+#[test]
+fn a_sleep_stopped_and_continued_keeps_its_deadline() {
+    // No handler: the stop and continue don't end nanosleep (no EINTR),
+    // and it wakes at its first deadline, as Linux's restart_syscall
+    // makes it.
+    let out = run(with("newcalls").allow(Capability::Process), &["/bin/newcalls", "sleep"]);
+    assert_eq!(out.stdout_str(), "sleep ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn descriptors_through_symlinks() {
     // nginx's logs are links to /dev/stderr, which it opens with O_APPEND.
     let b = with("popular").allow(Capability::FsWrite);
