@@ -255,6 +255,7 @@ pub fn enter_user(entry: u64, sp: u64) -> ! {
 // Exception classes (ESR_EL1.EC).
 const EC_UNKNOWN: u64 = 0x00;
 const EC_SVC64: u64 = 0x15;
+const EC_SYS64: u64 = 0x18;
 const EC_IABT_LOWER: u64 = 0x20;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_DABT_LOWER: u64 = 0x24;
@@ -329,6 +330,11 @@ fn el0_sync(tf: &mut TrapFrame) {
                 _ => (SIGSEGV, SEGV_ACCERR, far, Some(esr), access.describe_violation()),
             }
         }
+        // An MRS of an ID register: EC_SYS64 with FEAT_IDST, undefined
+        // (and decoded from the instruction) without it.
+        EC_SYS64 if emulate_mrs_trap(tf, esr) => return,
+        EC_UNKNOWN if emulate_undefined_mrs(tf) => return,
+        EC_SYS64 => (SIGILL, ILL_ILLOPC, tf.elr, None, "system register access"),
         EC_UNKNOWN => (SIGILL, ILL_ILLOPC, tf.elr, None, "illegal instruction"),
         EC_BRK => (SIGTRAP, TRAP_BRKPT, tf.elr, None, "breakpoint (brk)"),
         EC_PC_ALIGN => (SIGBUS, BUS_ADRALN, far(), None, "misaligned pc"),
@@ -391,14 +397,111 @@ pub fn hw_random() -> Option<u64> {
     (ok != 0).then_some(v)
 }
 
-/// Linux AT_HWCAP bits for the features this CPU has. Only plain unprivileged
-/// instructions are advertised (no SVE, no CPUID emulation, no pointer auth).
-pub fn hwcap() -> u64 {
-    let (isar0, pfr0): (u64, u64);
-    unsafe {
-        asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0);
-        asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0);
+/// ID_AA64ISAR0_EL1's fields user mode sees: AES, SHA1, SHA2, CRC32,
+/// Atomic, RDM, SHA3 and DP, the ones `hwcap` turns into HWCAP bits (not
+/// RNDR, TS, FHM, SM3, SM4 or TLB, which it doesn't advertise).
+const ISAR0_VISIBLE: u64 = 0xf << 4 | 0xf << 8 | 0xf << 12 | 0xf << 16 | 0xf << 20 | 0xf << 28 | 0xf << 32 | 0xf << 44;
+
+/// What user mode reads in ID_AA64ISAR0_EL1 (and HWCAP is made of).
+fn user_isar0() -> u64 {
+    let v: u64;
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) v) };
+    v & ISAR0_VISIBLE
+}
+
+/// What user mode reads in ID_AA64PFR0_EL1: FP and AdvSIMD, and EL0 and
+/// EL1 as AArch64 only, as Linux shows them (its hidden fields' safe
+/// values). No SVE, DIT, AMU, RAS, GIC or the other ELs.
+fn user_pfr0() -> u64 {
+    let v: u64;
+    unsafe { asm!("mrs {}, id_aa64pfr0_el1", out(reg) v) };
+    (v & (0xff << 16)) | 0x11
+}
+
+/// The value of ID register (op0, op1, CRn, CRm, op2) that an MRS from
+/// user mode gets, as Linux's emulate_sys_reg gives it
+/// (arch/arm64/kernel/cpufeature.c): only op0 3, op1 0, CRn 0, and CRm
+/// 0 or 2-7. In CRm 0, MIDR_EL1 (as this machine shows it, the same as
+/// /proc/cpuinfo), MPIDR_EL1 (Linux's SYS_MPIDR_SAFE_VAL, so no CPU's
+/// topology shows) and REVIDR_EL1 (0); nothing else. Elsewhere only the
+/// fields this kernel supports, enables and advertises in HWCAP;
+/// registers it shows nothing of read as 0, as Linux's untracked and
+/// hidden ones do (but ID_AA64DFR0_EL1's DebugVer, 6 as Linux has it).
+fn user_id_register(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> Option<u64> {
+    if op0 != 3 || op1 != 0 || crn != 0 {
+        return None;
     }
+    match (crm, op2) {
+        (0, 0) => Some(midr()),
+        (0, 5) => Some(1 << 31),
+        (0, 6) => Some(0),
+        (0 | 1, _) => None,
+        (4, 0) => Some(user_pfr0()),
+        (5, 0) => Some(6),
+        (6, 0) => Some(user_isar0()),
+        (2..=7, _) => Some(0),
+        _ => None,
+    }
+}
+
+/// Finish an emulated MRS: the value in Xt (XZR discards it) and on to
+/// the next instruction.
+fn complete_mrs(tf: &mut TrapFrame, rt: u64, value: u64) {
+    if rt < 31 {
+        tf.x[rt as usize] = value;
+    }
+    tf.elr += 4;
+}
+
+/// EC_SYS64: with FEAT_IDST, an MRS of an ID register from EL0 traps
+/// here (ISS: op0, op2, op1, CRn, Rt, CRm, and 1 for a read).
+fn emulate_mrs_trap(tf: &mut TrapFrame, esr: u64) -> bool {
+    let iss = esr & 0x1ff_ffff;
+    let field = |shift: u32, bits: u32| (iss >> shift) & ((1 << bits) - 1);
+    if iss & 1 == 0 {
+        return false;
+    }
+    match user_id_register(field(20, 2), field(14, 3), field(10, 4), field(1, 4), field(17, 3)) {
+        Some(v) => {
+            complete_mrs(tf, field(5, 5), v);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Without FEAT_IDST, the same MRS is undefined at EL0: read the
+/// instruction (Linux's try_emulate_mrs) and emulate it if it's one.
+fn emulate_undefined_mrs(tf: &mut TrapFrame) -> bool {
+    let mut b = [0u8; 4];
+    {
+        let mut guard = process::PROCESS.lock();
+        let Some(p) = guard.as_mut() else { return false };
+        if crate::uaccess::copy_in(&mut p.aspace, tf.elr, &mut b).is_err() {
+            return false;
+        }
+    }
+    let insn = u32::from_le_bytes(b) as u64;
+    // MRS: 1101 0101 0011 o0 op1 CRn CRm op2 Rt (op0 is 2 + o0).
+    if insn & 0xfff0_0000 != 0xd530_0000 {
+        return false;
+    }
+    let field = |shift: u32, bits: u32| (insn >> shift) & ((1 << bits) - 1);
+    match user_id_register(2 + field(19, 1), field(16, 3), field(12, 4), field(8, 4), field(5, 3)) {
+        Some(v) => {
+            complete_mrs(tf, field(0, 5), v);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Linux AT_HWCAP bits for the features this CPU has, made from the ID
+/// registers as user mode sees them (`user_id_register`), so the two
+/// agree. Only plain unprivileged instructions are advertised (no SVE, no
+/// pointer auth), and HWCAP_CPUID: reading the ID registers is emulated.
+pub fn hwcap() -> u64 {
+    let (isar0, pfr0) = (user_isar0(), user_pfr0());
     let field = |reg: u64, shift: u32| (reg >> shift) & 0xf;
     let mut cap = 0u64;
     let fp = field(pfr0, 16);
@@ -447,7 +550,7 @@ pub fn hwcap() -> u64 {
     if field(isar0, 44) >= 1 {
         cap |= 1 << 20; // ASIMDDP
     }
-    cap
+    cap | 1 << 11 // CPUID
 }
 
 pub fn set_user_page_table(root_pa: u64) {

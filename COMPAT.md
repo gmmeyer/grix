@@ -125,9 +125,9 @@ In order of impact (details in TODO.md, "Round 3"):
    back.
 5. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
    mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
-6. **Reading ID registers from EL0** (`mrs` of `ID_AA64*`, Linux's
-   `HWCAP_CPUID` emulation), for programs that do it without asking
-   HWCAP.
+6. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
+   of `ID_AA64*`, `MIDR_EL1`, `MPIDR_EL1`, `REVIDR_EL1` emulated as
+   Linux's `HWCAP_CPUID`, sanitized to what HWCAP advertises).
 
 Denied by design (nothing in this survey needed them): `mount`, raw
 sockets, ptrace, module loading.

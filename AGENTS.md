@@ -95,7 +95,10 @@ TLS registers, page-table entries (`pte`, and `USER_ROOT_ENTRIES`: an x86
 root's upper half is the kernel's), the interrupt controller and timer
 (`irq`), the early UART (`uart`), the signal frame (`sigframe`), the
 structures Linux lays out per architecture (`abi`: `stat`,
-`epoll_event`, the `O_*` flags that differ), the vDSO's code, the
+`epoll_event`, the `O_*` flags that differ), arm64's ID registers as
+user mode reads them (`user_id_register`, emulating an EL0 `mrs` as
+Linux's HWCAP_CPUID does; `hwcap` is made from the same values, so
+the two agree), the vDSO's code, the
 machine's layout (`machine`), USER_TOP and ELF_DYN_BASE, the VMM calls,
 and `/proc/cpuinfo`. Code outside `arch` uses only that interface. The
 syscall table (`syscall/table.rs`) has each architecture's numbers for

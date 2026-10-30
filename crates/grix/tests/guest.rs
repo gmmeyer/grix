@@ -1834,8 +1834,20 @@ fn popular(b: SandboxBuilder, checks: &[&str]) {
 #[test]
 fn proc_self_auxv() {
     // Go's x/sys/cpu reads HWCAP there; without it, it reads ID registers
-    // and dies of SIGILL (Caddy, Traefik).
+    // (see `id_registers_from_user_mode`).
     popular(with("popular"), &["auxv"]);
+}
+
+#[test]
+fn id_registers_from_user_mode() {
+    // arm64: an MRS of an ID register from EL0 is emulated as Linux
+    // emulates it (HWCAP_CPUID), with values that agree with HWCAP and
+    // /proc/cpuinfo; other system registers are still SIGILL. (x86_64's
+    // fixture just says ok: CPUID needs nothing of the kernel.)
+    let out = run(with("idregs"), &["/bin/idregs"]);
+    assert_eq!(out.stdout_str(), "idregs ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 #[test]

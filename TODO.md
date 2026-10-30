@@ -157,10 +157,13 @@ Left, in order of impact:
     instructions, and kmem). Left: user notification
     (`SECCOMP_RET_USER_NOTIF`, `NEW_LISTENER`: reported, refused as a
     kernel before 5.0 refuses them).
-28. [ ] **ID registers from EL0** (`mrs` of `ID_AA64*`, Linux's
-    `HWCAP_CPUID` emulation): Go reads `/proc/self/auxv` now, but other
-    code may read them directly. The trap (EC 0x18 with FEAT_IDST, or
-    an undefined instruction) can be emulated with sanitized values.
+28. [x] **ID registers from EL0**: an `mrs` of `ID_AA64*`, `MIDR_EL1`,
+    `MPIDR_EL1` or `REVIDR_EL1` (EC 0x18 with FEAT_IDST, an undefined
+    instruction without it) is emulated as Linux's `emulate_mrs` does,
+    with only the fields HWCAP advertises (HWCAP is made from the same
+    values, and has `HWCAP_CPUID`); MIDR as /proc/cpuinfo shows it,
+    MPIDR as Linux's safe value. Left: more HWCAPs (ID_AA64ISAR1's
+    LRCPC, JSCVT, FCMA, ...; HWCAP2), which would show there too.
 29. [ ] `/proc/sys/vm/overcommit_memory` says 0, so Redis warns that a
     background save may fail; what grix actually does (memory is only
     taken as it's touched) is closer to 1.
