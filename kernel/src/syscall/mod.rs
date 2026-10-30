@@ -304,6 +304,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::mprotect => mem::mprotect(p, a[0], a[1], a[2]),
         nr::mremap => mem::mremap(p, a[0], a[1], a[2], a[3], a[4]),
         nr::madvise => mem::madvise(p, a[0], a[1], a[2]),
+        nr::mbind => mem::mbind(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::set_mempolicy => mem::set_mempolicy(p, a[0], a[1], a[2]),
+        nr::get_mempolicy => mem::get_mempolicy(p, a[0], a[1], a[2], a[3], a[4]),
         nr::msync | nr::mlock | nr::munlock | nr::mlock2 | nr::mlockall | nr::munlockall => Ok(0),
 
         // threads (processes are gated in clone, not implemented yet)

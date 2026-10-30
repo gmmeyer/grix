@@ -155,8 +155,10 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let sigmask = p.cur().sigmask;
     let seccomp = p.cur().seccomp.clone();
+    let mempolicy = p.cur().mempolicy;
     let mut t = Thread::new(tid);
     t.seccomp = seccomp;
+    t.mempolicy = mempolicy;
     t.regs = regs;
     arch::save_fp(&mut t.fp);
     t.tls = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tls() };

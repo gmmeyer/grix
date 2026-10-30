@@ -156,6 +156,9 @@ pub struct Thread {
     /// Its seccomp mode, filters and no_new_privs (inherited by threads and
     /// processes it makes, kept across execve).
     pub seccomp: crate::seccomp::State,
+    /// Its NUMA memory policy (set_mempolicy's mode and mode flags), kept
+    /// to be read back: with one node, every policy places memory alike.
+    pub mempolicy: u32,
 }
 
 impl Thread {
@@ -181,6 +184,7 @@ impl Thread {
             fifo_wait: None,
             call: (0, 0),
             seccomp: Default::default(),
+            mempolicy: 0,
         }
     }
 }

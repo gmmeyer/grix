@@ -2073,6 +2073,12 @@ fn scheduling_priorities() {
 }
 
 #[test]
+fn numa_policies_on_one_node() {
+    // ClickHouse, .NET and NumPy's allocators ask; numactl sets them.
+    popular(with("popular"), &["numa"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

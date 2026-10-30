@@ -241,6 +241,9 @@ syscalls! {
     231 munlockall Core;
     232 mincore Core;
     233 madvise Core;
+    235 mbind Core; // one NUMA node: policies are checked, and change nothing
+    236 get_mempolicy Core;
+    237 set_mempolicy Core;
     240 rt_tgsigqueueinfo Core;
     241 perf_event_open Privileged;
     242 accept4 Core; // acts on existing sockets; see net.rs
@@ -497,6 +500,9 @@ syscalls! {
     233 epoll_ctl Core;
     234 tgkill Core;
     235 utimes Cap(FsWrite);
+    237 mbind Core;
+    238 set_mempolicy Core;
+    239 get_mempolicy Core;
     246 kexec_load Privileged;
     247 waitid Cap(Process);
     248 add_key Privileged;

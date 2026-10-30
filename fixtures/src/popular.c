@@ -941,6 +941,37 @@ static int schedprio(void) {
     return 0;
 }
 
+// NUMA policies (numactl, ClickHouse, .NET, NumPy's allocators): one
+// node, 0, so a policy naming it is kept and changes nothing, and one
+// naming another node is EINVAL.
+static int numa(void) {
+    enum { MPOL_DEFAULT, MPOL_PREFERRED, MPOL_BIND, MPOL_INTERLEAVE };
+    int mode = -1;
+    unsigned long mask[2] = {~0ul, ~0ul};
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 128, 0, 0) == 0);
+    CHECK(mode == MPOL_DEFAULT && mask[0] == 0 && mask[1] == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 65, 0, 4 /* MPOL_F_MEMS_ALLOWED */) == 0 && mask[0] == 1);
+    unsigned long one = 1, two = 2;
+    CHECK(syscall(SYS_set_mempolicy, MPOL_BIND, &two, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_DEFAULT, &one, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, 99, &one, 64) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &one, 64) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, mask, 65, 0, 0) == 0 && mode == MPOL_INTERLEAVE && mask[0] == 1);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 1 /* MPOL_F_NODE */) == 0 && mode == 0);
+    char *p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    CHECK(syscall(SYS_mbind, p, 8192, MPOL_BIND, &one, 64, 0) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, p, 3 /* MPOL_F_NODE | MPOL_F_ADDR */) == 0 && mode == 0);
+    CHECK(syscall(SYS_mbind, p + 1, 4096, MPOL_BIND, &one, 64, 0) == -1 && errno == EINVAL);
+    munmap(p + 4096, 4096);
+    CHECK(syscall(SYS_mbind, p, 8192, MPOL_BIND, &one, 64, 0) == -1 && errno == EFAULT);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, p + 4096, 2 /* MPOL_F_ADDR */) == -1 && errno == EFAULT);
+    CHECK(syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0) == 0);
+    CHECK(syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 1) == -1 && errno == EINVAL);
+    munmap(p, 4096);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -968,6 +999,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "xattrcopied") == 0) r = xattrcopied();
         if (strcmp(argv[i], "sysctls") == 0) r = sysctls();
         if (strcmp(argv[i], "schedprio") == 0) r = schedprio();
+        if (strcmp(argv[i], "numa") == 0) r = numa();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);
