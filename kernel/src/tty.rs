@@ -177,9 +177,10 @@ pub struct Tty {
     /// The next character is taken literally (VLNEXT).
     lnext: bool,
     /// The output column, and where the line being edited started (for
-    /// erasing tabs).
-    column: usize,
-    canon_col: usize,
+    /// erasing tabs). Only their low bits matter, and they may wrap, as
+    /// n_tty's: whatever the program wrote, no echo depends on their size.
+    column: u32,
+    canon_col: u32,
     /// Output toward the master side.
     output: VecDeque<u8>,
     /// Output stopped with VSTOP (IXON).
@@ -470,12 +471,7 @@ impl Tty {
                 if kind == Erase::Char && lflag & ECHOE == 0 {
                     self.echo(t.cc[VERASE]);
                 } else if c == b'\t' {
-                    // Back to where the rest of the line ends.
-                    let rest: Vec<u8> = self.input.range(self.canon..).copied().collect();
-                    let col = rest.iter().fold(self.canon_col, |col, &b| advance(col, b, lflag & ECHOCTL != 0));
-                    for _ in col..self.column {
-                        self.raw(b"\x08");
-                    }
+                    self.erase_tab();
                 } else {
                     let width = if is_cntrl(c) { if lflag & ECHOCTL != 0 { 2 } else { 0 } } else { 1 };
                     for _ in 0..width {
@@ -486,6 +482,31 @@ impl Tty {
             if kind == Erase::Char {
                 break;
             }
+        }
+    }
+
+    /// Back over an erased tab, as n_tty's eraser and ECHO_OP_ERASE_TAB: what
+    /// is since the last tab (or, offset by where the line started, since
+    /// the line's start) says how wide it was, 1 to 8 columns.
+    fn erase_tab(&mut self) {
+        let t = self.termios;
+        let (mut width, mut after_tab) = (0u32, false);
+        for &b in self.input.range(self.canon..).rev() {
+            if b == b'\t' {
+                after_tab = true;
+                break;
+            }
+            if is_cntrl(b) {
+                width += if t.lflag & ECHOCTL != 0 { 2 } else { 0 };
+            } else if t.iflag & IUTF8 == 0 || !is_continuation(b) {
+                width += 1;
+            }
+        }
+        if !after_tab {
+            width = width.wrapping_add(self.canon_col);
+        }
+        for _ in 0..8 - (width & 7) {
+            self.raw(b"\x08");
         }
     }
 
@@ -508,7 +529,7 @@ impl Tty {
             }
             match b {
                 0x08 => self.column = self.column.saturating_sub(1),
-                _ if !is_cntrl(b) => self.column += 1,
+                _ if !is_cntrl(b) => self.column = self.column.wrapping_add(1),
                 _ => {}
             }
             self.output.push_back(b);
@@ -559,7 +580,7 @@ impl Tty {
                 } else {
                     push(self, b'\t');
                 }
-                self.column += spaces;
+                self.column = self.column.wrapping_add(spaces);
             }
             0x08 => {
                 self.column = self.column.saturating_sub(1);
@@ -568,7 +589,7 @@ impl Tty {
             _ => {
                 let c = if oflag & OLCUC != 0 { c.to_ascii_uppercase() } else { c };
                 if !is_cntrl(c) && !(self.termios.iflag & IUTF8 != 0 && is_continuation(c)) {
-                    self.column += 1;
+                    self.column = self.column.wrapping_add(1);
                 }
                 push(self, c);
             }
@@ -741,16 +762,6 @@ fn is_cntrl(c: u8) -> bool {
 
 fn is_continuation(c: u8) -> bool {
     c & 0xc0 == 0x80
-}
-
-/// The column after echoing `c` at `col`.
-fn advance(col: usize, c: u8, echoctl: bool) -> usize {
-    match c {
-        b'\t' => col + 8 - (col & 7),
-        _ if is_continuation(c) => col,
-        _ if is_cntrl(c) => col + if echoctl { 2 } else { 0 },
-        _ => col + 1,
-    }
 }
 
 // ---------------------------------------------------------------- the files
