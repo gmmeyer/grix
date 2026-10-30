@@ -192,6 +192,8 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
             z.ppid = INIT;
         }
     }
+    // Its children's getppid, which may be a fast call on another CPU.
+    crate::fast::changed();
     // The vfork caller isn't the parent with CLONE_PARENT.
     if let Some((vpid, tid)) = dead.vfork_parent.take() {
         let caller = match cur.as_deref_mut() {

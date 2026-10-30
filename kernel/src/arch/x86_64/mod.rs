@@ -508,8 +508,14 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
             tf.rcx,
         );
     }
-    // A page not present, which `fast` may fill without the kernel lock.
-    if tf.vector == 14 && tf.error & 1 == 0 && crate::fast::fault(cr2(), page_access(tf.error)) {
+    // What can be done without the kernel lock (`fast`): some system
+    // calls, and pages not present.
+    let fast = match tf.vector {
+        SYSCALL => crate::fast::syscall(tf),
+        14 if tf.error & 1 == 0 => crate::fast::fault(cr2(), page_access(tf.error)),
+        _ => false,
+    };
+    if fast {
         return;
     }
     crate::smp::enter(match tf.vector {

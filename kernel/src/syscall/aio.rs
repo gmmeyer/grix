@@ -261,6 +261,9 @@ pub fn complete_polls(p: &mut Process) {
 /// io_submit(ctx, nr, iocbpp): the number of requests submitted, or the
 /// first one's error if none was.
 pub fn io_submit(p: &mut Process, id: u64, nr: u64, iocbpp: u64) -> SysResult {
+    // A poll completes at the process's next call, which mustn't be a
+    // fast one (`fast::calls_allowed`).
+    crate::fast::changed();
     if (nr as i64) < 0 {
         return Err(EINVAL);
     }

@@ -301,7 +301,7 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         );
     }
     // What can be done without the kernel lock (`fast`), and back.
-    if kind == 8 && fast_sync() {
+    if kind == 8 && fast_sync(tf) {
         return;
     }
     crate::smp::enter(match kind {
@@ -338,11 +338,14 @@ extern "C" fn stack_overflow_report(sp: u64) -> ! {
     panic!("kernel stack overflow on CPU {} at {elr:#x}, sp {sp:#x}, far {:#x}, esr {:#x}", cpu_number(), far(), esr());
 }
 
-/// A synchronous exception from EL0 that `fast` handled: a translation
-/// fault (demand paging) it could.
-fn fast_sync() -> bool {
+/// A synchronous exception from EL0 that `fast` handled: a system call or
+/// a translation fault (demand paging) it could.
+fn fast_sync(tf: &mut TrapFrame) -> bool {
     let esr = esr();
     let ec = esr >> 26;
+    if ec == EC_SVC64 {
+        return crate::fast::syscall(tf);
+    }
     let translation = (0b000100..=0b000111).contains(&(esr & 0x3f));
     (ec == EC_IABT_LOWER || ec == EC_DABT_LOWER) && translation && crate::fast::fault(far(), access(ec, esr))
 }

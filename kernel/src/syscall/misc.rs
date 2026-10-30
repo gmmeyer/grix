@@ -84,8 +84,17 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
                 }
             }
         }
-        nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => set_ids(p, n, name, a),
-        nr::setfsuid | nr::setfsgid => set_fs_id(p, n, name, a[0] as u32),
+        // Other threads' fast calls report the process's credentials.
+        nr::setuid | nr::setreuid | nr::setresuid | nr::setgid | nr::setregid | nr::setresgid => {
+            let r = set_ids(p, n, name, a);
+            crate::fast::changed();
+            r
+        }
+        nr::setfsuid | nr::setfsgid => {
+            let r = set_fs_id(p, n, name, a[0] as u32);
+            crate::fast::changed();
+            r
+        }
         nr::umask => {
             let old = p.fs.update(|f| core::mem::replace(&mut f.umask, a[0] as u32 & 0o777));
             Ok(old as u64)

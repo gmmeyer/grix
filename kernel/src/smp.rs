@@ -342,7 +342,7 @@ pub fn unlock() {
             c.slice_start = p.slice_start;
             c.resched = p.resched;
             c.timer_dirty = p.timer_dirty;
-            crate::fast::update(c.tid.map(|_| &*p));
+            crate::fast::update(c.tid.map(|tid| (&*p, tid)));
             // What's per CPU stays with the CPU.
             p.running = false;
             p.current = NO_THREAD;

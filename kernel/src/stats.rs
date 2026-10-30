@@ -6,11 +6,24 @@
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use grix_abi::machine::MAX_CPUS;
 use grix_abi::stats::{Limit, Resource, Stats, Usage};
 
 static CPU_NS: AtomicU64 = AtomicU64::new(0);
-static SYSCALLS: AtomicU64 = AtomicU64::new(0);
-static PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Per CPU, each on its own cache line: CPUs making system calls and
+/// taking faults at once, without the kernel lock (`fast`), would
+/// otherwise take turns at one.
+#[repr(align(128))]
+struct PerCpu {
+    syscalls: AtomicU64,
+    page_faults: AtomicU64,
+}
+static PER_CPU: [PerCpu; MAX_CPUS as usize] =
+    [const { PerCpu { syscalls: AtomicU64::new(0), page_faults: AtomicU64::new(0) } }; MAX_CPUS as usize];
+
+fn per_cpu() -> &'static PerCpu {
+    &PER_CPU[crate::smp::me()]
+}
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static FORKS: AtomicU64 = AtomicU64::new(0);
 static PEAKS: [AtomicU64; Resource::ALL.len()] = [const { AtomicU64::new(0) }; Resource::ALL.len()];
@@ -25,11 +38,11 @@ pub fn cpu(ns: u64) {
 }
 
 pub fn syscall() {
-    SYSCALLS.fetch_add(1, Relaxed);
+    per_cpu().syscalls.fetch_add(1, Relaxed);
 }
 
 pub fn page_fault() {
-    PAGE_FAULTS.fetch_add(1, Relaxed);
+    per_cpu().page_faults.fetch_add(1, Relaxed);
 }
 
 pub fn switched() {
@@ -60,8 +73,12 @@ pub fn tasks(processes: usize, threads: usize) {
 
 /// A run restored from a snapshot: its report is its own, from here.
 pub fn restored() {
-    for c in [&CPU_NS, &SYSCALLS, &PAGE_FAULTS, &SWITCHES, &FORKS].into_iter().chain(&PEAKS).chain(&HITS) {
+    for c in [&CPU_NS, &SWITCHES, &FORKS].into_iter().chain(&PEAKS).chain(&HITS) {
         c.store(0, Relaxed);
+    }
+    for c in &PER_CPU {
+        c.syscalls.store(0, Relaxed);
+        c.page_faults.store(0, Relaxed);
     }
 }
 
@@ -80,8 +97,8 @@ pub fn current() -> Stats {
     ];
     let mut s = Stats {
         cpu_ns: CPU_NS.load(Relaxed),
-        syscalls: SYSCALLS.load(Relaxed),
-        page_faults: PAGE_FAULTS.load(Relaxed),
+        syscalls: PER_CPU.iter().map(|c| c.syscalls.load(Relaxed)).sum(),
+        page_faults: PER_CPU.iter().map(|c| c.page_faults.load(Relaxed)).sum(),
         context_switches: SWITCHES.load(Relaxed),
         processes_started: FORKS.load(Relaxed),
         ..Stats::default()
