@@ -10,7 +10,7 @@
 //! (`watch.rs`), through descriptors opened the same way; lazy imports
 //! never change for the guest, so they aren't.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -246,16 +246,46 @@ impl Server {
         self.notices = Some(send);
     }
 
+    /// The ids that lead up to a mount's root, of `nodes`: a removed
+    /// directory's id goes, but those of what was in it stay until they're
+    /// looked at, and a file's state can say anything.
+    fn reachable(roots: u64, nodes: &HashMap<u64, Node>) -> HashSet<u64> {
+        let mut good = HashSet::new();
+        let mut bad = HashSet::new();
+        for &start in nodes.keys() {
+            let (mut path, mut at) = (Vec::new(), start);
+            let ok = loop {
+                if (1..=roots).contains(&at) || good.contains(&at) {
+                    break true;
+                }
+                // Gone, known not to lead anywhere, or seen on this walk.
+                if bad.contains(&at) || path.len() > nodes.len() {
+                    break false;
+                }
+                let Some(n) = nodes.get(&at) else { break false };
+                path.push(at);
+                at = n.parent;
+            };
+            if ok { good.extend(path) } else { bad.extend(path) }
+        }
+        good
+    }
+
     /// What a snapshot keeps of the server, for runs restored from it:
-    /// the ids it gave out (each a name in its parent), and what the guest
-    /// first saw of lazy imports. Not open files: they're opened again.
+    /// the ids it gave out that still lead somewhere (each a name in its
+    /// parent), and what the guest first saw of lazy imports. Not open
+    /// files: they're opened again. Parents can come after their children:
+    /// a file moved into a newer directory.
     pub fn save(&self) -> Vec<u8> {
         use grix_abi::codec::Writer;
         let mut w = Writer::default();
         w.u32(STATE_VERSION);
         w.u32(self.roots.len() as u32);
         w.u64(self.next_id);
-        let mut nodes: Vec<(&u64, &Node)> = self.nodes.iter().collect();
+        let roots = self.roots.len() as u64;
+        let live = Self::reachable(roots, &self.nodes);
+        let kept = |id: u64| id <= roots || live.contains(&id);
+        let mut nodes: Vec<(&u64, &Node)> = self.nodes.iter().filter(|(id, _)| kept(**id)).collect();
         nodes.sort_by_key(|(id, _)| **id);
         w.u32(nodes.len() as u32);
         for (id, n) in nodes {
@@ -264,14 +294,14 @@ impl Server {
             w.str(&n.name);
         }
         // In order of id, so the same state saves the same.
-        let mut attrs: Vec<(&u64, &Attr)> = self.attrs.iter().collect();
+        let mut attrs: Vec<(&u64, &Attr)> = self.attrs.iter().filter(|(id, _)| kept(**id)).collect();
         attrs.sort_by_key(|(id, _)| **id);
         w.u32(attrs.len() as u32);
         for (id, a) in attrs {
             w.u64(*id);
             a.put(&mut w);
         }
-        let mut frozen: Vec<_> = self.frozen.iter().collect();
+        let mut frozen: Vec<_> = self.frozen.iter().filter(|(id, _)| kept(**id)).collect();
         frozen.sort_by_key(|(id, _)| **id);
         w.u32(frozen.len() as u32);
         for (dir, entries) in frozen {
@@ -288,8 +318,8 @@ impl Server {
 
     /// A server for `mounts` that goes on from `state` (`save`'s). It may
     /// come from anyone's snapshot file: every name is one plain component,
-    /// every id's parent came before it, and nothing exceeds the limits, or
-    /// it's refused.
+    /// every id leads up to a mount's root (no parent missing, no circles),
+    /// and nothing exceeds the limits, or it's refused.
     pub fn restore(mounts: &[LiveMount], state: &[u8]) -> Result<Server> {
         use grix_abi::codec::Reader;
         let mut s = Server::new(mounts)?;
@@ -313,8 +343,8 @@ impl Server {
             let (id, parent) = (r.u64().map_err(d)?, r.u64().map_err(d)?);
             let name = r.str().map_err(d)?;
             cname(name).map_err(|_| bad("a name"))?;
-            // Sorted, and each after the one it's in.
-            if id <= last || id >= next_id || parent >= id || (parent > roots && !s.nodes.contains_key(&parent)) {
+            // Sorted. (Its parent may come later: `reachable` looks, below.)
+            if id <= last || id >= next_id || parent == id {
                 return Err(bad("an id"));
             }
             if parent == 0 || s.by_name.insert((parent, name.to_string()), id).is_some() {
@@ -326,6 +356,9 @@ impl Server {
             }
             s.nodes.insert(id, Node { parent, name: name.to_string() });
             last = id;
+        }
+        if Self::reachable(roots, &s.nodes).len() != s.nodes.len() {
+            return Err(bad("a parent"));
         }
         s.next_id = next_id.max(roots + 1);
         let known = |s: &Server, id: u64| (1..=roots).contains(&id) || s.nodes.contains_key(&id);
@@ -536,6 +569,12 @@ impl Server {
                             self.by_name.insert((dir, name.to_string()), id);
                         }
                     }
+                    return ok(Reply::Done);
+                }
+                // Onto itself: nothing happens, and the id stays (it has to
+                // be there, or noreplace's EEXIST; the host says).
+                if (from_dir, from) == (to_dir, to) {
+                    rename(df.as_raw_fd(), &cf, dt.as_raw_fd(), &ct, noreplace, false).map_err(err)?;
                     return ok(Reply::Done);
                 }
                 let keep = if noreplace { None } else { self.open_to_keep(to_dir, to, dt.as_raw_fd(), &ct) };
@@ -1106,6 +1145,112 @@ mod tests {
         let mut s = Server::new(&[ro]).unwrap();
         let r = req(&mut s, Request::Create { dir: 1, name: "x", ty: FileType::Dir, mode: 0o755, target: "" });
         assert_eq!(Reply::decode(&r).unwrap().1, Reply::Err(EROFS));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn known_id(r: &[u8]) -> u64 {
+        match Reply::decode(r).unwrap().1 {
+            Reply::Created { id, .. } | Reply::Found { id, .. } => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn scratch(name: &str) -> (PathBuf, impl Fn() -> LiveMount) {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let host = root.canonicalize().unwrap();
+        let mount = move || LiveMount { host: host.clone(), guest: "/m".into(), writable: true, lazy: false };
+        (root, mount)
+    }
+
+    #[test]
+    fn restore_takes_a_rename_into_a_newer_directory() {
+        // A file older than the directory it's in now: its parent's id
+        // comes after its own.
+        let (root, m) = scratch("rename");
+        let mut s = Server::new(&[m()]).unwrap();
+        let file = Request::Create { dir: 1, name: "a", ty: FileType::File, mode: 0o644, target: "" };
+        let a = known_id(&req(&mut s, file));
+        let z =
+            known_id(&req(&mut s, Request::Create { dir: 1, name: "z", ty: FileType::Dir, mode: 0o755, target: "" }));
+        assert!(a < z);
+        req(&mut s, Request::Rename { from_dir: 1, from: "a", to_dir: z, to: "a", noreplace: false, exchange: false });
+        let mut back = Server::restore(&[m()], &s.save()).unwrap();
+        let r = req(&mut back, Request::Stat { id: a });
+        assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(_)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_takes_what_a_removed_directory_leaves() {
+        // The guest knew d/f; f went on the host, d in the guest: f's id
+        // stays with no parent, and leads nowhere after a restore either.
+        let (root, m) = scratch("orphan");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/f"), "x").unwrap();
+        let mut s = Server::new(&[m()]).unwrap();
+        let d = known_id(&req(&mut s, Request::Lookup { dir: 1, name: "d" }));
+        let f = known_id(&req(&mut s, Request::Lookup { dir: d, name: "f" }));
+        std::fs::remove_file(root.join("d/f")).unwrap();
+        req(&mut s, Request::Remove { dir: 1, name: "d", is_dir: true });
+        let mut back = Server::restore(&[m()], &s.save()).unwrap();
+        let r = req(&mut back, Request::Stat { id: f });
+        assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Err(_)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A state as `save` writes it, of these ids.
+    fn state(next_id: u64, ids: &[(u64, u64, &str)]) -> Vec<u8> {
+        let mut w = grix_abi::codec::Writer::default();
+        w.u32(STATE_VERSION);
+        w.u32(1);
+        w.u64(next_id);
+        w.u32(ids.len() as u32);
+        for (id, parent, name) in ids {
+            w.u64(*id);
+            w.u64(*parent);
+            w.str(name);
+        }
+        w.u32(0);
+        w.u32(0);
+        w.buf
+    }
+
+    #[test]
+    fn restore_refuses_a_hostile_state() {
+        let (root, m) = scratch("hostile");
+        let good = Server::restore(&[m()], &state(5, &[(2, 1, "a"), (3, 4, "b"), (4, 1, "c")]));
+        assert!(good.is_ok(), "a parent after its child is fine");
+        for (what, bad) in [
+            ("a circle", state(5, &[(2, 3, "a"), (3, 2, "b")])),
+            ("its own parent", state(5, &[(2, 2, "a")])),
+            ("a circle under a good id", state(6, &[(2, 1, "a"), (3, 4, "b"), (4, 3, "c")])),
+            ("an unknown parent", state(5, &[(2, 9, "a")])),
+            ("no parent", state(5, &[(2, 0, "a")])),
+            ("a path as a name", state(5, &[(2, 1, "a/b")])),
+            ("dot dot", state(5, &[(2, 1, "..")])),
+            ("an empty name", state(5, &[(2, 1, "")])),
+            ("two ids for one name", state(5, &[(2, 1, "a"), (3, 1, "a")])),
+            ("out of order", state(5, &[(3, 1, "a"), (2, 1, "b")])),
+            ("an id past the next", state(3, &[(3, 1, "a")])),
+            ("a mount's root", state(5, &[(1, 1, "a")])),
+        ] {
+            assert!(Server::restore(&[m()], &bad).is_err(), "{what}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rename_onto_itself_keeps_the_id() {
+        let (root, m) = scratch("self");
+        std::fs::write(root.join("a"), "x").unwrap();
+        let mut s = Server::new(&[m()]).unwrap();
+        let a = known_id(&req(&mut s, Request::Lookup { dir: 1, name: "a" }));
+        let same = Request::Rename { from_dir: 1, from: "a", to_dir: 1, to: "a", noreplace: false, exchange: false };
+        assert_eq!(Reply::decode(&req(&mut s, same)).unwrap().1, Reply::Done);
+        let r = req(&mut s, Request::Stat { id: a });
+        assert!(matches!(Reply::decode(&r).unwrap().1, Reply::Attr(_)), "{:?}", Reply::decode(&r).unwrap().1);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
