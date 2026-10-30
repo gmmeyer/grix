@@ -4327,9 +4327,13 @@ fn kernel_stack_overflow_is_reported() {
     assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
     let deepest = stdout.rsplit_once(" stack_max=").and_then(|(_, n)| n.split_whitespace().next()?.parse::<u64>().ok());
     assert!(deepest.is_some_and(|n| n < 64 << 10), "{stdout}");
-    for (cpus, how) in [(1, "return"), (4, "return"), (1, "fault"), (4, "fault")] {
-        let threads = cpus.to_string();
-        let argv: &[&str] = if how == "fault" { &["/bin/kstack", &threads, how] } else { &["/bin/kstack", &threads] };
+    for (cpus, how) in [(1, "return"), (4, "return"), (1, "fault"), (4, "fault"), (1, "picked"), (4, "picked")] {
+        // `picked` wants a CPU with no thread to do the picking, which only
+        // one thread makes certain: with threads spinning, one of their
+        // CPUs may switch to the sleeper in its interrupt, and nothing goes
+        // that way before the program ends.
+        let threads = if how == "picked" { 1 } else { cpus }.to_string();
+        let argv: &[&str] = if how == "return" { &["/bin/kstack", &threads] } else { &["/bin/kstack", &threads, how] };
         // Seen by the canary on the way back, or by the exception.
         let says = if how == "fault" { " at " } else { " (its canary " };
         // The CPU the kernel names. With 4, the fixture calls from a
@@ -4339,13 +4343,15 @@ fn kernel_stack_overflow_is_reported() {
             let out = b("kstack", cpus).build().unwrap().run(argv).unwrap();
             assert_eq!(out.status, ExitStatus::KernelPanic, "{}{}", out.stdout_str(), out.kernel_log);
             assert!(out.stdout_str().starts_with("overflowing on cpu "), "{}", out.stdout_str());
+            // Before the thread gets back to user mode at all.
+            assert!(!out.stdout_str().contains("still here"), "{}", out.stdout_str());
             let cpu: u32 = out
                 .kernel_log
                 .split_once("kernel stack overflow on CPU ")
                 .and_then(|(_, rest)| rest.split_once(says))
                 .and_then(|(n, _)| n.parse().ok())
                 .unwrap_or_else(|| panic!("{}", out.kernel_log));
-            if cpus == 1 || cpu != 0 {
+            if cpus == 1 || how == "picked" || cpu != 0 {
                 assert!(cpu < cpus, "{}", out.kernel_log);
                 break;
             }

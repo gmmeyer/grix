@@ -32,13 +32,27 @@ pub(crate) const AT_FDCWD: i32 = -100;
 
 /// Debug builds only: a call no Linux has, which runs this CPU's kernel
 /// stack 1 KiB past its bottom, then returns (its first argument 0) or
-/// faults there (1), for the test that either is reported
-/// (`kernel_stack_overflow_is_reported`, with fixtures/src/kstack.c). And
-/// x86_64's next idle wait starts with the console's vector in service
+/// faults there (1), or leaves that for the next CPU that picks a thread
+/// to do on its way out (2, `overflow_if_asked`), for the test that each
+/// is reported (`kernel_stack_overflow_is_reported`, with
+/// fixtures/src/kstack.c). And x86_64's next idle wait starts with the console's vector in service
 /// (3, `irq::take_device_beneath`), for
 /// `a_device_interrupt_beneath_a_timer_is_not_left_behind`.
 #[cfg(debug_assertions)]
 const STACK_OVERFLOW_TEST: u64 = 0x6772_6978;
+
+#[cfg(debug_assertions)]
+static OVERFLOW_ASKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A thread was picked, and `signal::return_to_user` has run for it, which
+/// is as deep as a signal frame takes the stack: the `smp::finish` path no
+/// other way back to user mode goes.
+#[cfg(debug_assertions)]
+pub fn overflow_if_asked() {
+    if OVERFLOW_ASKED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        overflow_stack(crate::arch::stack_bottom(crate::smp::me()) - 1024, false);
+    }
+}
 
 #[cfg(debug_assertions)]
 fn overflow_stack(to: u64, fault: bool) -> u64 {
@@ -59,6 +73,10 @@ pub fn handle(tf: &mut TrapFrame) {
     let a = tf.syscall_args();
     #[cfg(debug_assertions)]
     if n == STACK_OVERFLOW_TEST {
+        if a[0] == 2 {
+            OVERFLOW_ASKED.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if a[0] == 3 {
             #[cfg(target_arch = "x86_64")]
             crate::arch::irq::device_beneath_next_wake(crate::console::irq());

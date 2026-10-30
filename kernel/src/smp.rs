@@ -555,7 +555,6 @@ fn kick(cpu: usize) {
 /// no thread (it parked, or idles), wait for something to run without
 /// holding anything, and load it into `tf`. Then give the kernel back.
 pub fn finish(tf: &mut TrapFrame) {
-    check_stack();
     // Schedule before waiting: a CPU whose thread just ended may have
     // others to run.
     loop {
@@ -580,6 +579,8 @@ pub fn finish(tf: &mut TrapFrame) {
             // never take them: Go waits for each preemption signal to land
             // before sending another).
             crate::signal::return_to_user(tf);
+            #[cfg(debug_assertions)]
+            crate::syscall::overflow_if_asked();
             continue;
         }
         // Checking on the host may itself have freed room for a writer.
@@ -592,6 +593,9 @@ pub fn finish(tf: &mut TrapFrame) {
         lock();
         crate::sched::interrupts();
     }
+    // Last, as what ran above may have gone deep (a signal frame pushed
+    // for the thread just picked).
+    check_stack();
     unlock();
 }
 
