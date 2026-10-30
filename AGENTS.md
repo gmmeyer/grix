@@ -436,8 +436,9 @@ write nothing the lock covers (the process, `PROCS`, the filesystem,
 timers, wait queues, the console, other CPUs' state: debug-asserted for
 the lock, `fs::lock` and `Procs::each`); never flush a TLB or change a
 present entry (x86's catch-up relies on flushes happening under the
-lock); wait for nothing but a gate, and never wait for another CPU
-holding one (but in `flush_tlb`); and if what it reports can change
+lock); wait for nothing but a gate (`lock_fast`, which gives way to the
+kernel lock's holder: `wanted`), and never wait for another CPU holding
+one (but in `flush_tlb`); return through x86's `sanitize`; and if what it reports can change
 while the thread runs on (another CPU's setuid, a parent's end, TSYNC),
 the change calls `fast::changed`. Pending signals, preemption and stops
 reach a CPU there as interrupts, taken on the way back to user mode.
