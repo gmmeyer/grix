@@ -129,8 +129,18 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             write_u64(&mut p.aspace, a[2], (1u64 << crate::smp::count()) - 1)?;
             Ok(8)
         }
-        nr::sched_setaffinity | nr::sched_setparam | nr::sched_setscheduler => Ok(0),
+        nr::sched_setaffinity => Ok(0),
+        nr::sched_setscheduler => sched_set(p, Some(a[1]), a[2]),
+        nr::sched_setparam => sched_set(p, None, a[1]),
         nr::sched_getscheduler => Ok(0),
+        // SCHED_OTHER, SCHED_BATCH, SCHED_IDLE and SCHED_DEADLINE have
+        // only priority 0; SCHED_FIFO and SCHED_RR 1 to 99.
+        nr::sched_get_priority_max | nr::sched_get_priority_min => match a[0] as i32 {
+            0 | 3 | 5 | 6 => Ok(0),
+            1 | 2 if n == nr::sched_get_priority_max => Ok(99),
+            1 | 2 => Ok(1),
+            _ => Err(EINVAL),
+        },
         nr::sched_getparam => write_u32(&mut p.aspace, a[1], 0).map(|_| 0),
         nr::getpriority => Ok(20),
         nr::setpriority => Ok(0),
@@ -282,6 +292,24 @@ fn set_fs_id(p: &mut Process, n: u32, name: &str, id: u32) -> SysResult {
         let _ = p.unimplemented(n, name, "file system ids apart from the effective ones", EINVAL);
     }
     Ok(e as u64)
+}
+
+/// sched_setscheduler (with a policy) and sched_setparam. Every thread
+/// is SCHED_OTHER: the normal policies' only priority, 0, changes nothing
+/// (the scheduler is round-robin anyway), and the real-time ones need
+/// CAP_SYS_NICE (or an RLIMIT_RTPRIO), which nothing has, as under Docker.
+fn sched_set(p: &mut Process, policy: Option<u64>, param: u64) -> SysResult {
+    const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+    let mut b = [0u8; 4];
+    copy_in(&mut p.aspace, param, &mut b)?;
+    let prio = i32::from_le_bytes(b);
+    let policy = policy.map_or(0, |n| n as u32 & !SCHED_RESET_ON_FORK) as i32;
+    match policy {
+        0 | 3 | 5 if prio == 0 => Ok(0),
+        1 | 2 if (1..=99).contains(&prio) => Err(EPERM),
+        6 => Err(EPERM),
+        _ => Err(EINVAL),
+    }
 }
 
 fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {

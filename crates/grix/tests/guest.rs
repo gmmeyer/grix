@@ -2067,6 +2067,12 @@ fn sysctls_say_what_grix_does() {
 }
 
 #[test]
+fn scheduling_priorities() {
+    // .NET's Thread.Priority (every MSBuild worker) asks for the range.
+    popular(with("popular"), &["schedprio"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

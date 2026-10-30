@@ -150,6 +150,8 @@ syscalls! {
     122 sched_setaffinity Core;
     123 sched_getaffinity Core;
     124 sched_yield Core;
+    125 sched_get_priority_max Core;
+    126 sched_get_priority_min Core;
     129 kill Core;
     130 tkill Core;
     131 tgkill Core;
@@ -421,6 +423,8 @@ syscalls! {
     143 sched_getparam Core;
     144 sched_setscheduler Core;
     145 sched_getscheduler Core;
+    146 sched_get_priority_max Core;
+    147 sched_get_priority_min Core;
     149 mlock Core;
     150 munlock Core;
     151 mlockall Core;

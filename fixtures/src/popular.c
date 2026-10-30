@@ -9,6 +9,8 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -918,6 +920,27 @@ static int sysctls(void) {
     return 0;
 }
 
+// .NET's Thread.Priority asks for the policy's priority range (MSBuild
+// sets it on every worker): SCHED_OTHER's is 0..0. Real-time policies
+// need CAP_SYS_NICE, which nothing has, as under Docker. (musl's
+// sched_setscheduler doesn't make the call: syscall() does.)
+static int schedprio(void) {
+    CHECK(sched_get_priority_max(SCHED_OTHER) == 0 && sched_get_priority_min(SCHED_OTHER) == 0);
+    CHECK(sched_get_priority_max(SCHED_FIFO) == 99 && sched_get_priority_min(SCHED_RR) == 1);
+    CHECK(sched_get_priority_max(SCHED_BATCH) == 0 && sched_get_priority_min(SCHED_IDLE) == 0);
+    errno = 0;
+    CHECK(sched_get_priority_max(42) == -1 && errno == EINVAL);
+    struct sched_param sp = {0};
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp) == 0);
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp) == 0);
+    sp.sched_priority = 10;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp) == -1 && errno == EPERM);
+    CHECK(syscall(SYS_sched_setparam, 0, &sp) == -1 && errno == EINVAL);
+    sp.sched_priority = 0;
+    CHECK(syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -944,6 +967,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "xattrmounts") == 0) r = xattrmounts();
         if (strcmp(argv[i], "xattrcopied") == 0) r = xattrcopied();
         if (strcmp(argv[i], "sysctls") == 0) r = sysctls();
+        if (strcmp(argv[i], "schedprio") == 0) r = schedprio();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);
