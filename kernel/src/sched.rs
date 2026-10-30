@@ -215,6 +215,10 @@ fn poll(mut p: Option<&mut Process>, procs: &mut Procs, timer: bool) -> bool {
             return woke;
         }
         let (mut next, mut cpu_timed) = (NONE, false);
+        if timers {
+            woke |= crate::timer::fire_timerfds();
+            next = crate::timer::timerfd_deadline().map_or(NONE, clamp);
+        }
         for q in procs.each(p.as_deref_mut()) {
             if timers {
                 woke |= crate::timer::fire(q);
@@ -383,7 +387,7 @@ fn earliest(p: Option<&mut Process>, procs: &mut Procs) -> Option<u64> {
     if known != 0 && !CPU_TIMED.load(Ordering::Relaxed) {
         return (known != NONE).then_some(known);
     }
-    let (mut next, mut cpu, mut cpu_timed) = (NONE, NONE, false);
+    let (mut next, mut cpu, mut cpu_timed) = (crate::timer::timerfd_deadline().map_or(NONE, clamp), NONE, false);
     for q in procs.each(p) {
         next = next.min(deadline_of(q));
         cpu = cpu.min(crate::timer::cpu_deadline(q).map_or(NONE, clamp));

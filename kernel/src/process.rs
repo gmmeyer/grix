@@ -569,7 +569,6 @@ impl Process {
         c.envp = self.envp.clone();
         c.auxv = self.auxv.clone();
         c.io_seen = self.io_seen;
-        c.timers.fds = self.timers.fds.clone();
         c.uses_signalfd = self.uses_signalfd;
         Ok(c)
     }

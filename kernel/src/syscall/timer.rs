@@ -264,7 +264,7 @@ pub fn timerfd_create(p: &mut Process, clock: u64, flags: u64) -> SysResult {
     }
     timer_clock(p, nr::timerfd_create, clock, false)?;
     let tfd = Arc::new(Mutex::new(TimerFd { clock, ..TimerFd::default() }));
-    p.timers.add_fd(&tfd);
+    crate::timer::add_timerfd(&tfd);
     let file = new_file(FileKind::TimerFd(tfd), O_RDONLY | (flags as u32 & O_NONBLOCK));
     p.fds.alloc(FdEntry { file, cloexec: flags & TFD_CLOEXEC != 0 }, 0)
 }
