@@ -84,6 +84,19 @@ int main(void) {
     CHECK(atomic_load(&counters[0]) > a && atomic_load(&counters[1]) > b);
     CHECK(nchld == 2 && chld_codes[0] == CLD_STOPPED && chld_codes[1] == CLD_CONTINUED);
 
+    // A stop is reported once every thread has left its CPU, as Linux's
+    // last thread to stop tells the parent: nothing counts after the wait.
+    for (int i = 0; i < 200; i++) {
+        CHECK(kill(pid, SIGSTOP) == 0);
+        CHECK(waitpid(pid, &st, WUNTRACED) == pid && WIFSTOPPED(st));
+        a = atomic_load(&counters[0]), b = atomic_load(&counters[1]);
+        ms(1);
+        CHECK(atomic_load(&counters[0]) == a && atomic_load(&counters[1]) == b);
+        CHECK(kill(pid, SIGCONT) == 0);
+        CHECK(waitpid(pid, &st, WCONTINUED) == pid && WIFCONTINUED(st));
+        for (int j = 0; j < 500 && (atomic_load(&counters[0]) == a || atomic_load(&counters[1]) == b); j++) ms(1);
+    }
+
     // waitid sees a stop too, and SIGKILL ends a stopped process.
     CHECK(kill(pid, SIGTSTP) == 0);
     siginfo_t si;
