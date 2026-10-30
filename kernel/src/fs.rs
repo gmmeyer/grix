@@ -880,7 +880,9 @@ pub fn proc_gone(pid: u32) {
 }
 
 /// Process `pid` ended and is a zombie: its /proc/<pid> stays until it's
-/// reaped (`proc_gone`), as on Linux, with what a zombie still has.
+/// reaped (`proc_gone`), as on Linux, with what a zombie still has: of
+/// /proc/<pid>/task only the leader, as its threads, which paid for their
+/// nodes, are gone (the zombie holds what its last one paid).
 pub fn proc_zombie(pid: u32) {
     later(Later::Proc(pid, false));
 }
@@ -1398,6 +1400,7 @@ impl Fs {
             match what {
                 Later::Proc(pid, true) => self.proc_remove(pid),
                 Later::Proc(pid, false) => {
+                    self.tasks_set(pid, &[pid]);
                     if let Some(&dir) = self.pid_dirs.get(&pid) {
                         self.zombie_dirs.insert(dir);
                     }

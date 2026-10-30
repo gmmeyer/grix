@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -174,7 +175,7 @@ static int do_zombies(int rounds) {
             if (atoi(name) == pid) leader = 1;
             else if (strcmp(name, ".") && strcmp(name, "..")) others++;
         }
-        CHECK(leader);
+        others += !leader;
         close(dir);
     }
     CHECK(others == 0);
@@ -335,6 +336,32 @@ static int do_holefill(long pages) {
     // Past a truncate, and back: a hole again.
     CHECK(ftruncate(fd, len + PAGE) == 0);
     printf("holes filled\n");
+    return 0;
+}
+
+// One file dup'ed to every descriptor there may be, and each registered
+// with epoll instance after instance: the file's the same, so no limit on
+// files or descriptors applies to what epoll keeps.
+static int do_epolls(long instances) {
+    struct rlimit rl = {65536, 65536};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    int ev = syscall(SYS_eventfd2, 0, 0);
+    CHECK(ev >= 0);
+    int low = 1000, high = 60000;
+    for (int i = low; i < high; i++) CHECK(dup2(ev, i) == i);
+    struct epoll_event event = {.events = EPOLLIN};
+    long added = 0, refused = 0;
+    for (long e = 0; e < instances && !refused; e++) {
+        int ep = epoll_create1(0);
+        CHECK(ep >= 0);
+        for (int i = low; i < high; i++) {
+            if (epoll_ctl(ep, EPOLL_CTL_ADD, i, &event) == 0) added++;
+            else if (errno == ENOSPC) { refused = 1; break; }
+            else CHECK(0);
+        }
+    }
+    CHECK(refused);
+    printf("%s after a while\n", added > 10000 ? "refused" : "refused early");
     return 0;
 }
 
@@ -510,6 +537,7 @@ int main(int argc, char **argv) {
     if (!strcmp(what, "holes")) return do_holes(a ? a : 4000000);
     if (!strcmp(what, "holefill")) return do_holefill(a ? a : 4096);
     if (!strcmp(what, "remaps")) return do_remaps(a ? a : 2000000);
+    if (!strcmp(what, "epolls")) return do_epolls(a ? a : 500);
     if (!strcmp(what, "magic")) return do_magic();
     if (!strcmp(what, "creds")) return do_creds();
     if (!strcmp(what, "xattrs")) return do_xattrs(a ? a : 5000);

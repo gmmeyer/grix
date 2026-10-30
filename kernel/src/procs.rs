@@ -30,6 +30,8 @@ pub struct Zombie {
     pub cpu_ns: u64,
     /// What its /proc/<pid> still shows.
     pub remains: crate::procfs::Remains,
+    /// What its last thread paid, for the task entry it keeps.
+    pub _charge: crate::kmem::Charge,
 }
 
 pub struct Procs {
@@ -155,6 +157,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     threads_gone(dead.threads.len());
     // What /proc/<pid> keeps of it, before anything goes.
     let remains = crate::procfs::Remains::of(dead);
+    let charge = dead.threads.values_mut().next().map(|t| core::mem::take(&mut t.charge)).unwrap_or_default();
     // Its POSIX locks go with its descriptor table, unless another process
     // (CLONE_FILES) still uses that.
     dead.fds = FdTable::empty();
@@ -212,9 +215,12 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     let act = parent.action(SIGCHLD);
     // Linux reaps at once for a parent that ignores SIGCHLD (or asked with
     // SA_NOCLDWAIT): its wait4 then just waits for the last child.
-    // Its /proc/<pid> stays while it's a zombie.
+    // Its /proc/<pid> stays while it's a zombie, its threads' entries
+    // but the leader's going with what paid for them.
     if act.handler != SIG_IGN && act.flags & SA_NOCLDWAIT == 0 {
-        procs.zombies.insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains });
+        procs
+            .zombies
+            .insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains, _charge: charge });
         crate::fs::proc_zombie(pid);
     } else {
         crate::fs::proc_gone(pid);

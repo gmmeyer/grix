@@ -4161,3 +4161,14 @@ fn page_table_entries_cost_no_heap() {
     let b = with("hardening").memory_mb(1024).timeout(Duration::from_secs(120));
     hardened(b, &["mremap", "256"], "moved 65536 pages");
 }
+
+/// A zombie's threads are gone and what they paid is given back, so its
+/// /proc/<pid>/task keeps only the leader, as on Linux. Zombies count
+/// against MAX_PROCESSES, and each of these had all the threads there may
+/// be: with their nodes left, some rounds of this run the heap out.
+#[test]
+fn zombies_keep_nothing_of_their_threads() {
+    let b = with("hardening").allow(Capability::Threads).allow(Capability::Process).timeout(Duration::from_secs(300));
+    hardened(b, &["zombies", "40"], "survived 40 rounds");
+}
+
