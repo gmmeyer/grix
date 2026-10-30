@@ -4023,6 +4023,14 @@ fn threads_run_in_parallel_on_more_cpus() {
     let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "discard"]);
     assert_eq!(out.stdout_str(), "discard ok\n", "{:?}\n{}", out.status, out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
+    // What the kernel answers without its lock (`fast`) follows changes
+    // made on other CPUs: a parent's end, another thread's seccomp TSYNC.
+    for cpus in [1, 4] {
+        let out = run(b().cpus(cpus).timeout(Duration::from_secs(60)), &["/bin/smp", "fast"]);
+        assert_eq!(out.stdout_str(), "fast ok\n", "{:?}", out.status);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     // The CPU count is checked.
     assert!(Sandbox::builder().cpus(0).build().is_err());
     assert!(Sandbox::builder().cpus(9).build().is_err());
@@ -4054,9 +4062,14 @@ fn smp_counters_and_benchmark() {
             assert!(n("lock_held_us") > 0 && n("syscall") > 0, "{stdout}");
             assert!(n("timer_idle") <= n("timer"), "{stdout}");
             match r["mode"] {
-                "syscall" | "futex" => assert!(n("syscall") >= ops, "{stdout}"),
-                // Each touches 16 new pages, and frees them.
-                "mmap" | "procs" => assert!(n("fault") >= 16 * ops && n("flush") >= ops, "{stdout}"),
+                // getppid is answered without the kernel lock (`fast`).
+                "syscall" => assert!(n("syscall") >= ops && n("fast") >= ops, "{stdout}"),
+                "futex" => assert!(n("syscall") >= ops, "{stdout}"),
+                // Each touches 16 new pages (without the kernel lock), and
+                // frees them.
+                "mmap" | "procs" => {
+                    assert!(n("fault") >= 16 * ops && n("fast") >= 16 * ops && n("flush") >= ops, "{stdout}")
+                }
                 "sleeper" => assert!(n("wakeups") > 0 && n("timer") > 0, "{stdout}"),
                 _ => {}
             }

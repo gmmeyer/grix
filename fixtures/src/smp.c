@@ -15,6 +15,10 @@
 //                pages up (MADV_DONTNEED) again and again, then that page
 //                is where both see it: no CPU keeps a mapping of a page
 //                that went (prints "discard ok")
+//   smp fast     what the kernel answers without its lock (getppid,
+//                getpid) follows changes made on other CPUs while a
+//                thread asks again and again: its parent's end, a
+//                sibling's seccomp TSYNC (prints "fast ok")
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -23,7 +27,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <linux/filter.h>
 #include <linux/membarrier.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -222,6 +231,107 @@ static int discard(void) {
     return 0;
 }
 
+// smp fast. Each check spins on a call while the change is made
+// elsewhere, then sees the change; spinning on the stale answer for 10 s
+// fails.
+static _Atomic int changed;
+
+// Raw calls, nothing of libc's in between.
+static long call0(long nr) {
+    return syscall(nr);
+}
+
+// The call a thread asks again and again until told its filter is in
+// (either answer meanwhile: the filter may come first), then only EPERM.
+static long asked_nr;
+
+static void *asks(void *arg) {
+    (void)arg;
+    // Before the filter (installed after a sleep): the answer as it was.
+    long was = call0(asked_nr);
+    while (!atomic_load(&changed)) {
+        errno = 0;
+        long r = call0(asked_nr);
+        CHECK(r == was || (r == -1 && errno == EPERM));
+    }
+    errno = 0;
+    CHECK(call0(asked_nr) == -1 && errno == EPERM);
+    return 0;
+}
+
+static void *yields(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100000; i++) CHECK(sched_yield() == 0);
+    return 0;
+}
+
+static int fast(long cpus) {
+    // getppid: a grandchild asks until its parent has ended.
+    pid_t mid = fork();
+    CHECK(mid >= 0);
+    if (mid == 0) {
+        int ready[2];
+        CHECK(pipe(ready) == 0);
+        pid_t c = fork();
+        CHECK(c >= 0);
+        if (c == 0) {
+            pid_t parent = call0(SYS_getppid);
+            CHECK(write(ready[1], "x", 1) == 1);
+            double t0 = now();
+            while (call0(SYS_getppid) == parent) {
+                if (now() - t0 > 10) _exit(2);
+            }
+            _exit(call0(SYS_getppid) == 1 ? 0 : 3);
+        }
+        char x;
+        CHECK(read(ready[0], &x, 1) == 1);
+        // Busy for a while (as below), so the child asks from a CPU of its
+        // own when this one ends.
+        for (double t0 = now(); now() - t0 < 0.01;) {
+        }
+        _exit(0);
+    }
+    for (int i = 0; i < 2; i++) {
+        int status;
+        pid_t pid = waitpid(-1, &status, 0);
+        CHECK(pid > 0 && WIFEXITED(status));
+        if (WEXITSTATUS(status) != 0) {
+            printf("FAILED: getppid (exit %d)\n", WEXITSTATUS(status));
+            return 1;
+        }
+    }
+    // sched_yield, with and without others to run.
+    pthread_t t[8];
+    int n = cpus + 1 < 8 ? cpus + 1 : 8;
+    for (int i = 0; i < n; i++) CHECK(pthread_create(&t[i], 0, yields, 0) == 0);
+    for (int i = 0; i < n; i++) pthread_join(t[i], 0);
+    // Each of those calls in turn, while a sibling installs a filter that
+    // refuses it on every thread.
+    CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+    long calls[] = {SYS_getpid, SYS_getppid, SYS_gettid, SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid};
+    for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        asked_nr = calls[i];
+        atomic_store(&changed, 0);
+        CHECK(pthread_create(&t[0], 0, asks, 0) == 0);
+        // Busy, not asleep: a timer waking this thread could preempt the
+        // asking one, and its next run would start from a fresh snapshot.
+        for (double t0 = now(); now() - t0 < 0.01;) {
+        }
+        struct sock_filter filter[] = {
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, calls[i], 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        struct sock_fprog prog = {sizeof filter / sizeof filter[0], filter};
+        CHECK(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0);
+        atomic_store(&changed, 1);
+        pthread_join(t[0], 0);
+    }
+    printf("fast ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "exec-done") == 0) {
         printf("exec ok\n");
@@ -241,6 +351,7 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && strcmp(argv[1], "cow") == 0) return cow(cpus);
     if (argc > 1 && strcmp(argv[1], "discard") == 0) return discard();
+    if (argc > 1 && strcmp(argv[1], "fast") == 0) return fast(cpus);
     if (argc > 1 && strcmp(argv[1], "fork") == 0) {
         // The child is another process: the spinning thread's CPU has to
         // give way for it to run at all.
