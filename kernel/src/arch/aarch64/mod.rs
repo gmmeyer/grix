@@ -300,6 +300,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             tf.sp_el0
         );
     }
+    // What can be done without the kernel lock (`fast`), and back.
+    if kind == 8 && fast_sync() {
+        return;
+    }
     crate::smp::enter(match kind {
         8 if esr() >> 26 == EC_SVC64 => crate::smp::Stat::Syscall,
         8 => crate::smp::Stat::Fault,
@@ -334,6 +338,29 @@ extern "C" fn stack_overflow_report(sp: u64) -> ! {
     panic!("kernel stack overflow on CPU {} at {elr:#x}, sp {sp:#x}, far {:#x}, esr {:#x}", cpu_number(), far(), esr());
 }
 
+/// A synchronous exception from EL0 that `fast` handled: a translation
+/// fault (demand paging) it could.
+fn fast_sync() -> bool {
+    let esr = esr();
+    let ec = esr >> 26;
+    let translation = (0b000100..=0b000111).contains(&(esr & 0x3f));
+    (ec == EC_IABT_LOWER || ec == EC_DABT_LOWER) && translation && crate::fast::fault(far(), access(ec, esr))
+}
+
+/// What an abort from EL0 tried. WnR is also set for cache maintenance
+/// (CM), which only needs to read the page, as Linux's is_write_abort
+/// says: `dc cvau` on a JIT's executable view of its code (Erlang's
+/// __clear_cache) must fault it in, not fail.
+fn access(ec: u64, esr: u64) -> process::Access {
+    if ec == EC_IABT_LOWER {
+        process::Access::Exec
+    } else if esr & (1 << 6) != 0 && esr & (1 << 8) == 0 {
+        process::Access::Write
+    } else {
+        process::Access::Read
+    }
+}
+
 fn el0_sync(tf: &mut TrapFrame) {
     let esr = esr();
     let ec = esr >> 26;
@@ -342,17 +369,7 @@ fn el0_sync(tf: &mut TrapFrame) {
         EC_IABT_LOWER | EC_DABT_LOWER => {
             let far = far();
             let dfsc = esr & 0x3f;
-            // WnR is also set for cache maintenance (CM), which only
-            // needs to read the page, as Linux's is_write_abort says:
-            // `dc cvau` on a JIT's executable view of its code (Erlang's
-            // __clear_cache) must fault it in, not fail.
-            let access = if ec == EC_IABT_LOWER {
-                process::Access::Exec
-            } else if esr & (1 << 6) != 0 && esr & (1 << 8) == 0 {
-                process::Access::Write
-            } else {
-                process::Access::Read
-            };
+            let access = access(ec, esr);
             match dfsc {
                 // Translation fault at any level: demand paging. A
                 // permission fault on a write may be a page shared

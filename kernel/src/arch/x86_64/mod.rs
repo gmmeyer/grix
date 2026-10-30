@@ -508,6 +508,10 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
             tf.rcx,
         );
     }
+    // A page not present, which `fast` may fill without the kernel lock.
+    if tf.vector == 14 && tf.error & 1 == 0 && crate::fast::fault(cr2(), page_access(tf.error)) {
+        return;
+    }
     crate::smp::enter(match tf.vector {
         SYSCALL => crate::smp::Stat::Syscall,
         v if v < 32 => crate::smp::Stat::Fault,
@@ -556,19 +560,24 @@ const FPE_INTDIV: i32 = 1;
 const ILL_ILLOPN: i32 = 2;
 const SI_KERNEL: i32 = 0x80;
 
+/// What a page fault with error code `error` tried.
+fn page_access(error: u64) -> process::Access {
+    if error & 0x10 != 0 {
+        process::Access::Exec
+    } else if error & 2 != 0 {
+        process::Access::Write
+    } else {
+        process::Access::Read
+    }
+}
+
 fn user_exception(tf: &mut TrapFrame) {
     // sigcontext's trapno and err.
     let syndrome = Some(tf.vector << 32 | (tf.error & 0xffff_ffff));
     let (sig, code, addr, why) = match tf.vector {
         14 => {
             let addr = cr2();
-            let access = if tf.error & 0x10 != 0 {
-                process::Access::Exec
-            } else if tf.error & 2 != 0 {
-                process::Access::Write
-            } else {
-                process::Access::Read
-            };
+            let access = page_access(tf.error);
             // Not present: demand paging. A write to a present page may be
             // to one shared copy-on-write; `user_fault` tells.
             if tf.error & 1 == 0 || access == process::Access::Write {

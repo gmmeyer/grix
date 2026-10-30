@@ -113,9 +113,12 @@ pub enum Stat {
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     FlushIpi,
     FlushWait,
+    /// Entries handled without the kernel lock (`fast`), counted among
+    /// the syscalls and faults too.
+    Fast,
 }
 
-const STATS: usize = Stat::FlushWait as usize + 1;
+const STATS: usize = Stat::Fast as usize + 1;
 /// The names /proc/grix/smp shows, in `Stat`'s order (times in µs).
 const STAT_NAMES: [&str; STATS] = [
     "syscall",
@@ -133,14 +136,18 @@ const STAT_NAMES: [&str; STATS] = [
     "flush",
     "flush_ipi",
     "flush_wait_us",
+    "fast",
 ];
-static COUNTS: [[AtomicU64; STATS]; N] = [const { [const { AtomicU64::new(0) }; STATS] }; N];
+/// A CPU's counts, on cache lines of their own.
+#[repr(align(128))]
+struct Counts([AtomicU64; STATS]);
+static COUNTS: [Counts; N] = [const { Counts([const { AtomicU64::new(0) }; STATS]) }; N];
 /// When this CPU took the kernel lock (`Stat::LockHeld`).
 static TAKEN: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
 /// Count `n` of `stat` on CPU `cpu`.
 pub fn note_on(cpu: usize, stat: Stat, n: u64) {
-    COUNTS[cpu % N][stat as usize].fetch_add(n, Ordering::Relaxed);
+    COUNTS[cpu % N].0[stat as usize].fetch_add(n, Ordering::Relaxed);
 }
 
 /// Count `n` of `stat` on this CPU.
@@ -218,7 +225,7 @@ pub fn stats(s: &mut alloc::string::String) {
     let (mut all, mut stack) = ([0u64; STATS], 0);
     for (cpu, counts) in COUNTS.iter().enumerate().take(count() as usize) {
         let _ = write!(s, "{cpu}");
-        for (i, c) in counts.iter().enumerate() {
+        for (i, c) in counts.0.iter().enumerate() {
             let v = c.load(Ordering::Relaxed);
             all[i] = if i == Stat::LockWaitMax as usize { all[i].max(v) } else { all[i] + v };
             let _ = write!(s, " {}", shown(i, v));
@@ -232,6 +239,22 @@ pub fn stats(s: &mut alloc::string::String) {
         let _ = write!(s, " {}", shown(i, v));
     }
     let _ = writeln!(s, " {stack}");
+}
+
+/// A fast entry (`fast`) starts, without the kernel lock: as one in the
+/// kernel for `barrier_others` and x86_64's TLB flushes, which then leave
+/// it to catch up (`arch::tlb_sync`) once it has the address space's gate.
+pub fn fast_enter() {
+    let cpu = me();
+    IN_KERNEL[cpu].store(true, Ordering::SeqCst);
+    ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
+}
+
+/// It's done (still holding the gate: a flush that comes after sees it
+/// out of the kernel, and its IPI is taken on the way back to user mode).
+pub fn fast_leave() {
+    check_stack();
+    IN_KERNEL[me()].store(false, Ordering::SeqCst);
 }
 
 /// Take the kernel for an exception of kind `why` (`Stat::Syscall`,
@@ -254,7 +277,7 @@ pub fn lock() {
     let taken = arch::counter();
     let waited = taken.wrapping_sub(start);
     note_on(cpu, Stat::LockWait, waited);
-    COUNTS[cpu][Stat::LockWaitMax as usize].fetch_max(waited, Ordering::Relaxed);
+    COUNTS[cpu].0[Stat::LockWaitMax as usize].fetch_max(waited, Ordering::Relaxed);
     TAKEN[cpu].store(taken, Ordering::Relaxed);
     arch::tlb_sync();
     let me = me();
@@ -310,6 +333,7 @@ pub fn unlock() {
         let mut procs = PROCS.lock();
         if taken.is_none() {
             (cpus[me].tid, cpus[me].pid) = (None, None);
+            crate::fast::update(None);
         }
         if let Some(mut p) = taken {
             let c = &mut cpus[me];
@@ -318,6 +342,7 @@ pub fn unlock() {
             c.slice_start = p.slice_start;
             c.resched = p.resched;
             c.timer_dirty = p.timer_dirty;
+            crate::fast::update(c.tid.map(|_| &*p));
             // What's per CPU stays with the CPU.
             p.running = false;
             p.current = NO_THREAD;

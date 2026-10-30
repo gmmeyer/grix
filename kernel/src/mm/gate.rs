@@ -69,6 +69,16 @@ impl Mm {
         self.0.held()
     }
 
+    /// A reference for this CPU's fast entries (`fast::update`).
+    pub fn share(&self) -> Arc<Inner> {
+        self.0.clone()
+    }
+
+    /// Is `inner` this address space?
+    pub fn is(&self, inner: &Arc<Inner>) -> bool {
+        Arc::ptr_eq(&self.0, inner)
+    }
+
     /// The address space, for code that may not hold its gate (another
     /// process's): taken until the guard goes, unless this CPU holds it.
     pub fn access(&self) -> Guard<'_> {

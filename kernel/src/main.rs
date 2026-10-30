@@ -20,6 +20,7 @@ mod console;
 mod elf;
 mod errno;
 mod export;
+mod fast;
 mod fasync;
 mod fd;
 mod fs;

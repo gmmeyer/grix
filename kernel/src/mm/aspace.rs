@@ -834,6 +834,26 @@ impl AddressSpace {
 
     /// Resolve a fault: an unmapped page, or a write to one shared
     /// copy-on-write.
+    /// `fault`, if it's one a CPU may handle without the kernel lock
+    /// (`fast::fault`): a page of anonymous memory or of an imported file
+    /// that isn't mapped yet, or is mapped and allowed (another CPU's fault
+    /// got there first). That fills an empty entry, which no TLB holds and
+    /// no other address space shares, from a new frame: nothing to flush,
+    /// no file to lock, nothing another process sees. Anything else, or
+    /// failing (out of memory), is left to `fault` under the lock. Returns
+    /// whether it was handled.
+    pub fn fast_fault(&mut self, va: u64, access: Access) -> bool {
+        let Some(vma) = self.find(va) else { return false };
+        if !vma.allows(access) || !matches!(vma.backing, Backing::Anon | Backing::File { .. }) {
+            return false;
+        }
+        if let Some(pte) = self.pt.lookup(page_down(va)) {
+            // A write to a page shared copy-on-write changes a present entry.
+            return access != Access::Write || paging::writable(pte);
+        }
+        self.fault(va, access).is_ok()
+    }
+
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), FaultError> {
         let page = page_down(va);
         let vma = self.find(va).ok_or(FaultError::Segv)?.clone();
