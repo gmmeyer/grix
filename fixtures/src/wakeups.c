@@ -15,6 +15,9 @@
 //                       spins: the parent's wait() returns
 //   wakeups sigio       SIGIO wakes a process, the writer spinning
 //   wakeups sigcont     O_ASYNC's signal is SIGCONT, for a stopped process
+//   wakeups futex       a futex between processes wakes one, the waker
+//                       spinning
+//   wakeups semaphore   the same for a process-shared semaphore's post
 //   wakeups console [S] for S seconds (2) writes to stdout that need the
 //                       console's interrupts go on, between the CPU idling
 //                       and spinning, with timers firing around them
@@ -32,6 +35,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -279,6 +283,48 @@ static int sigcont_continues(void) {
     return 0;
 }
 
+static int futex_wakes(void) {
+    atomic_int *word = shared_flag(), *ran = word + 1;
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        atomic_store(word, 1);
+        while (atomic_load(word) == 1) syscall(SYS_futex, word, FUTEX_WAIT, 1, 0, 0, 0);
+        atomic_store(ran, 1);
+        _exit(0);
+    }
+    spin_until(word, 1, "the child never started");
+    sleep_ms(50);
+    atomic_store(word, 2);
+    CHECK(syscall(SYS_futex, word, FUTEX_WAKE, 1, 0, 0, 0) == 1);
+    spin_until(ran, 1, "the child a futex woke never ran");
+    CHECK(waitpid(c, 0, 0) == c);
+    printf("futex ok\n");
+    return 0;
+}
+
+static int semaphore_wakes(void) {
+    atomic_int *ran = shared_flag(), *started = ran + 1;
+    sem_t *sem = (sem_t *)(ran + 16);
+    CHECK(sem_init(sem, 1, 0) == 0);
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) {
+        atomic_store(started, 1);
+        while (sem_wait(sem) != 0) {
+        }
+        atomic_store(ran, 1);
+        _exit(0);
+    }
+    spin_until(started, 1, "the child never started");
+    sleep_ms(50);
+    CHECK(sem_post(sem) == 0);
+    spin_until(ran, 1, "the child a semaphore woke never ran");
+    CHECK(waitpid(c, 0, 0) == c);
+    printf("semaphore ok\n");
+    return 0;
+}
+
 static void *ticker(void *arg) {
     (void)arg;
     for (;;) {
@@ -397,6 +443,8 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "timerspin")) return timer_ends_child_beside_spinner();
     if (!strcmp(c, "sigio")) return sigio_wakes();
     if (!strcmp(c, "sigcont")) return sigcont_continues();
+    if (!strcmp(c, "futex")) return futex_wakes();
+    if (!strcmp(c, "semaphore")) return semaphore_wakes();
     if (!strcmp(c, "console")) return console_traffic(argc > 2 ? atof(argv[2]) : 2);
     if (!strcmp(c, "beneath")) return device_beneath_timer();
     if (!strcmp(c, "deadwait")) return deadlock_after_wait();
