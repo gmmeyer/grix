@@ -33,10 +33,14 @@ use crate::uaccess::copy_out;
 pub const INIT: u32 = 1;
 /// What a thread holds of the kernel heap, charged to `kmem` while it
 /// lives: its `Thread` twice over (threads made one after another leave
-/// the process's B-tree nodes half full), x86_64's boxed XSAVE area, and
-/// its /proc/<pid>/task/<tid> nodes.
-pub const THREAD_COST: u64 =
-    (2 * core::mem::size_of::<Thread>() + arch::FP_HEAP_BYTES + 64) as u64 + crate::fs::TASK_NODES_COST;
+/// the process's B-tree nodes half full), x86_64's boxed XSAVE area, its
+/// /proc/<pid>/task/<tid> nodes, and a signal of each standard kind
+/// pending (real-time ones have `MAX_QUEUED_RT`).
+pub const THREAD_COST: u64 = (2 * core::mem::size_of::<Thread>()
+    + arch::FP_HEAP_BYTES
+    + 64
+    + 32 * core::mem::size_of::<crate::signal::SigInfo>()) as u64
+    + crate::fs::TASK_NODES_COST;
 /// threads-max at least: what grix always allowed.
 const MIN_THREADS_MAX: usize = 1024;
 
@@ -482,6 +486,7 @@ pub fn set_current_pid(pid: u32) {
 static REPORTED: Mutex<BTreeSet<(u8, u32, String)>> = Mutex::new(BTreeSet::new());
 
 const MAX_REPORTS: usize = 512;
+const MAX_REPORT_BYTES: usize = 512;
 const RLIM_INFINITY: u64 = u64::MAX;
 
 impl Process {
@@ -738,8 +743,10 @@ impl Process {
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {
+        // Enough to tell reports apart: a path has no limit but the tree's.
+        let kept = detail.floor_char_boundary(MAX_REPORT_BYTES);
         let mut reported = REPORTED.lock();
-        reported.len() < MAX_REPORTS && reported.insert((kind, nr, detail.into()))
+        reported.len() < MAX_REPORTS && reported.insert((kind, nr, detail[..kept].into()))
     }
 
     /// End the process with wait status `status`. The main program ending

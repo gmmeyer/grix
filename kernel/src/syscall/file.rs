@@ -44,6 +44,8 @@ const SETFL_MASK: u32 = 0o2000 | 0o4000 | O_ASYNC; // O_APPEND | O_NONBLOCK | O_
 
 /// Linux caps a single read/write at this many bytes.
 const MAX_RW: u64 = 0x7fff_f000;
+/// The most one getdents64 returns.
+const GETDENTS_MAX: u64 = 1 << 20;
 pub(super) const CHUNK: usize = 4096;
 
 // ---------------------------------------------------------------- paths
@@ -1655,6 +1657,8 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
 }
 
 pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
+    // A big directory comes in pieces, not all on the heap at once.
+    let count = count.min(GETDENTS_MAX);
     let file = p.fds.get(fd)?;
     let mut f = file.lock();
     let FileKind::Node(dir) = f.kind else { return Err(ENOTDIR) };
@@ -3095,6 +3099,8 @@ pub fn epoll_ctl(p: &mut Process, epfd: u64, op: u64, fd: u64, eventp: u64) -> S
 
 /// The architecture's struct epoll_event.
 const EPOLL_EVENT: usize = crate::arch::abi::EPOLL_EVENT;
+/// The most events one epoll_wait returns.
+const EPOLL_WAIT_MAX: i32 = 1 << 16;
 
 /// epoll_pwait / epoll_pwait2. `timeout`: None = forever.
 pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Option<u64>) -> SysResult {
@@ -3102,6 +3108,8 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
     if max <= 0 || max > 1 << 20 {
         return Err(EINVAL);
     }
+    // (Fewer is always allowed. It's built on the heap.)
+    let max = max.min(EPOLL_WAIT_MAX);
     let ep = epoll_of(p, epfd)?;
     let mut out: Vec<u8> = Vec::new();
     {

@@ -15,9 +15,12 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
+use crate::errno::*;
 use crate::ipc;
+use crate::kmem::Charge;
 use crate::process::Process;
 use crate::signal::{self, SigInfo, Target};
 use crate::time;
@@ -27,9 +30,15 @@ const SIGVTALRM: u32 = 26;
 const SIGPROF: u32 = 27;
 const SI_KERNEL: i32 = 0x80;
 const SI_TIMER: i32 = -2;
-/// timer_create's per-process limit (Linux's is RLIMIT_SIGPENDING-sized);
-/// it bounds kernel memory.
+/// timer_create's per-process limit (Linux's is RLIMIT_SIGPENDING-sized):
+/// `fire` and the scheduler look through a process's.
 pub const MAX_POSIX_TIMERS: usize = 1024;
+/// And in all processes together: what bounds kernel memory, as each is
+/// charged to `kmem` as well (`TIMER_COST`). EAGAIN at either.
+const MAX_TIMERS_TOTAL: usize = 8192;
+/// A timer's share of the heap: B-tree nodes are half empty when timers
+/// are made in order.
+const TIMER_COST: u64 = 2 * (core::mem::size_of::<PosixTimer>() + 4) as u64;
 /// `SigInfo::timer` for ITIMER_REAL's SIGALRM.
 const REAL_TIMER: u32 = u32::MAX;
 /// `SigInfo::timer` for ITIMER_VIRTUAL's and ITIMER_PROF's signals.
@@ -97,6 +106,31 @@ impl CpuClock {
     }
 }
 
+/// Timers in all processes (`MAX_TIMERS_TOTAL`).
+static TIMERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A timer's place in `TIMERS` and its charge, given back when it's dropped.
+pub struct TimerHeld(#[allow(dead_code)] Charge);
+
+impl TimerHeld {
+    pub fn new() -> Result<TimerHeld, Errno> {
+        if TIMERS.load(Ordering::Relaxed) >= MAX_TIMERS_TOTAL {
+            crate::stats::hit(grix_abi::stats::Limit::Timers);
+            return Err(EAGAIN);
+        }
+        let charge = Charge::new(TIMER_COST).map_err(|_| EAGAIN)?;
+        // Under the kernel lock: check-then-add doesn't race.
+        TIMERS.fetch_add(1, Ordering::Relaxed);
+        Ok(TimerHeld(charge))
+    }
+}
+
+impl Drop for TimerHeld {
+    fn drop(&mut self) {
+        TIMERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct PosixTimer {
     /// In CPU time, for a CPU-time clock's.
     pub timing: Interval,
@@ -108,6 +142,7 @@ pub struct PosixTimer {
     pub overrun: u32,
     /// Its signal is queued and hasn't been taken yet.
     pub pending: bool,
+    pub _held: TimerHeld,
 }
 
 /// A timerfd: readable once it has expired, `read` returns and resets the count.

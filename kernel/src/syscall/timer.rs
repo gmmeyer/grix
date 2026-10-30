@@ -9,7 +9,9 @@ use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, O_NONBLOCK, O_RDONLY, new_file};
 use crate::process::Process;
 use crate::time;
-use crate::timer::{CpuClock, Interval, MAX_POSIX_TIMERS, MAX_TIMER_ID, Notify, PosixTimer, SIGALRM, TimerFd};
+use crate::timer::{
+    CpuClock, Interval, MAX_POSIX_TIMERS, MAX_TIMER_ID, Notify, PosixTimer, SIGALRM, TimerFd, TimerHeld,
+};
 use crate::uaccess::*;
 
 const NS: u64 = 1_000_000_000;
@@ -195,9 +197,10 @@ pub fn timer_create(p: &mut Process, clock: u64, sevp: u64, idp: u64) -> SysResu
             _ => return Err(EINVAL),
         }
     };
+    let _held = TimerHeld::new()?;
     write_u32(&mut p.aspace, idp, id)?;
     p.timers.next_id = id.wrapping_add(1);
-    let timer = PosixTimer { timing: Interval::default(), notify, overrun: 0, clock, cpu, pending: false };
+    let timer = PosixTimer { timing: Interval::default(), notify, overrun: 0, clock, cpu, pending: false, _held };
     p.timers.posix.insert(id, timer);
     Ok(0)
 }

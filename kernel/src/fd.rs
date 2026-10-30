@@ -321,7 +321,7 @@ impl Slots {
             let most = if n <= NOFILE_DEFAULT { NOFILE_DEFAULT } else { MAX_FDS };
             let want = (cap * 2).clamp(n, most);
             self.held.resize(slots_cost(want))?;
-            self.entries.reserve_exact(want - self.entries.len());
+            self.entries.try_reserve_exact(want - self.entries.len()).map_err(|_| ENOMEM)?;
         }
         self.entries.resize(n, None);
         Ok(())

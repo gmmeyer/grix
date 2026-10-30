@@ -1,11 +1,12 @@
 //! A budget for kernel heap memory that programs can make the kernel hold:
 //! pipe and socket buffers, netlink replies, generated /proc contents,
-//! queued real-time signals, descriptor tables, threads. The heap is 32 MiB
-//! and a share of RAM (`mm::init`), and running out of it is a kernel
-//! panic, so these fail with an errno (ENOMEM, ENOBUFS, EAGAIN) once the
-//! budget is used up: `BASE`, and all of the share of RAM. Filesystem names
-//! and nodes have their own budget (fs.rs), and fixed-size tables (timers)
-//! their own limits.
+//! descriptor tables, threads, timers, mappings. The heap is 32 MiB and a
+//! share of RAM (`mm::init`), and running out of it is a kernel panic, so
+//! these fail with an errno (ENOMEM, ENOBUFS, EAGAIN) once the budget is
+//! used up: `BASE`, and all of the share of RAM. Filesystem names and nodes
+//! have their own budget (fs.rs). What stays out of both (open files,
+//! processes, locks, queued signals) has a low limit for all processes,
+//! and fits in what's left of the heap.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use grix_abi::stats::{Limit, Resource};

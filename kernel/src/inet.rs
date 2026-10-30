@@ -235,12 +235,14 @@ impl Conn {
     fn new(id: u32, state: ConnState, local: SockAddr, peer: SockAddr) -> Result<Conn, Errno> {
         let charge = Charge::new(WINDOW as u64).map_err(|_| Errno(105))?;
         let tx_credit = if state == ConnState::Open { WINDOW } else { 0 };
+        // All of it now: data never outgrows the window, and the charge
+        // then matches what's really held.
+        let mut rx = VecDeque::new();
+        rx.try_reserve_exact(WINDOW as usize).map_err(|_| Errno(105))?;
         Ok(Conn {
             id,
             state,
-            // All of it now: data never outgrows the window, and the
-            // charge then matches what's really held.
-            rx: VecDeque::with_capacity(WINDOW as usize),
+            rx,
             _charge: charge,
             rx_eof: false,
             rx_shut: false,
@@ -522,6 +524,8 @@ const UDP_BYTES: usize = 212_992;
 const DATAGRAM_OVERHEAD: usize = 64;
 /// Destinations one socket remembers the host's say on.
 const MAX_VERDICTS: usize = 256;
+/// A destination's share of the heap (half-empty B-tree nodes).
+const VERDICT_COST: u64 = 2 * (core::mem::size_of::<SockAddr>() + 8) as u64;
 /// How long an unanswered question to the host counts as asked.
 pub const VERDICT_PATIENCE_NS: u64 = 1_000_000_000;
 
@@ -544,6 +548,8 @@ pub struct Udp {
     /// (since when: a lost answer is asked again).
     verdicts: BTreeMap<SockAddr, bool>,
     asked: BTreeMap<SockAddr, u64>,
+    /// Both tables' room: small for one socket, but sockets are many.
+    known: Charge,
     pub asking: usize,
     /// It asked the host (which may hold a socket for it), and was allowed
     /// somewhere (replies may come any time).
@@ -582,6 +588,7 @@ impl Udp {
             servers: Vec::new(),
             verdicts: BTreeMap::new(),
             asked: BTreeMap::new(),
+            known: Charge::default(),
             asking: 0,
             used_host: false,
             talking: false,
@@ -696,6 +703,11 @@ impl Udp {
         }
         if self.verdicts.len() >= MAX_VERDICTS {
             self.verdicts.clear();
+        }
+        let tables = (self.verdicts.len() + self.asked.len() + 1) as u64;
+        if self.known.resize(tables * VERDICT_COST).is_err() {
+            self.busy = true;
+            return;
         }
         self.used_host = true;
         self.asked.insert(to, now);

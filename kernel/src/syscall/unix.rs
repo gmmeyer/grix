@@ -525,7 +525,8 @@ pub fn send_msg(
         }
         return if nonblock { Err(EAGAIN) } else { would_block(p, false) };
     }
-    let mut data = Vec::with_capacity(len as usize);
+    let mut data = Vec::new();
+    data.try_reserve_exact(len as usize).map_err(|_| ENOMEM)?;
     for &(base, n) in bufs {
         let at = data.len();
         data.resize(at + n as usize, 0);

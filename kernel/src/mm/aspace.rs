@@ -39,6 +39,9 @@ pub const MAX_VMAS: usize = 32768;
 pub const MAX_VMAS_TOTAL: usize = 65536;
 static VMAS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// A mapping's share of the heap, charged to `kmem`: B-tree nodes are half
+/// empty after the splits that make most mappings.
+const VMA_COST: u64 = 2 * (core::mem::size_of::<Vma>() + 8) as u64;
 pub const MMAP_BOTTOM: u64 = 1 << 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +326,8 @@ pub struct AddressSpace {
     vmas: BTreeMap<u64, Vma>,
     /// How many of `vmas` are counted in VMAS_TOTAL.
     counted: usize,
+    /// And charged, at `VMA_COST` each.
+    charge: crate::kmem::Charge,
     pub brk_start: u64,
     pub brk: u64,
     /// The stack is [STACK_TOP - stack_size, STACK_TOP); mmap allocates
@@ -358,6 +363,7 @@ impl AddressSpace {
             pt: PageTable::new()?,
             vmas: BTreeMap::new(),
             counted: 0,
+            charge: Default::default(),
             brk_start: 0,
             brk: 0,
             stack_size: 0,
@@ -388,19 +394,29 @@ impl AddressSpace {
         end <= self.stack_bottom() - STACK_GUARD
     }
 
-    /// Bring VMAS_TOTAL up to date after the mappings changed.
+    /// Bring VMAS_TOTAL up to date after the mappings changed. (`has_room`
+    /// looked at the budget first. What it didn't, a few more than it
+    /// checked for, stays uncharged until the next change.)
     fn recount(&mut self) {
         let n = self.vmas.len();
         VMAS_TOTAL.fetch_add(n, Ordering::Relaxed);
         VMAS_TOTAL.fetch_sub(self.counted, Ordering::Relaxed);
         self.counted = n;
+        let _ = self.charge.resize(n as u64 * VMA_COST);
+    }
+
+    /// Room for `more` mappings in all address spaces and in the kernel's
+    /// memory?
+    fn total_room(more: usize) -> bool {
+        VMAS_TOTAL.load(Ordering::Relaxed) + more <= MAX_VMAS_TOTAL
+            && crate::kmem::available() >= more as u64 * VMA_COST
     }
 
     /// A copy for a forked child: the same mappings, sharing every page.
     /// Writable pages become read-only in both, and the first write to one
     /// copies it (`fault`'s copy-on-write).
     pub fn fork(&mut self) -> Result<AddressSpace, Errno> {
-        if VMAS_TOTAL.load(Ordering::Relaxed) + self.vmas.len() > MAX_VMAS_TOTAL {
+        if !Self::total_room(self.vmas.len()) {
             crate::stats::hit(Limit::Mappings);
             return Err(ENOMEM);
         }
@@ -531,7 +547,7 @@ impl AddressSpace {
 
     /// Room for `more` mappings (an operation that may split some)?
     pub fn has_room(&self, more: usize) -> Result<(), Errno> {
-        if self.vmas.len() + more > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + more > MAX_VMAS_TOTAL {
+        if self.vmas.len() + more > MAX_VMAS || !Self::total_room(more) {
             crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {
@@ -549,7 +565,7 @@ impl AddressSpace {
             overlapping.iter().filter(|v| v.start < start).count() + overlapping.iter().filter(|v| v.end > end).count();
         let after = self.vmas.len() - overlapping.len() + edges + if keep { overlapping.len() } else { 0 } + added;
         let growth = after.saturating_sub(self.vmas.len());
-        if growth > 0 && (after > MAX_VMAS || VMAS_TOTAL.load(Ordering::Relaxed) + growth > MAX_VMAS_TOTAL) {
+        if growth > 0 && (after > MAX_VMAS || !Self::total_room(growth)) {
             crate::stats::hit(Limit::Mappings);
             Err(ENOMEM)
         } else {

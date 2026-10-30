@@ -83,7 +83,10 @@ impl Pipe {
         if self.charge.resize(want as u64).is_err() {
             return spare;
         }
-        self.buf.reserve_exact(n);
+        // The budget says there's room, but not that it's all in one piece.
+        if self.buf.try_reserve_exact(n).is_err() {
+            return spare;
+        }
         // reserve_exact may round up; charge what was really allocated if we can.
         let _ = self.charge.resize(self.buf.capacity().max(want) as u64);
         n
