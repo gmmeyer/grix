@@ -686,11 +686,25 @@ Left, none of it a way out of the sandbox:
       O_NOFOLLOW, `Pipe::creds` for bytes that are there, `/proc/self/mem`
       across execve, exchanges counted in `id_bytes`, and Landlock's rules
       paying for the nodes they keep.
+- [x] Review of 0.0.52 (`wakeups.c`, `read_only_copies` in `filelocks.c`,
+      `kstack picked`): what a process's end changes reaches every waiter
+      before anyone decides what can run (`sched::settle`), so a timer
+      ending a child isn't a deadlock and a sleeper isn't left behind a
+      spinning thread; a CPU's timer is the CPU's (`sched::timer_changed`),
+      so whoever wakes a thread in another process gives it a slice to
+      wait for; `mprotect` leaves a shared file's read-only copies
+      read-only; x86_64 handles every vector it took around `hlt`; and a
+      stack overflow is seen after a signal frame is pushed, not after.
+- [ ] `rv048 extremes` (`review/0.0.48-proofs`) hung once, on arm64 at 2
+      CPUs, and hasn't since (6600 runs of 0.0.52): not explained by the
+      lost wake-ups above, which need another thread to keep running. It
+      has a 1 ns periodic timerfd armed, 64 fatal timers and a child
+      spinning; look there, and in grix-vmm's wait for the virtual timer.
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.
-- [ ] `sched.rs`, `smp.rs`, `timer.rs` and the kernel's `hostfs.rs` have
-      had only a light security read.
+- [ ] `timer.rs` and the kernel's `hostfs.rs` have had only a light
+      security read.
 
 ## Performance and scale
 

@@ -129,7 +129,11 @@ touches user memory only inside `arch::user_access`. The GDT has no 32-bit
 user code segment, so user code can't enter compatibility mode (AMD's
 `syscall` from there would go to CSTAR). The idle loop's `sti; hlt` is the only place the kernel takes an interrupt:
 it's noted for `irq::ack` (which lets one still in the APIC in for an
-instruction), as a masked one waits in the GIC on arm64. The TSC is the
+instruction), as a masked one waits in the GIC on arm64. A wake-up can
+note two, a device's and just before the `cli` a timer's or a kick's
+above it, each in service until its `eoi`: `sched::interrupts` takes
+every one (`irq::more`), or the device's would hold up its priority
+class until the CPU next idled. The TSC is the
 counter, its rate from the hypervisor's CPUID leaf, CPUID 0x15, or the
 PIT; the APIC timer is one-shot. FP state is XSAVE's (`init_xsave`:
 x87, SSE, AVX, and AVX-512 when the CPU has it; fxsave without XSAVE),
@@ -339,8 +343,8 @@ stack per CPU (`arch::stack`'s
 with that CPU's emergency stack below it. There's no guard page (4 KiB
 mappings there cost contended system calls a fifth of their speed):
 the lowest `CANARY_SIZE` bytes of each stack are painted and checked on
-every way back to user mode and before the idle wait
-(`smp::check_stack`), and an exception taken that low is reported too
+every way back to user mode, the last thing before the lock goes, and
+before the idle wait (`smp::check_stack`), and an exception taken that low is reported too
 (arm64's vectors check sp against `tpidr_el1` before pushing a frame
 and move to the emergency stack), all as "kernel stack overflow on CPU
 n". `stack_max` in /proc/grix/smp is each CPU's high-water mark (about
@@ -376,7 +380,24 @@ new that sets a deadline must do one or the other, or its sleeper wakes
 only when something else comes due. So too I/O waiters are looked for
 only once the I/O generation has moved past the one they all saw
 (`sched::POLLED`), and the threads waiting to run are counted
-(`process::queued`, kept by `RunQ`). The vDSO (`vdso.rs`, a page every process
+(`process::queued`, kept by `RunQ`). The rule for anything that changes
+what a waiter sees (data, room, a closed end, a process's end or stop):
+it calls `ipc::changed()`, and nobody then decides what can run until
+every waiter has been told. `sched::settle` is how: it finishes off what
+ended, fires what's due and wakes I/O waiters in every process, round
+and round until the generation is back at `POLLED` (`sched::quiet`), as
+each makes work for the other: a timer's signal ends a process, and a
+process's end is what wait4 and a pipe's reader wait for. `schedule`
+does that before `pick` and `idle`, and `irq` and the end of a system
+call (`wake_io_everywhere`, if not quiet or something ended) before user
+mode, where a spinning thread may never come back by itself. `idle`
+calls nothing a deadlock unless `quiet` holds, and `smp::finish` doesn't
+wait unless it does. So anything new that ends or wakes belongs in
+`sched::end_processes` or `poll`, not in one more poll after some step.
+A thread that comes to wait to run, in any process (`RunQ::push_back`),
+or a stopped process that continues, marks this CPU's timer
+(`sched::timer_changed`, which never needs a process: the timer is the
+CPU's, and only it ends the slice the thread is waiting for). The vDSO (`vdso.rs`, a page every process
 shares) reads the clocks without a system call from a page only the
 kernel writes (`vdso::publish`); the kernel's clock uses the same
 `(ticks * mult) >> 32`, so keep the two in step.
@@ -398,7 +419,7 @@ first), so kernel code still sees "the running process" and "the
 others", and a process in `PROCS` may be running on another CPU. Under
 the lock only the holder's slot is filled (a debug assertion checks). Each
 CPU's scheduling state (`smp::CPUS`: its process and thread, time slice,
-resched, timer_dirty) is swapped into the `Process` fields while it holds
+resched) is swapped into the `Process` fields while it holds
 the lock, so `p.current` is this CPU's thread, and a thread running on
 another CPU is in neither `runq` nor `current`, its registers live in that
 CPU: don't touch them. A CPU with nothing to run waits in `smp::finish`
@@ -565,7 +586,8 @@ sandbox maps the file's own frames (`Backing::SharedFile`; the file and
 each mapping hold a reference; a read of a page without a frame maps a
 read-only copy, marked in `FileData::copied`, a page index of its own,
 and taken out everywhere once the page gets one, `procs::zap_stale`,
-which goes by spans and may take more than it must), so it's never
+which goes by spans and may take more than it must; `mprotect` keeps it
+read-only, so a write faults and gets the frame), so it's never
 copy-on-write, and a file
 that shrinks takes its pages out of every process's mappings
 (`file::zap_shared`): page tables are kernel memory, so another
