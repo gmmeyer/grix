@@ -338,7 +338,14 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
     const PR_CAP_AMBIENT_IS_SET: u64 = 1;
     const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
     const PR_SET_VMA: u64 = 0x53564d41;
-    match a[0] {
+    const PR_SET_MM: u64 = 35;
+    const PR_SVE_SET_VL: u64 = 50;
+    const PR_SVE_GET_VL: u64 = 51;
+    const PR_SME_SET_VL: u64 = 63;
+    const PR_SME_GET_VL: u64 = 64;
+    const PR_SET_PTRACER: u64 = 0x59616d61;
+    // An int, on Linux.
+    match a[0] as u32 as u64 {
         PR_SET_NAME => {
             let mut name = [0u8; 16];
             let s = read_cstr(&mut p.aspace, a[1], 4096).unwrap_or_default();
@@ -385,6 +392,19 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
         PR_CAPBSET_DROP => Ok(0),
         PR_CAP_AMBIENT if a[1] == PR_CAP_AMBIENT_IS_SET || a[1] == PR_CAP_AMBIENT_CLEAR_ALL => Ok(0),
         PR_CAP_AMBIENT => Err(EPERM),
+        // Changing the memory map's fields (setproctitle's ARG_START, as
+        // some JDKs do) needs CAP_SYS_RESOURCE, which nothing has: Docker
+        // doesn't grant it either.
+        PR_SET_MM => Err(EPERM),
+        // No SVE or SME: Linux says EINVAL without them, as on x86_64.
+        PR_SVE_SET_VL | PR_SVE_GET_VL | PR_SME_SET_VL | PR_SME_GET_VL => Err(EINVAL),
+        // Yama's: there's no ptrace for anyone to be allowed.
+        PR_SET_PTRACER => Ok(0),
+        // Not a number any option could have (Linux's go up to about 80,
+        // and the magic ones above are ASCII tags): garbage, which Linux
+        // refuses too, as OpenSearch's seccomp self-test expects. An
+        // option grix doesn't know below that is reported.
+        n if n > 0xffff => Err(EINVAL),
         n => p.unimplemented(nr::prctl, "prctl", &alloc::format!("option {n}"), EINVAL),
     }
 }

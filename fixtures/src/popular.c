@@ -18,6 +18,7 @@
 #include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/shm.h>
@@ -972,6 +973,18 @@ static int numa(void) {
     return 0;
 }
 
+// prctl options Linux refuses here too, quietly: PR_SET_MM (some JDKs'
+// setproctitle) needs CAP_SYS_RESOURCE; there's no SVE; and an option
+// Linux doesn't have (OpenSearch's seccomp self-test) is EINVAL.
+static int prctls(void) {
+    char arg[] = "x";
+    CHECK(prctl(35 /* PR_SET_MM */, 8 /* PR_SET_MM_ARG_START */, (unsigned long)arg, 0, 0) == -1 && errno == EPERM);
+    CHECK(prctl(51 /* PR_SVE_GET_VL */, 0, 0, 0, 0) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_prctl, 0xfffffffff7a46a5cul, 0, 0, 0, 0) == -1 && errno == EINVAL);
+    CHECK(syscall(SYS_prctl, 0x100000000ul | PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1000,6 +1013,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "sysctls") == 0) r = sysctls();
         if (strcmp(argv[i], "schedprio") == 0) r = schedprio();
         if (strcmp(argv[i], "numa") == 0) r = numa();
+        if (strcmp(argv[i], "prctls") == 0) r = prctls();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

@@ -2079,6 +2079,12 @@ fn numa_policies_on_one_node() {
 }
 
 #[test]
+fn prctl_options_linux_refuses() {
+    // Alpine's JDK (PR_SET_MM), Chromium (SVE), OpenSearch (a bogus option).
+    popular(with("popular"), &["prctls"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.
