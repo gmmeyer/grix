@@ -10,7 +10,19 @@ use crate::errno::*;
 use crate::fs::{Content, Dev, Ino};
 use crate::ipc::{self, EPOLLIN, EPOLLOUT, EventFd, PipeEnd, SocketEnd};
 
-pub const MAX_FDS: usize = 1024;
+/// The most descriptors a table may have (/proc/sys/fs/nr_open), and so
+/// RLIMIT_NOFILE's hard limit. A table grows with use, each slot charged
+/// to the kernel memory budget, so this is a bound, not what it costs.
+pub const MAX_FDS: usize = 65536;
+/// RLIMIT_NOFILE's soft limit to start with, as Docker gives (programs
+/// that want more raise it to the hard limit, as Redis does).
+pub const NOFILE_DEFAULT: usize = 1024;
+/// What `n` descriptor slots cost the kernel memory budget: those past
+/// the first `NOFILE_DEFAULT`, which every table could always have (the
+/// heap was sized for `MAX_PROCESSES` of those).
+fn slots_cost(n: usize) -> u64 {
+    n.saturating_sub(NOFILE_DEFAULT) as u64 * core::mem::size_of::<Option<FdEntry>>() as u64
+}
 
 /// A named pipe's node and the ends this open has: one, or both for
 /// O_RDWR (which Linux allows on a FIFO, and never waits).
@@ -211,15 +223,46 @@ pub struct FdEntry {
 /// another, `copy` a table of one's own). Every access is under the big
 /// kernel lock, so the mutex is only ever held for a moment, and never
 /// while an open file is dropped (which may take other locks).
-pub struct FdTable(Arc<Mutex<Slots>>);
+pub struct FdTable {
+    slots: Arc<Mutex<Slots>>,
+    /// The process's RLIMIT_NOFILE soft limit (`Process::rlimits` has it
+    /// too; prlimit sets both): descriptors at or above it can't be made.
+    /// Kept with the process's handle, as a table shared by CLONE_FILES
+    /// is limited by each user's own rlimit, as on Linux.
+    limit: usize,
+}
 
 struct Slots {
     /// The owner of the POSIX record locks taken through it: the table,
     /// not the process, as Linux's fl_owner is the files_struct.
     id: u64,
     entries: Vec<Option<FdEntry>>,
+    /// The lowest descriptor that may be free (Linux's next_fd).
+    first_free: usize,
+    /// `entries`' room, charged to the kernel memory budget: up to a MiB
+    /// each, and fork copies tables.
+    held: crate::kmem::Charge,
     /// POSIX record locks have been taken through it (they go when it does).
     posix_locks: bool,
+}
+
+impl Slots {
+    /// Room for descriptors below `n`, charged first (ENOMEM).
+    fn grow(&mut self, n: usize) -> Result<(), Errno> {
+        if n <= self.entries.len() {
+            return Ok(());
+        }
+        let cap = self.entries.capacity();
+        if n > cap {
+            // Doubling, but not past the free slots for less than that.
+            let most = if n <= NOFILE_DEFAULT { NOFILE_DEFAULT } else { MAX_FDS };
+            let want = (cap * 2).clamp(n, most);
+            self.held.resize(slots_cost(want))?;
+            self.entries.reserve_exact(want - self.entries.len());
+        }
+        self.entries.resize(n, None);
+        Ok(())
+    }
 }
 
 impl Drop for Slots {
@@ -249,9 +292,15 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
 }
 
 impl FdTable {
-    fn new(entries: Vec<Option<FdEntry>>) -> Self {
+    fn new(entries: Vec<Option<FdEntry>>, held: crate::kmem::Charge, limit: usize) -> Self {
         let id = NEXT_TABLE.fetch_add(1, Ordering::Relaxed);
-        FdTable(Arc::new(Mutex::new(Slots { id, entries, posix_locks: false })))
+        let slots = Slots { id, entries, first_free: 0, held, posix_locks: false };
+        FdTable { slots: Arc::new(Mutex::new(slots)), limit }
+    }
+
+    /// The kernel's own tables of a few descriptors (nothing to charge).
+    fn boot(entries: Vec<Option<FdEntry>>) -> Self {
+        Self::new(entries, Default::default(), NOFILE_DEFAULT)
     }
 
     pub fn with_stdio() -> Self {
@@ -259,69 +308,85 @@ impl FdTable {
             .into_iter()
             .map(|(kind, flags)| Some(FdEntry { file: new_file(kind, flags), cloexec: false }))
             .collect();
-        Self::new(entries)
+        Self::boot(entries)
     }
 
     /// TTY mode: stdin, stdout and stderr are one open terminal.
     pub fn with_terminal(file: FileRef) -> Self {
-        Self::new((0..3).map(|_| Some(FdEntry { file: file.clone(), cloexec: false })).collect())
+        Self::boot((0..3).map(|_| Some(FdEntry { file: file.clone(), cloexec: false })).collect())
     }
 
     /// No descriptors at all (a process that has ended).
     pub fn empty() -> Self {
         ipc::changed();
-        Self::new(Vec::new())
+        Self::boot(Vec::new())
     }
 
     /// The same table (CLONE_FILES).
     pub fn share(&self) -> Self {
-        FdTable(self.0.clone())
+        FdTable { slots: self.slots.clone(), limit: self.limit }
     }
 
-    /// A table of its own with the same descriptors (fork, and unsharing).
-    /// It holds no POSIX locks: they stay with this one.
-    pub fn copy(&self) -> Self {
-        Self::new(self.0.lock().entries.clone())
+    /// A table of its own with the same descriptors (fork, and unsharing),
+    /// as far as the last one open (as Linux's dup_fd). It holds no POSIX
+    /// locks: they stay with this one. ENOMEM if the budget can't hold it.
+    pub fn copy(&self) -> Result<Self, Errno> {
+        let t = self.slots.lock();
+        let used = t.entries.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        let held = crate::kmem::Charge::new(slots_cost(used))?;
+        let mut entries = Vec::with_capacity(used);
+        entries.extend_from_slice(&t.entries[..used]);
+        drop(t);
+        Ok(Self::new(entries, held, self.limit))
     }
 
     /// Other processes use this table too.
     pub fn shared(&self) -> bool {
-        Arc::strong_count(&self.0) > 1
+        Arc::strong_count(&self.slots) > 1
     }
 
     /// Make it a table of this process's own, if it's shared (exec, unshare).
-    pub fn unshare(&mut self) {
+    pub fn unshare(&mut self) -> Result<(), Errno> {
         if self.shared() {
-            *self = self.copy();
+            *self = self.copy()?;
         }
+        Ok(())
+    }
+
+    /// RLIMIT_NOFILE's soft limit changed (prlimit).
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit.min(MAX_FDS as u64) as usize;
     }
 
     /// The owner of POSIX record locks taken through it.
     pub fn lock_owner(&self) -> crate::locks::Owner {
-        crate::locks::Owner::Files(self.0.lock().id)
+        crate::locks::Owner::Files(self.slots.lock().id)
     }
 
     pub fn posix_locks(&self) -> bool {
-        self.0.lock().posix_locks
+        self.slots.lock().posix_locks
     }
 
     pub fn set_posix_locks(&mut self) {
-        self.0.lock().posix_locks = true;
+        self.slots.lock().posix_locks = true;
     }
 
     /// execve: close what's marked close-on-exec.
     /// What `close_on_exec` will close.
     pub fn cloexec_files(&self) -> Vec<FileRef> {
-        self.0.lock().entries.iter().flatten().filter(|e| e.cloexec).map(|e| e.file.clone()).collect()
+        self.slots.lock().entries.iter().flatten().filter(|e| e.cloexec).map(|e| e.file.clone()).collect()
     }
 
     pub fn close_on_exec(&mut self) {
         let mut closed = Vec::new();
-        for s in self.0.lock().entries.iter_mut() {
+        let mut t = self.slots.lock();
+        for s in t.entries.iter_mut() {
             if s.as_ref().is_some_and(|e| e.cloexec) {
                 closed.extend(s.take());
             }
         }
+        t.first_free = 0;
+        drop(t);
         if !closed.is_empty() {
             ipc::changed();
         }
@@ -333,46 +398,54 @@ impl FdTable {
 
     pub fn get(&self, fd: u64) -> Result<FileRef, Errno> {
         let i = Self::index(fd)?;
-        Ok(self.0.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.file.clone())
+        Ok(self.slots.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.file.clone())
     }
 
     pub fn cloexec(&self, fd: u64) -> Result<bool, Errno> {
         let i = Self::index(fd)?;
-        Ok(self.0.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.cloexec)
+        Ok(self.slots.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.cloexec)
     }
 
     pub fn set_cloexec(&mut self, fd: u64, on: bool) -> Result<(), Errno> {
         let i = Self::index(fd)?;
-        self.0.lock().entries.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)?.cloexec = on;
+        self.slots.lock().entries.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)?.cloexec = on;
         Ok(())
     }
 
-    /// Install at the lowest free descriptor >= `min`. Fails with ENFILE
-    /// once there are too many open files everywhere (the new one, already
-    /// made, is then dropped by the caller).
+    /// Install at the lowest free descriptor >= `min`, below the
+    /// process's RLIMIT_NOFILE (EMFILE). Fails with ENFILE once there are
+    /// too many open files everywhere (the new one, already made, is then
+    /// dropped by the caller).
     pub fn alloc(&mut self, entry: FdEntry, min: usize) -> Result<u64, Errno> {
         if OPEN_FILES.load(Ordering::Relaxed) > MAX_OPEN_FILES {
             crate::stats::hit(grix_abi::stats::Limit::OpenFiles);
             return Err(ENFILE);
         }
-        let mut t = self.0.lock();
-        let start = min.min(MAX_FDS);
-        let i = (start..MAX_FDS).find(|&i| t.entries.get(i).is_none_or(|s| s.is_none())).ok_or(EMFILE)?;
-        if i >= t.entries.len() {
-            t.entries.resize(i + 1, None);
-        }
+        let limit = self.limit;
+        let mut t = self.slots.lock();
+        let start = min.max(t.first_free).min(limit);
+        let i = (start..limit).find(|&i| t.entries.get(i).is_none_or(|s| s.is_none())).ok_or(EMFILE)?;
+        t.grow(i + 1)?;
         t.entries[i] = Some(entry);
+        if min <= t.first_free {
+            t.first_free = i + 1;
+        }
         Ok(i as u64)
     }
 
+    /// The most descriptors this process may have (fcntl's F_DUPFD
+    /// refuses to start at or above it).
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// Install at exactly `fd`, replacing whatever was there (dup2/dup3).
+    /// EBADF at or above RLIMIT_NOFILE, as Linux's ksys_dup3.
     pub fn set(&mut self, fd: u64, entry: FdEntry) -> Result<(), Errno> {
-        let i = usize::try_from(fd as i32).ok().filter(|&i| i < MAX_FDS).ok_or(EBADF)?;
+        let i = usize::try_from(fd as i32).ok().filter(|&i| i < self.limit).ok_or(EBADF)?;
         let old = {
-            let mut t = self.0.lock();
-            if i >= t.entries.len() {
-                t.entries.resize(i + 1, None);
-            }
+            let mut t = self.slots.lock();
+            t.grow(i + 1)?;
             t.entries[i].replace(entry)
         };
         drop(old);
@@ -382,19 +455,32 @@ impl FdTable {
 
     pub fn close(&mut self, fd: u64) -> Result<(), Errno> {
         let i = Self::index(fd)?;
-        let old = self.0.lock().entries.get_mut(i).and_then(|s| s.take()).ok_or(EBADF)?;
+        let old = {
+            let mut t = self.slots.lock();
+            let old = t.entries.get_mut(i).and_then(|s| s.take()).ok_or(EBADF)?;
+            t.first_free = t.first_free.min(i);
+            old
+        };
         drop(old);
         ipc::changed();
         Ok(())
     }
 
+    /// The lowest open descriptor at or above `from`.
+    pub fn next_open(&self, from: u64) -> Option<u64> {
+        let t = self.slots.lock();
+        let from = usize::try_from(from).ok()?;
+        t.entries.get(from..)?.iter().position(Option::is_some).map(|i| (from + i) as u64)
+    }
+
     pub fn len(&self) -> usize {
-        self.0.lock().entries.len()
+        self.slots.lock().entries.len()
     }
 
     /// Is there a free descriptor (so open can fail with EMFILE before it creates anything)?
     pub fn has_room(&self) -> bool {
-        let t = self.0.lock();
-        t.entries.len() < MAX_FDS || t.entries.iter().any(Option::is_none)
+        let t = self.slots.lock();
+        let free = t.first_free.min(self.limit);
+        t.entries.len() < self.limit || t.entries[free..self.limit].iter().any(Option::is_none)
     }
 }

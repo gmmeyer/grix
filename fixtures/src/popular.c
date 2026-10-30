@@ -2,6 +2,7 @@
 // COMPAT.md): one check per argument.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <setjmp.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 #include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
@@ -687,6 +689,84 @@ static int openat2_ro(void) {
     return 0;
 }
 
+// Redis raises RLIMIT_NOFILE to what it wants for its clients (and lowered
+// maxclients to 992 when the hard limit was 1024).
+static int nofile(void) {
+    struct rlimit rl;
+    CHECK(getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == 1024 && rl.rlim_max == 65536);
+    CHECK(slurp("/proc/self/limits") > 0 && strstr(buf, "Max open files            1024                 65536"));
+    CHECK(slurp("/proc/sys/fs/nr_open") > 0 && strcmp(buf, "65536\n") == 0);
+    // The soft limit holds: EMFILE, and EBADF/EINVAL for descriptors past it.
+    int last = -1, fd;
+    while ((fd = dup(0)) >= 0) last = fd;
+    CHECK(errno == EMFILE && last == 1023);
+    CHECK(dup2(0, 1024) == -1 && errno == EBADF);
+    CHECK(fcntl(0, F_DUPFD, 1024) == -1 && errno == EINVAL);
+    for (fd = 3; fd <= last; fd++) close(fd);
+    // Up to the hard limit, not past it.
+    rl.rlim_max = 65537;
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == -1 && errno == EPERM);
+    rl.rlim_cur = rl.rlim_max = 65536;
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    for (fd = 3; fd < 5000; fd++) CHECK(dup(0) == fd);
+    CHECK(fcntl(0, F_DUPFD, 60000) == 60000 && dup2(0, 65535) == 65535);
+    CHECK(dup2(0, 65536) == -1 && errno == EBADF);
+    // /proc/self/fd lists them all, in order (and its own descriptor).
+    DIR *d = opendir("/proc/self/fd");
+    CHECK(d != NULL);
+    struct dirent *e;
+    int listed = 0, highest = -1, sorted = 1;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        int n = atoi(e->d_name);
+        sorted &= n > highest;
+        highest = n;
+        listed++;
+    }
+    closedir(d);
+    CHECK(listed == 5003 && highest == 65535 && sorted);
+    // poll takes as many as the limit.
+    static struct pollfd pfds[5000];
+    for (int i = 0; i < 5000; i++) pfds[i] = (struct pollfd){.fd = i, .events = POLLIN};
+    CHECK(poll(pfds, 5000, 0) >= 0);
+    // A child gets a copy of the table.
+    int status;
+    pid_t pid = fork();
+    if (pid == 0) _exit(fcntl(65535, F_GETFD) == 0 && fcntl(4999, F_GETFD) == 0 ? 0 : 1);
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
+    // Open files are still limited for all processes together (ENFILE)...
+    static int nulls[8192];
+    int n = 0;
+    while (n < 8192 && (nulls[n] = open("/dev/null", O_RDONLY)) >= 0) n++;
+    CHECK(n < 8192 && errno == ENFILE && n > 3000);
+    while (n > 0) close(nulls[--n]);
+    // ... and tables cost kernel memory: forking a big one, again and
+    // again, runs out of it (ENOMEM) before the kernel's heap does.
+    int hold[2];
+    CHECK(pipe(hold) == 0);
+    pid_t kids[64];
+    int forked = 0;
+    for (; forked < 64; forked++) {
+        kids[forked] = fork();
+        if (kids[forked] == 0) {
+            char c;
+            close(hold[1]);
+            read(hold[0], &c, 1);
+            _exit(0);
+        }
+        if (kids[forked] < 0) break;
+    }
+    CHECK(forked < 64 && errno == ENOMEM && forked > 2);
+    close(hold[1]);
+    for (int i = 0; i < forked; i++) CHECK(waitpid(kids[i], &status, 0) == kids[i]);
+    // Closing them all leaves a table that's cheap to copy again.
+    for (fd = 3; fd < 65536; fd++) close(fd);
+    pid = fork();
+    if (pid == 0) _exit(0);
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -706,6 +786,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "mkdirexist") == 0) r = mkdirexist();
         if (strcmp(argv[i], "openat2") == 0) r = openat2_check();
         if (strcmp(argv[i], "openat2ro") == 0) r = openat2_ro();
+        if (strcmp(argv[i], "nofile") == 0) r = nofile();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

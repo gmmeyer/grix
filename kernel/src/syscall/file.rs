@@ -1441,21 +1441,21 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     let mut out: Vec<u8> = Vec::new();
     let mut pos = f.offset;
     let mut cursor = f.dir_pos.clone();
-    // /proc/<pid>/fd lists the process's descriptors as symlinks.
+    // /proc/<pid>/fd lists the process's descriptors as symlinks, each
+    // at offset fd + 2 (as Linux's proc_readfd_common), found as it goes:
+    // a table may have 65536.
     let fd_pid = fs.fd_dir_pid(dir);
-    let fd_names: Vec<String> = match fd_pid {
-        Some(pid) if pid == p.pid => {
-            (0..p.fds.len() as u64).filter(|&fd| p.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
-        }
+    if let Some(pid) = fd_pid.filter(|&pid| pid != p.pid)
+        && let Some(q) = crate::procs::PROCS.lock().others.get(&pid)
+        && !crate::procs::may_inspect(p, q, false)
+    {
         // Another process's, if the caller may look at them (`with_other`).
-        Some(pid) => match crate::procs::PROCS.lock().others.get(&pid) {
-            Some(q) if !crate::procs::may_inspect(p, q, false) => return Err(EACCES),
-            Some(q) => {
-                (0..q.fds.len() as u64).filter(|&fd| q.fds.get(fd).is_ok()).map(|fd| alloc::format!("{fd}")).collect()
-            }
-            None => Vec::new(),
-        },
-        None => Vec::new(),
+        return Err(EACCES);
+    }
+    let next_fd = |from: u64| match fd_pid {
+        Some(pid) if pid == p.pid => p.fds.next_open(from),
+        Some(pid) => crate::procs::PROCS.lock().others.get(&pid).and_then(|q| q.fds.next_open(from)),
+        None => None,
     };
     loop {
         let entry = match pos {
@@ -1464,7 +1464,10 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
                 let parent = fs.node(dir).parent;
                 Some((String::from(".."), fs.ino_number(parent), 4))
             }
-            n if fd_pid.is_some() => fd_names.get(n as usize - 2).map(|name| (name.clone(), fs.ino_number(dir), 10)),
+            n if fd_pid.is_some() => next_fd(n - 2).map(|fd| {
+                pos = fd + 2;
+                (alloc::format!("{fd}"), fs.ino_number(dir), 10)
+            }),
             // Resume after the last name returned: entries may have come and
             // gone since (rm -rf unlinks while it reads).
             _ => match fs.dir_next(dir, cursor.as_deref()) {
@@ -2263,6 +2266,10 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let file = p.fds.get(fd)?;
+            // Not at or above RLIMIT_NOFILE (f_dupfd).
+            if arg >= p.fds.limit() as u64 {
+                return Err(EINVAL);
+            }
             p.fds.alloc(FdEntry { file, cloexec: cmd == F_DUPFD_CLOEXEC }, arg as usize)
         }
         F_GETFD => Ok(p.fds.cloexec(fd)? as u64),
@@ -2555,9 +2562,11 @@ pub fn ppoll(p: &mut Process, fds: u64, nfds: u64, timeout: u64) -> SysResult {
 
 /// ppoll with its timeout in ns (None = forever), poll's too.
 pub fn poll_ns(p: &mut Process, fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
-    if nfds > 1024 {
+    // Up to RLIMIT_NOFILE of them, as Linux's do_sys_poll.
+    if nfds > p.fds.limit() as u64 {
         return Err(EINVAL);
     }
+    let _held = crate::kmem::Charge::new(nfds * 8)?;
     let mut raw = alloc::vec![0u8; nfds as usize * 8];
     copy_in(&mut p.aspace, fds, &mut raw)?;
     // A re-run after the deadline passed reports what's ready (perhaps
@@ -2610,9 +2619,11 @@ pub fn pselect6(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, tim
 
 /// pselect6 with its timeout in ns (None = forever), select's too.
 pub fn select_ns(p: &mut Process, nfds: u64, rfds: u64, wfds: u64, efds: u64, timeout: Option<u64>) -> SysResult {
-    if nfds > 1024 {
+    if (nfds as i32) < 0 {
         return Err(EINVAL);
     }
+    // Linux's core_sys_select looks no further than the table can reach.
+    let nfds = nfds.min(crate::fd::MAX_FDS as u64);
     // As ppoll: after the deadline, the sets come back (cleared if nothing
     // is ready), as Linux returns them.
     let deadline = p.timeout_deadline(timeout);

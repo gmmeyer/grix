@@ -1962,6 +1962,13 @@ fn openat2_and_its_resolve_flags() {
 }
 
 #[test]
+fn more_than_1024_descriptors() {
+    // Redis raises RLIMIT_NOFILE for its clients (it lowered maxclients to
+    // 992); the global open-file cap and the kernel memory budget hold.
+    popular(with("popular").allow(Capability::Process), &["nofile"]);
+}
+
+#[test]
 fn arguments_and_environment_in_linux_order() {
     // libuv's process title (mongosh) measures the area by it.
     let out = run(with("popular").env("A", "1").env("BB", "22"), &["/bin/popular", "argvlayout", "x", "yy"]);

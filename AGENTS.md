@@ -603,7 +603,9 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       has them) before anything fails.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
       all processes), queued real-time signals, inotify watches, POSIX
-      timers, threads (all processes), descriptors, open files
+      timers, threads (all processes), descriptors (RLIMIT_NOFILE, at
+      most `fd::MAX_FDS`; a table's slots take a `kmem::Charge`, so
+      fork's copies are budgeted too), open files
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
       zombies included), network connections (`inet::MAX_CONNS`),
       connections waiting to be accepted (`inet::MAX_PENDING`),

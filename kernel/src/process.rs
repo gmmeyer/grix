@@ -387,7 +387,7 @@ impl Process {
         let mut rlimits = [(RLIM_INFINITY, RLIM_INFINITY); 16];
         rlimits[3] = (STACK_SIZE, RLIM_INFINITY); // RLIMIT_STACK
         rlimits[4] = (0, 0); // RLIMIT_CORE
-        rlimits[7] = (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64); // RLIMIT_NOFILE
+        rlimits[7] = (crate::fd::NOFILE_DEFAULT as u64, crate::fd::MAX_FDS as u64); // RLIMIT_NOFILE
         Process {
             pid,
             ppid: 0,
@@ -450,7 +450,7 @@ impl Process {
         c.pgid = self.pgid;
         c.sid = self.sid;
         c.ctty = self.ctty.clone();
-        c.fds = if share.files { self.fds.share() } else { self.fds.copy() };
+        c.fds = if share.files { self.fds.share() } else { self.fds.copy()? };
         c.fs = if share.fs { self.fs.share() } else { self.fs.copy() };
         c.ids = self.ids.clone();
         c.sigactions = if share.sighand { self.sigactions.share() } else { self.sigactions.copy() };

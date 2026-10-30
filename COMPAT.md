@@ -41,7 +41,7 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | Traefik | 3.7.16 | `traefik:v3` | file provider routing to its own API, curl from the host | n t | works | SIGILL, as Caddy. | Fixed: auxv |
 | PostgreSQL | 17.11 | `postgres:17-alpine` | `docker-entrypoint.sh postgres` (initdb, temporary server, real one), psql: table, 10,000 rows, index | n t p w | works | initdb: `shmget` not implemented (the postmaster's System V interlock segment). | Fixed: System V shm |
 | MariaDB | 11.8.9 | `mariadb:11` | `docker-entrypoint.sh mariadbd`, client: database, table, rows | n t p w | works | Works; it listens on 0.0.0.0 and `::` (needed `IPV6_V6ONLY`). io_uring and `io_setup` were ENOSYS (reported), and it fell back to synchronous I/O; it has Linux AIO now (io_uring stays ENOSYS, as under Docker's default seccomp profile). | |
-| Redis | 7.4.12 | `redis:7-alpine` | `redis-server`, PING/SET/GET/BGSAVE from the host, SIGINT shutdown | n t p w | works | 1. Exited: its arm64 copy-on-write bug check forks and reads `Shared_Dirty` in `/proc/self/smaps`, which didn't exist. 2. `bind: Address in use`: `[::]:6379` with `IPV6_V6ONLY` beside `0.0.0.0:6379`. Still warns that `maxclients` drops to 992 (`RLIMIT_NOFILE` is 1024/1024) and about `vm.overcommit_memory`. | Fixed: smaps, `IPV6_V6ONLY` |
+| Redis | 7.4.12 | `redis:7-alpine` | `redis-server`, PING/SET/GET/BGSAVE from the host, SIGINT shutdown | n t p w | works | 1. Exited: its arm64 copy-on-write bug check forks and reads `Shared_Dirty` in `/proc/self/smaps`, which didn't exist. 2. `bind: Address in use`: `[::]:6379` with `IPV6_V6ONLY` beside `0.0.0.0:6379`. It warned that `maxclients` dropped to 992 (`RLIMIT_NOFILE` was 1024/1024); it still warns about `vm.overcommit_memory`. | Fixed: smaps, `IPV6_V6ONLY`, `RLIMIT_NOFILE` |
 | Memcached | 1.6.45 | `memcached:alpine` | `memcached -u root`, set/get/stats from the host | n t | works | | |
 | MongoDB | 7.0.45, mongosh 2.14.0 | `mongo:7` | `mongod`, mongosh: insert, index, query | n t p w | works | mongosh died of SIGSEGV: the strings at the top of the stack were in reverse order within argv and environ, so libuv's process title came out with a negative length and wrote past the stack. | Fixed: the stack's strings |
 | SQLite | 3.40.1 | `debian:bookworm` | `sqlite3` create/insert/select; Python's sqlite3 | w | works | | |
@@ -107,6 +107,7 @@ In this series (each with its check in `popular.c`):
 | the stack's strings | The stack's strings in Linux's order, with a zero word on top | mongosh (Node's process title), nginx's and PostgreSQL's setproctitle |
 | shared memory budget | Shared memory's page list is charged to the kernel memory budget (it could fill the kernel heap) | anything with big `MAP_SHARED` or System V memory |
 | `openat2` | openat2 and its RESOLVE_* flags | rsync |
+| `RLIMIT_NOFILE` | Up to 65536 descriptors | Redis (`maxclients` 10000), busy servers |
 
 Already in 0.0.31 and the Datadog series (0.0.32), found here too:
 `/proc/<pid>/auxv` (Caddy, Traefik), connecting to 0.0.0.0 and `::` as
@@ -118,18 +119,16 @@ images from registries, run on their own machine).
 
 In order of impact (details in TODO.md, "Round 3"):
 
-1. **`RLIMIT_NOFILE` above 1024**: Redis lowers `maxclients` to 992;
-   busy servers want more descriptors.
-2. **xattrs** (`cp -a`, `tar --xattrs`, `setcap` metadata).
-3. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
+1. **xattrs** (`cp -a`, `tar --xattrs`, `setcap` metadata).
+2. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
    `io_getevents`, ...: requests complete as they're submitted).
    **io_uring** stays ENOSYS, on purpose and unreported (programs probe it): it is a
    second way into every operation (each would need its own gate), and
    Docker's default seccomp profile blocks it too, so programs (MariaDB,
    nginx, libuv) are used to falling back to AIO or plain calls.
-4. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
+3. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
    mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
-5. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
+4. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
    of `ID_AA64*`, `MIDR_EL1`, `MPIDR_EL1`, `REVIDR_EL1` emulated as
    Linux's `HWCAP_CPUID`, sanitized to what HWCAP advertises).
 

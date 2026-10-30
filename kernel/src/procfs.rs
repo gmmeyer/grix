@@ -127,7 +127,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/fs/aio-nr", ProcFile::AioNr),
     ("/proc/sys/fs/aio-max-nr", ProcFile::Text("65536\n")),
     ("/proc/sys/fs/inode-nr", ProcFile::InodeNr),
-    ("/proc/sys/fs/nr_open", ProcFile::Text("1024\n")),
+    ("/proc/sys/fs/nr_open", ProcFile::Text("65536\n")), // fd::MAX_FDS
     // Linux 6.1's last capability, CAP_CHECKPOINT_RESTORE (libcap and Go's
     // capability packages read it).
     ("/proc/sys/kernel/cap_last_cap", ProcFile::Text("40\n")),

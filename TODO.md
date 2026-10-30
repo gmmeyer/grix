@@ -140,10 +140,11 @@ Left, in order of impact:
     mounts NO_XDEV won't cross are /proc, /dev and the host's
     directories; magic links are /proc/<pid>/{exe,cwd,root,fd/N};
     RESOLVE_CACHED is EAGAIN on a live mount (the host would be asked).
-24. [ ] **More than 1024 descriptors** (`RLIMIT_NOFILE` is 1024/1024):
-    Redis lowers `maxclients` to 992. A higher hard limit needs a
-    descriptor table that grows with use, with the global open-file cap
-    still the bound (ENFILE).
+24. [x] **More than 1024 descriptors**: `RLIMIT_NOFILE` is 1024/65536
+    (as Docker gives), the table grows with use up to `fd::MAX_FDS`,
+    each slot charged to kmem (fork copies only up to the last open
+    one, and fails with ENOMEM past the budget), and the global
+    open-file cap is still the bound (ENFILE).
 25. [ ] **xattrs** (`cp -a`, `tar --xattrs`): unsupported `setxattr`.
 26. [x] **Linux AIO**: `io_setup`, `io_destroy`, `io_submit` (pread,
     pwrite, preadv, pwritev, fsync, fdsync, poll), `io_cancel`,

@@ -184,11 +184,12 @@ pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
         let what = "CLONE_FILES or CLONE_FS with more threads (one thread's own)";
         return p.unimplemented(table::nr::unshare, name, what, EINVAL);
     }
+    // The table's copy may fail (ENOMEM): first, so a failure changes nothing.
+    if flags & CLONE_FILES != 0 {
+        p.fds.unshare()?;
+    }
     if flags & CLONE_FS != 0 {
         p.fs.unshare();
-    }
-    if flags & CLONE_FILES != 0 {
-        p.fds.unshare();
     }
     Ok(0)
 }
@@ -266,6 +267,10 @@ pub fn execve(
         return p.block_io(None, Err(EINTR));
     }
     p.exclusive_wanted = false;
+    // A descriptor table shared with another process (CLONE_FILES) becomes
+    // this one's own below: copied now, while failing (ENOMEM) still
+    // leaves the caller running.
+    let own_fds = if p.fds.shared() { Some(p.fds.copy()?) } else { None };
     // The point of no return.
     let (entry, sp) = program.install(p);
     // As on Linux, the saved ids become the effective ones.
@@ -291,7 +296,9 @@ pub fn execve(
     // (CLONE_FILES, CLONE_SIGHAND) become this one's own first, as Linux's
     // exec unshares them (unshare_files, de_thread). A working directory
     // shared by CLONE_FS stays shared.
-    p.fds.unshare();
+    if let Some(fds) = own_fds {
+        p.fds = fds;
+    }
     p.sigactions.unshare();
     for file in p.fds.cloexec_files() {
         super::file::closing(p, &file);
