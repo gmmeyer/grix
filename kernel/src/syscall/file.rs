@@ -483,7 +483,10 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         if writes && fs.read_only(ino) && !fs.is_dir(ino) && !matches!(fs.node(ino).kind, Kind::Fifo(_)) {
             return Err(EROFS);
         }
+        // Linux's may_open: read and write as `open`'s mode asks.
+        let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
         match &fs.node(ino).kind {
+            Kind::Dev(_) if !fs.permits(ino, p.uid, p.gid, want) => return Err(EACCES),
             &Kind::Dev(d @ (Dev::Ptmx | Dev::Pts(_) | Dev::Tty)) => {
                 let denied = landlock_open(&fs)?;
                 let file = super::tty::open_dev(p, &mut fs, d, ino, flags)?;
@@ -525,7 +528,6 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             // Linux's mem_open without ptrace_may_access(ATTACH).
             Kind::Proc(ProcFile::Mem) if proc_pid.is_some() => return Err(EACCES),
             Kind::Proc(ProcFile::Mem) => {
-                let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
                 if !fs.permits(ino, p.uid, p.gid, want) {
                     return Err(EACCES);
                 }
@@ -537,7 +539,6 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             }
             // A thread's name, for its owner (0644).
             Kind::Proc(f) if writes && procfs::writable(*f) => {
-                let want = if acc != O_WRONLY { MAY_READ } else { 0 } | MAY_WRITE;
                 if !fs.permits(ino, p.uid, p.gid, want) {
                     return Err(EACCES);
                 }
@@ -2711,7 +2712,7 @@ fn owner(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             if arg > 64 {
                 return Err(EINVAL);
             }
-            file.lock().fown.sig = arg as u32;
+            (file.lock().fown.sig, file.lock().fown.sig_sender) = (arg as u32, p.pid);
             return Ok(0);
         }
         F_SETOWN => match arg as i32 {
@@ -2746,7 +2747,7 @@ fn owner(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     };
     let mut f = file.lock();
     f.fown.owner = owner;
-    (f.fown.sender, f.fown.sender_uid) = (p.pid, p.uid);
+    (f.fown.sender, f.fown.uid, f.fown.euid) = (p.pid, p.ids.ruid, p.uid);
     Ok(0)
 }
 

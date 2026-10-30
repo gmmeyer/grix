@@ -36,15 +36,26 @@ pub enum Owner {
 }
 
 /// A file's owner and the signal it gets (F_SETSIG; 0 is SIGIO without
-/// details), and who named the owner: the signals are that process's, as
-/// if it sent them with kill, so they can't reach init unless it asked.
+/// details), and who chose them: the signals are those processes', as if
+/// they sent them with kill, so they can't reach init unless it asked for
+/// both, nor anyone the one that named the owner couldn't signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fown {
     pub owner: Owner,
     pub sig: u32,
-    /// The process that called F_SETOWN, and its effective uid then.
+    /// The process that called F_SETOWN, and its real and effective uid
+    /// then (Linux's f_modown).
     pub sender: u32,
-    pub sender_uid: u32,
+    pub uid: u32,
+    pub euid: u32,
+    /// The process that called F_SETSIG (0: none has).
+    pub sig_sender: u32,
+}
+
+/// May the F_SETOWN caller signal `q`? Linux's sigio_perm: its ids then,
+/// against what `q`'s are now.
+fn sigio_perm(q: &Process, fown: &Fown) -> bool {
+    fown.euid == 0 || [q.ids.suid, q.ids.ruid].iter().any(|&id| id == fown.euid || id == fown.uid)
 }
 
 struct Entry {
@@ -151,8 +162,12 @@ fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: 
             Owner::Thread(tid) if q.threads.contains_key(&tid) => Target::Thread(tid),
             _ => continue,
         };
+        if !sigio_perm(q, &fown) {
+            continue;
+        }
         // As kill's: init only takes what it handles, unless it asked.
-        if crate::syscall::shields_init(q, fown.sender, signo) {
+        let chose = [fown.sender, fown.sig_sender];
+        if chose.iter().any(|&s| s != 0 && crate::syscall::shields_init(q, s, signo)) {
             continue;
         }
         let _ = signal::send(q, target, info);
