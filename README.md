@@ -295,11 +295,14 @@ let sandbox = Sandbox::builder()
 ```
 
 - Without `allow_host` rules, the program may connect anywhere except the
-  host itself and special addresses (loopback, link-local such as cloud
-  metadata at 169.254.169.254, multicast). With rules, only what they match,
-  and DNS answers only names they cover, so lookups can't carry data out
-  either. Special addresses need a rule for them specifically: `0.0.0.0/0`
-  doesn't open them.
+  host itself and special addresses: loopback, link-local such as cloud
+  metadata at 169.254.169.254, multicast, IPv6 unique local addresses
+  (`fc00::/7`, where AWS's and GCP's metadata services also are; IPv4's
+  private ranges aren't special), and any IPv6 address that carries a
+  special IPv4 one (NAT64, 6to4, Teredo and the like). With rules, only
+  what they match, and DNS answers only names they cover, so lookups can't
+  carry data out either. Special addresses need a rule for them
+  specifically: `0.0.0.0/0` and `::/0` don't open them.
 - The host's own services are `host.grix.internal` (10.0.2.2) and need a
   rule naming them.
 - Connections inside the sandbox (127.0.0.1, `::1`, its own 10.0.2.15) stay
