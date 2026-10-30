@@ -140,6 +140,11 @@ pub fn bind(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResult {
             let perm = 0o777 & !p.umask();
             let mut fs = fs::lock();
             let (dir, leaf) = fs.lookup_parent(base, &path)?;
+            if let Some(d) = crate::landlock::domain_changing(p, &fs, dir)
+                && fs.child_of(dir, &leaf).is_none()
+            {
+                d.check(&fs, dir, crate::landlock::MAKE_SOCK)?;
+            }
             match fs.create(dir, &leaf, Kind::Socket(id), perm, p.uid, p.gid) {
                 Ok(_) => {}
                 Err(EEXIST) => return Err(EADDRINUSE),

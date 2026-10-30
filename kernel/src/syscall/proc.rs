@@ -105,7 +105,9 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.sigmask = parent_thread.sigmask;
     t.altstack = parent_thread.altstack;
     t.seccomp = parent_thread.seccomp.clone();
+    t.landlock = parent_thread.landlock.clone();
     t.mempolicy = parent_thread.mempolicy;
+    c.landlocked = t.landlock.is_some();
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     if flags & CLONE_CHILD_SETTID != 0 {
         // In the child's memory: through its own mapping, unsharing the page.

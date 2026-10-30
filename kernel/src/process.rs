@@ -171,6 +171,9 @@ pub struct Thread {
     /// Its seccomp mode, filters and no_new_privs (inherited by threads and
     /// processes it makes, kept across execve).
     pub seccomp: crate::seccomp::State,
+    /// Its Landlock domain (landlock.rs): inherited like `seccomp`, and
+    /// only ever replaced by one with a layer more.
+    pub landlock: Option<alloc::sync::Arc<crate::landlock::Domain>>,
     /// Its NUMA memory policy (set_mempolicy's mode and mode flags), kept
     /// to be read back: with one node, every policy places memory alike.
     pub mempolicy: u32,
@@ -213,6 +216,7 @@ impl Thread {
             fifo_wait: None,
             call: (0, 0),
             seccomp: Default::default(),
+            landlock: None,
             mempolicy: 0,
             name: [0; 16],
             charge: Default::default(),
@@ -383,6 +387,9 @@ pub struct Process {
     pub ctty: Option<crate::tty::TtyRef>,
     /// AIO contexts (io_setup), shared by its threads, not inherited.
     pub aio: crate::syscall::aio::Contexts,
+    /// A thread of it may have a Landlock domain: without, checks are this
+    /// one test (`landlock::domain`).
+    pub landlocked: bool,
 }
 
 /// What a child made by clone shares with its parent instead of copying.
@@ -529,6 +536,7 @@ impl Process {
             job_notice: None,
             ctty: None,
             aio: Default::default(),
+            landlocked: false,
         }
     }
 
@@ -996,9 +1004,10 @@ pub fn load_program(
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<Program, ExecError> {
+    let landlock = crate::landlock::domain(p);
     let (exe, ino, src, argv) = {
         let mut fs = fs::lock();
-        resolve_interpreters(&mut fs, base, path, argv)?
+        resolve_interpreters(&mut fs, landlock.as_deref(), base, path, argv)?
     };
     let bytes = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
     let args_charge = crate::kmem::Charge::new(bytes)
@@ -1020,7 +1029,11 @@ pub fn load_program(
                     exec_error(ENOENT, alloc::format!("ELF interpreter {ipath} not found (was it imported?)"))
                 })?;
                 match &fs.node(ino).kind {
-                    Kind::File(c) => (elf::Source::of(c), ino),
+                    Kind::File(c) => {
+                        let src = elf::Source::of(c);
+                        may_execute(&mut fs, landlock.as_deref(), ino, cwd, ipath)?;
+                        (src, ino)
+                    }
                     _ => {
                         return Err(exec_error(
                             EACCES,
@@ -1119,8 +1132,26 @@ fn is_x86_64_elf(head: &[u8]) -> bool {
 /// `interp [arg] script args...`, and x86_64 programs through their
 /// translator. Returns the ELF to load (its path, node and bytes) and the
 /// final argv.
+/// Landlock's check of a file execve opens (the program, a script's
+/// interpreter, the ELF interpreter) by `path` from `base`: as Linux's
+/// open_exec, it's read too.
+fn may_execute(
+    fs: &mut fs::Fs,
+    landlock: Option<&crate::landlock::Domain>,
+    ino: Ino,
+    base: Ino,
+    path: &str,
+) -> Result<(), ExecError> {
+    use crate::landlock::{EXECUTE, READ_FILE};
+    let Some(d) = landlock else { return Ok(()) };
+    let dir = fs.found_in(ino, base, path, &fs::Scope::NONE);
+    d.check_in(fs, ino, dir, EXECUTE | READ_FILE)
+        .map_err(|e| exec_error(e, alloc::format!("{path}: refused by the program's Landlock rules")))
+}
+
 fn resolve_interpreters(
     fs: &mut fs::Fs,
+    landlock: Option<&crate::landlock::Domain>,
     cwd: Ino,
     path: &str,
     mut argv: Vec<String>,
@@ -1137,6 +1168,7 @@ fn resolve_interpreters(
             Kind::File(_) => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable"))),
             _ => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file"))),
         };
+        may_execute(fs, landlock, ino, cwd, &path)?;
         // Linux reads at most this much of the #! line.
         let mut buf = [0u8; 256];
         let n = src.read(0, &mut buf);

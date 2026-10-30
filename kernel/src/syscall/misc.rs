@@ -11,13 +11,6 @@ use crate::{rng, time};
 pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
     match n {
         nr::uname => uname(p, a[0]),
-        // Landlock is a program's own further restriction, like seccomp,
-        // which grix doesn't have yet (TODO.md): as Linux built without it
-        // or with it disabled at boot, every call fails with EOPNOTSUPP,
-        // which programs (Chromium, systemd's services) take to mean "run
-        // without it". Not reported: it's an answer Linux gives, and the
-        // sandbox's own limits are the policy's.
-        nr::landlock_create_ruleset | nr::landlock_add_rule | nr::landlock_restrict_self => Err(EOPNOTSUPP),
         nr::clock_gettime => clock_gettime(p, a[0], a[1]),
         nr::clock_getres => {
             if a[1] != 0 {

@@ -2495,12 +2495,6 @@ fn credentials_with_messages() {
 }
 
 #[test]
-fn landlock_is_disabled() {
-    // EOPNOTSUPP, as Linux with Landlock disabled at boot, and not reported.
-    popular(with("popular"), &["landlock"]);
-}
-
-#[test]
 fn credentials_with_streams() {
     // SO_PASSCRED on a stream: reads stop where the writer changes.
     popular(with("popular").allow(Capability::Process), &["streamcred"]);
@@ -2540,6 +2534,125 @@ fn pidfds() {
     assert_eq!(out.stdout_str(), "pidfd ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn landlock_rulesets() {
+    // The version query and the calls' errors, then rulesets as Linux
+    // enforces them: opens, making and removing nodes, execve, truncate,
+    // rename and link (REFER), stacking, inheritance, no_new_privs, TCP
+    // ports and device ioctls. What they refuse is the program's own
+    // choice: nothing is reported.
+    let b = with("landlock")
+        .allow(Capability::Process)
+        .allow(Capability::Threads)
+        .allow(Capability::Net)
+        .allow(Capability::FsWrite);
+    let out = run(b, &["/bin/landlock"]);
+    assert_eq!(out.stdout_str(), "landlock ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn landlock_comes_after_the_policy() {
+    // The policy's gate first: without fs_write, mkdir is denied (EPERM,
+    // reported) though the program's rules would refuse it too.
+    let out = run(with("landlock").allow(Capability::Process), &["/bin/landlock", "policy"]);
+    assert_eq!(out.stdout_str(), "landlock policy ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    let denied: Vec<_> = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            GuestEvent::Denied { syscall, capability, .. } => Some((syscall.as_str(), capability.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(denied, [("mkdirat", "fs_write")], "{:?}", out.events);
+    assert_eq!(out.events.len(), 1, "{:?}", out.events);
+}
+
+#[test]
+fn landlock_rules_on_live_mounts_and_lazy_imports() {
+    // Rules on a live mount's nodes and a lazy import's (whose file is
+    // copied up by the write), and on a live mount bigger than the kernel
+    // keeps: the directories rules hold aren't forgotten, and what's
+    // listed again under them is still theirs. Links and exchanges there,
+    // in both directions.
+    let host = temp_dir("landlock-mounts");
+    for root in ["live", "lazy"] {
+        for dir in ["open", "shut"] {
+            std::fs::create_dir_all(host.join(root).join(dir)).unwrap();
+            std::fs::write(host.join(root).join(dir).join("f"), "f\n").unwrap();
+        }
+        // Links and exchanges: each file holds its name.
+        for file in ["a/f", "a/x", "a/p", "b/y", "c/g", "c/z", "d/w", "out/v"] {
+            let path = host.join(root).join("m").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, path.file_name().unwrap().as_encoded_bytes()).unwrap();
+        }
+        std::fs::create_dir(host.join(root).join("m/b/sub")).unwrap();
+    }
+    std::fs::create_dir(host.join("ro")).unwrap();
+    std::fs::write(host.join("ro/f"), "f").unwrap();
+    let b = with("landlock")
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .mount(host.join("live"), "/live")
+        .unwrap()
+        .import_lazy(host.join("lazy"), "/lazy")
+        .unwrap()
+        .mount_read_only(host.join("ro"), "/ro")
+        .unwrap();
+    let out = run(b, &["/bin/landlock", "mounts"]);
+    assert_eq!(out.stdout_str(), "landlock mounts ok\n", "{:?} {:?}\n{}", out.status, out.events, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // The live mount's changes are the host's; the lazy import's aren't.
+    assert_eq!(std::fs::read_to_string(host.join("live/open/f")).unwrap(), "f\n+");
+    assert!(host.join("live/open/new").exists());
+    assert_eq!(std::fs::read_to_string(host.join("lazy/open/f")).unwrap(), "f\n");
+    assert!(!host.join("lazy/open/new").exists());
+    // Links and exchanges allowed happened on the host, those refused
+    // didn't, and the lazy import's stayed in the sandbox.
+    let live = host.join("live/m");
+    assert_eq!(std::fs::read_to_string(live.join("b/f2")).unwrap(), "f");
+    assert!(!live.join("d/f4").exists() && !live.join("out/f5").exists() && !live.join("a/g2").exists());
+    let contents = ["a/x", "a/p", "b/y", "c/z", "d/w", "out/v"].map(|f| std::fs::read_to_string(live.join(f)).unwrap());
+    assert_eq!(contents, ["p", "y", "x", "z", "w", "v"]);
+    assert_eq!(std::fs::read_to_string(host.join("lazy/m/a/x")).unwrap(), "x");
+    assert!(!host.join("lazy/m/b/f2").exists());
+    assert_eq!(std::fs::read_dir(host.join("ro")).unwrap().count(), 1);
+
+    // 30,000 files in 10 directories, about twice what the kernel keeps.
+    let big = temp_dir("landlock-evict");
+    std::fs::create_dir_all(big.join("keep/open/sub")).unwrap();
+    std::fs::create_dir_all(big.join("keep/shut")).unwrap();
+    std::fs::write(big.join("keep/open/sub/x"), "x").unwrap();
+    std::fs::write(big.join("keep/open/f"), "f").unwrap();
+    std::fs::write(big.join("keep/shut/f"), "f").unwrap();
+    for i in 0..10 {
+        let d = big.join(format!("big/d{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::File::create(d.join("f0")).unwrap();
+        for j in 0..3000 {
+            std::fs::File::create(d.join(format!("a-somewhat-long-file-name-{j:05}.txt"))).unwrap();
+        }
+    }
+    let b = with("landlock").allow(Capability::Process).timeout(Duration::from_secs(300)).mount(&big, "/live").unwrap();
+    let out = run(b, &["/bin/landlock", "evict"]);
+    assert_eq!(
+        out.stdout_str(),
+        "60060 entries\nlandlock evict ok\n",
+        "{:?} {:?}\n{}",
+        out.status,
+        out.events,
+        out.kernel_log
+    );
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    std::fs::remove_dir_all(&host).unwrap();
+    std::fs::remove_dir_all(&big).unwrap();
 }
 
 #[test]

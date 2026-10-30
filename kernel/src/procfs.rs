@@ -844,6 +844,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::TimerFd(_) => String::from("anon_inode:[timerfd]"),
         FileKind::SignalFd(_) => String::from("anon_inode:[signalfd]"),
         FileKind::PidFd(_) => String::from("anon_inode:[pidfd]"),
+        FileKind::Landlock(_) => String::from("anon_inode:[landlock-ruleset]"),
         FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_) => {
             alloc::format!("socket:[{}]", 0x3000_0000 + fd)
         }

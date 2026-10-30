@@ -361,6 +361,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::sigaltstack => signal::sigaltstack(p, tf.sp(), a[0], a[1]),
         nr::kill => signal::kill(p, a[0], a[1]),
         nr::seccomp => crate::seccomp::seccomp(p, a[0], a[1], a[2]),
+        nr::landlock_create_ruleset => crate::landlock::create_ruleset(p, a[0], a[1], a[2]),
+        nr::landlock_add_rule => crate::landlock::add_rule(p, a[0], a[1], a[2], a[3]),
+        nr::landlock_restrict_self => crate::landlock::restrict_self(p, a[0], a[1]),
 
         // processes
         nr::execve => proc::execve(p, tf, AT_FDCWD as u64, a[0], a[1], a[2], 0),

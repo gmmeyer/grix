@@ -176,7 +176,12 @@ fn is_netlink(file: &FileRef) -> bool {
 pub fn bind(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
-        return with_inet(p, fd, |p, s, _| inet_bind(p, s, addr, len))?;
+        return with_inet(p, fd, |p, s, _| {
+            if !s.dgram {
+                crate::landlock::check_socket(p, s.v6, addr, len, true)?;
+            }
+            inet_bind(p, s, addr, len)
+        })?;
     }
     if is_unix(&file) {
         return super::unix::bind(p, &file, addr, len);
@@ -996,6 +1001,9 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u
             }
             return Ok(0);
         }
+    }
+    if !s.dgram {
+        crate::landlock::check_socket(p, s.v6, addr, len, false)?;
     }
     let to = read_sockaddr(p, addr, len)?.or_loopback();
     if s.dgram {

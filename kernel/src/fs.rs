@@ -2803,6 +2803,37 @@ impl Fs {
         self.nodes[ino].remote.as_ref().is_some_and(|r| !r.writable && !self.lazy[r.mount])
     }
 
+    /// The directory `path` (from `start`) found `ino` in, for Landlock,
+    /// which goes by the way a file was reached: `Node::parent` is its
+    /// first name's, and that name may be gone. Reached through a symlink
+    /// its first name is all that's known, and if that's gone the root.
+    /// (Each name on a live mount is a node of its own.)
+    pub fn found_in(&mut self, ino: Ino, start: Ino, path: &str, scope: &Scope) -> Ino {
+        let n = &self.nodes[ino];
+        let parent = n.parent;
+        if self.is_dir(ino) || n.remote.is_some() || n.nlink == 0 {
+            return parent;
+        }
+        let first = self.child(parent, &n.name) == Some(ino);
+        if first && n.nlink <= 1 {
+            return parent;
+        }
+        if let Ok((dir, name)) = self.lookup_parent_in(start, path, scope)
+            && self.child_of(dir, &name) == Some(ino)
+        {
+            return dir;
+        }
+        if first { parent } else { ROOT }
+    }
+
+    /// Are `a` and `b` on different mounts, as a link or rename between
+    /// them can't be (EXDEV)? A lazy import's nodes are the sandbox's by
+    /// then.
+    pub fn crosses_mount(&self, a: Ino, b: Ino) -> bool {
+        let mount = |ino: Ino| self.nodes[ino].remote.as_ref().filter(|r| !self.lazy[r.mount]).map(|r| r.mount);
+        mount(a) != mount(b)
+    }
+
     /// Is `ino` still the host's, in a lazy import?
     fn is_lazy(&self, ino: Ino) -> bool {
         self.nodes[ino].remote.as_ref().is_some_and(|r| self.lazy[r.mount])

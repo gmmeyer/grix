@@ -15,8 +15,8 @@ use crate::fd::{
     Registration, new_file,
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
-use crate::locks;
 use crate::procfs::{self, ProcFile};
+use crate::{landlock, locks};
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
@@ -223,7 +223,8 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Inotify(_)
         | FileKind::TimerFd(_)
         | FileKind::SignalFd(_)
-        | FileKind::PidFd(_) => anon(0x2000_0000 + fd, 0o600, 0),
+        | FileKind::PidFd(_)
+        | FileKind::Landlock(_) => anon(0x2000_0000 + fd, 0o600, 0),
     })
 }
 
@@ -360,21 +361,28 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         return Err(EMFILE); // before creating or truncating anything
     }
     let perm = mode & 0o7777 & !p.umask();
+    let landlock = landlock::domain(p);
     if flags & O_TMPFILE == O_TMPFILE {
         if acc == O_RDONLY {
             return Err(EINVAL);
         }
         let dir = fs::lock().lookup_in(base, path, true, &scope).ok();
         need_write_in(p, n, dir, path)?;
-        let (ino, content) = {
+        let (ino, content, denied) = {
             let mut fs = fs::lock();
             let dir = fs.lookup_in(base, path, true, &scope)?;
             if !fs.is_dir(dir) {
                 return Err(ENOTDIR);
             }
-            fs.create_unnamed(dir, perm, p.uid, p.gid)?
+            let (ino, content) = fs.create_unnamed(dir, perm, p.uid, p.gid)?;
+            // Opened as a file in `dir`.
+            let denied = match &landlock {
+                Some(d) => landlock::open_access(d, &fs, ino, dir, acc)?,
+                None => 0,
+            };
+            (ino, content, denied)
         };
-        return open_node(p, ino, Some(content), flags, cloexec);
+        return open_node(p, ino, Some(content), flags, cloexec, denied);
     }
     let creat = flags & O_CREAT != 0;
     let excl = creat && flags & O_EXCL != 0;
@@ -434,6 +442,14 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     let writes = acc != O_RDONLY || flags & O_TRUNC != 0;
+    // The opener's Landlock domain, checked (after the errors the kind of
+    // node gives) as Linux's hook_file_open: the rights refused that
+    // matter later, or EACCES.
+    let dir = if landlock.is_some() { fs::lock().found_in(ino, base, path, &scope) } else { ROOT };
+    let landlock_open = |fs: &fs::Fs| match &landlock {
+        Some(d) => landlock::open_access(d, fs, ino, dir, acc),
+        None => Ok(0),
+    };
     let (content, proc, proc_pid) = {
         let mut fs = fs::lock();
         let proc_pid = fs.proc_pid(ino).filter(|&pid| pid != p.pid);
@@ -444,14 +460,16 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         }
         match &fs.node(ino).kind {
             &Kind::Dev(d @ (Dev::Ptmx | Dev::Pts(_) | Dev::Tty)) => {
+                let denied = landlock_open(&fs)?;
                 let file = super::tty::open_dev(p, &mut fs, d, ino, flags)?;
-                file.lock().pin = Some(fs.pin(ino));
+                (file.lock().pin, file.lock().landlock_denied) = (Some(fs.pin(ino)), denied);
                 drop(fs);
                 return p.fds.alloc(FdEntry { file, cloexec }, 0);
             }
             Kind::Dev(d) => {
+                let denied = landlock_open(&fs)?;
                 let file = new_file(FileKind::Dev(*d, ino), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
-                file.lock().pin = Some(fs.pin(ino));
+                (file.lock().pin, file.lock().landlock_denied) = (Some(fs.pin(ino)), denied);
                 drop(fs);
                 return p.fds.alloc(FdEntry { file, cloexec }, 0);
             }
@@ -460,6 +478,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             Kind::Socket(_) => return Err(ENXIO),
             Kind::Fifo(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Kind::Fifo(_) => {
+                landlock_open(&fs)?;
                 drop(fs);
                 return open_fifo(p, ino, flags, cloexec);
             }
@@ -470,6 +489,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
                 if !fs.permits(ino, p.uid, p.gid, MAY_READ) {
                     return Err(EACCES);
                 }
+                landlock_open(&fs)?;
                 fs.list_now(ino)?;
                 (None, None, None)
             }
@@ -484,6 +504,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
                 if !fs.permits(ino, p.uid, p.gid, want) {
                     return Err(EACCES);
                 }
+                landlock_open(&fs)?;
                 drop(fs);
                 let file = new_file(FileKind::ProcMem(p.pid), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
                 return p.fds.alloc(FdEntry { file, cloexec }, 0);
@@ -494,10 +515,14 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
                 if !fs.permits(ino, p.uid, p.gid, want) {
                     return Err(EACCES);
                 }
+                landlock_open(&fs)?;
                 (None, Some(*f), proc_pid)
             }
             Kind::Proc(_) if writes => return Err(EACCES),
-            Kind::Proc(f) => (None, Some(*f), proc_pid),
+            Kind::Proc(f) => {
+                landlock_open(&fs)?;
+                (None, Some(*f), proc_pid)
+            }
         }
     };
     if let Some(f) = proc {
@@ -530,14 +555,23 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         }
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
-    if let Some(c) = &content
-        && !created
-    {
+    if content.is_some() && !created {
         if writes {
             need_write(p, n, path)?;
         }
         let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
         if !fs::lock().permits(ino, p.uid, p.gid, want) {
+            return Err(EACCES);
+        }
+    }
+    // A new file is checked once made, as on Linux (MAKE_REG let it be
+    // made; this open may still fail).
+    let denied = if landlock.is_some() && content.is_some() { landlock_open(&fs::lock())? } else { 0 };
+    if let Some(c) = &content
+        && !created
+    {
+        // O_TRUNC on a regular file is a truncate (Linux's handle_truncate).
+        if flags & O_TRUNC != 0 && denied & landlock::TRUNCATE != 0 {
             return Err(EACCES);
         }
         // A lazy import's file is the sandbox's before it changes.
@@ -553,7 +587,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             fs::lock().modified(ino);
         }
     }
-    open_node(p, ino, content, flags, cloexec)
+    open_node(p, ino, content, flags, cloexec, denied)
 }
 
 /// Open a named pipe, as Linux's fifo_open: for reading it waits for a
@@ -609,11 +643,11 @@ fn open_fifo(p: &mut Process, ino: Ino, flags: u32, cloexec: bool) -> SysResult 
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
-fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool) -> SysResult {
+fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool, denied: u16) -> SysResult {
     let file = new_file(FileKind::Node(ino), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC | O_TMPFILE));
     let pin = fs::lock().pin(ino);
     let mut f = file.lock();
-    (f.content, f.pin) = (content, Some(pin));
+    (f.content, f.pin, f.landlock_denied) = (content, Some(pin), denied);
     drop(f);
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
@@ -637,6 +671,11 @@ fn create_file(p: &mut Process, base: Ino, path: &str, perm: u32, depth: u32, sc
     }
     if name.is_empty() || name == "." || name == ".." {
         return Err(EISDIR);
+    }
+    if let Some(d) = landlock::domain(p)
+        && fs.child_of(dir, &name).is_none()
+    {
+        d.check(&fs, dir, landlock::MAKE_REG)?;
     }
     fs.create(dir, &name, Kind::File(FileData::new(&[])), perm, p.uid, p.gid)
 }
@@ -725,7 +764,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             None => would_block(p, nonblock),
         },
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
-        FileKind::PidFd(_) => Err(EINVAL),
+        FileKind::PidFd(_) | FileKind::Landlock(_) => Err(EINVAL),
         FileKind::SignalFd(mask) => {
             // struct signalfd_siginfo is 128 bytes; read as many as fit.
             if count < 128 {
@@ -988,7 +1027,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::TimerFd(_) => return Err(EINVAL),
         FileKind::UnixUnbound(_) => return Err(ENOTCONN),
-        FileKind::SignalFd(_) | FileKind::PidFd(_) => return Err(EINVAL),
+        FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Landlock(_) => return Err(EINVAL),
         FileKind::Netlink(_) => {
             let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
             return super::net::netlink_request(p, nl, &[(buf, count)]);
@@ -1735,6 +1774,7 @@ pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
         return Err(EEXIST);
     }
     need_write_in(p, nr::mkdirat, Some(dir), &path)?;
+    landlock::check(p, dir, landlock::MAKE_DIR)?;
     let perm = mode as u32 & 0o1777 & !p.umask();
     fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
 }
@@ -1757,7 +1797,14 @@ pub fn mknodat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
         _ => return Err(EINVAL),
     };
     let (dir, name) = parent_of(p, dirfd, &path)?;
-    fs::lock().create(dir, &name, kind, perm, p.uid, p.gid).map(|_| 0)
+    let mut fs = fs::lock();
+    // A name that's there already is EEXIST first, as on Linux.
+    if let Some(d) = landlock::domain_changing(p, &fs, dir)
+        && fs.child_of(dir, &name).is_none()
+    {
+        d.check(&fs, dir, landlock::make_access(&kind))?;
+    }
+    fs.create(dir, &name, kind, perm, p.uid, p.gid).map(|_| 0)
 }
 
 pub fn unlinkat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResult {
@@ -1779,6 +1826,12 @@ pub fn unlinkat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) -> SysResul
     // "file/" names a directory.
     if path.ends_with('/') && fs.child_of(dir, &name).is_some_and(|c| !fs.is_dir(c)) {
         return Err(ENOTDIR);
+    }
+    // A name that isn't there is ENOENT first, as on Linux.
+    if let Some(d) = landlock::domain_changing(p, &fs, dir)
+        && fs.child_of(dir, &name).is_some()
+    {
+        d.check(&fs, dir, if rmdir { landlock::REMOVE_DIR } else { landlock::REMOVE_FILE })?;
     }
     fs.remove(dir, &name, rmdir, p.uid, p.gid).map(|_| 0)
 }
@@ -1806,6 +1859,14 @@ pub fn renameat2(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp:
         return Err(ENOTDIR);
     }
     let (noreplace, exchange) = (flags & RENAME_NOREPLACE != 0, flags & RENAME_EXCHANGE != 0);
+    // Not when the rename fails first: across mounts, EEXIST, or ENOENT
+    // for an exchange.
+    if let Some(d) = landlock::domain_changing(p, &fs, ndir) {
+        let dst = fs.child_of(ndir, &nname);
+        if !(fs.crosses_mount(odir, ndir) || noreplace && dst.is_some() || exchange && dst.is_none()) {
+            d.check_refer(&fs, src, odir, ndir, dst, true, exchange)?;
+        }
+    }
     fs.rename(odir, &oname, ndir, &nname, noreplace, exchange, p.uid, p.gid).map(|_| 0)
 }
 
@@ -1816,9 +1877,21 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
     let follow = if flags & AT_SYMLINK_FOLLOW != 0 { 0 } else { AT_SYMLINK_NOFOLLOW };
     let src = at_node(p, odirfd, opathp, (flags & AT_EMPTY_PATH) | follow)?;
     let _pin = fs::lock().pin(src);
+    let opath = read_cstr(&mut p.aspace, opathp, PATH_MAX)?;
+    // (An empty path is the descriptor's: `found_in` gives its parent.)
+    let obase = if opath.is_empty() { ROOT } else { base_of(p, odirfd, &opath)? };
     let npath = read_cstr(&mut p.aspace, npathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, ndirfd, &npath)?;
-    fs::lock().link(src, dir, &name, p.uid, p.gid).map(|_| 0)
+    let mut fs = fs::lock();
+    if let Some(d) = landlock::domain_changing(p, &fs, dir)
+        && fs.child_of(dir, &name).is_none()
+        && !fs.crosses_mount(src, dir)
+    {
+        // The directory its path went through, as a dentry's parent.
+        let odir = fs.found_in(src, obase, &opath, &fs::Scope::NONE);
+        d.check_refer(&fs, src, odir, dir, None, false, false)?;
+    }
+    fs.link(src, dir, &name, p.uid, p.gid).map(|_| 0)
 }
 
 pub fn symlinkat(p: &mut Process, targetp: u64, dirfd: u64, pathp: u64) -> SysResult {
@@ -1828,7 +1901,13 @@ pub fn symlinkat(p: &mut Process, targetp: u64, dirfd: u64, pathp: u64) -> SysRe
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let (dir, name) = parent_of(p, dirfd, &path)?;
-    fs::lock().create(dir, &name, Kind::Symlink(target), 0o777, p.uid, p.gid).map(|_| 0)
+    let mut fs = fs::lock();
+    if let Some(d) = landlock::domain_changing(p, &fs, dir)
+        && fs.child_of(dir, &name).is_none()
+    {
+        d.check(&fs, dir, landlock::MAKE_SYM)?;
+    }
+    fs.create(dir, &name, Kind::Symlink(target), 0o777, p.uid, p.gid).map(|_| 0)
 }
 
 /// Set a regular file's length, as truncate/ftruncate do.
@@ -1861,15 +1940,18 @@ pub(super) fn zap_shared(p: &mut Process, c: &Content, len: u64) {
 pub fn truncate(p: &mut Process, pathp: u64, len: u64) -> SysResult {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let ino = resolve(p, AT_FDCWD as u64, &path, true)?;
-    let fs = fs::lock();
+    let base = base_of(p, AT_FDCWD as u64, &path)?;
+    let mut fs = fs::lock();
     if fs.is_dir(ino) {
         return Err(EISDIR);
     }
     if !fs.permits(ino, p.uid, p.gid, MAY_WRITE) {
         return Err(EACCES);
     }
-    drop(fs);
-    let mut fs = fs::lock();
+    if let Some(d) = landlock::domain_changing(p, &fs, ino) {
+        let dir = fs.found_in(ino, base, &path, &fs::Scope::NONE);
+        d.check_in(&fs, ino, dir, landlock::TRUNCATE)?;
+    }
     fs.copy_up(ino)?;
     let c = fs.content(ino).ok_or(EINVAL)?;
     drop(fs);
@@ -1890,6 +1972,10 @@ fn writable_file(p: &Process, fd: u64, not_file: Errno) -> Result<(Ino, Content)
 
 pub fn ftruncate(p: &mut Process, fd: u64, len: u64) -> SysResult {
     let (ino, c) = writable_file(p, fd, EINVAL).map_err(|e| if e == ESPIPE { EINVAL } else { e })?;
+    // Landlock decided at open (hook_file_truncate).
+    if p.fds.get(fd)?.lock().landlock_denied & landlock::TRUNCATE != 0 {
+        return Err(EACCES);
+    }
     set_len(p, nr::ftruncate, &c, ino, len)
 }
 
@@ -2456,9 +2542,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
             let f = file.lock();
             let end = match &f.kind {
                 FileKind::Pipe(end) => end,
-                FileKind::Fifo(FifoFile { read: Some(end), .. }) | FileKind::Fifo(FifoFile { write: Some(end), .. }) => {
-                    end
-                }
+                FileKind::Fifo(FifoFile { read: Some(end), .. })
+                | FileKind::Fifo(FifoFile { write: Some(end), .. }) => end,
                 _ => return Err(EBADF),
             };
             let mut pipe = end.pipe.lock();
@@ -2529,7 +2614,7 @@ pub fn memfd_create(p: &mut Process, namep: u64, flags: u64) -> SysResult {
     let sealable = flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0;
     let seals = if sealable { 0 } else { fs::F_SEAL_SEAL };
     let (ino, content) = fs::lock().create_memfd(&name, seals, p.uid, p.gid)?;
-    open_node(p, ino, Some(content), O_RDWR, flags & MFD_CLOEXEC != 0)
+    open_node(p, ino, Some(content), O_RDWR, flags & MFD_CLOEXEC != 0, 0)
 }
 
 /// signalfd4: read pending signals in `mask` as signalfd_siginfo records
@@ -2650,6 +2735,10 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     // The command is an unsigned int: C callers may pass it sign-extended.
     let req = req as u32 as u64;
     let file = p.fds.get(fd)?;
+    // A device opened without Landlock's IOCTL_DEV (hook_file_ioctl).
+    if file.lock().landlock_denied & landlock::IOCTL_DEV != 0 && !landlock::ioctl_exempt(req as u32) {
+        return Err(EACCES);
+    }
     let pty = match &file.lock().kind {
         FileKind::Pty(end) => Some((end.tty.clone(), end.master)),
         _ => None,

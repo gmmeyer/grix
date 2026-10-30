@@ -1167,17 +1167,6 @@ static int streamcred(void) {
     return 0;
 }
 
-// Landlock: as on a Linux with it disabled at boot, every call fails with
-// EOPNOTSUPP, even the ABI version query (Chromium probes it).
-static int landlock(void) {
-    CHECK(syscall(444, NULL, 0, 1) == -1 && errno == EOPNOTSUPP);
-    unsigned long long attr = 1; // LANDLOCK_ACCESS_FS_EXECUTE
-    CHECK(syscall(444, &attr, sizeof attr, 0) == -1 && errno == EOPNOTSUPP);
-    CHECK(syscall(445, 3, 1, &attr, 0) == -1 && errno == EOPNOTSUPP);
-    CHECK(syscall(446, 3, 0) == -1 && errno == EOPNOTSUPP);
-    return 0;
-}
-
 // capset: nothing has a capability, so dropping them all is allowed
 // (Chromium's zygote does before it forks); raising one is denied.
 struct cap_header { unsigned version; int pid; };
@@ -1229,7 +1218,6 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "tasks") == 0) r = tasks();
         if (strcmp(argv[i], "passcred") == 0) r = passcred();
         if (strcmp(argv[i], "streamcred") == 0) r = streamcred();
-        if (strcmp(argv[i], "landlock") == 0) r = landlock();
         if (strcmp(argv[i], "capdrop") == 0) r = capdrop();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {

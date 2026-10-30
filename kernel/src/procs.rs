@@ -59,7 +59,7 @@ pub fn ended(p: &Process, pid: u32) -> bool {
 /// whose user and group (`real`: real ids, otherwise effective ones) are
 /// all of `q`'s.
 pub fn may_inspect(p: &Process, q: &Process, real: bool) -> bool {
-    may_inspect_creds(p, q.uid, q.gid, &q.ids, real)
+    may_inspect_creds(p, q.uid, q.gid, &q.ids, real) && crate::landlock::may_inspect(p, q)
 }
 
 /// `may_inspect` for a process with these credentials (a zombie's).

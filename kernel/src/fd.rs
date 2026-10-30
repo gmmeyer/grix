@@ -98,6 +98,8 @@ pub enum FileKind {
     /// /proc/<pid>/mem, for the process itself: reads and writes at its
     /// virtual addresses (the offset), through `uaccess`.
     ProcMem(u32),
+    /// A Landlock ruleset being made (landlock.rs).
+    Landlock(crate::landlock::RulesetRef),
 }
 
 impl FileKind {
@@ -131,6 +133,8 @@ impl FileKind {
             // Depend on the reader's pending signals, or on other
             // processes: see file::poll_kind.
             FileKind::SignalFd(_) | FileKind::PidFd(_) => (0, 0),
+            // No poll of its own: Linux's DEFAULT_POLLMASK.
+            FileKind::Landlock(_) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Socket(s) => s.poll(),
             FileKind::Inet(s) => s.poll(),
             FileKind::Pty(end) => {
@@ -169,6 +173,10 @@ pub struct OpenFile {
     pub fown: crate::fasync::Fown,
     /// A writable /proc comm file: the thread it names (pid, tid).
     pub comm_of: Option<(u32, u32)>,
+    /// Rights the opener's Landlock domain refused that matter after the
+    /// open (`landlock::TRUNCATE`, `IOCTL_DEV`): Linux's allowed_access,
+    /// inverted, so a file opened any other way has them all.
+    pub landlock_denied: u16,
 }
 
 impl Drop for OpenFile {
@@ -296,6 +304,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         locked: false,
         fown: Default::default(),
         comm_of: None,
+        landlock_denied: 0,
     }))
 }
 

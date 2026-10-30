@@ -28,6 +28,7 @@ mod inet;
 mod inotify;
 mod ipc;
 mod kmem;
+mod landlock;
 mod locks;
 mod mm;
 mod netlink;

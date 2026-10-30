@@ -158,6 +158,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let sigmask = p.cur().sigmask;
     let seccomp = p.cur().seccomp.clone();
+    let landlock = p.cur().landlock.clone();
     let mempolicy = p.cur().mempolicy;
     let name = p.thread_name(p.current);
     let mut t = Thread::new(tid);
@@ -167,6 +168,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         t.name = name;
     }
     t.seccomp = seccomp;
+    t.landlock = landlock;
     t.mempolicy = mempolicy;
     t.regs = regs;
     arch::save_fp(&mut t.fp);
