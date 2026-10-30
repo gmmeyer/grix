@@ -458,7 +458,19 @@ fn run_step(
     }
     let out = b.build()?.run_streaming(&argv, |s, d| on_output(s, d))?;
     if out.status != ExitStatus::Exited(0) {
-        bail!("build step {step:?} failed: {:?}\n{}", out.status, out.stderr_str());
+        // What the guest says it ran out of (its say-so, only for a hint):
+        // a full file system shows as ENOSPC, or as SIGBUS through a mapping.
+        use grix_abi::stats::Limit;
+        let full = out.guest_stats.as_ref().is_some_and(|s| s.hits(Limit::FileData) + s.hits(Limit::Memory) > 0);
+        let hint = if full {
+            format!(
+                "\nThe step ran out of room: its files live in guest memory ({memory_mb} MiB, half of it for \
+                 files). Ask for more with `memory_mb` in the Grixfile."
+            )
+        } else {
+            String::new()
+        };
+        bail!("build step {step:?} failed: {:?}{hint}\n{}", out.status, out.stderr_str());
     }
     let ex = out.export("/").context("no export")?;
     if ex.state != crate::ExportState::Complete {

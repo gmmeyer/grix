@@ -765,6 +765,30 @@ fn images_for_the_other_architecture_run_anywhere() {
 }
 
 #[test]
+fn build_steps_that_run_out_of_room_say_so() {
+    // Files live in guest memory: a step that fills it fails with ENOSPC
+    // (or SIGBUS, through a mapping: `apk add chromium`), and the error
+    // says what to change.
+    let dir = temp_dir("full-step");
+    let g = grix::build::Grixfile {
+        from: Some(format!("oci:{}", fixture("oci/alpine").display())),
+        from_outside_context: true,
+        run: vec![grix::build::Step::Shell("head -c 3000000000 /dev/zero > /big".into())],
+        ..Default::default()
+    };
+    let opts = grix::build::BuildOptions {
+        arch: None,
+        kernel: None,
+        on_output: &mut |_, _| {},
+        policy: Default::default(),
+        control: None,
+    };
+    let err = format!("{:#}", g.build(&dir, opts).err().unwrap());
+    assert!(err.contains("ran out of room") && err.contains("`memory_mb`"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn images_with_no_other_os() {
     // Just the grix kernel and static programs: no base image, and build
     // steps that need no shell. What the kernel makes at boot (/etc/passwd,
