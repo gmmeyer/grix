@@ -15,8 +15,8 @@
 //! so the rest of the kernel still sees "the running process" and "the
 //! others". Each CPU keeps its own scheduling state (`Cpu`: process,
 //! thread, time slice), swapped into the `Process` fields the kernel uses
-//! (`current`, `slice_start`, `resched`, `timer_dirty`, `running`) while it
-//! holds the lock. Finishing off a process that ended, and execve, wait
+//! (`current`, `slice_start`, `resched`, `running`) while it holds the
+//! lock. Finishing off a process that ended, and execve, wait
 //! until the CPU doing it is the only one running the process (`alone`):
 //! the others leave it at their next scheduling point, which a kick (an
 //! SGI) brings forward.
@@ -41,12 +41,11 @@ struct Cpu {
     tid: Option<u32>,
     slice_start: u64,
     resched: bool,
-    timer_dirty: bool,
     /// The user page table in TTBR0 (0: the empty one).
     ttbr: u64,
 }
 
-const IDLE: Cpu = Cpu { pid: None, tid: None, slice_start: 0, resched: false, timer_dirty: true, ttbr: 0 };
+const IDLE: Cpu = Cpu { pid: None, tid: None, slice_start: 0, resched: false, ttbr: 0 };
 
 /// Indexed by CPU; only touched with the kernel lock held.
 static CPUS: spin::Mutex<[Cpu; N]> = spin::Mutex::new([IDLE; N]);
@@ -301,7 +300,6 @@ pub fn lock() {
         p.running = tid.is_some();
         p.slice_start = cpu.slice_start;
         p.resched = cpu.resched || tid.is_none() && cpu.tid.is_some();
-        p.timer_dirty = cpu.timer_dirty;
         process::set_current_pid(p.pid);
         // Its address space, from a fast entry on another CPU if one has it.
         if checked_out {
@@ -345,7 +343,6 @@ pub fn unlock() {
             c.pid = c.tid.map(|_| p.pid);
             c.slice_start = p.slice_start;
             c.resched = p.resched;
-            c.timer_dirty = p.timer_dirty;
             crate::fast::update(c.tid.map(|tid| (&*p, tid)));
             // What's per CPU stays with the CPU.
             p.running = false;

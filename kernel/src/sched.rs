@@ -111,7 +111,7 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
         crate::stats::switched();
     }
     p.slice_start = time::monotonic_ns();
-    p.timer_dirty = true;
+    timer_changed();
     update_timer(p);
 }
 
@@ -223,7 +223,7 @@ fn poll(mut p: Option<&mut Process>, procs: &mut Procs, timer: bool) -> bool {
             CPU_TIMED.store(cpu_timed, Ordering::Relaxed);
             timers = false;
         }
-        crate::fasync::deliver(p.as_deref_mut(), procs);
+        woke |= crate::fasync::deliver(p.as_deref_mut(), procs);
         if crate::ipc::generation() == generation {
             POLLED.store(generation, Ordering::Relaxed);
             return woke;
@@ -279,6 +279,19 @@ fn settle(mut p: Option<&mut Process>, procs: &mut Procs, mut timer: bool) -> bo
     }
 }
 
+/// This CPU's timer may no longer be what it should: `update_timer` sets
+/// it again. It's the CPU's, whichever process it's about: only a CPU's
+/// own timer ends its time slice, and other processes' threads that came
+/// to wait for one need it as much as its own process's.
+static TIMER_DIRTY: [AtomicBool; MAX_CPUS as usize] = [const { AtomicBool::new(true) }; MAX_CPUS as usize];
+
+/// Something changed that this CPU's timer depends on: a thread came to
+/// wait to run, in any process, or a deadline or timer of the process it
+/// runs did.
+pub fn timer_changed() {
+    TIMER_DIRTY[smp::me()].store(true, Ordering::Relaxed);
+}
+
 /// A signal from the host: to the program's process group, as a terminal
 /// sends Ctrl-C to its foreground group. Unlike other senders, nothing
 /// shields init (the program) from it.
@@ -286,15 +299,13 @@ fn from_host(mut p: Option<&mut Process>, procs: &mut Procs, sig: u32) -> bool {
     let init = procs.each(p.as_deref_mut()).find(|q| q.pid == crate::process::INIT).map(|q| q.pgid);
     let Some(group) = init else { return false };
     let mut sent = false;
-    for q in procs.each(p.as_deref_mut()) {
+    for q in procs.each(p) {
         if q.pgid == group {
             let info = crate::signal::SigInfo::sent(sig, crate::signal::SI_USER, 0, 0, "a signal from the host");
             sent |= crate::signal::send(q, crate::signal::Target::Process, info).is_ok();
         }
     }
-    if let Some(p) = p {
-        p.timer_dirty = true;
-    }
+    timer_changed();
     sent
 }
 
@@ -304,8 +315,8 @@ fn from_host(mut p: Option<&mut Process>, procs: &mut Procs, sig: u32) -> bool {
 /// Nothing to do (the usual case) takes no lock and looks at no other
 /// process.
 pub fn wake_io_everywhere(p: &mut Process) {
-    if (!quiet() || procs::housekeeping_due()) && settle(Some(&mut *p), &mut PROCS.lock(), false) {
-        p.timer_dirty = true;
+    if !quiet() || procs::housekeeping_due() {
+        settle(Some(p), &mut PROCS.lock(), false);
     }
 }
 
@@ -352,9 +363,7 @@ fn idle(mut p: Option<&mut Process>, procs: &mut Procs) {
         }
         None => deadlock(p, procs),
     }
-    if let Some(p) = p.as_deref_mut() {
-        p.timer_dirty = true;
-    }
+    timer_changed();
     // The moment a snapshot wants: everything started, waiting for input.
     if !others_running && waiting_for_input(p, procs) {
         crate::snapshot::take_if_wanted();
@@ -453,12 +462,12 @@ fn deadlock(p: Option<&mut Process>, procs: &mut Procs) -> ! {
 /// end of the time slice (if anything else is runnable), the process's
 /// CPU-time timers, or the next deadline (`arm`).
 pub fn update_timer(p: &mut Process) {
-    if !p.timer_dirty {
+    let me = smp::me();
+    if !TIMER_DIRTY[me].load(Ordering::Relaxed) {
         return;
     }
-    p.timer_dirty = false;
+    TIMER_DIRTY[me].store(false, Ordering::Relaxed);
     // A CPU running a thread keeps the time, if one does (see `KEEPER`).
-    let me = smp::me();
     let keeper = KEEPER.load(Ordering::Relaxed);
     if keeper != me && p.running && !smp::has_thread(keeper) {
         KEEPER.store(me, Ordering::Relaxed);
@@ -509,7 +518,7 @@ pub fn irq(tf: &mut TrapFrame) {
     // Its thread (or its process) ended while it ran (on another CPU's
     // say): `smp::finish` schedules.
     let Some(p) = guard.as_mut().filter(|p| p.running) else { return };
-    p.timer_dirty = true;
+    timer_changed();
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
     let (woke, others_runnable) = {
         let mut procs = PROCS.lock();

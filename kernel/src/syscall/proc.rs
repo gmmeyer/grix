@@ -135,7 +135,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     crate::stats::forked();
     crate::stats::peak(Resource::Processes, count as u64 + 1);
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     drop(procs);
     {
         let mut fs = crate::fs::lock();
@@ -354,7 +354,7 @@ pub fn execve(
     // POSIX timers go; setitimer's survives.
     p.timers.posix.clear();
     crate::timer::resync(p);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     if let Some((ppid, tid)) = p.vfork_parent.take()
         && let Some(parent) = PROCS.lock().other_mut(ppid)
     {

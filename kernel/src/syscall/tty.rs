@@ -307,7 +307,7 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
                 let sid = p.sid;
                 let mut procs = crate::procs::PROCS.lock();
                 tty::disassociate(Some(&mut *p), &mut procs, &tty, sid, false);
-                p.timer_dirty = true;
+                crate::sched::timer_changed();
             }
             p.ctty = None;
             Ok(0)

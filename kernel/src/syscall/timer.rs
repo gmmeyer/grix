@@ -139,7 +139,7 @@ pub fn setitimer(p: &mut Process, which: u64, new: u64, old: u64) -> SysResult {
     }
     let timing = arm(p, 1, cpu, 0, interval, value);
     *itimer(p, which)?.0 = timing;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::sched::deadlines_changed();
     Ok(0)
 }
@@ -157,7 +157,7 @@ pub fn alarm(p: &mut Process, secs: u64) -> SysResult {
     };
     let timing = arm(p, 1, None, 0, 0, secs.saturating_mul(1_000_000_000));
     p.timers.real = timing;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::sched::deadlines_changed();
     Ok(old)
 }
@@ -221,7 +221,7 @@ pub fn timer_settime(p: &mut Process, id: u64, flags: u64, new: u64, old: u64) -
     let prev = t.timing;
     t.timing = timing;
     t.overrun = 0;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::sched::deadlines_changed();
     // A CPU-time timer set to a time already passed fires now, its signal
     // delivered as this call returns (Linux's posix_cpu_timer_set), not
@@ -249,7 +249,7 @@ pub fn timer_getoverrun(p: &mut Process, id: u64) -> SysResult {
 pub fn timer_delete(p: &mut Process, id: u64) -> SysResult {
     let id = u32::try_from(id).map_err(|_| EINVAL)?;
     p.timers.posix.remove(&id).ok_or(EINVAL)?;
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::sched::deadlines_changed();
     Ok(0)
 }
@@ -292,7 +292,7 @@ pub fn timerfd_settime(p: &mut Process, fd: u64, flags: u64, new: u64, old: u64)
         t.version += 1;
         prev
     };
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::sched::deadlines_changed();
     crate::ipc::changed();
     if old != 0 {

@@ -378,7 +378,7 @@ pub fn fire(p: &mut Process) -> bool {
         p.timers.posix.get_mut(&id).unwrap().pending = queued;
     }
     if fired {
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     fired
 }
@@ -423,17 +423,17 @@ pub fn resync(p: &mut Process) {
     for id in ids {
         if signal::queued_timer_signal(p, id).is_none() {
             p.timers.posix.get_mut(&id).unwrap().pending = false;
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
     }
     if p.timers.real_pending && signal::queued_timer_signal(p, REAL_TIMER).is_none() {
         p.timers.real_pending = false;
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     for (i, id) in CPU_ITIMERS.into_iter().enumerate() {
         if p.timers.cpu_pending[i] && signal::queued_timer_signal(p, id).is_none() {
             p.timers.cpu_pending[i] = false;
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
     }
 }

@@ -314,7 +314,7 @@ fn stop(p: &mut Process, sig: u32) {
         p.resched = true;
     }
     crate::smp::kick_others(p.pid);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     // A parent's wait4 looks again.
     crate::ipc::changed();
 }
@@ -338,7 +338,7 @@ fn resume(p: &mut Process) {
     if p.pid == crate::process::INIT {
         crate::console::event(&grix_abi::wire::Event::Continued);
     }
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::ipc::changed();
 }
 
@@ -691,7 +691,7 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
             break;
         };
         if crate::timer::delivered(p, &mut info) {
-            p.timer_dirty = true;
+            crate::sched::timer_changed();
         }
         let act = p.action(info.signo);
         if is_ignored(&act, info.signo) {
@@ -805,7 +805,7 @@ pub fn dequeue(p: &mut Process, set: u64) -> Option<SigInfo> {
     }?;
     let mut info = info;
     if crate::timer::delivered(p, &mut info) {
-        p.timer_dirty = true;
+        crate::sched::timer_changed();
     }
     Some(info)
 }

@@ -1930,12 +1930,12 @@ fn deadlocks_are_reported_after_a_process_ends() {
 /// ended, and whatever else the CPUs are doing: a parent alone in wait() is
 /// no deadlock when a timer ends its child, and a thread or process that
 /// spins, with no system call to bring the kernel round, doesn't keep the
-/// waiter from running.
+/// waiter from running. Nor one a signal woke (O_ASYNC).
 #[test]
 fn waiters_wake_when_a_process_ends() {
     for cpus in [1, 4] {
         let b = || with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
-        for mode in ["alarm", "killtimer", "timers", "killwait", "killpipe", "timerspin"] {
+        for mode in ["alarm", "killtimer", "timers", "killwait", "killpipe", "timerspin", "sigio", "sigcont"] {
             let out = run(b(), &["/bin/wakeups", mode]);
             assert_eq!(out.stdout_str(), format!("{mode} ok\n"), "{cpus} CPUs: {:?}", out.events);
             assert_eq!(out.status, ExitStatus::Exited(0), "{mode}, {cpus} CPUs");

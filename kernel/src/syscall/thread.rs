@@ -179,7 +179,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     crate::procs::thread_added();
     crate::fs::task_changed(p.pid, tid, true);
     p.runq.push_back(tid);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
     Ok(tid as u64)
 }

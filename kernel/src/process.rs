@@ -369,8 +369,6 @@ pub struct Process {
     /// A thread waits to be the only one running (execve): other CPUs
     /// leave this process at their next scheduling point (see `smp`).
     pub exclusive_wanted: bool,
-    /// The timer needs reprogramming (runnable set or deadlines changed).
-    pub timer_dirty: bool,
     /// `ipc::generation()` when I/O waiters were last woken.
     pub io_seen: u64,
     /// setitimer, POSIX timers and timerfds (see timer.rs).
@@ -435,6 +433,8 @@ impl RunQ {
     pub fn push_back(&mut self, tid: u32) {
         self.0.push_back(tid);
         QUEUED.fetch_add(1, Ordering::Relaxed);
+        // Whichever process it's in, this CPU may have no slice to end.
+        crate::sched::timer_changed();
     }
 
     pub fn pop_front(&mut self) -> Option<u32> {
@@ -534,7 +534,6 @@ impl Process {
             slice_start: 0,
             resched: false,
             exclusive_wanted: false,
-            timer_dirty: true,
             io_seen: 0,
             timers: crate::timer::Timers::default(),
             exited_cpu_ns: 0,
@@ -654,7 +653,7 @@ impl Process {
         let t = self.cur();
         t.wait = Some(Wait { on, deadline, timeout_ret, rerun: false });
         t.restart_deadline = deadline;
-        self.timer_dirty = true;
+        crate::sched::timer_changed();
         if let Some(deadline) = deadline {
             crate::sched::deadline_at(deadline);
         }
@@ -702,7 +701,6 @@ impl Process {
             t.restarting = true;
             t.recheck = true;
             self.runq.push_back(tid);
-            self.timer_dirty = true;
         }
         any
     }
@@ -722,7 +720,6 @@ impl Process {
             t.restart_deadline = None;
         }
         self.runq.push_back(tid);
-        self.timer_dirty = true;
     }
 
     /// Stop a thread's wait (leaving its futex queue) without making it runnable.
@@ -746,7 +743,7 @@ impl Process {
                 }
             }
         }
-        self.timer_dirty = true;
+        crate::sched::timer_changed();
         Some(w)
     }
 

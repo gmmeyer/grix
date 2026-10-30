@@ -232,7 +232,6 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     if dead.exit_signal != 0 && dead.exit_signal <= signal::NSIG {
         let _ = signal::send(parent, Target::Process, SigInfo::child(dead.exit_signal, pid, dead.uid, status));
     }
-    parent.timer_dirty = true;
     // wait4 waits for I/O state to change.
     crate::ipc::changed();
 }

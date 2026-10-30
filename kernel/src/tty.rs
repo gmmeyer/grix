@@ -998,7 +998,7 @@ pub fn signal_group(cur: Option<&mut Process>, procs: &mut Procs, pgrp: u32, sig
 pub fn signal_group_now(p: &mut Process, pgrp: u32, sig: u32) {
     let mut procs = crate::procs::PROCS.lock();
     signal_group(Some(&mut *p), &mut procs, pgrp, sig);
-    p.timer_dirty = true;
+    crate::sched::timer_changed();
 }
 
 /// The session leader `leader` (with terminal `tty`) ended, or gave its

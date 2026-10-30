@@ -100,11 +100,11 @@ pub fn watch(file: &FileRef, fd: u64) {
 }
 
 /// Signal the owners of files that became ready since the I/O state last
-/// changed.
-pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) {
+/// changed. Returns whether it signalled anyone.
+pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) -> bool {
     let generation = crate::ipc::generation();
     if SEEN.swap(generation, Ordering::Relaxed) == generation {
-        return;
+        return false;
     }
     let mut due = Vec::new();
     {
@@ -127,14 +127,16 @@ pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) {
             }
         }
     }
+    let mut sent = false;
     for (fown, fd, ready) in due {
-        send(p.as_deref_mut(), procs, fown, fd, ready);
+        sent |= send(p.as_deref_mut(), procs, fown, fd, ready);
     }
+    sent
 }
 
 /// Linux's send_sigio: SIGIO plain, or F_SETSIG's signal with the reason
 /// (si_code), the poll bits (si_band) and the descriptor (si_fd).
-fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
+fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) -> bool {
     // POLLIN|POLLRDNORM, POLLOUT|POLLWRNORM|POLLWRBAND, POLLERR, POLLHUP|POLLERR.
     let (code, band) = if ready & EPOLLHUP != 0 {
         (POLL_HUP, 0x18)
@@ -155,6 +157,7 @@ fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: 
         timer: None,
         why: "I/O possible (O_ASYNC)",
     };
+    let mut sent = false;
     for q in procs.each(p) {
         let target = match fown.owner {
             Owner::Process(pid) if q.pid == pid => Target::Process,
@@ -170,7 +173,7 @@ fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: 
         if chose.iter().any(|&s| s != 0 && crate::syscall::shields_init(q, s, signo)) {
             continue;
         }
-        let _ = signal::send(q, target, info);
-        q.timer_dirty = true;
+        sent |= signal::send(q, target, info).is_ok();
     }
+    sent
 }
