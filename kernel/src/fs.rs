@@ -102,6 +102,10 @@ const META_LIMIT: u64 = 12 << 20;
 /// entry (B-tree slot), on top of the bytes of names and symlink targets.
 const NODE_COST: u64 = core::mem::size_of::<Node>() as u64 + 64;
 const ENTRY_COST: u64 = 64;
+/// A thread's /proc/<pid>/task/<tid> and its files, with names of up to 16
+/// bytes: paid for by the thread (`process::THREAD_COST`, from `kmem`),
+/// not the metadata budget, so threads don't crowd out files.
+pub const TASK_NODES_COST: u64 = (procfs::TASK_FILES.len() as u64 + 1) * (NODE_COST + ENTRY_COST + 16);
 
 /// Limit written file data to `pages` pages of guest memory.
 pub fn set_limit(pages: u64) {
@@ -666,6 +670,9 @@ pub struct Node {
     pub ctime: u64,
     /// Extended attributes, by name (none for most nodes).
     xattrs: Option<Box<Xattrs>>,
+    /// A kernel node whose cost a thread holds (`TASK_NODES_COST`), not
+    /// the metadata budget.
+    prepaid: bool,
     /// Held by open descriptors and the working directory: an unlinked
     /// node's slot is only reused once nothing refers to it.
     pin: Arc<()>,
@@ -691,6 +698,7 @@ impl Node {
             mtime: time,
             ctime: time,
             xattrs: None,
+            prepaid: false,
             pin: Arc::new(()),
         }
     }
@@ -846,8 +854,10 @@ static FS: Mutex<Option<Fs>> = Mutex::new(None);
 enum Later {
     /// /proc/<pid> goes (`true`), or stays as a zombie's (`false`).
     Proc(u32, bool),
-    /// /proc/<pid>/task lists these threads now.
-    Tasks(u32, Vec<u32>),
+    /// /proc/<pid>/task lists only this thread now (execve).
+    Tasks(u32, u32),
+    /// /proc/<pid>/task/<tid> comes (`true`) or goes.
+    Task(u32, u32, bool),
     /// /dev/pts/N goes (its master closed).
     PtsHide(u32),
 }
@@ -875,10 +885,16 @@ pub fn proc_zombie(pid: u32) {
     later(Later::Proc(pid, false));
 }
 
-/// Process `pid`'s threads are now `tids`: its /proc/<pid>/task follows
-/// (now, or once the filesystem is free).
-pub fn tasks_changed(pid: u32, tids: Vec<u32>) {
-    later(Later::Tasks(pid, tids));
+/// Process `pid`'s only thread is now `tid` (execve): its /proc/<pid>/task
+/// follows (now, or once the filesystem is free).
+pub fn tasks_reset(pid: u32, tid: u32) {
+    later(Later::Tasks(pid, tid));
+}
+
+/// Process `pid` has a new thread `tid` (`true`), or one went: its
+/// /proc/<pid>/task follows (now, or once the filesystem is free).
+pub fn task_changed(pid: u32, tid: u32, added: bool) {
+    later(Later::Task(pid, tid, added));
 }
 
 /// Pseudo-terminal `index`'s master closed: /dev/pts/N goes (now, or once
@@ -1237,7 +1253,7 @@ impl Fs {
             self.pid_dirs.insert(pid, dir);
             self.dir_pids.insert(dir, pid);
             for &(name, file) in procfs::PID_FILES {
-                let perm = if procfs::private(file) { 0o400 } else { 0o444 };
+                let perm = procfs::perm(file);
                 self.add_node(dir, name, Kind::Proc(file), perm, owner)?;
             }
             let fd = self.add_node(dir, "fd", Kind::Dir(BTreeMap::new()), 0o500, owner)?;
@@ -1254,37 +1270,50 @@ impl Fs {
         }
     }
 
-    /// /proc/<pid>/task/<tid>: what Linux shows of each thread, here the
-    /// process's own files (`procfs::TASK_FILES`). Threads are counted by
-    /// the task directory's link count (Chromium's single-thread check).
+    /// /proc/<pid>/task/<tid>: what Linux shows of each thread
+    /// (`procfs::TASK_FILES`, made the thread's by `procfs::task_file`).
+    /// Threads are counted by the task directory's link count (Chromium's
+    /// single-thread check). The thread paid for these nodes
+    /// (`TASK_NODES_COST`).
     fn task_add(&mut self, task: Ino, pid: u32, tid: u32, owner: (u32, u32)) -> Result<(), Errno> {
-        let dir = self.add_node(task, &alloc::format!("{tid}"), Kind::Dir(BTreeMap::new()), 0o555, owner)?;
+        let dir = self.add_node_paid(task, &alloc::format!("{tid}"), Kind::Dir(BTreeMap::new()), 0o555, owner, true)?;
         self.dir_pids.insert(dir, pid);
         for &(name, file) in procfs::TASK_FILES {
-            self.add_node(dir, name, Kind::Proc(file), 0o444, owner)?;
+            let perm = procfs::perm(file);
+            self.add_node_paid(dir, name, Kind::Proc(procfs::task_file(file, tid)), perm, owner, true)?;
         }
         Ok(())
     }
 
-    /// Make /proc/<pid>/task list `tids`. Without room for a thread's
-    /// directory (the metadata budget), it isn't listed.
+    /// /proc/<pid>/task.
+    fn task_dir(&self, pid: u32) -> Option<(Ino, (u32, u32))> {
+        let dir = *self.pid_dirs.get(&pid)?;
+        let task = self.child(dir, "task")?;
+        Some((task, (self.nodes[task].uid, self.nodes[task].gid)))
+    }
+
+    /// Take `name` (`child`) out of directory `dir`, giving back what it was
+    /// charged.
+    fn unlink_kernel_node(&mut self, dir: Ino, name: &str, child: Ino) {
+        self.dir_pids.remove(&child);
+        self.remove_tree(child);
+        if let Kind::Dir(children) = &mut self.nodes[dir].kind {
+            children.remove(name);
+        }
+        if !self.nodes[child].prepaid {
+            release(entry_cost(name));
+        }
+        self.drop_name(child);
+    }
+
+    /// Make /proc/<pid>/task list only `tids`.
     fn tasks_set(&mut self, pid: u32, tids: &[u32]) {
-        let Some(&dir) = self.pid_dirs.get(&pid) else { return };
-        let Some(task) = self.child(dir, "task") else { return };
-        let (owner, Kind::Dir(children)) = ((self.nodes[task].uid, self.nodes[task].gid), &self.nodes[task].kind)
-        else {
-            return;
-        };
+        let Some((task, owner)) = self.task_dir(pid) else { return };
+        let Kind::Dir(children) = &self.nodes[task].kind else { return };
         let shown: Vec<(String, Ino)> = children.iter().map(|(n, &i)| (n.clone(), i)).collect();
         for (name, child) in shown {
             if !name.parse().is_ok_and(|tid: u32| tids.contains(&tid)) {
-                self.dir_pids.remove(&child);
-                self.remove_tree(child);
-                if let Kind::Dir(children) = &mut self.nodes[task].kind {
-                    children.remove(&name);
-                }
-                release(entry_cost(&name));
-                self.drop_name(child);
+                self.unlink_kernel_node(task, &name, child);
             }
         }
         for &tid in tids {
@@ -1294,13 +1323,46 @@ impl Fs {
         }
     }
 
+    /// /proc/<pid>/task/<tid> appears.
+    fn task_show(&mut self, pid: u32, tid: u32) {
+        let Some((task, owner)) = self.task_dir(pid) else { return };
+        if self.child(task, &alloc::format!("{tid}")).is_none() {
+            let _ = self.task_add(task, pid, tid, owner);
+        }
+    }
+
+    /// /proc/<pid>/task/<tid> goes.
+    fn task_hide(&mut self, pid: u32, tid: u32) {
+        let Some((task, _)) = self.task_dir(pid) else { return };
+        let name = alloc::format!("{tid}");
+        if let Some(child) = self.child(task, &name) {
+            self.unlink_kernel_node(task, &name, child);
+        }
+    }
+
     /// A node of the kernel's own (in /proc), counted against the metadata
     /// budget, in a slot that's reused once it's gone.
     fn add_node(&mut self, dir: Ino, name: &str, kind: Kind, perm: u32, owner: (u32, u32)) -> Result<Ino, Errno> {
+        self.add_node_paid(dir, name, kind, perm, owner, false)
+    }
+
+    /// The same, or (`prepaid`) one whose cost someone else holds.
+    fn add_node_paid(
+        &mut self,
+        dir: Ino,
+        name: &str,
+        kind: Kind,
+        perm: u32,
+        owner: (u32, u32),
+        prepaid: bool,
+    ) -> Result<Ino, Errno> {
         let mut node = Node::new(kind, perm, owner, dir, name, crate::time::realtime_ns());
         node.system = true;
+        node.prepaid = prepaid;
         self.reclaim();
-        charge(node.cost() + entry_cost(name))?;
+        if !prepaid {
+            charge(node.cost() + entry_cost(name))?;
+        }
         let ino = self.alloc_node(node);
         if let Kind::Dir(children) = &mut self.nodes[dir].kind {
             children.insert(name.into(), ino);
@@ -1340,7 +1402,9 @@ impl Fs {
                         self.zombie_dirs.insert(dir);
                     }
                 }
-                Later::Tasks(pid, tids) => self.tasks_set(pid, &tids),
+                Later::Tasks(pid, tid) => self.tasks_set(pid, &[tid]),
+                Later::Task(pid, tid, true) => self.task_show(pid, tid),
+                Later::Task(pid, tid, false) => self.task_hide(pid, tid),
                 Later::PtsHide(index) => self.pts_hide(index),
             }
         }
@@ -1366,7 +1430,9 @@ impl Fs {
             self.fd_dirs.remove(&child);
             self.dir_pids.remove(&child);
             self.remove_tree(child);
-            release(entry_cost(&name));
+            if !self.nodes[child].prepaid {
+                release(entry_cost(&name));
+            }
             self.drop_name(child);
         }
     }
@@ -1961,7 +2027,9 @@ impl Fs {
                 continue;
             }
             self.orphans.swap_remove(i);
-            release(self.nodes[ino].cost());
+            if !self.nodes[ino].prepaid {
+                release(self.nodes[ino].cost());
+            }
             // Dropping the node drops its contents (unlinked files have none
             // left by now) and its name.
             *self.nodes[ino] = Node::new(Kind::Unlinked { data: Weak::new(), linkable: false }, 0, (0, 0), ROOT, "", 0);

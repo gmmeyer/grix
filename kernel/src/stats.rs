@@ -72,11 +72,11 @@ pub fn current() -> Stats {
     let (meta, meta_limit) = crate::fs::meta_usage();
     let now_limit = [
         (used * 4096, total * 4096),
-        (crate::kmem::used(), crate::kmem::LIMIT),
+        (crate::kmem::used(), crate::kmem::limit()),
         (data * 4096, data_limit * 4096),
         (meta, meta_limit),
         (PROCESSES.load(Relaxed), crate::procs::MAX_PROCESSES as u64),
-        (THREADS.load(Relaxed), crate::process::MAX_THREADS as u64),
+        (THREADS.load(Relaxed), crate::process::threads_max() as u64),
     ];
     let mut s = Stats {
         cpu_ns: CPU_NS.load(Relaxed),

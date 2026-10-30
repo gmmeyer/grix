@@ -7,7 +7,7 @@ use grix_abi::stats::{Limit, Resource};
 use super::{require, table::nr};
 use crate::arch::{self, TrapFrame};
 use crate::errno::*;
-use crate::process::{self, MAX_THREADS, Process, Thread, WaitOn};
+use crate::process::{self, Process, Thread, WaitOn};
 use crate::time;
 use crate::uaccess::*;
 
@@ -134,10 +134,13 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return Err(EINVAL);
     }
     let threads = crate::procs::threads();
-    if threads >= MAX_THREADS {
+    if threads >= process::threads_max() {
         crate::stats::hit(Limit::Threads);
         return Err(EAGAIN);
     }
+    // Its kernel state, budgeted: EAGAIN as Linux's copy_process fails
+    // when it can't allocate a task.
+    let charge = crate::kmem::Charge::new(process::THREAD_COST).map_err(|_| EAGAIN)?;
 
     let tid = process::new_tid();
     // The child resumes right after the system call with the parent's
@@ -156,7 +159,13 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let sigmask = p.cur().sigmask;
     let seccomp = p.cur().seccomp.clone();
     let mempolicy = p.cur().mempolicy;
+    let name = p.thread_name(p.current);
     let mut t = Thread::new(tid);
+    t.charge = charge;
+    // Named as its creator is (Linux's copy_process copies comm).
+    if name != p.name {
+        t.name = name;
+    }
     t.seccomp = seccomp;
     t.mempolicy = mempolicy;
     t.regs = regs;
@@ -166,7 +175,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.sigmask = sigmask;
     p.threads.insert(tid, t);
     crate::procs::thread_added();
-    crate::fs::tasks_changed(p.pid, p.threads.keys().copied().collect());
+    crate::fs::task_changed(p.pid, tid, true);
     p.runq.push_back(tid);
     p.timer_dirty = true;
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
@@ -189,7 +198,7 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
         p.terminate(process::exited(code));
         return Err(EBLOCKED);
     }
-    crate::fs::tasks_changed(p.pid, p.threads.keys().copied().collect());
+    crate::fs::task_changed(p.pid, t.tid, false);
     if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
         futex_wake(p, t.clear_child_tid, 1, u32::MAX);
     }

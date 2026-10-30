@@ -95,6 +95,9 @@ pub enum FileKind {
     Unix(crate::unix::SockRef),
     /// A pidfd: refers to process `pid` (pids aren't reused).
     PidFd(u32),
+    /// /proc/<pid>/mem, for the process itself: reads and writes at its
+    /// virtual addresses (the offset), through `uaccess`.
+    ProcMem(u32),
 }
 
 impl FileKind {
@@ -112,7 +115,9 @@ impl FileKind {
                 let (writable, version) = crate::console::output_state();
                 (if writable { EPOLLOUT } else { 0 }, version)
             }
-            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) => (EPOLLIN | EPOLLOUT, 0),
+            FileKind::Node(_) | FileKind::Dev(..) | FileKind::Generated(_) | FileKind::ProcMem(_) => {
+                (EPOLLIN | EPOLLOUT, 0)
+            }
             FileKind::Inotify(n) => n.poll(),
             FileKind::TimerFd(t) => {
                 let mut t = t.lock();
@@ -162,6 +167,8 @@ pub struct OpenFile {
     pub locked: bool,
     /// O_ASYNC's owner and signal (F_SETOWN, F_SETSIG).
     pub fown: crate::fasync::Fown,
+    /// A writable /proc comm file: the thread it names (pid, tid).
+    pub comm_of: Option<(u32, u32)>,
 }
 
 impl Drop for OpenFile {
@@ -288,6 +295,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         held: None,
         locked: false,
         fown: Default::default(),
+        comm_of: None,
     }))
 }
 

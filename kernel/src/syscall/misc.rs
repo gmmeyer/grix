@@ -386,11 +386,12 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
             let s = read_cstr(&mut p.aspace, a[1], 4096).unwrap_or_default();
             let n = s.len().min(15);
             name[..n].copy_from_slice(&s.as_bytes()[..n]);
-            p.name = name;
+            // The calling thread's (the process's, for its main thread).
+            p.set_thread_name(p.current, name);
             Ok(0)
         }
         PR_GET_NAME => {
-            let name = p.name;
+            let name = p.thread_name(p.current);
             copy_out(&mut p.aspace, a[1], &name).map(|_| 0)
         }
         PR_GET_DUMPABLE => Ok(1),

@@ -1,17 +1,31 @@
 //! A budget for kernel heap memory that programs can make the kernel hold:
 //! pipe and socket buffers, netlink replies, generated /proc contents,
-//! queued real-time signals, descriptor tables. The heap is 32 MiB and running out of it is a
-//! kernel panic, so these fail with an errno (ENOMEM, ENOBUFS, EAGAIN) once
-//! the budget is used up. Filesystem names and nodes have their own budget
-//! (fs.rs), and fixed-size tables (threads, timers) their own limits.
+//! queued real-time signals, descriptor tables, threads. The heap is 32 MiB
+//! and a share of RAM (`mm::init`), and running out of it is a kernel
+//! panic, so these fail with an errno (ENOMEM, ENOBUFS, EAGAIN) once the
+//! budget is used up: `BASE`, and all of the share of RAM. Filesystem names
+//! and nodes have their own budget (fs.rs), and fixed-size tables (timers)
+//! their own limits.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use grix_abi::stats::{Limit, Resource};
 
 use crate::errno::*;
 
-pub const LIMIT: u64 = 10 << 20;
+/// What the fixed part of the heap gives the budget.
+pub const BASE: u64 = 10 << 20;
+static LIMIT: AtomicU64 = AtomicU64::new(BASE);
 static USED: AtomicU64 = AtomicU64::new(0);
+
+/// The heap's share of RAM gives the budget `extra` bytes more.
+pub fn init(extra: u64) {
+    LIMIT.store(BASE + extra, Ordering::Relaxed);
+}
+
+/// The whole budget.
+pub fn limit() -> u64 {
+    LIMIT.load(Ordering::Relaxed)
+}
 
 /// Bytes charged now.
 pub fn used() -> u64 {
@@ -20,7 +34,7 @@ pub fn used() -> u64 {
 
 /// Bytes left in the budget.
 pub fn available() -> u64 {
-    LIMIT.saturating_sub(USED.load(Ordering::Relaxed))
+    limit().saturating_sub(USED.load(Ordering::Relaxed))
 }
 
 /// Bytes charged against the budget, given back when dropped.
@@ -44,7 +58,7 @@ impl Charge {
         if bytes > self.0 {
             let more = bytes - self.0;
             // One CPU, no preemption in the kernel: check-then-add doesn't race.
-            if USED.load(Ordering::Relaxed) + more > LIMIT {
+            if USED.load(Ordering::Relaxed) + more > limit() {
                 crate::stats::hit(Limit::KernelMemory);
                 return Err(ENOMEM);
             }

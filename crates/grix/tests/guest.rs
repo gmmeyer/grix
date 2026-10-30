@@ -1611,6 +1611,38 @@ fn pthreads() {
 }
 
 #[test]
+fn threads_until_eagain() {
+    // More than the 1024 grix used to allow, up to threads-max (sized from
+    // the heap's share of RAM), then EAGAIN; sooner with kernel memory
+    // taken by pipe buffers. Never a kernel panic.
+    let out = run(with("threadmax").allow(Capability::Threads), &["/bin/threadmax"]);
+    assert_eq!(out.stdout_str(), "threadmax ok\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn per_thread_proc_files() {
+    // /proc/<pid>/task/<tid>: each thread's name (PR_SET_NAME,
+    // pthread_setname_np, its comm file), state and CPU time.
+    let out = run(with("taskproc").allow(Capability::Threads).allow(Capability::Process), &["/bin/taskproc"]);
+    assert_eq!(out.stdout_str(), "taskproc ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
+fn proc_self_mem() {
+    // /proc/self/mem at the process's own addresses (the vDSO's ELF
+    // header, as cilium/ebpf's kernel version probe reads it); another
+    // process's is refused.
+    let out = run(with("procmem").allow(Capability::Process), &["/bin/procmem"]);
+    assert_eq!(out.stdout_str(), "procmem ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn processes() {
     // fork, vfork, posix_spawn, execve of imported and written programs and
     // #! scripts, wait4/waitid, SIGCHLD, orphans, process groups and

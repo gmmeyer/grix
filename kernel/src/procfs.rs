@@ -39,6 +39,12 @@ pub enum ProcFile {
     Limits,
     Mountinfo,
     Mounts,
+    /// /proc/<pid>/mem: opened as a `FileKind::ProcMem`, never generated.
+    Mem,
+    // /proc/<pid>/task/<tid>/...: the thread's own.
+    TaskStat(u32),
+    TaskStatus(u32),
+    TaskComm(u32),
     // /proc/...
     Cpuinfo,
     /// 0-(n-1), the CPUs.
@@ -70,6 +76,8 @@ pub enum ProcFile {
     NetIpv6Route,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
+    /// /proc/sys/kernel/threads-max and /sys/fs/cgroup/pids.max.
+    ThreadsMax,
 }
 
 /// Each process's directory, /proc/<pid> (made at fork, gone once it has
@@ -86,6 +94,7 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("smaps", ProcFile::Smaps),
     ("smaps_rollup", ProcFile::SmapsRollup),
     ("comm", ProcFile::Comm),
+    ("mem", ProcFile::Mem),
     ("limits", ProcFile::Limits),
     ("mountinfo", ProcFile::Mountinfo),
     ("mounts", ProcFile::Mounts),
@@ -93,10 +102,36 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("oom_score_adj", ProcFile::Text("0\n")),
 ];
 
-/// What /proc/<pid>/task/<tid> has: the process's, as grix keeps names,
-/// times and state per process.
+/// What /proc/<pid>/task/<tid> has (each made the thread's by `task_file`).
 pub const TASK_FILES: &[(&str, ProcFile)] =
     &[("stat", ProcFile::Stat), ("status", ProcFile::Status), ("statm", ProcFile::Statm), ("comm", ProcFile::Comm)];
+
+/// A /proc/<pid> file as /proc/<pid>/task/`tid` has it: the thread's name,
+/// state and times rather than the process's.
+pub fn task_file(f: ProcFile, tid: u32) -> ProcFile {
+    match f {
+        ProcFile::Stat => ProcFile::TaskStat(tid),
+        ProcFile::Status => ProcFile::TaskStatus(tid),
+        ProcFile::Comm => ProcFile::TaskComm(tid),
+        f => f,
+    }
+}
+
+/// Files the owner may write (0644): a thread's name, as Linux's
+/// comm_write, for the process's own threads.
+pub fn writable(f: ProcFile) -> bool {
+    matches!(f, ProcFile::Comm | ProcFile::TaskComm(_))
+}
+
+/// A /proc/<pid> file's mode.
+pub fn perm(f: ProcFile) -> u32 {
+    match f {
+        ProcFile::Mem => 0o600,
+        _ if private(f) => 0o400,
+        _ if writable(f) => 0o644,
+        _ => 0o444,
+    }
+}
 
 /// Files of /proc/<pid> that are its owner's (0400), and that another
 /// process may open only if it may inspect this one: Linux's environ and
@@ -125,7 +160,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/kernel/osrelease", ProcFile::Text("6.1.0-grix\n")),
     ("/proc/sys/kernel/ostype", ProcFile::Text("Linux\n")),
     ("/proc/sys/kernel/pid_max", ProcFile::Text("4194304\n")),
-    ("/proc/sys/kernel/threads-max", ProcFile::Text("1024\n")),
+    ("/proc/sys/kernel/threads-max", ProcFile::ThreadsMax),
     ("/proc/sys/kernel/ngroups_max", ProcFile::Text("65536\n")),
     ("/proc/sys/kernel/random/uuid", ProcFile::RandomUuid),
     ("/proc/sys/kernel/random/boot_id", ProcFile::BootId),
@@ -176,7 +211,7 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/sys/fs/cgroup/cgroup.controllers", ProcFile::Text("cpu memory pids\n")),
     ("/sys/fs/cgroup/cpu.max", ProcFile::CgroupCpuMax),
     ("/sys/fs/cgroup/memory.max", ProcFile::CgroupMemoryMax),
-    ("/sys/fs/cgroup/pids.max", ProcFile::Text("1024\n")),
+    ("/sys/fs/cgroup/pids.max", ProcFile::ThreadsMax),
     ("/proc/grix/smp", ProcFile::SmpStats),
 ];
 
@@ -205,6 +240,16 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         ProcFile::SmapsRollup => smaps(p, &mut s, true)?,
         ProcFile::Status => status(&shown(p), &mut s),
         ProcFile::Stat => stat(&shown(p), &mut s),
+        ProcFile::TaskStatus(tid) => status(&shown_task(p, tid)?, &mut s),
+        ProcFile::TaskStat(tid) => stat(&shown_task(p, tid)?, &mut s),
+        ProcFile::TaskComm(tid) => {
+            let _ = writeln!(s, "{}", thread_comm(p, tid).ok_or(ENOENT)?);
+        }
+        ProcFile::ThreadsMax => {
+            let _ = writeln!(s, "{}", crate::process::threads_max());
+        }
+        // Read and written through its descriptor (`FileKind::ProcMem`).
+        ProcFile::Mem => {}
         ProcFile::Statm => {
             let (size, rss) = mem_pages(p);
             let _ = writeln!(s, "{size} {rss} 0 0 0 {size} 0");
@@ -374,11 +419,15 @@ pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> R
     let mut s = String::new();
     match f {
         ProcFile::Text(t) => s.push_str(t),
+        ProcFile::TaskStat(_) => return generate_zombie(reader, pid, z, ProcFile::Stat),
+        ProcFile::TaskStatus(_) => return generate_zombie(reader, pid, z, ProcFile::Status),
+        ProcFile::TaskComm(_) => return generate_zombie(reader, pid, z, ProcFile::Comm),
         ProcFile::Status | ProcFile::Stat => {
             // Its exit code is for those ptrace would let look (do_task_stat).
             let permitted = crate::procs::may_inspect_creds(reader, r.uid, r.gid, &r.ids, false);
             let sh = Shown {
                 pid,
+                tid: pid,
                 ppid: z.ppid,
                 pgid: z.pgid,
                 sid: z.sid,
@@ -426,6 +475,14 @@ fn dispositions(p: &Process) -> (u64, u64) {
     let ignored: u64 = (1..=64).filter(|&i| acts[i].handler == 1).map(|i| 1u64 << (i - 1)).sum();
     let caught: u64 = (1..=64).filter(|&i| acts[i].handler > 1).map(|i| 1u64 << (i - 1)).sum();
     (ignored, caught)
+}
+
+/// Thread `tid`'s name: its own (PR_SET_NAME, its comm file), or else the
+/// process's. None if there's no such thread.
+pub fn thread_comm(p: &Process, tid: u32) -> Option<String> {
+    let t = p.threads.get(&tid)?;
+    let n = t.name.iter().position(|&b| b == 0).unwrap_or(t.name.len());
+    Some(if n > 0 { String::from_utf8_lossy(&t.name[..n]).into_owned() } else { comm(p) })
 }
 
 fn comm(p: &Process) -> String {
@@ -549,6 +606,8 @@ fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String
 /// What status and stat show of a process, live or a zombie.
 struct Shown<'a> {
     pid: u32,
+    /// The thread shown (the process's: its pid).
+    tid: u32,
     ppid: u32,
     pgid: u32,
     sid: u32,
@@ -586,6 +645,7 @@ fn shown(p: &Process) -> Shown<'_> {
     let (ignored, caught) = dispositions(p);
     Shown {
         pid: p.pid,
+        tid: p.pid,
         ppid: p.ppid,
         pgid: p.pgid,
         sid: p.sid,
@@ -615,6 +675,29 @@ fn shown(p: &Process) -> Shown<'_> {
     }
 }
 
+/// Thread `tid` of `p`, as its /proc/<pid>/task/<tid> shows it: its name,
+/// state, signals and CPU time, and the rest the process's.
+fn shown_task(p: &Process, tid: u32) -> Result<Shown<'_>, Errno> {
+    let t = p.threads.get(&tid).ok_or(ENOENT)?;
+    let mut sh = shown(p);
+    sh.tid = tid;
+    sh.comm = thread_comm(p, tid).ok_or(ENOENT)?;
+    sh.state = thread_state(p, tid);
+    (sh.blocked, sh.pending) = (t.sigmask, t.pending.mask);
+    sh.cpu_ns = p.thread_cpu_ns(tid).unwrap_or(0);
+    sh.children_ns = 0;
+    Ok(sh)
+}
+
+/// Stopped, waiting for something (sleeping), or running or ready to.
+fn thread_state(p: &Process, tid: u32) -> &'static str {
+    match p.threads.get(&tid) {
+        _ if p.stopped => "T (stopped)",
+        Some(t) if t.wait.is_some() => "S (sleeping)",
+        _ => "R (running)",
+    }
+}
+
 /// As Linux's proc_pid_status lays it out: without a filesystem context
 /// there's no Umask line, and without memory no Vm lines.
 fn status(sh: &Shown, s: &mut String) {
@@ -622,14 +705,14 @@ fn status(sh: &Shown, s: &mut String) {
     let (ru, u, su) = (ids.ruid, sh.uid, ids.suid);
     let (rg, g, sg) = (ids.rgid, sh.gid, ids.sgid);
     let groups = ids.groups.iter().map(|g| alloc::format!("{g}")).collect::<alloc::vec::Vec<_>>().join(" ");
-    let (pid, ppid) = (sh.pid, sh.ppid);
+    let (pid, tid, ppid) = (sh.pid, sh.tid, sh.ppid);
     let _ = writeln!(s, "Name:\t{}", sh.comm);
     if let Some(umask) = sh.umask {
         let _ = writeln!(s, "Umask:\t{umask:04o}");
     }
     let _ = write!(
         s,
-        "State:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\n\
+        "State:\t{}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{tid}\nPPid:\t{ppid}\n\
          TracerPid:\t0\nUid:\t{ru}\t{u}\t{su}\t{u}\nGid:\t{rg}\t{g}\t{sg}\t{g}\nFDSize:\t{}\nGroups:\t{groups}\n",
         sh.state, sh.fds,
     );
@@ -670,7 +753,7 @@ fn stat(sh: &Shown, s: &mut String) {
     let (size, rss) = sh.mem.unwrap_or((0, 0));
     // utime and cutime, in clock ticks (all CPU time counts as user time).
     let (ticks, cticks) = (sh.cpu_ns / 10_000_000, sh.children_ns / 10_000_000);
-    let (pid, ppid, pgrp, sid, flags) = (sh.pid, sh.ppid, sh.pgid, sh.sid, sh.flags);
+    let (pid, ppid, pgrp, sid, flags) = (sh.tid, sh.ppid, sh.pgid, sh.sid, sh.flags);
     let _ = writeln!(
         s,
         "{pid} ({}) {} {ppid} {pgrp} {sid} 0 -1 {flags} 0 0 0 0 {ticks} 0 {cticks} 0 20 0 {} 0 0 {} {rss} \
@@ -737,6 +820,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         }
         FileKind::Pty(end) => fs::lock().path_of(end.ino),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
+        FileKind::ProcMem(pid) => format!("/proc/{pid}/mem"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
         FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),
         FileKind::EventFd(_) => String::from("anon_inode:[eventfd]"),

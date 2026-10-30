@@ -54,10 +54,11 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let mut procs = PROCS.lock();
     let (count, threads) = (procs.count(), crate::procs::threads());
-    if count >= MAX_PROCESSES || threads >= process::MAX_THREADS {
+    if count >= MAX_PROCESSES || threads >= process::threads_max() {
         crate::stats::hit(if count >= MAX_PROCESSES { Limit::Processes } else { Limit::Threads });
         return Err(EAGAIN);
     }
+    let charge = crate::kmem::Charge::new(process::THREAD_COST).map_err(|_| EAGAIN)?;
     let pid = process::new_tid();
     if flags & CLONE_PARENT_SETTID != 0 {
         write_u32(&mut p.aspace, args.parent_tid, pid)?;
@@ -66,6 +67,8 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let share =
         Share { files: flags & CLONE_FILES != 0, fs: flags & CLONE_FS != 0, sighand: flags & CLONE_SIGHAND != 0 };
     let mut c = p.fork(pid, aspace, share)?;
+    // Named as the thread that forked it.
+    c.name = p.thread_name(p.current);
     if flags & CLONE_CLEAR_SIGHAND != 0 {
         // clone3: handled signals start out default in the child (ignored
         // ones stay ignored), as after an exec.
@@ -90,6 +93,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         None
     };
     let mut t = Thread::new(pid);
+    t.charge = charge;
     t.regs = *tf;
     t.regs.set_return(0);
     if args.stack != 0 {
@@ -289,7 +293,9 @@ pub fn execve(
     // AIO contexts belong to the old address space (Linux's exit_aio).
     p.aio = Default::default();
     t.tid = p.pid;
-    crate::fs::tasks_changed(p.pid, alloc::vec![p.pid]);
+    crate::fs::tasks_reset(p.pid, p.pid);
+    // The process's name is the program's now (`install`).
+    t.name = [0; 16];
     t.clear_child_tid = 0;
     t.robust_list = 0;
     t.altstack = Default::default();

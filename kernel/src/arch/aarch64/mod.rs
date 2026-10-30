@@ -103,6 +103,8 @@ pub struct FpState {
 /// A thread's FP state as `process::Thread` holds it: inline, as it's
 /// 528 bytes (x86_64's is boxed).
 pub type ThreadFp = FpState;
+/// Heap bytes a thread's FP state takes beside its `Thread`: none.
+pub const FP_HEAP_BYTES: usize = 0;
 
 unsafe extern "C" {
     fn enter_user_asm(entry: u64, sp: u64, kernel_stack_top: u64) -> !;

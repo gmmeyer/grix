@@ -16,7 +16,7 @@ use crate::fd::{
 };
 use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
 use crate::locks;
-use crate::procfs;
+use crate::procfs::{self, ProcFile};
 
 const S_IFSOCK: u32 = 0o140000;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EVENTFD_MAX, EventFd, PIPE_BUF, PipeEnd};
@@ -176,6 +176,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Inet(_)
         | FileKind::Unix(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
+        FileKind::ProcMem(_) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o600, 0),
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_)
         | FileKind::Epoll(_)
@@ -424,6 +425,26 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             Kind::File(_) | Kind::Unlinked { .. } if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Kind::File(c) => (Some(c.clone()), None, None),
             Kind::Unlinked { .. } => return Err(ENOENT),
+            // Another process's memory isn't reachable (invariant 13): as
+            // Linux's mem_open without ptrace_may_access(ATTACH).
+            Kind::Proc(ProcFile::Mem) if proc_pid.is_some() => return Err(EACCES),
+            Kind::Proc(ProcFile::Mem) => {
+                let want = if acc != O_WRONLY { MAY_READ } else { 0 } | if writes { MAY_WRITE } else { 0 };
+                if !fs.permits(ino, p.uid, p.gid, want) {
+                    return Err(EACCES);
+                }
+                drop(fs);
+                let file = new_file(FileKind::ProcMem(p.pid), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
+                return p.fds.alloc(FdEntry { file, cloexec }, 0);
+            }
+            // A thread's name, for its owner (0644).
+            Kind::Proc(f) if writes && procfs::writable(*f) => {
+                let want = if acc != O_WRONLY { MAY_READ } else { 0 } | MAY_WRITE;
+                if !fs.permits(ino, p.uid, p.gid, want) {
+                    return Err(EACCES);
+                }
+                (None, Some(*f), proc_pid)
+            }
             Kind::Proc(_) if writes => return Err(EACCES),
             Kind::Proc(f) => (None, Some(*f), proc_pid),
         }
@@ -449,8 +470,13 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             None => procfs::generate(p, f)?,
         };
         let held = crate::kmem::Charge::new(data.capacity() as u64)?;
-        let file = new_file(FileKind::Generated(data), flags & !(O_CLOEXEC | O_CREAT | O_EXCL));
+        let file = new_file(FileKind::Generated(data), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
         file.lock().held = Some(held);
+        if writes {
+            let pid = proc_pid.unwrap_or(p.pid);
+            let tid = if let ProcFile::TaskComm(tid) = f { tid } else { pid };
+            file.lock().comm_of = Some((pid, tid));
+        }
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     if let Some(c) = &content
@@ -687,6 +713,14 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             crate::sched::deadlines_changed();
             copy_out(&mut p.aspace, buf, &ticks.to_le_bytes()).map(|_| 8)
         }
+        &FileKind::ProcMem(pid) => {
+            let addr = at.unwrap_or(f.offset);
+            let n = proc_mem(p, pid, addr, buf, count, false)?;
+            if at.is_none() {
+                f.offset = addr.wrapping_add(n);
+            }
+            Ok(n)
+        }
         FileKind::Generated(data) => {
             let off = (at.unwrap_or(f.offset) as usize).min(data.len());
             let n = (count as usize).min(data.len().saturating_sub(off));
@@ -881,6 +915,18 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
                 f.offset = off + n;
             }
             return Ok(n);
+        }
+        &FileKind::ProcMem(pid) => {
+            let addr = at.unwrap_or(f.offset);
+            let n = proc_mem(p, pid, addr, buf, count, true)?;
+            if at.is_none() {
+                f.offset = addr.wrapping_add(n);
+            }
+            return Ok(n);
+        }
+        FileKind::Generated(_) if f.comm_of.is_some() => {
+            let (pid, tid) = f.comm_of.unwrap();
+            return comm_write(p, pid, tid, buf, count);
         }
         FileKind::Stdin | FileKind::Epoll(_) | FileKind::Generated(_) | FileKind::Inotify(_) => {
             return Err(EBADF);
@@ -1111,7 +1157,9 @@ pub fn pread(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRes
     let mut f = file.lock();
     match f.kind {
         FileKind::Node(_) | FileKind::Generated(_) if (off as i64) < 0 => Err(EINVAL),
-        FileKind::Node(_) | FileKind::Generated(_) => read_into(p, &mut f, buf, count, Some(off)),
+        FileKind::Node(_) | FileKind::Generated(_) | FileKind::ProcMem(_) => {
+            read_into(p, &mut f, buf, count, Some(off))
+        }
         FileKind::Dev(..) => read_into(p, &mut f, buf, count, None),
         _ => Err(ESPIPE),
     }
@@ -1128,7 +1176,7 @@ pub fn pwrite(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRe
     let mut f = file.lock();
     match f.kind {
         FileKind::Node(_) if (off as i64) < 0 => Err(EINVAL),
-        FileKind::Node(_) => write_from(p, &mut f, buf, count, Some(off)),
+        FileKind::Node(_) | FileKind::ProcMem(_) => write_from(p, &mut f, buf, count, Some(off)),
         FileKind::Dev(..) => write_from(p, &mut f, buf, count, None),
         _ => Err(ESPIPE),
     }
@@ -1175,7 +1223,7 @@ fn vectored(p: &mut Process, fd: u64, iov: u64, cnt: u64, at: Option<u64>, write
 fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Option<u64>, write: bool) -> SysResult {
     if at.is_some() {
         match f.kind {
-            FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..) => {}
+            FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..) | FileKind::ProcMem(_) => {}
             _ => return Err(ESPIPE),
         }
         if at.is_some_and(|o| (o as i64) < 0) {
@@ -1326,6 +1374,16 @@ pub fn lseek(p: &mut Process, fd: u64, off: u64, whence: u64) -> SysResult {
         }
         (FileKind::Generated(data), _) => data.len() as i64,
         (FileKind::Dev(..), _) => return Ok(0),
+        // Any address, as Linux's mem_lseek (unsigned offsets): from the
+        // start or from here, no end.
+        (FileKind::ProcMem(_), _) => {
+            f.offset = match whence {
+                0 => off,
+                1 => f.offset.wrapping_add(off),
+                _ => return Err(EINVAL),
+            };
+            return Ok(f.offset);
+        }
         _ => return Err(ESPIPE),
     };
     let off = off as i64;
@@ -3116,4 +3174,52 @@ pub fn inotify_rm_watch(p: &mut Process, fd: u64, wd: u64) -> SysResult {
     let f = file.lock();
     let FileKind::Inotify(n) = &f.kind else { return Err(EINVAL) };
     n.rm_watch(wd as i32).map(|_| 0)
+}
+
+/// /proc/<pid>/mem: `count` bytes at virtual address `addr` to or from the
+/// program's buffer, a page at a time, as far as the mappings allow (EIO if
+/// nothing was), as Linux's mem_rw. Only for the process itself: the
+/// descriptor of another (inherited across fork) can't reach its memory
+/// (invariant 13). Read-only mappings can't be written (Linux's
+/// FOLL_FORCE is a debugger's).
+fn proc_mem(p: &mut Process, pid: u32, addr: u64, buf: u64, count: u64, write: bool) -> SysResult {
+    if pid != p.pid {
+        return Err(EIO);
+    }
+    let mut chunk = [0u8; CHUNK];
+    let mut done = 0u64;
+    while done < count {
+        let Some(at) = addr.checked_add(done) else { break };
+        let n = (count - done).min(CHUNK as u64 - at % CHUNK as u64) as usize;
+        if write {
+            copy_in(&mut p.aspace, buf + done, &mut chunk[..n])?;
+            if copy_out(&mut p.aspace, at, &chunk[..n]).is_err() {
+                break;
+            }
+        } else {
+            if copy_in(&mut p.aspace, at, &mut chunk[..n]).is_err() {
+                break;
+            }
+            copy_out(&mut p.aspace, buf + done, &chunk[..n])?;
+        }
+        done += n as u64;
+    }
+    if done == 0 && count > 0 { Err(EIO) } else { Ok(done) }
+}
+
+/// A write to /proc/<pid>/comm or /proc/<pid>/task/<tid>/comm: the
+/// thread's new name (at most 15 bytes, as written), for the process's
+/// own threads only (Linux's comm_write: EINVAL otherwise).
+fn comm_write(p: &mut Process, pid: u32, tid: u32, buf: u64, count: u64) -> SysResult {
+    if pid != p.pid {
+        return Err(EINVAL);
+    }
+    if !p.threads.contains_key(&tid) && tid != pid {
+        return Err(ESRCH);
+    }
+    let mut name = [0u8; 16];
+    let n = (count as usize).min(15);
+    copy_in(&mut p.aspace, buf, &mut name[..n])?;
+    p.set_thread_name(tid, name);
+    Ok(count)
 }

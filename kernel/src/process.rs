@@ -31,9 +31,22 @@ use crate::uaccess::copy_out;
 
 /// The program the sandbox runs. When it ends, the sandbox does.
 pub const INIT: u32 = 1;
-/// Threads in all processes together. Linux allows far more; this bounds
-/// kernel memory per sandbox.
-pub const MAX_THREADS: usize = 1024;
+/// What a thread holds of the kernel heap, charged to `kmem` while it
+/// lives: its `Thread` twice over (threads made one after another leave
+/// the process's B-tree nodes half full), x86_64's boxed XSAVE area, and
+/// its /proc/<pid>/task/<tid> nodes.
+pub const THREAD_COST: u64 =
+    (2 * core::mem::size_of::<Thread>() + arch::FP_HEAP_BYTES + 64) as u64 + crate::fs::TASK_NODES_COST;
+/// threads-max at least: what grix always allowed.
+const MIN_THREADS_MAX: usize = 1024;
+
+/// Threads in all processes together (/proc/sys/kernel/threads-max): as
+/// many as the heap's share of RAM holds (`mm::init`), as Linux sizes
+/// threads-max from RAM. Each also takes its `THREAD_COST` from `kmem`,
+/// which fails first if buffers have taken the rest.
+pub fn threads_max() -> usize {
+    (((crate::kmem::limit() - crate::kmem::BASE) / THREAD_COST) as usize).max(MIN_THREADS_MAX)
+}
 
 /// Thread and process ids, from one sequence (a process's id is its first
 /// thread's). Never reused.
@@ -159,6 +172,11 @@ pub struct Thread {
     /// Its NUMA memory policy (set_mempolicy's mode and mode flags), kept
     /// to be read back: with one node, every policy places memory alike.
     pub mempolicy: u32,
+    /// Its name (PR_SET_NAME, /proc/<pid>/task/<tid>/comm); all zeros:
+    /// the process's (`Process::name`, which is the main thread's).
+    pub name: [u8; 16],
+    /// Its `THREAD_COST` (none for a placeholder that's replaced).
+    pub charge: crate::kmem::Charge,
 }
 
 impl Thread {
@@ -185,6 +203,8 @@ impl Thread {
             call: (0, 0),
             seccomp: Default::default(),
             mempolicy: 0,
+            name: [0; 16],
+            charge: Default::default(),
         }
     }
 }
@@ -545,6 +565,27 @@ impl Process {
         self.sigactions.update(|a| a[sig as usize] = act);
     }
 
+    /// Name thread `tid` (PR_SET_NAME, a write to its comm file): the main
+    /// thread's is the process's.
+    pub fn set_thread_name(&mut self, tid: u32, name: [u8; 16]) {
+        if tid == self.pid {
+            self.name = name;
+            if let Some(t) = self.threads.get_mut(&tid) {
+                t.name = [0; 16];
+            }
+        } else if let Some(t) = self.threads.get_mut(&tid) {
+            t.name = name;
+        }
+    }
+
+    /// Thread `tid`'s name as comm holds it (16 bytes, NUL-padded).
+    pub fn thread_name(&self, tid: u32) -> [u8; 16] {
+        match self.threads.get(&tid) {
+            Some(t) if t.name[0] != 0 => t.name,
+            _ => self.name,
+        }
+    }
+
     /// The command name (comm), for reports.
     pub fn comm(&self) -> &str {
         let n = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
@@ -861,6 +902,7 @@ pub fn start(img: Image<'static>) -> ! {
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");
     if let Some((rows, cols)) = img.tty {
         // The program leads its session, with the terminal as its
         // controlling one, in the foreground.
