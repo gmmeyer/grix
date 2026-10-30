@@ -377,7 +377,9 @@ up without CAP_SYS_RESOURCE would do.
       share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more threads (reported).
 - [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
       `/proc/self` is the caller's. Another process's descriptors need its user (or root).
-- [ ] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
+- [x] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
+      `signal.rs`'s `stop`/`resume`, `job_report`; the `jobs` fixture
+      (`job_control` test). Round 2, item 10.
 
 ## Signals
 
@@ -396,11 +398,16 @@ up without CAP_SYS_RESOURCE would do.
       `rt_sigqueueinfo` and the ppoll/pselect/epoll_pwait masks work too.
 - [x] Signals from the host: SIGTERM before the timeout kill, SIGINT from the agent.
       `RunControl::signal` / `stop`, the CLI's Ctrl-C (and SIGTERM, SIGHUP, SIGQUIT), to the program's process group. A timeout sends SIGTERM and waits `grace` (5 s). Threads waiting for a signal (including musl's ppoll-based `pause()`) aren't a deadlock.
-- [ ] Job control from the host (SIGTSTP/SIGCONT stopping and continuing the program).
-- [ ] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT). They are ignored today:
-      there is no job control or host to report the stop to.
-- [ ] Restarted `nanosleep`-style calls without a handler (Linux's
-      `restart_syscall`). This only matters once stop signals exist.
+- [x] Job control from the host (SIGTSTP/SIGCONT stopping and continuing the program).
+      `RunControl::stop`, `ExitStatus::Stopped`, `Event::Stopped`
+      (`stopped_and_continued_from_the_host`).
+- [x] Stop and continue (SIGSTOP/SIGTSTP/SIGCONT): the whole process
+      stops (`Process::stopped`) and the scheduler passes it over.
+- [x] Restarted `nanosleep`-style calls without a handler (Linux's
+      `restart_syscall`): a woken sleep re-runs with its first deadline
+      (`Thread::restart_deadline`), so a stop and continue doesn't
+      lengthen it; with a handler, EINTR and the time left in `rem`
+      (`signals` fixture).
 
 ## Timers and clocks
 
@@ -458,14 +465,18 @@ up without CAP_SYS_RESOURCE would do.
 - [x] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
       `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice`, `tee` and `vmsplice`: round 4, item 37.
-- [ ] `openat2`, `name_to_handle_at` (newer tools).
+- [~] `openat2`, `name_to_handle_at` (newer tools).
+      `openat2` is done (round 3, item 23). `name_to_handle_at` and
+      `open_by_handle_at` are missing.
 - [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
 - [x] `MAP_SHARED` mappings of writable files, `msync`.
       They map the file's own pages. A live mount's files still map as copies: a writable shared mapping of one, or changing one mapped shared, is reported as unimplemented.
 - [x] Executing files the program wrote.
-- [ ] Large imports without copying everything into RAM: read-only
-      virtio-blk/virtio-fs, loaded lazily (big runtimes, datasets).
+- [x] Large imports without copying everything into RAM (big runtimes,
+      datasets): lazy imports (`import_lazy`, `--mount HOST:GUEST:lazy`,
+      round 2, item 12), served by the host over hostfs. Not virtio-blk or
+      virtio-fs: more devices would break invariant 7.
 
 ## /proc, /sys, /dev
 
@@ -481,8 +492,10 @@ up without CAP_SYS_RESOURCE would do.
 - [x] `/sys/devices/system/cpu/{online,possible}` (glibc `get_nprocs`),
       `/sys/kernel/mm/transparent_hugepage/*` (Go probes it),
       `/sys/fs/cgroup/*` (cgroup v2 limits for Go/Java/Node).
-- [ ] `/dev/tty`, `/dev/pts`, pseudo-terminals (`openpty`, termios,
+- [x] `/dev/tty`, `/dev/pts`, pseudo-terminals (`openpty`, termios,
       `TIOCGWINSZ`). Interactive REPLs, shells, `less`, progress bars.
+      `tty.rs`, `syscall/tty.rs`; the `pty` fixture (`pseudo_terminals`)
+      and `an_interactive_shell_on_a_pty` in runtimes.rs.
 
 ## Users, environment, host config
 
@@ -490,6 +503,9 @@ up without CAP_SYS_RESOURCE would do.
       imported). Python `getpass.getuser()` raises; Node `os.userInfo()` and
       `os.homedir()` throw; `ls -l` and `id` show numbers.
 - [ ] Opt-in default environment (`HOME`, `PATH`, `LANG`, `TMPDIR`).
+      Images get Docker's `HOME` and `HOSTNAME` (round 4) and their own
+      `Env`; a run without an image still starts with nothing but what it
+      was given.
 - [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
       A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
 - [~] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
@@ -497,7 +513,8 @@ up without CAP_SYS_RESOURCE would do.
       `/etc/hosts` and `/etc/resolv.conf` are generated unless imported. Alpine's
       runtimes bring their own CA bundle (`ca-certificates`); there's no option yet
       to pass in the host's.
-- [ ] Configurable hostname.
+- [ ] Configurable hostname. It's always `grix` (`grix_abi::HOSTNAME`:
+      uname, /etc/hostname, /proc/sys/kernel/hostname, images' `HOSTNAME`).
 
 ## Networking (`net`)
 
@@ -518,8 +535,10 @@ up without CAP_SYS_RESOURCE would do.
 - [x] DNS through a host resolver (A and AAAA; other types get empty answers).
 - [x] Loopback (127.0.0.1, `::1`, 10.0.2.15) inside the sandbox, so a server
       and its client in the same sandbox work without the host.
-- [ ] Forwarded connections reach a listener whatever address it bound
-      (Docker-like), not only 0.0.0.0. Decide whether that should be stricter.
+- [x] Forwarded connections reach a listener whatever address it bound
+      (Docker-like), not only 0.0.0.0. Decided: one on the guest's
+      address (10.0.2.15) or all of them, never one bound to loopback only,
+      as Linux and Docker's published ports do (`inet.rs`, `Incoming`).
 - [x] `AF_NETLINK` route sockets (`getifaddrs`): report `lo` only. Node
       `os.networkInterfaces()` throws today.
       No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
@@ -540,7 +559,9 @@ up without CAP_SYS_RESOURCE would do.
       virtio-console moves frames through shared 4 KiB buffers: about 50 MB/s out and 30 MB/s in with HVF. A slow host reader blocks the writing thread only (EAGAIN with `O_NONBLOCK`, epoll readiness), never the whole VM.
 - [x] Output size limits with truncation reported.
       `max_output` (64 MiB per stream by default): the program keeps running, and the rest is dropped and reported.
-- [ ] Interactive TTY mode (`grix run -t`).
+- [x] Interactive TTY mode (`grix run -t`, `SandboxBuilder::tty`): the
+      program's stdio is /dev/pts/0, the console its master (`tty::pump`,
+      `wire::Input::Resize`); `tty_mode`. Not yet over MCP or Python.
 
 ## Memory
 
@@ -563,18 +584,23 @@ up without CAP_SYS_RESOURCE would do.
 - [x] Report the syscall number for unknown syscalls. Today the event says
       only "unsupported unknown".
 - [x] glibc dynamic executables (Debian/Ubuntu arm64): see round 2, item 9.
-- [ ] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
+- [~] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
+      `HWCAP_CPUID` and the `mrs` emulation are done (round 3, item 28,
+      `id_registers_from_user_mode`). `AT_HWCAP2` is always 0 and
+      `AT_MINSIGSTKSZ` isn't given.
 - [~] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
       and ignore, or implement. seccomp filters work; Landlock is
       EOPNOTSUPP (round 4, item 34, with the design).
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).
+      `futex_waitv` (Wine/Proton, newer glibc's tests) is missing.
 - [x] x86_64 programs, through a user-mode translator in the arm64 guest
       (`--x86-64`: qemu-x86_64; box64 untested; binfmt_misc-style). x86_64
       Alpine busybox and CPython run.
-- [ ] A native x86_64 kernel (and grix-vmm on x86 KVM), for x86 hosts and
-      full speed there.
+- [x] A native x86_64 kernel (and grix-vmm on x86 KVM), for x86 hosts and
+      full speed there: `kernel/src/arch/x86_64`, `vm_x86.rs`, `x86.yml`
+      (round 2, item 19).
 
 ## Performance and scale
 
@@ -583,7 +609,10 @@ up without CAP_SYS_RESOURCE would do.
       kernel lock; on grix-vmm (HVF, KVM) and QEMU.
 - [x] SMP for several processes at once (each CPU runs a thread of any
       process).
-- [ ] Finer locking than one kernel lock.
+- [~] Finer locking than one kernel lock. Round 2, item 17 made the big
+      lock cheap (skipping descheduled waiters, per-CPU process slots, a
+      filesystem lock that knows its holder, flushes only where needed).
+      Left: phase 2, a reader/writer lock with per-process check-out.
 - [x] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s
