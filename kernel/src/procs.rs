@@ -238,7 +238,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
 pub fn zap_stale(cur: Option<&mut Process>, procs: &mut Procs) {
     let Some(stale) = crate::fs::take_stale() else { return };
     for q in procs.each(cur) {
-        q.aspace.zap_stale(&stale);
+        q.aspace.access().zap_stale(&stale);
     }
 }
 

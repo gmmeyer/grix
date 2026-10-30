@@ -11,7 +11,7 @@ use crate::errno::{EINVAL, ENOENT, ENOMEM, Errno};
 use crate::fd::FileKind;
 use crate::fs;
 use crate::kmem::Charge;
-use crate::mm::aspace::{Backing, STACK_TOP, Usage, VVAR};
+use crate::mm::aspace::{AddressSpace, Backing, STACK_TOP, Usage, VVAR};
 use crate::mm::frame;
 use crate::process::{Ids, Process};
 use crate::procs::Zombie;
@@ -511,7 +511,7 @@ fn comm(p: &Process) -> String {
 
 /// (virtual size, resident) in pages.
 fn mem_pages(p: &Process) -> (u64, u64) {
-    let size: u64 = p.aspace.vmas().map(|v| (v.end - v.start) / 4096).sum();
+    let size: u64 = p.aspace.access().vmas().map(|v| (v.end - v.start) / 4096).sum();
     let (_, used) = frame::stats();
     (size, used)
 }
@@ -521,9 +521,10 @@ fn root_mode(p: &Process) -> &'static str {
 }
 
 fn maps(p: &Process, s: &mut String) {
+    let a = p.aspace.access();
     let fs = fs::lock();
-    for v in p.aspace.vmas() {
-        map_line(p, &fs, v, s);
+    for v in a.vmas() {
+        map_line(&a, &fs, v, s);
     }
 }
 
@@ -532,17 +533,18 @@ fn maps(p: &Process, s: &mut String) {
 /// a heap that can't grow is ENOMEM, not a panic.
 fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
     let mut held = Charge::default();
+    let a = p.aspace.access();
     let fs = fs::lock();
     let mut total = Usage::default();
     let mut block = String::new();
-    for v in p.aspace.vmas() {
-        let u = p.aspace.usage(v);
+    for v in a.vmas() {
+        let u = a.usage(v);
         total.add(&u);
         if rollup {
             continue;
         }
         block.clear();
-        map_line(p, &fs, v, &mut block);
+        map_line(&a, &fs, v, &mut block);
         usage_lines(&mut block, v.end - v.start, &u);
         let flags =
             [(v.prot.read, "rd"), (v.prot.write, "wr"), (v.prot.exec, "ex"), (true, "mr"), (true, "mw"), (true, "me")];
@@ -556,7 +558,7 @@ fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
         s.push_str(&block);
     }
     if rollup {
-        let (start, end) = (p.aspace.vmas().next().map_or(0, |v| v.start), p.aspace.vmas().last().map_or(0, |v| v.end));
+        let (start, end) = (a.vmas().next().map_or(0, |v| v.start), a.vmas().last().map_or(0, |v| v.end));
         let _ = writeln!(s, "{start:08x}-{end:08x} ---p 00000000 00:00 0                          [rollup]");
         usage_lines(s, 0, &total);
     }
@@ -592,7 +594,7 @@ fn usage_lines(s: &mut String, size: u64, u: &Usage) {
 }
 
 /// A mapping's line in /proc/<pid>/maps.
-fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String) {
+fn map_line(a: &AddressSpace, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String) {
     let perms = [(v.prot.read || v.prot.write || v.prot.exec, 'r'), (v.prot.write, 'w'), (v.prot.exec, 'x')];
     let mut flags = String::new();
     for (on, c) in perms {
@@ -604,7 +606,7 @@ fn map_line(p: &Process, fs: &fs::Fs, v: &crate::mm::aspace::Vma, s: &mut String
         Backing::File { offset, ino, .. }
         | Backing::Data { offset, ino, .. }
         | Backing::SharedFile { offset, ino, .. } => (offset, fs.ino_number(ino), fs.path_of(ino)),
-        Backing::Anon if v.start == p.aspace.brk_start && v.start < p.aspace.brk => (0, 0, "[heap]".into()),
+        Backing::Anon if v.start == a.brk_start && v.start < a.brk => (0, 0, "[heap]".into()),
         Backing::Anon if v.end == STACK_TOP => (0, 0, "[stack]".into()),
         // What Linux calls the page holding the signal-return code on arm32.
         Backing::Sigpage => (0, 0, "[sigpage]".into()),

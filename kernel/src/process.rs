@@ -24,6 +24,7 @@ pub use crate::mm::aspace::Access;
 use crate::mm::aspace::{
     AddressSpace, Backing, FaultError, MAX_STACK, SIGPAGE, STACK_SIZE, STACK_TOP, VDSO, VVAR, Vma,
 };
+use crate::mm::gate::Mm;
 use crate::mm::paging::Prot;
 use crate::rng;
 use crate::signal::{self, AltStack, SigQueue};
@@ -325,7 +326,8 @@ pub struct Process {
     pub vfork_parent: Option<(u32, u32)>,
     /// CPU time of reaped children (RUSAGE_CHILDREN, times).
     pub children_cpu_ns: u64,
-    pub aspace: AddressSpace,
+    /// Held by this CPU while the process is checked out here (`mm::gate`).
+    pub aspace: Mm,
     pub fds: FdTable,
     /// The working directory and umask (`cwd`, `umask`).
     pub fs: Shared<FsInfo>,
@@ -506,7 +508,7 @@ impl Process {
             running: false,
             vfork_parent: None,
             children_cpu_ns: 0,
-            aspace,
+            aspace: Mm::new(aspace),
             fds: FdTable::with_stdio(),
             fs: Shared::new(FsInfo { cwd: ROOT, cwd_pin: None, umask: 0o022 }),
             policy,
@@ -936,6 +938,8 @@ pub fn start(img: Image<'static>) -> ! {
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
     p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");
+    // This CPU's process from the start (`mm::gate`).
+    p.aspace.lock();
     if let Some((rows, cols)) = img.tty {
         // The program leads its session, with the terminal as its
         // controlling one, in the foreground.
@@ -1122,7 +1126,9 @@ impl Program {
     /// Replace `p`'s image with this program (the point of no return).
     /// Returns where it starts: (entry, sp).
     pub fn install(self, p: &mut Process) -> (u64, u64) {
-        let old = core::mem::replace(&mut p.aspace, self.aspace);
+        // Held here, as the process is (`mm::gate`); the old one's gate
+        // goes with it.
+        let old = core::mem::replace(&mut p.aspace, Mm::new_held(self.aspace));
         p.aspace.activate();
         drop(old);
         let base = self.exe.rsplit('/').next().unwrap_or(&self.exe).as_bytes();

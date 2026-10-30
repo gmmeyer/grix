@@ -111,8 +111,11 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     if flags & CLONE_CHILD_SETTID != 0 {
         // In the child's memory: through its own mapping, unsharing the page.
-        c.aspace.activate();
-        let r = write_u32(&mut c.aspace, args.child_tid, pid);
+        let r = {
+            let mut a = c.aspace.access();
+            a.activate();
+            write_u32(&mut a, args.child_tid, pid)
+        };
         p.aspace.activate();
         if let Err(e) = r {
             if let Some(fd) = pidfd {

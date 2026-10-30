@@ -261,7 +261,8 @@ pub fn lock() {
     let cpu = CPUS.lock()[me];
     let mut guard = process::running().lock();
     let mut procs = PROCS.lock();
-    if guard.is_none() {
+    let checked_out = guard.is_none();
+    if checked_out {
         // Gone if it ended (finished off on another CPU).
         *guard = cpu.pid.and_then(|pid| procs.others.remove(&pid));
     }
@@ -275,6 +276,10 @@ pub fn lock() {
         p.resched = cpu.resched || tid.is_none() && cpu.tid.is_some();
         p.timer_dirty = cpu.timer_dirty;
         process::set_current_pid(p.pid);
+        // Its address space, from a fast entry on another CPU if one has it.
+        if checked_out {
+            p.aspace.lock();
+        }
     }
     drop(procs);
     drop(guard);
@@ -319,11 +324,12 @@ pub fn unlock() {
             if p.dead {
                 // Finished off (no other CPU runs it): its address space
                 // goes, once it isn't this CPU's.
-                if c.ttbr == p.aspace.pt.root {
+                if c.ttbr == p.aspace.root() {
                     arch::set_user_page_table(arch::empty_page_table());
                     c.ttbr = 0;
                 }
             } else {
+                p.aspace.unlock();
                 procs.others.insert(p.pid, p);
             }
         }
@@ -588,7 +594,7 @@ fn wait() {
 
 /// Point this CPU's TTBR0 at `p`'s address space, if it isn't already.
 fn activate(p: &Process) {
-    let root = p.aspace.pt.root;
+    let root = p.aspace.root();
     let mut cpus = CPUS.lock();
     let c = &mut cpus[me()];
     if c.ttbr != root {
@@ -605,7 +611,7 @@ pub fn activated(root: u64) {
 /// Start the other CPUs (on CPU 0, before the program runs).
 pub fn start(cpus: u32) {
     COUNT.store(cpus.clamp(1, MAX_CPUS), Ordering::Relaxed);
-    CPUS.lock()[0].ttbr = process::running().lock().as_ref().map_or(0, |p| p.aspace.pt.root);
+    CPUS.lock()[0].ttbr = process::running().lock().as_ref().map_or(0, |p| p.aspace.root());
     for cpu in 1..count() {
         let entry = arch::secondary_entry_phys();
         let stack = arch::stack_top(cpu as usize);

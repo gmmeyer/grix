@@ -1966,7 +1966,7 @@ pub(super) fn zap_shared(p: &mut Process, c: &Content, len: u64) {
     }
     p.aspace.zap_file(c, len);
     for q in crate::procs::PROCS.lock().others.values_mut() {
-        q.aspace.zap_file(c, len);
+        q.aspace.access().zap_file(c, len);
     }
 }
 

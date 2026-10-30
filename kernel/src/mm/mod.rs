@@ -2,6 +2,7 @@
 
 pub mod aspace;
 pub mod frame;
+pub mod gate;
 pub mod pageindex;
 pub mod paging;
 

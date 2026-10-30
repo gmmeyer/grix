@@ -97,16 +97,18 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
     };
     if slot.as_ref().is_none_or(|p| p.pid != next) {
         let body = procs.others.remove(&next).unwrap();
+        body.aspace.lock();
         let old = slot.replace(body);
         let p = slot.as_mut().unwrap();
         process::set_current_pid(p.pid);
         p.aspace.activate();
-        smp::activated(p.aspace.pt.root);
+        smp::activated(p.aspace.root());
         // The process that was running: back with the others, unless it
         // has ended (its address space is no longer in TTBR0).
         if let Some(old) = old
             && !old.dead
         {
+            old.aspace.unlock();
             procs.others.insert(old.pid, old);
         }
     }
