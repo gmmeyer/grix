@@ -2097,6 +2097,23 @@ fn credentials_with_messages() {
 }
 
 #[test]
+fn dropping_capabilities() {
+    // Dropping all of them succeeds (none are held); raising one is
+    // denied, and reported.
+    let out = run(with("popular"), &["/bin/popular", "capdrop"]);
+    assert_eq!(out.stdout_str(), "capdrop ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied {
+            syscall: "capset".into(),
+            capability: "privileged".into(),
+            detail: "capabilities".into()
+        }]
+    );
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

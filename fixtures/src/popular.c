@@ -1089,6 +1089,25 @@ static int passcred(void) {
     return 0;
 }
 
+// capset: nothing has a capability, so dropping them all is allowed
+// (Chromium's zygote does before it forks); raising one is denied.
+struct cap_header { unsigned version; int pid; };
+struct cap_data { unsigned effective, permitted, inheritable; };
+static int capdrop(void) {
+    struct cap_header h = {0x20080522, 0};
+    struct cap_data d[2] = {{0}};
+    CHECK(syscall(SYS_capget, &h, d) == 0 && d[0].effective == 0 && d[0].permitted == 0);
+    CHECK(syscall(SYS_capset, &h, d) == 0);
+    h.pid = getpid() + 1000;
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EPERM);
+    h = (struct cap_header){0x12345678, 0};
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EINVAL && h.version == 0x20080522);
+    h.pid = 0;
+    d[0].effective = d[0].permitted = 1 << 10;  // CAP_NET_BIND_SERVICE
+    CHECK(syscall(SYS_capset, &h, d) == -1 && errno == EPERM);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1120,6 +1139,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "prctls") == 0) r = prctls();
         if (strcmp(argv[i], "tasks") == 0) r = tasks();
         if (strcmp(argv[i], "passcred") == 0) r = passcred();
+        if (strcmp(argv[i], "capdrop") == 0) r = capdrop();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

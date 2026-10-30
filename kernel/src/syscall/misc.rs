@@ -160,6 +160,7 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
+        nr::capset => capset(p, n, name, a[0], a[1]),
         nr::membarrier => membarrier(p, a[0], a[1]),
         nr::mincore => mincore(p, a[0], a[1], a[2]),
         // glibc probes rseq, and copes with ENOSYS.
@@ -292,6 +293,40 @@ fn set_fs_id(p: &mut Process, n: u32, name: &str, id: u32) -> SysResult {
         let _ = p.unimplemented(n, name, "file system ids apart from the effective ones", EINVAL);
     }
     Ok(e as u64)
+}
+
+/// capset: no process has a capability (capget says so), so the only
+/// sets it may have are empty ones: dropping everything succeeds, as it
+/// does for an unprivileged Linux process (Chromium's zygote drops all of
+/// them before it forks), and asking for any is denied.
+fn capset(p: &mut Process, n: u32, name: &str, header: u64, data: u64) -> SysResult {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    let mut h = [0u8; 8];
+    copy_in(&mut p.aspace, header, &mut h)?;
+    let version = u32::from_le_bytes(h[..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(h[4..].try_into().unwrap());
+    let sets = match version {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            // As capget does: the version the kernel prefers.
+            write_u32(&mut p.aspace, header, V3)?;
+            return Err(EINVAL);
+        }
+    };
+    // Only the calling thread's own (Linux 2.6.25+).
+    if pid != 0 && pid as u32 != p.current {
+        return Err(EPERM);
+    }
+    // Effective, permitted and inheritable, 32 bits each, per set.
+    let mut d = [0u8; 24];
+    copy_in(&mut p.aspace, data, &mut d[..12 * sets])?;
+    if d.iter().any(|&b| b != 0) {
+        return p.deny(n, name, "privileged", "capabilities");
+    }
+    Ok(0)
 }
 
 /// sched_setscheduler (with a policy) and sched_setparam. Every thread

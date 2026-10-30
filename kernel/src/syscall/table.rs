@@ -112,7 +112,7 @@ syscalls! {
     88 utimensat Cap(FsWrite);
     89 acct Privileged;
     90 capget Core;
-    91 capset Privileged;
+    91 capset Core; // dropping what there is (nothing); raising is denied
     92 personality Core;
     93 exit Core;
     94 exit_group Core;
@@ -408,7 +408,7 @@ syscalls! {
     123 setfsgid Core;
     124 getsid Core;
     125 capget Core;
-    126 capset Privileged;
+    126 capset Core;
     127 rt_sigpending Core;
     128 rt_sigtimedwait Core;
     129 rt_sigqueueinfo Core;
