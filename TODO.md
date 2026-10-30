@@ -309,6 +309,12 @@ makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
 
 Left, none of it a way out of the sandbox:
 
+- [ ] An image's files don't keep their owners (a layer's or a build
+      step's `chown`): everything imported is the sandbox user's. Docker's
+      own entrypoints (PostgreSQL, MariaDB, MySQL) work anyway, as they
+      `chown` at run time; it takes the image format, `Entry`, the export
+      messages and the tree cache. Do this before the next item, which
+      would otherwise refuse services their own directories.
 - [ ] A path's directories aren't searched by anyone's permission: only
       the last component is checked (`MAY_EXEC` on the way down isn't).
 - [ ] An image's user gets no supplementary groups from its `/etc/group`,

@@ -258,14 +258,20 @@ static int server(int port) {
     CHECK(bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 8) == 0);
     struct sockaddr_in6 peer;
     socklen_t len = sizeof peer;
-    int c = accept(l, (struct sockaddr *)&peer, &len);
-    CHECK(c >= 0);
+    // Only the test's "ping": tools on the host probe new ports.
+    int c;
     char line[256];
-    int got = 0;
-    while (got < (int)sizeof line - 1) {
+    for (;;) {
+        c = accept(l, (struct sockaddr *)&peer, &len);
+        CHECK(c >= 0);
+        if (read(c, line, 1) == 1 && line[0] == 'p') break;
+        close(c);
+    }
+    int got = 1;
+    while (got < (int)sizeof line - 1 && line[got - 1] != '\n') {
         ssize_t n = read(c, line + got, 1);
         CHECK(n == 1);
-        if (line[got++] == '\n') break;
+        got++;
     }
     line[got] = 0;
     char reply[300];
