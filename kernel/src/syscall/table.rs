@@ -101,6 +101,9 @@ syscalls! {
     69 preadv Core;
     70 pwritev Core;
     71 sendfile Core;
+    75 vmsplice Core;
+    76 splice Core;
+    77 tee Core;
     72 pselect6 Core;
     73 ppoll Core;
     78 readlinkat Core;
@@ -529,6 +532,9 @@ syscalls! {
     272 unshare Core; // new namespaces refused in the handler
     273 set_robust_list Core;
     274 get_robust_list Core;
+    275 splice Core;
+    276 tee Core;
+    278 vmsplice Core;
     280 utimensat Cap(FsWrite);
     281 epoll_pwait Core;
     282 signalfd Core;

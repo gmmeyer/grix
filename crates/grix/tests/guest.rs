@@ -1632,6 +1632,17 @@ fn per_thread_proc_files() {
 }
 
 #[test]
+fn splice_tee_vmsplice() {
+    // Between pipes, files, AF_UNIX and loopback TCP sockets, and stdout,
+    // with Linux's errnos.
+    let b = with("splice").allow(Capability::FsWrite).allow(Capability::Net);
+    let out = run(b, &["/bin/splice"]);
+    assert_eq!(out.stdout_str(), "spliced to stdout\nsplice ok\n");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+#[test]
 fn proc_self_mem() {
     // /proc/self/mem at the process's own addresses (the vDSO's ELF
     // header, as cilium/ebpf's kernel version probe reads it); another

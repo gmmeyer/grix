@@ -9,6 +9,7 @@ mod proc;
 pub use proc::shields_init;
 mod shm;
 mod signal;
+mod splice;
 pub mod table;
 mod thread;
 mod timer;
@@ -257,6 +258,9 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::setxattr | nr::lsetxattr | nr::fsetxattr => file::setxattr(p, n, a[0], a[1], a[2], a[3], a[4]),
         nr::removexattr | nr::lremovexattr | nr::fremovexattr => file::removexattr(p, n, a[0], a[1]),
         nr::sendfile => file::sendfile(p, a[0], a[1], a[2], a[3]),
+        nr::splice => splice::splice(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::tee => splice::tee(p, a[0], a[1], a[2], a[3]),
+        nr::vmsplice => splice::vmsplice(p, a[0], a[1], a[2], a[3]),
         nr::memfd_create => file::memfd_create(p, a[0], a[1]),
         nr::signalfd4 => file::signalfd4(p, a[0], a[1], a[2], a[3]),
         nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),

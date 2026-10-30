@@ -836,13 +836,13 @@ const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 /// Copy user bytes into a file at `off` (see `read_content`).
 /// With `append`, at the end of a live mount's file (where the host says
 /// the end is). Returns how much was written, and where.
-fn write_content_at(
+pub(super) fn write_content_at(
     p: &mut Process,
     c: &Content,
     ino: Ino,
     mut off: u64,
     append: bool,
-    buf: u64,
+    src: Src,
     count: u64,
 ) -> Result<(u64, u64), Errno> {
     if off.checked_add(count).is_none_or(|end| end > MAX_FILE_SIZE) {
@@ -863,7 +863,7 @@ fn write_content_at(
     let mut err = None;
     while done < count {
         let n = (count - done).min(chunk.len() as u64) as usize;
-        if let Err(e) = copy_in(&mut p.aspace, buf + done, &mut chunk[..n]) {
+        if let Err(e) = src.read(p, done, &mut chunk[..n]) {
             err = Some(e);
             break;
         }
@@ -914,7 +914,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
             let off = if append { c.lock().len() } else { at.unwrap_or(f.offset) };
             // A live mount's file may have grown on the host: its end is
             // where the host says.
-            let (n, off) = write_content_at(p, &c, ino, off, append, buf, count)?;
+            let (n, off) = write_content_at(p, &c, ino, off, append, Src::User(buf), count)?;
             if at.is_none() {
                 f.offset = off + n;
             }
