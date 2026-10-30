@@ -317,7 +317,6 @@ Left, none of it a way out of the sandbox:
       new offset, no permission check); Linux's is a new open.
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
       another process's are ENOENT past their own name.
-- [ ] The ELF interpreter (`PT_INTERP`) needs no execute permission.
 - [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
       stays unwatched until the guest watches it again.
 

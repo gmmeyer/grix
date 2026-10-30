@@ -838,12 +838,15 @@ content = "a note"
         assert_eq!(out.status, ExitStatus::Exited(0));
         assert!(out.events.is_empty(), "{:?}", out.events);
     }
-    // Supplementary groups count, and access asks for the real ids.
+    // Supplementary groups count, access asks for the real ids, and an
+    // ELF interpreter needs execute permission.
     let writes = Sandbox::builder().image(&image).unwrap().allow(Capability::FsWrite).build().unwrap();
-    let out = writes.run(&["/bin/hardening2", "groupperm"]).unwrap();
-    assert_eq!(out.stdout_str(), "groupperm ok\n", "{}", out.kernel_log);
-    assert_eq!(out.status, ExitStatus::Exited(0));
-    assert!(out.events.is_empty(), "{:?}", out.events);
+    for name in ["groupperm", "interpperm"] {
+        let out = writes.run(&["/bin/hardening2", name]).unwrap();
+        assert_eq!(out.stdout_str(), format!("{name} ok\n"), "{}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
     let out = sb.run(&["uname", "-m"]).unwrap();
     assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
     // Docker's HOME (root's, from the image's /etc/passwd, for build

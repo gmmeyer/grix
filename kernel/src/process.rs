@@ -1096,6 +1096,12 @@ pub fn load_program(
                 match &fs.node(ino).kind {
                     Kind::File(c) => {
                         let src = elf::Source::of(c);
+                        if !fs.permits(ino, p.who(), fs::MAY_EXEC) {
+                            return Err(exec_error(
+                                EACCES,
+                                alloc::format!("ELF interpreter {ipath} is not executable"),
+                            ));
+                        }
                         may_execute(&mut fs, landlock.as_deref(), ino, cwd, ipath)?;
                         (src, ino)
                     }

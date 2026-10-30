@@ -1003,6 +1003,29 @@ static void t_groupperm(void) {
     as_user(other_effective);
 }
 
+// A dynamic program takes execute permission on its interpreter too.
+static void busybox_runs(void) {
+    CHECK(setgroups(0, 0) == 0 && setgid(2000) == 0 && setuid(2000) == 0);
+    char *argv[] = {"busybox", "true", 0}, *envp[] = {0};
+    execve("/bin/busybox", argv, envp);
+    CHECK(!"execve failed");
+}
+
+static void busybox_refused(void) {
+    CHECK(setgroups(0, 0) == 0 && setgid(2000) == 0 && setuid(2000) == 0);
+    // `false`: if it runs after all, this child doesn't end as a success.
+    char *argv[] = {"busybox", "false", 0}, *envp[] = {0};
+    FAILS(execve("/bin/busybox", argv, envp), EACCES);
+}
+
+static void t_interpperm(void) {
+    CHECK(getuid() == 0);
+    const char *ld[] = {"/lib/ld-musl-aarch64.so.1", "/lib/ld-musl-x86_64.so.1"};
+    as_user(busybox_runs);
+    CHECK(chmod(ld[0], 0700) == 0 || chmod(ld[1], 0700) == 0);
+    as_user(busybox_refused);
+}
+
 // ---- /proc/self/fd/N/name
 
 static void fdpath_jailed(void) {
@@ -1264,7 +1287,7 @@ int main(int argc, char **argv) {
     struct { const char *name; void (*f)(void); } tests[] = {
         {"mode3", t_mode3}, {"opath", t_opath}, {"race", t_race}, {"heap", t_heap}, {"timers", t_timers},
         {"epoll", t_epoll}, {"argv", t_argv}, {"tabs", t_tabs}, {"ptsperm", t_ptsperm}, {"sigioperm", t_sigioperm},
-        {"execperm", t_execperm}, {"groupperm", t_groupperm},
+        {"execperm", t_execperm}, {"groupperm", t_groupperm}, {"interpperm", t_interpperm},
         {"fasync", t_fasync}, {"timerfd", t_timerfd}, {"fexec", t_fexec}, {"fdpath", t_fdpath},
         {"altstack", t_altstack}, {"rules", t_rules},
     };
