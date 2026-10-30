@@ -50,6 +50,72 @@ static int bus_error(volatile char *p) {
     return 1;
 }
 
+// A shared mapping that reads a hole holds a read-only copy of it. Whatever
+// happens to that mapping, a write must fault and reach the file: it's
+// seen by read() and by another mapping.
+static void written_through(int fd, char *other, char *m, off_t at, char c) {
+    char b = 0;
+    m[0] = c;
+    CHECK(other[at] == c);
+    CHECK(pread(fd, &b, 1, at) == 1 && b == c);
+}
+
+static void read_only_copies(void) {
+    enum { PAGE = 4096, PAGES = 6 };
+    int fd = open("/tmp/holes", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0 && ftruncate(fd, PAGES * PAGE) == 0);
+    char *other = mmap(0, PAGES * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *ro = mmap(0, PAGES * PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    char *rw = mmap(0, PAGES * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(other != MAP_FAILED && ro != MAP_FAILED && rw != MAP_FAILED);
+    volatile char seen;
+
+    // mprotect, from read-only and from nothing at all.
+    seen = ro[0];
+    CHECK(mprotect(ro, PAGE, PROT_READ | PROT_WRITE) == 0);
+    written_through(fd, other, ro, 0, 'p');
+    seen = ro[PAGE];
+    CHECK(mprotect(ro + PAGE, PAGE, PROT_NONE) == 0);
+    CHECK(mprotect(ro + PAGE, PAGE, PROT_READ | PROT_WRITE) == 0);
+    written_through(fd, other, ro + PAGE, PAGE, 'n');
+    // And back: read-only and writable again, a frame this time.
+    CHECK(mprotect(ro, PAGE, PROT_READ) == 0);
+    CHECK(mprotect(ro, PAGE, PROT_READ | PROT_WRITE) == 0);
+    written_through(fd, other, ro, 0, 'b');
+
+    // mremap moves the copy.
+    seen = rw[2 * PAGE];
+    char *moved = mremap(rw + 2 * PAGE, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, ro + 2 * PAGE);
+    CHECK(moved == ro + 2 * PAGE);
+    written_through(fd, other, moved, 2 * PAGE, 'm');
+
+    // fork copies it, into a child that writes.
+    seen = rw[3 * PAGE];
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        rw[3 * PAGE] = 'f';
+        _exit(0);
+    }
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    written_through(fd, other, rw + 3 * PAGE, 3 * PAGE, 'F');
+    CHECK(other[3 * PAGE] == 'F');
+
+    // Something else writes the page: a copy still in a read-only mapping
+    // shows it, and goes writable like any other.
+    seen = ro[4 * PAGE];
+    CHECK(pwrite(fd, "w", 1, 4 * PAGE) == 1 && ro[4 * PAGE] == 'w');
+    CHECK(mprotect(ro + 4 * PAGE, PAGE, PROT_READ | PROT_WRITE) == 0);
+    written_through(fd, other, ro + 4 * PAGE, 4 * PAGE, 'W');
+    (void)seen;
+    munmap(ro, PAGES * PAGE);
+    munmap(rw, PAGES * PAGE);
+    munmap(other, PAGES * PAGE);
+    close(fd);
+    unlink("/tmp/holes");
+}
+
 static void shared_mappings(void) {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     CHECK(fd >= 0 && ftruncate(fd, 8192) == 0);
@@ -107,6 +173,8 @@ static void shared_mappings(void) {
     munmap(rd, 8192);
     munmap(rw, 8192);
     close(blob);
+
+    read_only_copies();
 
     // Sealed memfds can't be written through mappings, and can't be sealed
     // while a mapping may write.

@@ -747,10 +747,16 @@ impl AddressSpace {
             piece.prot = prot;
             // A page shared with a forked process stays read-only until
             // it's written (and copied); shared memory is meant to be shared.
+            // So does what a shared file's mapping has read-only: it may be
+            // a copy of a hole (`fault`), and a write must fault to reach
+            // the file's own frame. On the way through PROT_NONE too, whose
+            // entries look writable.
             let cow = prot.write && !piece.shared_pages();
+            let file = matches!(piece.backing, Backing::SharedFile { .. });
             self.pt.for_each_mapped(piece.start, piece.end, |va, pte| unsafe {
                 let pa = *pte & ADDR_MASK;
-                let new = if cow && frame::is_shared(pa) { paging::read_only(pa | flags) } else { pa | flags };
+                let keep = cow && frame::is_shared(pa) || file && !paging::writable(*pte);
+                let new = if keep { paging::read_only(pa | flags) } else { pa | flags };
                 if new != *pte {
                     changed.add(va);
                 }
