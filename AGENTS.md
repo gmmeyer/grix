@@ -455,6 +455,26 @@ group (`job_control`) and re-run once it continues. In TTY mode
 console: `tty::pump` moves host stdin in and output out, and
 `wire::Input::Resize` changes its size.
 
+seccomp (`seccomp.rs`): a program's filters on itself. State is per
+thread (`Thread::seccomp`: the mode, the newest filter, which holds
+the ones before it in an `Arc` chain shared by every thread and process
+that inherited it, and no_new_privs), copied by fork and clone, kept by
+execve. `syscall::handle` runs the policy's gate first (`gate`: what
+the policy refuses is denied and reported whatever a filter says),
+then the filters (`seccomp::verdict`, Linux's precedence: the
+strictest action, the newest of equals), then the call; a check
+inside a handler (`syscall::require`) comes after the filters, as the
+call has to run to make it. A filter can only take away: what it
+refuses isn't a denial and isn't reported, but a kill is (a `Fault`).
+TRAP leaves the registers as they were and forces SIGSYS
+(`signal::force`: fatal if blocked or ignored) with `si_syscall`,
+`si_arch` and the data in `si_errno`. Programs are checked as Linux's
+`bpf_check_classic` and `seccomp_check_filter` check them (only
+forward jumps, so a run ends within its length). TSYNC writes the
+other threads' state directly: one running on another CPU is in user
+mode and sees it at its next call. User notification is unimplemented
+(reported).
+
 Signals (`signal.rs`): actions are per process; masks, pending queues and
 sigaltstacks are per thread. `kill` picks a receiver like Linux (the main
 thread first, then any thread that doesn't block the signal) and queues it
@@ -572,9 +592,11 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       zombies included), network connections (`inet::MAX_CONNS`),
       connections waiting to be accepted (`inet::MAX_PENDING`),
       pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers),
-      file locks (`locks::MAX_LOCKS`) and descriptors in flight over
+      file locks (`locks::MAX_LOCKS`), descriptors in flight over
       AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
-      `kmem::Charge`). argv and environment copies take a
+      `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
+      `MAX_INSNS_TOTAL` in all processes, each filter charged to
+      `kmem`; ENOMEM). argv and environment copies take a
       `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,

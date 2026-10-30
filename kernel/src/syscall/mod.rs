@@ -22,6 +22,7 @@ use crate::arch::TrapFrame;
 use crate::errno::*;
 use crate::process::{PROCESS, Process};
 use crate::sched;
+use crate::seccomp::Verdict;
 use table::{Gate, nr};
 
 /// execve's dirfd for "relative to the working directory".
@@ -44,8 +45,36 @@ pub fn handle(tf: &mut TrapFrame) {
     if t.fifo_wait.as_ref().is_some_and(|w| w.call != call) {
         t.fifo_wait = None;
     }
+    // A seccomp filter's SECCOMP_RET_TRAP leaves the registers as they
+    // were (Linux's syscall_rollback): no result to set.
+    let mut trapped = false;
     let result = match u32::try_from(n) {
-        Ok(n) => dispatch(p, tf, n, a),
+        Ok(n) => match gate(p, n) {
+            Err(e) => Err(e),
+            Ok(()) => match crate::seccomp::verdict(p, n, a, tf.pc()) {
+                Verdict::Allow => dispatch(p, tf, n, a),
+                Verdict::Return(r) => r,
+                Verdict::Trap => {
+                    trapped = true;
+                    Ok(0)
+                }
+                Verdict::KillThread(_) if p.threads.len() > 1 => thread::exit_thread(p, 0),
+                Verdict::KillThread(sig) => {
+                    let why = if sig == crate::signal::SIGKILL {
+                        "killed by seccomp's strict mode"
+                    } else {
+                        "killed by its seccomp filter (SECCOMP_RET_KILL_THREAD)"
+                    };
+                    p.kill(sig, 0, tf.pc(), &alloc::format!("{why} at syscall {n}"), true);
+                    Err(EBLOCKED)
+                }
+                Verdict::KillProcess => {
+                    let why = alloc::format!("killed by its seccomp filter (SECCOMP_RET_KILL_PROCESS) at syscall {n}");
+                    p.kill(crate::signal::SIGSYS, 0, tf.pc(), &why, true);
+                    Err(EBLOCKED)
+                }
+            },
+        },
         Err(_) => p.unimplemented(u32::MAX, "unknown", "", ENOSYS),
     };
     // The process ended (exit_group, a fatal signal to itself, a policy
@@ -65,10 +94,12 @@ pub fn handle(tf: &mut TrapFrame) {
     if result != Err(EBLOCKED) {
         p.cur().restart_deadline = None;
         p.cur().io_done = 0;
-        tf.set_return(match result {
-            Ok(v) => v,
-            Err(e) => (-(e.0 as i64)) as u64,
-        });
+        if !trapped {
+            tf.set_return(match result {
+                Ok(v) => v,
+                Err(e) => (-(e.0 as i64)) as u64,
+            });
+        }
         crate::signal::syscall_done(p, result == Err(EINTR));
     }
     sched::wake_io_everywhere(p);
@@ -94,17 +125,21 @@ pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) ->
     p.deny(n, name, cap.name(), detail).map(|_| ())
 }
 
-fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
+/// The policy's gate for call `n`. It comes before any seccomp filter:
+/// what the policy refuses is denied (and reported) whatever the
+/// program's filters say.
+fn gate(p: &mut Process, n: u32) -> Result<(), Errno> {
     let (name, gate) = table::info(n);
     match gate {
-        Gate::Core => {}
-        Gate::Cap(cap) => {
-            if !p.policy.allows(cap) {
-                return p.deny(n, name, cap.name(), "");
-            }
-        }
-        Gate::Privileged => return p.deny(n, name, "privileged", ""),
+        Gate::Core => Ok(()),
+        Gate::Cap(cap) if p.policy.allows(cap) => Ok(()),
+        Gate::Cap(cap) => p.deny(n, name, cap.name(), "").map(|_| ()),
+        Gate::Privileged => p.deny(n, name, "privileged", "").map(|_| ()),
     }
+}
+
+fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResult {
+    let (name, _) = table::info(n);
     #[cfg(target_arch = "x86_64")]
     if let Some(r) = x86::legacy(p, tf, n, a) {
         return r;
@@ -273,6 +308,7 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::rt_sigreturn => crate::signal::sigreturn(p, tf),
         nr::sigaltstack => signal::sigaltstack(p, tf.sp(), a[0], a[1]),
         nr::kill => signal::kill(p, a[0], a[1]),
+        nr::seccomp => crate::seccomp::seccomp(p, a[0], a[1], a[2]),
 
         // processes
         nr::execve => proc::execve(p, tf, AT_FDCWD as u64, a[0], a[1], a[2], 0),

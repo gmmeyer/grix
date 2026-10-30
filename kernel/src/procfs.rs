@@ -366,6 +366,7 @@ pub fn generate_zombie(reader: &Process, pid: u32, z: &Zombie, f: ProcFile) -> R
                 children_ns: r.children_ns,
                 flags: PF_DEFAULT | PF_EXITING,
                 exit_code: if permitted { z.status } else { 0 },
+                seccomp: (false, 0, 0),
             };
             if f == ProcFile::Status { status(&sh, &mut s) } else { stat(&sh, &mut s) }
         }
@@ -536,6 +537,8 @@ struct Shown<'a> {
     children_ns: u64,
     flags: u64,
     exit_code: i32,
+    /// The leader's no_new_privs, seccomp mode and filter count.
+    seccomp: (bool, u8, usize),
 }
 
 /// The task flags stat shows (PF_RANDOMIZE | PF_SUPERPRIV), and the one
@@ -569,6 +572,11 @@ fn shown(p: &Process) -> Shown<'_> {
         children_ns: p.children_cpu_ns,
         flags: PF_DEFAULT,
         exit_code: 0,
+        seccomp: p
+            .threads
+            .get(&p.pid)
+            .or_else(|| p.threads.values().next())
+            .map_or((false, 0, 0), |t| (t.seccomp.no_new_privs, t.seccomp.mode, t.seccomp.filters())),
     }
 }
 
@@ -599,8 +607,16 @@ fn status(sh: &Shown, s: &mut String) {
          SigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
          SigCgt:\t{:016x}\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
          CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\n\
-         NoNewPrivs:\t1\nSeccomp:\t0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
-        sh.threads, sh.pending, sh.shared_pending, sh.blocked, sh.ignored, sh.caught,
+         NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+        sh.threads,
+        sh.pending,
+        sh.shared_pending,
+        sh.blocked,
+        sh.ignored,
+        sh.caught,
+        sh.seccomp.0 as u8,
+        sh.seccomp.1,
+        sh.seccomp.2,
     );
 }
 

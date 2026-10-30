@@ -1956,6 +1956,62 @@ fn pidfds() {
 }
 
 #[test]
+fn seccomp_filters() {
+    // Strict mode, classic BPF checked as Linux checks it, every action (a
+    // SIGSYS handler emulating the call from si_syscall), stacking,
+    // inheritance across fork, threads and execve, TSYNC, and the budget.
+    for cpus in [1, 4] {
+        let b = with("seccomp").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        let out = run(b, &["/bin/seccomp"]);
+        assert_eq!(
+            out.stdout_str(),
+            "seccomp ok\n",
+            "{cpus} CPUs {:?} {:?}\n{}",
+            out.status,
+            out.events,
+            out.kernel_log
+        );
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        // The policy's gate comes first: mount is denied (EPERM, reported)
+        // whatever the program's filter says.
+        let denied: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GuestEvent::Denied { syscall, capability, .. } => Some((syscall.as_str(), capability.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(denied, [("mount", "privileged")]);
+        // User notification is unimplemented, and says so.
+        let mut missing: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GuestEvent::Unimplemented { syscall, detail, .. } if syscall == "seccomp" => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect();
+        missing.sort();
+        assert_eq!(missing, ["SECCOMP_FILTER_FLAG_NEW_LISTENER", "SECCOMP_RET_USER_NOTIF"]);
+        // The children the filters killed: TRAP with SIGSYS blocked,
+        // KILL_PROCESS, KILL_THREAD alone, an unknown action (SIGSYS), and
+        // strict mode (SIGKILL).
+        let mut killed: Vec<u32> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GuestEvent::Fault { signal, .. } => Some(*signal),
+                _ => None,
+            })
+            .collect();
+        killed.sort();
+        assert_eq!(killed, [9, 31, 31, 31, 31], "{:?}", out.events);
+        assert_eq!(out.events.len(), 8, "{:?}", out.events);
+    }
+}
+
+#[test]
 fn clone_sharing_flags() {
     // CLONE_FILES, CLONE_FS, CLONE_SIGHAND (with vfork), CLONE_PARENT and
     // CLONE_CLEAR_SIGHAND, by clone and clone3; unsharing by execve and

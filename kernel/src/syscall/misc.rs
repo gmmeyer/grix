@@ -288,6 +288,7 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
     const PR_SET_NAME: u64 = 15;
     const PR_GET_NAME: u64 = 16;
     const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_SECCOMP: u64 = 22;
     const PR_CAPBSET_READ: u64 = 23;
     const PR_CAPBSET_DROP: u64 = 24;
     const PR_SET_TIMERSLACK: u64 = 29;
@@ -316,14 +317,25 @@ fn prctl(p: &mut Process, a: [u64; 6]) -> SysResult {
             let name = p.name;
             copy_out(&mut p.aspace, a[1], &name).map(|_| 0)
         }
-        PR_GET_DUMPABLE | PR_GET_NO_NEW_PRIVS => Ok(1),
+        PR_GET_DUMPABLE => Ok(1),
         // Nothing to signal (no parent), dump, or slack: these are settings
         // with no effect inside the sandbox.
-        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_TIMERSLACK | PR_SET_NO_NEW_PRIVS | PR_SET_VMA => Ok(0),
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_TIMERSLACK | PR_SET_VMA => Ok(0),
+        // It only matters to seccomp here (nothing honours setuid bits),
+        // but it's kept as Linux keeps it: set for good, and inherited.
+        PR_SET_NO_NEW_PRIVS if a[1] != 1 || a[2] != 0 || a[3] != 0 || a[4] != 0 => Err(EINVAL),
+        PR_SET_NO_NEW_PRIVS => {
+            p.cur().seccomp.no_new_privs = true;
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS if a[1] != 0 || a[2] != 0 || a[3] != 0 || a[4] != 0 => Err(EINVAL),
+        PR_GET_NO_NEW_PRIVS => Ok(p.cur().seccomp.no_new_privs as u64),
+        PR_GET_SECCOMP => Ok(p.cur().seccomp.mode as u64),
+        PR_SET_SECCOMP => crate::seccomp::prctl_set(p, a[1], a[2]),
         PR_GET_PDEATHSIG => write_u32(&mut p.aspace, a[1], 0).map(|_| 0),
         PR_GET_TIMERSLACK => Ok(50_000), // Linux's default, in ns
         PR_SET_KEEPCAPS | PR_SET_THP_DISABLE => Ok(0),
-        PR_GET_KEEPCAPS | PR_GET_THP_DISABLE | PR_GET_SECCOMP => Ok(0),
+        PR_GET_KEEPCAPS | PR_GET_THP_DISABLE => Ok(0),
         // There are no child processes yet, so being a subreaper changes nothing.
         PR_SET_CHILD_SUBREAPER => {
             p.subreaper = a[1] != 0;

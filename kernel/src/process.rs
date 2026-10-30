@@ -148,6 +148,9 @@ pub struct Thread {
     pub fifo_wait: Option<FifoWait>,
     /// The syscall it's in: (pc, number) as it entered.
     pub call: (u64, u64),
+    /// Its seccomp mode, filters and no_new_privs (inherited by threads and
+    /// processes it makes, kept across execve).
+    pub seccomp: crate::seccomp::State,
 }
 
 impl Thread {
@@ -172,6 +175,7 @@ impl Thread {
             lock_wait: None,
             fifo_wait: None,
             call: (0, 0),
+            seccomp: Default::default(),
         }
     }
 }

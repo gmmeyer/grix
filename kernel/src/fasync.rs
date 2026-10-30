@@ -135,8 +135,15 @@ fn send(p: &mut Process, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
         (POLL_OUT, 0x304)
     };
     let (signo, code) = if fown.sig == 0 { (SIGIO, SI_KERNEL) } else { (fown.sig, code) };
-    let info =
-        SigInfo { signo, code, fields: [band, fd, 0, 0], fault: None, timer: None, why: "I/O possible (O_ASYNC)" };
+    let info = SigInfo {
+        signo,
+        errno: 0,
+        code,
+        fields: [band, fd, 0, 0],
+        fault: None,
+        timer: None,
+        why: "I/O possible (O_ASYNC)",
+    };
     for q in procs.all(p) {
         let target = match fown.owner {
             Owner::Process(pid) if q.pid == pid => Target::Process,

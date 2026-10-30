@@ -45,7 +45,7 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | Memcached | 1.6.45 | `memcached:alpine` | `memcached -u root`, set/get/stats from the host | n t | works | | |
 | MongoDB | 7.0.45, mongosh 2.14.0 | `mongo:7` | `mongod`, mongosh: insert, index, query | n t p w | works | mongosh died of SIGSEGV: the strings at the top of the stack were in reverse order within argv and environ, so libuv's process title came out with a negative length and wrote past the stack. | Fixed: the stack's strings |
 | SQLite | 3.40.1 | `debian:bookworm` | `sqlite3` create/insert/select; Python's sqlite3 | w | works | | |
-| Elasticsearch | 8.15.3 | `elasticsearch:8.15.3` | single node, index and search a document, cluster health | n t p w | works | 1. `UnknownHostException: grix` (the hostname didn't resolve). 2. curl aborted: glibc 2.31's getaddrinfo asserts on a UDP socket reconnected after `connect(AF_UNSPEC)`. 3. The ML controller needs named pipes, which 0.0.32 has: its `controller` runs and `_ml/info` answers. seccomp is unimplemented (it warns and goes on). | Fixed: the sandbox's name, UDP `AF_UNSPEC`, named pipes (0.0.32) |
+| Elasticsearch | 8.15.3 | `elasticsearch:8.15.3` | single node, index and search a document, cluster health | n t p w | works | 1. `UnknownHostException: grix` (the hostname didn't resolve). 2. curl aborted: glibc 2.31's getaddrinfo asserts on a UDP socket reconnected after `connect(AF_UNSPEC)`. 3. The ML controller needs named pipes, which 0.0.32 has: its `controller` runs and `_ml/info` answers. seccomp was unimplemented (it warned and went on); it installs its filter now. | Fixed: the sandbox's name, UDP `AF_UNSPEC`, named pipes (0.0.32) |
 | RabbitMQ | 3.13.7 (Erlang/OTP 26.2.5) | `rabbitmq:3-alpine` | `rabbitmq-server`, `rabbitmqctl add_vhost`, AMQP handshake | n t p w | works | Every BEAM died of SIGSEGV: Erlang's JIT cleans the cache (`dc cvau`) on the executable view of its code before touching it, and grix took that fault for a write. | Fixed: cache maintenance faults |
 | etcd | 3.5.17 | `quay.io/coreos/etcd:v3.5.17` | v3 put/range and health over HTTP from the host | n t w | works | v3 HTTP API: "connection refused": its gRPC gateway dials `0.0.0.0:2379`, which Linux treats as this host. | Fixed: connect to 0.0.0.0 |
 | Prometheus | 3.15.1 | `prom/prometheus` | server, `/api/v1/query`, `/-/healthy` from the host | n t w | works | | |
@@ -123,7 +123,8 @@ In order of impact (details in TODO.md, "Round 3"):
 3. **xattrs** (`cp -a`, `tar --xattrs`, `setcap` metadata).
 4. **Linux AIO** (`io_setup`) and **io_uring**: MariaDB and nginx fall
    back.
-5. **seccomp filters**: Elasticsearch warns that it can't install its own.
+5. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
+   mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
 6. **Reading ID registers from EL0** (`mrs` of `ID_AA64*`, Linux's
    `HWCAP_CPUID` emulation), for programs that do it without asking
    HWCAP.

@@ -99,6 +99,8 @@ pub struct Fault {
 #[derive(Clone, Copy, Debug)]
 pub struct SigInfo {
     pub signo: u32,
+    /// si_errno: 0 but for a seccomp filter's SIGSYS (its data).
+    pub errno: i32,
     pub code: i32,
     /// The siginfo union from byte 16: pid and uid (kill), the address
     /// (faults), pid, uid and value (sigqueue).
@@ -113,7 +115,15 @@ pub struct SigInfo {
 impl SigInfo {
     /// Sent by process `pid`: kill, tgkill, or the kernel on its behalf (SIGPIPE).
     pub fn sent(signo: u32, code: i32, pid: u32, uid: u32, why: &'static str) -> Self {
-        SigInfo { signo, code, fields: [pid as u64 | (uid as u64) << 32, 0, 0, 0], fault: None, timer: None, why }
+        SigInfo {
+            signo,
+            errno: 0,
+            code,
+            fields: [pid as u64 | (uid as u64) << 32, 0, 0, 0],
+            fault: None,
+            timer: None,
+            why,
+        }
     }
 
     /// A child ended, stopped or continued (usually SIGCHLD): its pid,
@@ -126,12 +136,13 @@ impl SigInfo {
             sig => (CLD_KILLED, sig),
         };
         let fields = [pid as u64 | (uid as u64) << 32, value as u32 as u64, 0, 0];
-        SigInfo { signo, code, fields, fault: None, timer: None, why: "a child process ended" }
+        SigInfo { signo, errno: 0, code, fields, fault: None, timer: None, why: "a child process ended" }
     }
 
     pub fn bytes(&self) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&self.signo.to_le_bytes());
+        b[4..8].copy_from_slice(&self.errno.to_le_bytes());
         b[8..12].copy_from_slice(&self.code.to_le_bytes());
         for (i, w) in self.fields.iter().enumerate() {
             b[16 + i * 8..24 + i * 8].copy_from_slice(&w.to_le_bytes());
@@ -357,6 +368,7 @@ pub fn signalfd_record(si: &SigInfo) -> [u8; 128] {
     let mut b = [0u8; 128];
     let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
     put(0, &si.signo.to_le_bytes());
+    put(4, &si.errno.to_le_bytes());
     put(8, &si.code.to_le_bytes());
     match (si.fault, si.timer) {
         (Some(f), _) => put(72, &f.addr.to_le_bytes()), // ssi_addr
@@ -482,13 +494,23 @@ pub fn raise(p: &mut Process, sig: u32, why: &'static str) {
 /// on the way back to EL0 with the faulting pc; if it is blocked or ignored
 /// the program dies, as with Linux's force_sig_fault.
 pub fn fault(p: &mut Process, sig: u32, code: i32, fault: Fault, why: &'static str) {
+    let info =
+        SigInfo { signo: sig, errno: 0, code, fields: [fault.addr, 0, 0, 0], fault: Some(fault), timer: None, why };
+    force(p, info, fault.pc)
+}
+
+/// Force a synchronous signal on the calling thread (Linux's
+/// force_sig_info with HANDLER_CURRENT): delivered on the way back to
+/// user mode if it has a handler, else, or if it's blocked, the process
+/// dies of it. `pc` is where, for the report.
+pub fn force(p: &mut Process, info: SigInfo, pc: u64) {
+    let sig = info.signo;
     let act = p.action(sig);
     let t = p.cur();
     if act.handler == SIG_DFL || act.handler == SIG_IGN || t.sigmask & bit(sig) != 0 {
-        p.kill(sig, fault.addr, fault.pc, why, true);
+        p.kill(sig, info.fault.map_or(0, |f| f.addr), pc, info.why, true);
         return;
     }
-    let info = SigInfo { signo: sig, code, fields: [fault.addr, 0, 0, 0], fault: Some(fault), timer: None, why };
     t.pending.push(info).expect("standard signals always queue");
 }
 

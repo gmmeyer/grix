@@ -149,10 +149,14 @@ Left, in order of impact:
     nginx fall back to synchronous I/O. io_uring is a large surface
     (its own submission paths for every operation, each needing its
     gate); AIO on in-memory files could complete at submission.
-27. [ ] **seccomp filters** (Elasticsearch warns it can't install its
-    own): a classic-BPF interpreter over the syscall number and
-    arguments, checked before the gate. It can only take away, so it
-    can't weaken the policy.
+27. [x] **seccomp filters**: `seccomp(2)` and `prctl(PR_SET_SECCOMP)`,
+    strict mode and classic BPF checked and run as Linux does (every
+    action, stacking, TSYNC, inherited across fork, threads and
+    execve, `no_new_privs` unless root), run after the policy's gate so
+    it can only take away. Filters are budgeted globally (count and
+    instructions, and kmem). Left: user notification
+    (`SECCOMP_RET_USER_NOTIF`, `NEW_LISTENER`: reported, refused as a
+    kernel before 5.0 refuses them).
 28. [ ] **ID registers from EL0** (`mrs` of `ID_AA64*`, Linux's
     `HWCAP_CPUID` emulation): Go reads `/proc/self/auxv` now, but other
     code may read them directly. The trap (EC 0x18 with FEAT_IDST, or

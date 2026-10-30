@@ -36,6 +36,7 @@ mod procfs;
 mod procs;
 mod rng;
 mod sched;
+mod seccomp;
 mod signal;
 mod smp;
 mod snapshot;
