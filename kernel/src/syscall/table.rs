@@ -285,6 +285,10 @@ syscalls! {
     437 openat2 Core; // as openat: write flags need fs_write in the handler
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    // Landlock: answered as Linux with it disabled at boot (misc.rs).
+    444 landlock_create_ruleset Core;
+    445 landlock_add_rule Core;
+    446 landlock_restrict_self Core;
     452 fchmodat2 Cap(FsWrite);
 }
 
@@ -589,5 +593,9 @@ syscalls! {
     438 pidfd_getfd Cap(Process);
     439 faccessat2 Core;
     441 epoll_pwait2 Core;
+    // Landlock: answered as Linux with it disabled at boot (misc.rs).
+    444 landlock_create_ruleset Core;
+    445 landlock_add_rule Core;
+    446 landlock_restrict_self Core;
     452 fchmodat2 Cap(FsWrite);
 }

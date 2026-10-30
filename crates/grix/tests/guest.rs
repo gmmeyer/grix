@@ -2261,6 +2261,12 @@ fn credentials_with_messages() {
 }
 
 #[test]
+fn landlock_is_disabled() {
+    // EOPNOTSUPP, as Linux with Landlock disabled at boot, and not reported.
+    popular(with("popular"), &["landlock"]);
+}
+
+#[test]
 fn credentials_with_streams() {
     // SO_PASSCRED on a stream: reads stop where the writer changes.
     popular(with("popular").allow(Capability::Process), &["streamcred"]);
