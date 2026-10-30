@@ -56,6 +56,24 @@ fn args_env_output_and_exit_status() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// A VMM that fails before it connects its serial port: the run says
+/// what it said, rather than "waiting for the VMM: No child processes"
+/// (seen to have exited, it had been reaped already).
+#[test]
+fn a_vmm_that_fails_to_start_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("failing-vmm");
+    let vmm = dir.join("vmm");
+    std::fs::write(&vmm, "#!/bin/sh\necho 'no machine for you' >&2\nexit 3\n").unwrap();
+    std::fs::set_permissions(&vmm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = with("hello").vmm(&vmm).build().unwrap().run(&["/bin/hello"]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    match out.status {
+        ExitStatus::VmFailed(why) => assert!(why.contains("Some(3)") && why.contains("no machine for you"), "{why}"),
+        s => panic!("{s:?}"),
+    }
+}
+
 #[test]
 fn environment_is_empty_unless_given() {
     let out = run(with("hello"), &["/bin/hello"]);

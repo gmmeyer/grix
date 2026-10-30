@@ -72,32 +72,54 @@ pub(crate) enum VmEnd {
 }
 
 /// Kills the VMM if we bail out early (error, timeout, caller panic).
-/// `reaped` once `reap` has waited for it.
-struct ChildGuard(Child, bool);
+/// The only thing that waits for it, by `wait4` (never `Child`'s own
+/// `wait` or `try_wait`, which would reap it behind our back and leave
+/// `wait4` with ECHILD): `reaped` keeps what that found.
+struct ChildGuard {
+    child: Child,
+    reaped: Option<(std::process::ExitStatus, HostUsage)>,
+}
 
 impl ChildGuard {
+    fn new(child: Child) -> ChildGuard {
+        ChildGuard { child, reaped: None }
+    }
+
+    /// Whether the VMM has ended, reaping it if so.
+    fn exited(&mut self) -> Result<bool> {
+        Ok(self.wait4(libc::WNOHANG)?.is_some())
+    }
+
     /// Wait for the VMM to end (killing it first, with `kill`): its status
     /// and what it cost, as the operating system counted it.
     fn reap(&mut self, kill: bool) -> Result<(std::process::ExitStatus, HostUsage)> {
-        if kill {
-            let _ = self.0.kill();
+        if kill && self.reaped.is_none() {
+            let _ = self.child.kill();
         }
-        let pid = self.0.id() as libc::pid_t;
+        Ok(self.wait4(0)?.expect("wait4 without WNOHANG returns a child"))
+    }
+
+    fn wait4(&mut self, flags: libc::c_int) -> Result<Option<(std::process::ExitStatus, HostUsage)>> {
+        if let Some(reaped) = self.reaped {
+            return Ok(Some(reaped));
+        }
+        let pid = self.child.id() as libc::pid_t;
         let mut status = 0;
         // SAFETY: a zeroed rusage is a valid one for wait4 to fill.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         loop {
             // SAFETY: wait4 fills the status and rusage it's given. Our own
-            // child: nothing else waits for it (`Child` won't: `reaped`).
-            if unsafe { libc::wait4(pid, &mut status, 0, &mut ru) } == pid {
-                break;
+            // child, not yet reaped: nothing else waits for it.
+            match unsafe { libc::wait4(pid, &mut status, flags, &mut ru) } {
+                0 => return Ok(None),
+                r if r == pid => break,
+                _ => {}
             }
             let e = std::io::Error::last_os_error();
             if e.kind() != ErrorKind::Interrupted {
                 return Err(e).context("waiting for the VMM");
             }
         }
-        self.1 = true;
         let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
         // Linux counts the peak in KiB, macOS in bytes.
         let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
@@ -106,16 +128,18 @@ impl ChildGuard {
             cpu_system: time(ru.ru_stime),
             peak_memory_bytes: (ru.ru_maxrss as u64).saturating_mul(unit),
         };
-        Ok((std::process::ExitStatus::from_raw(status), usage))
+        self.reaped = Some((std::process::ExitStatus::from_raw(status), usage));
+        Ok(self.reaped)
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        // Not once reaped: its pid may be another process's by now.
-        if !self.1 {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        // Not once reaped: its pid may be another process's by now (and
+        // `Child` doesn't know it's gone).
+        if self.reaped.is_none() {
+            let _ = self.child.kill();
+            let _ = self.wait4(0);
         }
     }
 }
@@ -193,20 +217,21 @@ const MAX_UART: usize = 1 << 20;
 
 /// Wait for the VMM to connect to the serial port's socket, which it does
 /// while starting up, before the guest runs. `None` if it exits first.
-fn accept_uart(listener: &UnixListener, child: &mut Child) -> Result<Option<UnixStream>> {
+fn accept_uart(listener: &UnixListener, child: &mut ChildGuard) -> Result<Option<UnixStream>> {
     listener.set_nonblocking(true)?;
     let started = Instant::now();
     loop {
+        // Looked at first: a VMM that connected and ended while we weren't
+        // looking left its connection, and what it wrote there, to accept.
+        let exited = child.exited()?;
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false)?;
                 return Ok(Some(stream));
             }
+            Err(e) if e.kind() == ErrorKind::WouldBlock && exited => return Ok(None),
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(e) => return Err(e).context("accepting the VMM's serial connection"),
-        }
-        if child.try_wait()?.is_some() {
-            return Ok(None);
         }
         if started.elapsed() > Duration::from_secs(30) {
             anyhow::bail!("the VMM didn't connect its serial port");
@@ -404,8 +429,8 @@ pub(crate) fn run(
             format!("starting {}", vmm.display())
         }
     })?;
-    let mut child = ChildGuard(child, false);
-    let uart = accept_uart(&listener, &mut child.0)?;
+    let mut child = ChildGuard::new(child);
+    let uart = accept_uart(&listener, &mut child)?;
     drop(listener);
     run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
 }
@@ -460,7 +485,7 @@ fn run_vm(
     let uart_thread = thread::spawn(move || uart.map(read_uart).unwrap_or_default());
     // Kept open until QEMU is gone (the proxy stops), after stdin's end
     // frame too.
-    let mut qemu_in = child.0.stdin.take().unwrap();
+    let mut qemu_in = child.child.stdin.take().unwrap();
     let outbox = to_guest.clone();
     thread::spawn(move || {
         while let Some(frame) = outbox.next() {
@@ -476,7 +501,7 @@ fn run_vm(
         thread::spawn(move || feed_stdin(tx, gate, input));
     }
 
-    let mut stdout = child.0.stdout.take().unwrap();
+    let mut stdout = child.child.stdout.take().unwrap();
     // Bounded, so a slow `on_frame` holds QEMU back (and through it the
     // guest) instead of piling output up here.
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
@@ -493,7 +518,7 @@ fn run_vm(
             }
         }
     });
-    let mut stderr = child.0.stderr.take().unwrap();
+    let mut stderr = child.child.stderr.take().unwrap();
     let stderr_thread = thread::spawn(move || {
         let mut s = Vec::new();
         let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut s);
@@ -590,4 +615,23 @@ fn run_vm(
     };
     let fs_state = matches!(cfg.snapshot, Some(SnapshotFile::Take(_))).then(|| fs.save());
     Ok(VmRun { end, events, timed_out, fs_state, usage: Some(usage) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VMM seen to end while we wait for its serial port is reaped then,
+    /// and `reap` still has its status and usage, not ECHILD.
+    #[test]
+    fn a_child_seen_to_exit_is_reaped_once() {
+        let mut child = ChildGuard::new(Command::new("/bin/sh").args(["-c", "exit 3"]).spawn().unwrap());
+        while !child.exited().unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (status, _) = child.reap(false).unwrap();
+        assert_eq!(status.code(), Some(3));
+        let (status, _) = child.reap(true).unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
 }
