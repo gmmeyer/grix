@@ -850,12 +850,12 @@ pub fn waiting_on(tty: &TtyRef) {
     }
 }
 
-fn pump(cur: &mut Process, procs: &mut Procs) {
+fn pump(mut cur: Option<&mut Process>, procs: &mut Procs) {
     let Some(tty) = CONSOLE_TTY.lock().clone() else { return };
     if let Some((rows, cols)) = crate::console::take_resize() {
         let fg = tty.lock().set_winsize([rows, cols, 0, 0]);
         if let Some(fg) = fg {
-            signal_group(Some(&mut *cur), procs, fg, SIGWINCH);
+            signal_group(cur.as_deref_mut(), procs, fg, SIGWINCH);
         }
     }
     let mut buf = [0u8; 1024];
@@ -868,7 +868,7 @@ fn pump(cur: &mut Process, procs: &mut Procs) {
             crate::console::StdinRead::Data(n) => {
                 let (_, sigs) = tty.lock().receive(&buf[..n]);
                 for (pgrp, sig) in sigs {
-                    signal_group(Some(&mut *cur), procs, pgrp, sig);
+                    signal_group(cur.as_deref_mut(), procs, pgrp, sig);
                 }
             }
             crate::console::StdinRead::Empty => break,
@@ -936,8 +936,8 @@ static WORK: AtomicBool = AtomicBool::new(false);
 /// Hang up the terminals whose master closed (Linux's tty_vhangup of the
 /// slave): its session leader gets SIGHUP and SIGCONT, and nobody in the
 /// session has it as controlling terminal any more. Its /dev/pts entry goes.
-pub fn service(cur: &mut Process, procs: &mut Procs) {
-    pump(cur, procs);
+pub fn service(mut cur: Option<&mut Process>, procs: &mut Procs) {
+    pump(cur.as_deref_mut(), procs);
     if !WORK.swap(false, Ordering::Relaxed) {
         return;
     }
@@ -946,7 +946,7 @@ pub fn service(cur: &mut Process, procs: &mut Procs) {
         let session = core::mem::take(&mut tty.lock().session);
         tty.lock().fg = 0;
         if session != 0 {
-            for q in procs.all(&mut *cur) {
+            for q in procs.each(cur.as_deref_mut()) {
                 if q.ctty.as_ref().is_some_and(|t| Arc::ptr_eq(t, &tty)) {
                     q.ctty = None;
                 }
@@ -956,9 +956,7 @@ pub fn service(cur: &mut Process, procs: &mut Procs) {
                 }
             }
         }
-        if let Some(mut fs) = crate::fs::try_lock() {
-            fs.pts_hide(index);
-        }
+        crate::fs::pts_gone(index);
     }
 }
 
@@ -967,15 +965,9 @@ fn send(q: &mut Process, sig: u32) {
     let _ = signal::send(q, Target::Process, info);
 }
 
-/// Every live process: the running one (`cur`, if it isn't the one being
-/// finished off) and the others.
-fn each<'a>(cur: Option<&'a mut Process>, procs: &'a mut Procs) -> impl Iterator<Item = &'a mut Process> {
-    cur.into_iter().filter(|p| !p.dead).chain(procs.others.values_mut())
-}
-
 /// Send `sig` to every process in group `pgrp`, as the terminal does.
 pub fn signal_group(cur: Option<&mut Process>, procs: &mut Procs, pgrp: u32, sig: u32) {
-    for q in each(cur, procs) {
+    for q in procs.each(cur) {
         if q.pgid == pgrp {
             send(q, sig);
         }
@@ -1008,7 +1000,7 @@ pub fn disassociate(mut cur: Option<&mut Process>, procs: &mut Procs, tty: &TtyR
             signal_group(cur.as_deref_mut(), procs, fg, SIGCONT);
         }
     }
-    for q in each(cur, procs) {
+    for q in procs.each(cur) {
         if q.sid == session {
             q.ctty = None;
         }

@@ -184,8 +184,9 @@ pub fn enter(why: Stat) {
 }
 
 /// Take the kernel, and make the process this CPU runs its `PROCESS`, with
-/// this CPU's scheduling state in it. A CPU with no thread gets some
-/// process to schedule from.
+/// this CPU's scheduling state in it. A CPU with no thread takes none: it
+/// schedules from no process (`sched::schedule`), so it never holds one
+/// another CPU may want.
 pub fn lock() {
     let cpu = me();
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
@@ -203,8 +204,8 @@ pub fn lock() {
     let mut guard = process::running().lock();
     let mut procs = PROCS.lock();
     if guard.is_none() {
-        let pid = cpu.pid.filter(|pid| procs.others.contains_key(pid)).or_else(|| procs.others.keys().next().copied());
-        *guard = pid.and_then(|pid| procs.others.remove(&pid));
+        // Gone if it ended (finished off on another CPU).
+        *guard = cpu.pid.and_then(|pid| procs.others.remove(&pid));
     }
     if let Some(p) = guard.as_mut() {
         // A thread that ended while this CPU ran it (exit_group, execve on
@@ -220,6 +221,12 @@ pub fn lock() {
     drop(procs);
     drop(guard);
     debug_assert!(checked_out_elsewhere(me) == 0, "a process checked out on another CPU");
+}
+
+/// Is this CPU the only one with a process checked out? (Always, under
+/// the kernel lock.)
+pub fn exclusive() -> bool {
+    checked_out_elsewhere(me()) == 0
 }
 
 /// How many CPUs other than `me` have a process in their slot of
@@ -238,6 +245,9 @@ pub fn unlock() {
         let taken = process::running().lock().take();
         debug_assert!(checked_out_elsewhere(me) == 0, "a process checked out on another CPU");
         let mut procs = PROCS.lock();
+        if taken.is_none() {
+            (cpus[me].tid, cpus[me].pid) = (None, None);
+        }
         if let Some(mut p) = taken {
             let c = &mut cpus[me];
             c.tid = (p.running && p.current != NO_THREAD).then_some(p.current);
@@ -452,24 +462,21 @@ fn kick(cpu: usize) {
 pub fn finish(tf: &mut TrapFrame) {
     // Schedule before waiting: a CPU whose thread just ended may have
     // others to run.
-    let mut look = true;
     loop {
         let picked = {
             let mut guard = process::running().lock();
-            let Some(p) = guard.as_mut() else { break };
-            if p.running {
+            if let Some(p) = guard.as_mut().filter(|p| p.running) {
                 activate(p);
                 break;
             }
-            if look {
-                crate::sched::schedule(p, tf);
-            }
+            crate::sched::schedule(&mut guard, tf);
             // Its address space, before anything reads or writes its
             // memory (a signal frame, below).
-            if p.running {
+            let p = guard.as_ref().filter(|p| p.running);
+            if let Some(p) = p {
                 activate(p);
             }
-            p.running
+            p.is_some()
         };
         if picked {
             // Picked here: its pending signals haven't been looked at (a
@@ -489,7 +496,6 @@ pub fn finish(tf: &mut TrapFrame) {
         if let Some(id) = irq::ack() {
             crate::sched::handle_interrupt(id);
         }
-        look = true;
     }
     unlock();
 }
@@ -565,12 +571,9 @@ pub extern "C" fn secondary_main(frame: *mut TrapFrame) -> ! {
         frame.write(TrapFrame::default());
         &mut *frame
     };
+    // Nothing yet (no process either): wait for a thread, like any CPU
+    // that has none.
     lock();
-    // Nothing yet: wait for a thread, like any CPU that has none.
-    if let Some(p) = process::running().lock().as_mut() {
-        p.running = false;
-        p.current = NO_THREAD;
-    }
     finish(tf);
     // SAFETY: `frame` holds the thread's user state, at the top of the
     // stack, as a trap would have left it.

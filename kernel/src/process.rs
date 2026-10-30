@@ -731,7 +731,7 @@ pub fn user_fault(tf: &TrapFrame, far: u64, access: Access, esr: u64) {
     match p.aspace.fault(far, access) {
         // A write that gave a page its frame: other mappings' copies of it
         // go before this thread goes on.
-        Ok(()) => crate::procs::zap_stale(p, &mut crate::procs::PROCS.lock()),
+        Ok(()) => crate::procs::zap_stale(Some(p), &mut crate::procs::PROCS.lock()),
         Err(FaultError::Segv) => {
             let code = if p.aspace.find(far).is_some() { signal::SEGV_ACCERR } else { signal::SEGV_MAPERR };
             let fault = signal::Fault { addr: far, pc: tf.pc(), syndrome: Some(esr) };
@@ -818,6 +818,7 @@ pub fn start(img: Image<'static>) -> ! {
     p.fs.update(|f| (f.cwd, f.cwd_pin) = (cwd, cwd_pin));
     p.running = true;
     // One process and its thread, until the scheduler counts.
+    crate::procs::born();
     crate::stats::tasks(1, 1);
     let argv = img.argv.iter().map(|s| String::from(*s)).collect();
     let envp: Vec<String> = img.envp.iter().map(|s| String::from(*s)).collect();

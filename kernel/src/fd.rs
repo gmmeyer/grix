@@ -135,7 +135,7 @@ impl FileKind {
                 }
                 (mask, version)
             }
-            FileKind::Unix(s) => s.lock().poll(),
+            FileKind::Unix(s) => crate::unix::poll(s),
             FileKind::EventFd(e) => e.lock().poll(),
             // Nested epoll is not supported (epoll_ctl refuses it).
             FileKind::Epoll(_) => (0, 0),

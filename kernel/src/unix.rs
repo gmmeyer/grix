@@ -345,7 +345,18 @@ impl Sock {
         }
     }
 
-    pub fn poll(&self) -> (u32, u64) {
+    /// The peer of a message socket, connected or gone (for `poll`).
+    fn peer_ref(&self) -> Option<Weak<Mutex<Sock>>> {
+        match &self.state {
+            State::Messages { peer, .. } => peer.clone(),
+            _ => None,
+        }
+    }
+
+    /// Its readiness and version. `peer_state` is its peer's room and
+    /// version, looked at without this socket's lock (`poll`): `None`
+    /// unconnected, `Some(None)` gone.
+    fn poll_with(&self, peer_state: Option<Option<(bool, u64)>>) -> (u32, u64) {
         let mask = match &self.state {
             State::Idle => EPOLLOUT,
             State::Listening { queue, .. } => {
@@ -361,15 +372,7 @@ impl Sock {
                     m |= EPOLLIN | EPOLLRDHUP;
                 }
                 // Writable while the peer has room; its pops change that, so
-                // they count in the version (for edge-triggered epoll). A
-                // datagram socket may be connected to itself: its lock is
-                // already held.
-                let peer_state = peer.as_ref().map(|w| {
-                    w.upgrade().map(|s| match s.try_lock() {
-                        Some(s) => (s.has_room(1), s.version),
-                        None => (self.has_room(1), 0),
-                    })
-                });
+                // they count in the version (for edge-triggered epoll).
                 let (writable, peer_version) = match peer_state {
                     None => (!(*eof && self.ty == SOCK_SEQPACKET), 0),
                     Some(None) => (false, 0),
@@ -388,6 +391,20 @@ impl Sock {
         };
         (mask, self.version)
     }
+}
+
+/// A socket's readiness and version. Its peer's are looked at with only
+/// the peer's lock held: a datagram socket may be connected to itself,
+/// and two connected to each other may be polled at once.
+pub fn poll(s: &SockRef) -> (u32, u64) {
+    let peer = s.lock().peer_ref();
+    let peer_state = peer.map(|w| {
+        w.upgrade().map(|q| {
+            let q = q.lock();
+            (q.has_room(1), q.version)
+        })
+    });
+    s.lock().poll_with(peer_state)
 }
 
 impl Drop for Sock {

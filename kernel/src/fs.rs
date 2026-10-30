@@ -17,7 +17,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use grix_abi::hostfs::{Attr, FileType};
 use grix_abi::image::{Entry, EntryKind, LiveMount};
 use grix_abi::stats::{Limit, Resource};
@@ -392,7 +392,7 @@ impl FileData {
         self.pages.insert(idx, pa);
         if self.copied.remove(&idx) {
             STALE.lock().push((self.id(), idx));
-            STALE_ANY.store(true, Ordering::Relaxed);
+            STALE_ANY.store(true, Ordering::Release);
         }
         Ok(pa)
     }
@@ -545,7 +545,7 @@ static STALE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 static STALE_ANY: AtomicBool = AtomicBool::new(false);
 
 pub fn take_stale() -> Vec<(usize, u64)> {
-    if !STALE_ANY.swap(false, Ordering::Relaxed) {
+    if !STALE_ANY.swap(false, Ordering::Acquire) {
         return Vec::new();
     }
     core::mem::take(&mut *STALE.lock())
@@ -812,29 +812,45 @@ pub struct Fs {
 
 static FS: Mutex<Option<Fs>> = Mutex::new(None);
 
-/// Processes that ended (or were reaped) while the filesystem was busy:
-/// their /proc directories change at the next chance, in order. `true`:
-/// the directory goes; `false`: it stays, a zombie's.
-static PROC_ENDED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+/// What code that can't wait for the filesystem leaves for whoever takes it
+/// next (`lock`), in order: it may run in the middle of a filesystem
+/// operation, or hold what the filesystem's holder may want (the process
+/// table).
+enum Later {
+    /// /proc/<pid> goes (`true`), or stays as a zombie's (`false`).
+    Proc(u32, bool),
+    /// /dev/pts/N goes (its master closed).
+    PtsHide(u32),
+}
+
+static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+static LATER_ANY: AtomicBool = AtomicBool::new(false);
+
+/// Do `what` to the filesystem now if it's free, or once it is.
+fn later(what: Later) {
+    LATER.lock().push(what);
+    LATER_ANY.store(true, Ordering::Release);
+    // Taking it does what's pending.
+    drop(try_lock());
+}
 
 /// Process `pid` ended, or its zombie was reaped: its /proc/<pid> goes
 /// (now, or once the filesystem is free).
 pub fn proc_gone(pid: u32) {
-    proc_ended(pid, true);
+    later(Later::Proc(pid, true));
 }
 
 /// Process `pid` ended and is a zombie: its /proc/<pid> stays until it's
 /// reaped (`proc_gone`), as on Linux, with what a zombie still has.
 pub fn proc_zombie(pid: u32) {
-    proc_ended(pid, false);
+    later(Later::Proc(pid, false));
 }
 
-fn proc_ended(pid: u32, gone: bool) {
-    let mut ended = PROC_ENDED.lock();
-    ended.push((pid, gone));
-    if let Some(mut fs) = try_lock() {
-        fs.proc_apply(&mut ended);
-    }
+/// Pseudo-terminal `index`'s master closed: /dev/pts/N goes (now, or once
+/// the filesystem is free; before a new pair takes the index, which
+/// shows it again under the filesystem's lock).
+pub fn pts_gone(index: u32) {
+    later(Later::PtsHide(index));
 }
 
 /// Live mounts' nodes the host said changed (watched directories and an
@@ -864,9 +880,8 @@ pub fn host_changed(what: Option<(Ino, &str)>) {
     }
     // What was read ahead may be the old bytes.
     hostfs::forget_kept();
-    if let Some(mut fs) = try_lock() {
-        fs.apply_host_changes();
-    }
+    // Taking it does what's pending.
+    drop(try_lock());
 }
 
 /// Make `fs` the filesystem. Done once, after exec resolved the program.
@@ -889,23 +904,59 @@ impl core::ops::DerefMut for FsGuard {
     }
 }
 
-/// The filesystem, unless it isn't built yet or is held further up the call
-/// stack (for code that may run in the middle of a filesystem operation).
+/// The filesystem, if it's built and nobody holds it (for code that may
+/// run in the middle of a filesystem operation, or holding something the
+/// holder may want): whatever it wanted done must wait for the holder
+/// (`later`, `host_changed`).
 pub fn try_lock() -> Option<FsGuard> {
-    FS.try_lock().filter(|g| g.is_some()).map(FsGuard)
+    let g = FS.try_lock().filter(|g| g.is_some())?;
+    Some(FsGuard::new(g))
 }
 
-/// The filesystem. One CPU and no preemption in the kernel, so the lock is
-/// never contended: failing to take it means it is already held further up
-/// the call stack, a kernel bug that would otherwise hang.
-pub fn lock() -> FsGuard {
-    let g = FS.try_lock().expect("filesystem lock taken twice");
-    assert!(g.is_some(), "fs not initialised");
-    let mut g = FsGuard(g);
-    if HOST_CHANGED_ANY.load(Ordering::Relaxed) {
-        g.apply_host_changes();
+/// The filesystem, unless this CPU holds it already further up its stack
+/// (or it isn't built yet). Another CPU's hold is waited for.
+pub fn lock_unless_held_here() -> Option<FsGuard> {
+    if HOLDER.load(Ordering::Relaxed) == crate::smp::me() || FS.lock().is_none() {
+        return None;
     }
-    g
+    Some(lock())
+}
+
+/// The CPU holding `FS` (`NOBODY`: none). Only the holder sets it, and
+/// clears it before letting go, so a CPU that reads its own number holds
+/// the lock.
+static HOLDER: AtomicUsize = AtomicUsize::new(NOBODY);
+const NOBODY: usize = usize::MAX;
+
+/// The filesystem: waits while another CPU holds it. Taking it again on the
+/// same CPU (held further up the call stack) is a kernel bug that would
+/// otherwise hang.
+pub fn lock() -> FsGuard {
+    assert!(HOLDER.load(Ordering::Relaxed) != crate::smp::me(), "filesystem lock taken twice");
+    let g = FS.lock();
+    assert!(g.is_some(), "fs not initialised");
+    FsGuard::new(g)
+}
+
+impl FsGuard {
+    fn new(g: MutexGuard<'static, Option<Fs>>) -> FsGuard {
+        HOLDER.store(crate::smp::me(), Ordering::Relaxed);
+        let mut g = FsGuard(g);
+        if LATER_ANY.load(Ordering::Acquire) {
+            g.apply_later();
+        }
+        if HOST_CHANGED_ANY.load(Ordering::Relaxed) {
+            g.apply_host_changes();
+        }
+        g
+    }
+}
+
+impl Drop for FsGuard {
+    fn drop(&mut self) {
+        // Before the mutex goes (fields drop after this).
+        HOLDER.store(NOBODY, Ordering::Relaxed);
+    }
 }
 
 /// A TZif (version 2) file for UTC, the same 114 bytes as zoneinfo's `UTC`:
@@ -1138,7 +1189,6 @@ impl Fs {
     /// running: the interpreter, for `#!` scripts), `cwd` and `root`.
     /// Without room for it (the metadata budget), there's none.
     pub fn proc_add(&mut self, pid: u32, owner: (u32, u32), exe: &str, cwd: &str) {
-        self.proc_apply(&mut PROC_ENDED.lock());
         self.proc_remove(pid);
         let made = (|| -> Result<(), Errno> {
             let dir =
@@ -1195,13 +1245,19 @@ impl Fs {
         }
     }
 
-    /// What `proc_gone` and `proc_zombie` put off.
-    fn proc_apply(&mut self, ended: &mut Vec<(u32, bool)>) {
-        for (pid, gone) in core::mem::take(ended) {
-            if gone {
-                self.proc_remove(pid);
-            } else if let Some(&dir) = self.pid_dirs.get(&pid) {
-                self.zombie_dirs.insert(dir);
+    /// What `later` put off.
+    fn apply_later(&mut self) {
+        let mut later = LATER.lock();
+        LATER_ANY.store(false, Ordering::Relaxed);
+        for what in core::mem::take(&mut *later) {
+            match what {
+                Later::Proc(pid, true) => self.proc_remove(pid),
+                Later::Proc(pid, false) => {
+                    if let Some(&dir) = self.pid_dirs.get(&pid) {
+                        self.zombie_dirs.insert(dir);
+                    }
+                }
+                Later::PtsHide(index) => self.pts_hide(index),
             }
         }
     }
@@ -2212,8 +2268,9 @@ impl Fs {
     /// What the host said changed (`host_changed`) is fetched again when
     /// next used: a watched directory's entries, and the entry named.
     fn apply_host_changes(&mut self) {
-        let pending = core::mem::take(&mut *HOST_CHANGED.lock());
+        // Cleared first: what comes meanwhile sets it again.
         HOST_CHANGED_ANY.store(false, Ordering::Relaxed);
+        let pending = core::mem::take(&mut *HOST_CHANGED.lock());
         if HOST_CHANGED_ALL.swap(false, Ordering::Relaxed) {
             self.forget_live();
             return;

@@ -90,7 +90,7 @@ pub fn watch(file: &FileRef, fd: u64) {
 
 /// Signal the owners of files that became ready since the I/O state last
 /// changed.
-pub fn deliver(p: &mut Process, procs: &mut Procs) {
+pub fn deliver(mut p: Option<&mut Process>, procs: &mut Procs) {
     let generation = crate::ipc::generation();
     if SEEN.swap(generation, Ordering::Relaxed) == generation {
         return;
@@ -117,13 +117,13 @@ pub fn deliver(p: &mut Process, procs: &mut Procs) {
         }
     }
     for (fown, fd, ready) in due {
-        send(p, procs, fown, fd, ready);
+        send(p.as_deref_mut(), procs, fown, fd, ready);
     }
 }
 
 /// Linux's send_sigio: SIGIO plain, or F_SETSIG's signal with the reason
 /// (si_code), the poll bits (si_band) and the descriptor (si_fd).
-fn send(p: &mut Process, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
+fn send(p: Option<&mut Process>, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
     // POLLIN|POLLRDNORM, POLLOUT|POLLWRNORM|POLLWRBAND, POLLERR, POLLHUP|POLLERR.
     let (code, band) = if ready & EPOLLHUP != 0 {
         (POLL_HUP, 0x18)
@@ -144,7 +144,7 @@ fn send(p: &mut Process, procs: &mut Procs, fown: Fown, fd: u64, ready: u32) {
         timer: None,
         why: "I/O possible (O_ASYNC)",
     };
-    for q in procs.all(p) {
+    for q in procs.each(p) {
         let target = match fown.owner {
             Owner::Process(pid) if q.pid == pid => Target::Process,
             Owner::Group(pgid) if q.pgid == pgid => Target::Process,

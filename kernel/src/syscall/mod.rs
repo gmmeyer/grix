@@ -86,13 +86,13 @@ pub fn handle(tf: &mut TrapFrame) {
     // The process ended (exit_group, a fatal signal to itself, a policy
     // kill): it's finished off and something else runs.
     if p.exit_status.is_some() {
-        sched::schedule(p, tf);
+        sched::schedule(&mut guard, tf);
         return;
     }
     if result == Err(EBLOCKED) && !crate::signal::interrupt_self(p, tf) {
         // The thread blocked or exited: its return value is set when it wakes.
         // (schedule() saves its registers before waking any I/O waiters.)
-        sched::schedule(p, tf);
+        sched::schedule(&mut guard, tf);
         return;
     }
     // (If it was about to block for a deliverable signal, interrupt_self
@@ -110,7 +110,7 @@ pub fn handle(tf: &mut TrapFrame) {
     }
     sched::wake_io_everywhere(p);
     if p.resched {
-        sched::schedule(p, tf);
+        sched::schedule(&mut guard, tf);
     } else {
         sched::update_timer(p);
     }

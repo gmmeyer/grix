@@ -997,34 +997,32 @@ pub(super) fn pipe_read_rights(
     }
     let mut n = (count as usize).min(pipe.buf.len());
     let at = pipe.read;
+    // Descriptors that came with the first byte read arrive with it.
+    let mut take_rights = false;
     if let Some(&(pos, _)) = pipe.rights.front() {
         if pos <= at {
-            if !peek {
-                rights.push(pipe.rights.pop_front().unwrap().1);
-            }
-            if let Some(&(next, _)) = pipe.rights.get(if peek { 1 } else { 0 }) {
+            take_rights = !peek;
+            // The next ones, which this read stops short of.
+            if let Some(&(next, _)) = pipe.rights.get(1) {
                 n = n.min(next.saturating_sub(at).max(1) as usize);
             }
         } else {
             n = n.min((pos - at) as usize);
         }
     }
-    // Through a kernel buffer, so the pipe isn't locked while user pages
-    // fault in (as `read_content`). Under the kernel lock nothing else
-    // reads or writes it meanwhile.
-    drop(pipe);
-    let mut chunk = [0u8; CHUNK];
-    let mut done = 0;
-    while done < n {
-        let k = (n - done).min(CHUNK);
-        for (d, s) in chunk[..k].iter_mut().zip(end.pipe.lock().buf.range(done..done + k)) {
-            *d = *s;
-        }
-        copy_out(&mut p.aspace, buf + done as u64, &chunk[..k])?;
-        done += k;
+    // With the pipe held, as `pipe_write` holds it across `copy_in`: another
+    // reader on another CPU would otherwise take the same bytes. A fault
+    // on the buffer reads files or the host, never a pipe.
+    let (front, back) = pipe.buf.as_slices();
+    let front_n = front.len().min(n);
+    copy_out(&mut p.aspace, buf, &front[..front_n])?;
+    if front_n < n {
+        copy_out(&mut p.aspace, buf + front_n as u64, &back[..n - front_n])?;
+    }
+    if take_rights {
+        rights.push(pipe.rights.pop_front().unwrap().1);
     }
     if !peek {
-        let mut pipe = end.pipe.lock();
         pipe.buf.drain(..n);
         pipe.read += n as u64;
         pipe.drained();

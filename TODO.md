@@ -99,9 +99,9 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     CPU that doesn't take it (twice the kernel-bound throughput with
     80 other vCPUs on a 32-core host); one CPU keeps the deadlines,
     rather than every CPU being interrupted for each; each CPU has its
-    own running-process slot. Next (phase 2): what assumes one CPU in
-    the kernel, scheduler state kept as it changes, then a reader/writer
-    lock. On macOS an idle
+    own running-process slot, an idle CPU takes none, and the filesystem
+    lock knows its holder. Next (phase 2): scheduler state kept as it
+    changes, then a reader/writer lock. On macOS an idle
     vCPU wakes ~0.5 ms late for a 1 ms timer (the host's timer
     coalescing, in grix-vmm and QEMU alike): a kqueue timer with
     NOTE_CRITICAL in grix-vmm might fix it.

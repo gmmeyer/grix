@@ -53,7 +53,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
         return Err(EINVAL);
     }
     let mut procs = PROCS.lock();
-    let (count, threads) = (procs.count(), procs.threads(p));
+    let (count, threads) = (procs.count(), crate::procs::threads());
     if count >= MAX_PROCESSES || threads >= process::MAX_THREADS {
         crate::stats::hit(if count >= MAX_PROCESSES { Limit::Processes } else { Limit::Threads });
         return Err(EAGAIN);
@@ -121,6 +121,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     }
     let owner = (c.uid, c.gid);
     procs.others.insert(pid, c);
+    crate::procs::born();
     crate::stats::forked();
     crate::stats::peak(Resource::Processes, count as u64 + 1);
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
@@ -278,6 +279,7 @@ pub fn execve(
     crate::fs::lock().proc_set(p.pid, "exe", &p.exe);
     // The other threads end (Linux's de_thread); this one takes the pid.
     let mut t = p.threads.remove(&p.current).unwrap();
+    crate::procs::threads_gone(p.threads.len());
     for (_, other) in core::mem::take(&mut p.threads) {
         p.exited_cpu_ns += other.cpu_ns;
     }

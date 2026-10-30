@@ -7,7 +7,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::fd::FdTable;
@@ -68,15 +68,36 @@ pub fn may_inspect_creds(p: &Process, quid: u32, qgid: u32, qids: &Ids, real: bo
 /// A process has ended and may need finishing off (`reap_others`).
 pub static DYING: AtomicBool = AtomicBool::new(false);
 
-impl Procs {
-    /// Processes in existence, the running one and zombies included.
-    pub fn count(&self) -> usize {
-        1 + self.others.len() + self.zombies.len()
-    }
+/// Live processes (not finished off yet) and their threads, counted as
+/// they come and go, wherever they are: in `PROCS` or a CPU's slot.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static THREADS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Threads in every process (bounded by `process::MAX_THREADS`).
-    pub fn threads(&self, cur: &Process) -> usize {
-        cur.threads.len() + self.others.values().map(|q| q.threads.len()).sum::<usize>()
+/// A process with one thread came into being (fork, the first one).
+pub fn born() {
+    LIVE.fetch_add(1, Ordering::Relaxed);
+    THREADS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A thread was added to a live process (clone).
+pub fn thread_added() {
+    THREADS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `n` threads of a live process went (exit, execve).
+pub fn threads_gone(n: usize) {
+    THREADS.fetch_sub(n, Ordering::Relaxed);
+}
+
+/// Threads in every process (bounded by `process::MAX_THREADS`).
+pub fn threads() -> usize {
+    THREADS.load(Ordering::Relaxed)
+}
+
+impl Procs {
+    /// Processes in existence, zombies included.
+    pub fn count(&self) -> usize {
+        LIVE.load(Ordering::Relaxed) + self.zombies.len()
     }
 
     /// Live process `pid`: the running one (`cur`) or another.
@@ -87,9 +108,16 @@ impl Procs {
         self.others.get_mut(&pid)
     }
 
-    /// Every live process: the running one first.
+    /// Every live process: the running one first. Only with the kernel to
+    /// this CPU (any other CPU's process is in `others` then).
     pub fn all<'a>(&'a mut self, cur: &'a mut Process) -> impl Iterator<Item = &'a mut Process> {
-        core::iter::once(cur).filter(|p| !p.dead).chain(self.others.values_mut())
+        self.each(Some(cur))
+    }
+
+    /// `all`, from a CPU that may have no process (`cur`: its own, if any).
+    pub fn each<'a>(&'a mut self, cur: Option<&'a mut Process>) -> impl Iterator<Item = &'a mut Process> {
+        debug_assert!(crate::smp::exclusive(), "another CPU has a process checked out");
+        cur.into_iter().filter(|p| !p.dead).chain(self.others.values_mut())
     }
 }
 
@@ -102,6 +130,8 @@ impl Procs {
 pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut Procs) {
     let status = dead.exit_status.expect("finalizing a live process");
     let cpu_ns = dead.process_cpu_ns() + dead.children_cpu_ns;
+    LIVE.fetch_sub(1, Ordering::Relaxed);
+    threads_gone(dead.threads.len());
     // What /proc/<pid> keeps of it, before anything goes.
     let remains = crate::procfs::Remains::of(dead);
     // Its POSIX locks go with its descriptor table, unless another process
@@ -177,12 +207,12 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
 
 /// Shared mappings' read-only copies of file pages that now have frames
 /// go from every process (see `fs::take_stale`).
-pub fn zap_stale(cur: &mut Process, procs: &mut Procs) {
+pub fn zap_stale(cur: Option<&mut Process>, procs: &mut Procs) {
     let stale = crate::fs::take_stale();
     if stale.is_empty() {
         return;
     }
-    for q in procs.all(cur) {
+    for q in procs.each(cur) {
         q.aspace.zap_stale(&stale);
     }
 }
@@ -190,14 +220,17 @@ pub fn zap_stale(cur: &mut Process, procs: &mut Procs) {
 /// Finish off processes other than the running one that were killed (by a
 /// signal from it, or a timer). Their address spaces go too. And tell the
 /// parents of processes that stopped or continued.
-pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
-    crate::tty::service(cur, procs);
-    zap_stale(cur, procs);
+pub fn reap_others(mut cur: Option<&mut Process>, procs: &mut Procs) {
+    crate::tty::service(cur.as_deref_mut(), procs);
+    zap_stale(cur.as_deref_mut(), procs);
     if signal::JOBS.swap(false, Ordering::Relaxed) {
         let notices: Vec<(u32, SigInfo)> =
-            procs.all(cur).filter_map(|q| Some((q.ppid, q.job_notice.take()?))).collect();
+            procs.each(cur.as_deref_mut()).filter_map(|q| Some((q.ppid, q.job_notice.take()?))).collect();
         for (ppid, info) in notices {
-            let parent = if cur.pid == ppid { Some(&mut *cur) } else { procs.others.get_mut(&ppid) };
+            let parent = match cur.as_deref_mut() {
+                Some(c) if c.pid == ppid => Some(c),
+                _ => procs.others.get_mut(&ppid),
+            };
             if let Some(parent) = parent
                 && parent.action(SIGCHLD).flags & SA_NOCLDSTOP == 0
             {
@@ -218,7 +251,7 @@ pub fn reap_others(cur: &mut Process, procs: &mut Procs) {
                 continue;
             }
             let mut q = procs.others.remove(&pid).unwrap();
-            finalize(&mut q, Some(cur), procs);
+            finalize(&mut q, cur.as_deref_mut(), procs);
         }
     }
     if later {

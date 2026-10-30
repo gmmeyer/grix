@@ -336,13 +336,24 @@ resched, timer_dirty) is swapped into the `Process` fields while it holds
 the lock, so `p.current` is this CPU's thread, and a thread running on
 another CPU is in neither `runq` nor `current`, its registers live in that
 CPU: don't touch them. A CPU with nothing to run waits in `smp::finish`
-holding nothing (a kick: SGI 0, plus `KICK_CALL` for grix-vmm); `unlock`
-kicks idle CPUs for threads waiting anywhere. Finishing off a process
+holding nothing, no process either (a kick: SGI 0, plus `KICK_CALL` for
+grix-vmm), and schedules from none (`sched::schedule` takes the CPU's
+slot, empty or not); `unlock` kicks idle CPUs for threads waiting
+anywhere. Finishing off a process
 that ended and execve need the other CPUs out of it (`smp::alone(pid)`);
 they leave at their next schedule (`exclusive_wanted`, `kick_others`), and
 a process killed while it runs elsewhere is finished off there
 (`smp::running_anywhere`, `procs::reap_others`). Signals for a thread on
-another CPU kick it (`kick_thread`).
+another CPU kick it (`kick_thread`). Little else relies on the lock
+making one CPU the kernel's, and what does says so: `Procs::all` and
+`each` (every process, so no other CPU may have one out: debug-asserted,
+`smp::exclusive`) and the program's end (`export::send`). The
+filesystem's lock knows its holder (`fs::lock` waits for another CPU's
+and panics on this one's), and code that can't wait for it leaves the
+work to its next holder (`fs::later`); the process and thread counts are
+kept as they change (`procs::born`, `threads_gone`); a pipe is held
+across the copy to a reader as to a writer; a socket polls its peer
+without its own lock.
 TLB flushes are of the pages that changed (`flush_tlb(root, start,
 end)`, through `AddressSpace::flush`) and instruction-cache invalidation
 is broadcast. Arm64's TLBIs are broadcast too, per page (`vale1is`;
@@ -640,8 +651,9 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
 
     Limits must be global, not per object: a program can open many objects,
     and fork copies whatever is per process.
-11. **`fs::lock()` is not re-entrant**; it panics if the lock is already
-    held. Drop the guard before calling anything that takes it
+11. **`fs::lock()` is not re-entrant**; it panics if this CPU already
+    holds it (another CPU's hold is waited for), and `fs::try_lock` fails
+    if anyone does. Drop the guard before calling anything that takes it
     (`Process::missing_path`, `procfs::generate`, …). Lock order:
     `OpenFile` → filesystem → `FileData`. Never hold a `FileData` lock
     across `copy_in`/`copy_out`, because a fault may read the same file

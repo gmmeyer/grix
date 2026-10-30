@@ -52,13 +52,17 @@ pub fn init(exports: &[&'static str], mounts: &[&'static str], entries: &'static
 }
 
 /// Send every export, then `Done`. The host reads each directory's state as
-/// it is now, so this runs once the program can't change it any more.
+/// it is now, so this runs once the program can't change it any more. It
+/// has the kernel to itself (`process::finish`, under the kernel lock), so
+/// a file whose lock is taken is in the middle of a write further up this
+/// CPU's stack (`try_lock` below).
 pub fn send() {
+    debug_assert!(crate::smp::exclusive());
     let Some(cfg) = CONFIG.get().filter(|c| !c.roots.is_empty()) else { return };
     // Not yet built (exec failed early), or the program ended inside a
     // filesystem operation: nothing to read now, and the host reports the
     // exports as incomplete.
-    let Some(mut fs) = fs::try_lock() else {
+    let Some(mut fs) = fs::lock_unless_held_here() else {
         klog!("export skipped: the filesystem isn't available\n");
         return;
     };

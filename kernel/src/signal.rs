@@ -636,22 +636,20 @@ const MAX_FRAMES: usize = 8;
 /// something else runs instead, and gets its signals.
 pub fn return_to_user(tf: &mut TrapFrame) {
     let mut guard = crate::process::running().lock();
-    let Some(p) = guard.as_mut() else { return };
     loop {
+        let Some(p) = guard.as_mut() else { return };
         if (p.exit_status.is_some() || p.stopped) && p.running {
-            crate::sched::schedule(p, tf);
+            crate::sched::schedule(&mut guard, tf);
         }
         // Nothing to run here now: `smp::finish` waits for something.
-        if !p.running {
-            return;
-        }
+        let Some(p) = guard.as_mut().filter(|p| p.running) else { return };
         deliver(p, tf);
         if p.exit_status.is_none() && !p.stopped {
-            break;
+            // A timer whose signal was just taken re-arms.
+            crate::sched::update_timer(p);
+            return;
         }
     }
-    // A timer whose signal was just taken re-arms.
-    crate::sched::update_timer(p);
 }
 
 fn deliver(p: &mut Process, tf: &mut TrapFrame) {

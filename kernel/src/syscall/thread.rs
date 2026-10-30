@@ -133,7 +133,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & CLONE_PIDFD != 0 {
         return Err(EINVAL);
     }
-    let threads = crate::procs::PROCS.lock().threads(p);
+    let threads = crate::procs::threads();
     if threads >= MAX_THREADS {
         crate::stats::hit(Limit::Threads);
         return Err(EAGAIN);
@@ -165,6 +165,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     t.sigmask = sigmask;
     p.threads.insert(tid, t);
+    crate::procs::thread_added();
     p.runq.push_back(tid);
     p.timer_dirty = true;
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
@@ -180,6 +181,7 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     crate::stats::cpu(now.saturating_sub(p.slice_start));
     p.slice_start = now;
     let t = p.threads.remove(&p.current).expect("current thread missing");
+    crate::procs::threads_gone(1);
     // Its queued signals went with it, perhaps a timer's.
     crate::timer::resync(p);
     if p.threads.is_empty() {
