@@ -26,8 +26,9 @@ use grix_abi::wire::{self, Input};
 
 use crate::event::GuestEvent;
 
-/// Connections at once (the guest has its own, lower, limit).
-const MAX_CONNS: usize = 512;
+/// Connections at once, two threads each (the guest has its own, lower,
+/// limit, and a thread that can't be made refuses the connection).
+const MAX_CONNS: usize = 4096;
 /// Connects still waiting for the peer.
 const MAX_CONNECTING: u32 = 128;
 /// DNS lookups in flight; more get SERVFAIL.

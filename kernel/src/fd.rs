@@ -39,10 +39,30 @@ impl FifoFile {
         (mask, version)
     }
 }
-/// Open file descriptions in all processes together (Linux's file-max):
-/// each takes kernel memory, and descriptor limits are per process.
-pub const MAX_OPEN_FILES: usize = 4096;
+/// An open file description's share of the heap, charged to `kmem`: itself
+/// and what a socket's or pipe's end brings, a pipe.
+const OPEN_FILE_COST: u64 =
+    (core::mem::size_of::<OpenFile>() + core::mem::size_of::<crate::ipc::Pipe>() + 2 * 64) as u64;
+/// Open files that fit in what's left of the heap, charged or not: with
+/// `kmem` full of pipes' data a program can still open a file.
+const OPEN_FILES_ANYWAY: usize = 4096;
 static OPEN_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Open file descriptions in all processes together (Linux's file-max,
+/// which it sizes from RAM too): what the `kmem` budget pays for, as
+/// descriptor limits are per process. A server with thousands of
+/// connections has two files for each in the guest, and a pipe for each
+/// if it's Go's io.Copy.
+pub fn max_open_files() -> usize {
+    (crate::kmem::limit() / OPEN_FILE_COST) as usize
+}
+
+/// No room for another open file? (Past `OPEN_FILES_ANYWAY` each must be
+/// paid for.)
+fn open_files_full() -> bool {
+    let open = OPEN_FILES.load(Ordering::Relaxed);
+    open > max_open_files() || (open > OPEN_FILES_ANYWAY && crate::kmem::available() < OPEN_FILE_COST)
+}
 
 /// Open file descriptions now (/proc/sys/fs/file-nr).
 pub fn open_files() -> usize {
@@ -177,6 +197,8 @@ pub struct OpenFile {
     /// open (`landlock::TRUNCATE`, `IOCTL_DEV`): Linux's allowed_access,
     /// inverted, so a file opened any other way has them all.
     pub landlock_denied: u16,
+    /// `OPEN_FILE_COST`, if `kmem` has it (`open_files_full`).
+    _cost: crate::kmem::Charge,
 }
 
 impl Drop for OpenFile {
@@ -378,6 +400,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         fown: Default::default(),
         comm_of: None,
         landlock_denied: 0,
+        _cost: crate::kmem::Charge::if_room(OPEN_FILE_COST),
     }))
 }
 
@@ -526,7 +549,7 @@ impl FdTable {
     /// too many open files everywhere (the new one, already made, is then
     /// dropped by the caller).
     pub fn alloc(&mut self, entry: FdEntry, min: usize) -> Result<u64, Errno> {
-        if OPEN_FILES.load(Ordering::Relaxed) > MAX_OPEN_FILES {
+        if open_files_full() {
             crate::stats::hit(grix_abi::stats::Limit::OpenFiles);
             return Err(ENFILE);
         }

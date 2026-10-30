@@ -1259,6 +1259,11 @@ fn resolve_interpreters(
     Err(exec_error(ELOOP, alloc::format!("{path}: too many levels of #! interpreters")))
 }
 
+/// The most argv + envp may hold, their pointers counted: a quarter of the
+/// default stack, as Linux and so `sysconf(_SC_ARG_MAX)`, which is what
+/// `find -exec {} +` fills.
+pub const MAX_ARGS: usize = (crate::mm::aspace::STACK_SIZE / 4) as usize;
+
 /// Lay out argc/argv/envp/auxv at the top of the stack as Linux does.
 /// Returns the stack pointer and the auxiliary vector as written.
 fn build_stack(
@@ -1269,7 +1274,7 @@ fn build_stack(
     aux: &[(u64, u64)],
 ) -> Result<(u64, Vec<u64>), Errno> {
     let total: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum::<usize>() + execfn.len() + 1;
-    if total > 1 << 20 {
+    if total > MAX_ARGS {
         return Err(E2BIG);
     }
     // As Linux's exec, the strings start a pointer below the top: the

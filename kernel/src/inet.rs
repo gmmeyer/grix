@@ -24,14 +24,18 @@ use crate::kmem::Charge;
 
 pub const ECONNREFUSED: Errno = Errno(111);
 
-/// Connections through the host, all processes together (each holds a
-/// receive window of kernel memory).
-const MAX_CONNS: usize = 256;
+/// Connections through the host, all processes together. Each holds a
+/// receive window charged to `kmem`, which is what bounds kernel memory:
+/// this bounds what the host's proxy is asked for, two threads each.
+const MAX_CONNS: usize = 2048;
 /// DNS answers queued on one socket.
 const MAX_ANSWERS: usize = 16;
 /// Connections waiting in accept queues, all listeners together (each
-/// holds a socket pair or a connection that no descriptor counts yet).
-const MAX_PENDING: usize = 1024;
+/// holds a socket pair or a connection that no descriptor counts yet,
+/// charged to `kmem`: `PENDING_COST`).
+const MAX_PENDING: usize = 16384;
+/// A connection's place in a queue, and a socket pair's two pipes.
+const PENDING_COST: u64 = (core::mem::size_of::<Pending>() + 2 * core::mem::size_of::<ipc::Pipe>() + 3 * 64) as u64;
 static PENDING: AtomicU32 = AtomicU32::new(0);
 /// How long an unanswered DNS query counts as something the host may
 /// still answer (it may have dropped it).
@@ -358,16 +362,18 @@ fn conn(id: u32) -> Option<Arc<Mutex<Conn>>> {
 // ---------------------------------------------------------------- listeners
 
 /// A place in the accept queues (MAX_PENDING of them in all).
-pub struct Slot(());
+pub struct Slot(#[allow(dead_code)] Charge);
 
 impl Slot {
     pub fn take() -> Option<Slot> {
-        if PENDING.fetch_add(1, Ordering::Relaxed) as usize >= MAX_PENDING {
-            PENDING.fetch_sub(1, Ordering::Relaxed);
+        let charge = (PENDING.load(Ordering::Relaxed) as usize) < MAX_PENDING;
+        let Some(charge) = charge.then(|| Charge::new(PENDING_COST).ok()).flatten() else {
             crate::stats::hit(grix_abi::stats::Limit::Connections);
             return None;
-        }
-        Some(Slot(()))
+        };
+        // Under the kernel lock: check-then-add doesn't race.
+        PENDING.fetch_add(1, Ordering::Relaxed);
+        Some(Slot(charge))
     }
 }
 
@@ -382,7 +388,7 @@ pub enum Pending {
     /// From a socket in the guest: our end, its address and ours.
     Local { end: SocketEnd, peer: SockAddr, local: SockAddr, _slot: Slot },
     /// Through a port forwarded from the host.
-    Remote(Arc<Mutex<Conn>>, Slot),
+    Remote(Arc<Mutex<Conn>>, #[allow(dead_code)] Slot),
 }
 
 pub struct Listener {
@@ -391,7 +397,6 @@ pub struct Listener {
     pub addr: Addr,
     /// IPV6_V6ONLY: a v6 wildcard that leaves v4 to another listener.
     v6only: bool,
-    backlog: usize,
     pub queue: VecDeque<Pending>,
     pub version: u64,
 }
@@ -417,7 +422,7 @@ fn listeners_on(port: u16) -> Vec<Arc<Mutex<Listener>>> {
 impl Listener {
     /// Listen on `port` of `addr` (port 0: pick one). EADDRINUSE if
     /// someone already listens there.
-    pub fn listen(addr: Addr, port: u16, backlog: usize, v6only: bool) -> Result<Arc<Mutex<Listener>>, Errno> {
+    pub fn listen(addr: Addr, port: u16, v6only: bool) -> Result<Arc<Mutex<Listener>>, Errno> {
         let port = if port != 0 {
             port
         } else {
@@ -430,7 +435,6 @@ impl Listener {
             port,
             addr,
             v6only,
-            backlog: backlog.clamp(1, 4096),
             queue: VecDeque::new(),
             version: 0,
         }));
@@ -461,14 +465,13 @@ impl Listener {
         listeners_on(to.port).into_iter().find(|l| l.lock().takes(to))
     }
 
-    fn push(&mut self, p: Pending) -> Result<(), Pending> {
-        if self.queue.len() >= self.backlog {
-            return Err(p);
-        }
+    /// Queue a connection. listen's backlog bounds nothing: a queue that
+    /// full on Linux has clients wait, never refused, and the program sees
+    /// the same from a longer queue (`Slot`s bound them all).
+    fn push(&mut self, p: Pending) {
         self.queue.push_back(p);
         self.version += 1;
         ipc::changed();
-        Ok(())
     }
 
     pub fn poll(&self) -> (u32, u64) {
@@ -502,16 +505,13 @@ impl Drop for Listener {
 }
 
 /// connect() to the guest's own address: a socket pair, one end queued on
-/// the listener. ECONNREFUSED if nothing listens there (or its queue is full).
+/// the listener. ECONNREFUSED if nothing listens there (or the queues are full).
 pub fn connect_local(peer: SockAddr) -> Result<(SocketEnd, SockAddr), Errno> {
     let listener = Listener::find(peer).ok_or(ECONNREFUSED)?;
     let slot = Slot::take().ok_or(ECONNREFUSED)?;
     let local = SockAddr { addr: peer.addr, port: ephemeral_port() };
     let (ours, theirs) = ipc::socketpair();
-    listener
-        .lock()
-        .push(Pending::Local { end: theirs, peer: local, local: peer, _slot: slot })
-        .map_err(|_| ECONNREFUSED)?;
+    listener.lock().push(Pending::Local { end: theirs, peer: local, local: peer, _slot: slot });
     Ok((ours, local))
 }
 
@@ -917,7 +917,7 @@ pub fn from_host(payload: &[u8]) {
             match (listener, made.and_then(Conn::register), Slot::take()) {
                 // A refused Conn says Close as it's dropped.
                 (Some(l), Ok(c), Some(slot)) => {
-                    let _ = l.lock().push(Pending::Remote(c, slot));
+                    l.lock().push(Pending::Remote(c, slot));
                 }
                 (_, Ok(_), _) => {}
                 // Nobody listens there (yet), or no room for it.

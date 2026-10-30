@@ -14,9 +14,11 @@ pub const PAGE_SIZE: u64 = 4096;
 /// where the kernel runs: its linker script says the same).
 pub const KERNEL_OFFSET: u64 = crate::arch::KERNEL_OFFSET;
 const HEAP_SIZE: u64 = 32 << 20;
-/// The share of RAM the heap grows by, beyond `HEAP_SIZE`, and at most how
-/// much: room for threads' kernel state (`process::THREAD_COST`), as Linux
-/// sizes threads-max from RAM.
+/// The share of what the boot image leaves of RAM that the heap grows by,
+/// beyond `HEAP_SIZE`, and at most how much: room for threads' kernel state
+/// (`process::THREAD_COST`), as Linux sizes threads-max from RAM. The image
+/// is left out: its bytes are RAM no thread can run in, and of 2 GiB with
+/// an image of 1.7 (Maven's) a share of it all takes 40% of what's free.
 const HEAP_RAM_SHARE: u64 = 16;
 const HEAP_EXTRA_MAX: u64 = 128 << 20;
 
@@ -87,19 +89,22 @@ pub fn init(ram_size: u64, image_base: u64, image_len: u64) {
     assert!(early <= image_base, "no room below the boot image for frame counts");
 
     // More from the top of RAM (the highest region's end, mapped by now),
-    // in proportion to it (32 MiB of 512 MiB), half of it for the `kmem`
-    // budget (threads above all): the other half is for what the budgets
+    // in proportion to what the boot image leaves of it (32 MiB of 512
+    // MiB), half of it for the `kmem` budget (threads above all) and a
+    // quarter for files' names and nodes: the rest is for what the budgets
     // can't see, the holes that many small allocations leave once they go
     // (thousands of threads' leave 15 MiB free in 30,000 pieces too small
     // for a pipe's buffer).
     let highest = regions.iter().rposition(|r| r.1 > 0).unwrap_or(0);
     let (hbase, hsize) = regions[highest];
     let room = (hbase + hsize).saturating_sub(hbase.max(image_end));
-    let extra = page_down((ram_size / HEAP_RAM_SHARE).min(HEAP_EXTRA_MAX)).min(page_down(room / 2));
+    let usable = ram_size.saturating_sub(image_len);
+    let extra = page_down((usable / HEAP_RAM_SHARE).min(HEAP_EXTRA_MAX)).min(page_down(room / 2));
     if extra > 0 {
         frame::init_heap(hbase + hsize - extra, extra);
     }
     crate::kmem::init(extra / 2);
+    crate::fs::grow_meta(extra / 4);
 
     // Highest first (`frame::Frames`): RAM above 4 GiB, then the rest.
     let mut free = alloc::vec::Vec::new();

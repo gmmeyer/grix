@@ -713,11 +713,19 @@ fn deliver(p: &mut Process, tf: &mut TrapFrame) {
         // A FIFO open it waited in is interrupted: its end goes (a
         // restart opens afresh).
         t.fifo_wait = None;
-        if push_frame(p, tf, &info, &act).is_err() {
+        match push_frame(p, tf, &info, &act) {
+            Ok(()) => {}
+            // No page for the frame is no bad stack: as a fault with none.
+            Err(ENOMEM) => {
+                p.kill(SIGKILL, tf.sp(), tf.pc(), "out of memory", true);
+                return;
+            }
             // Linux's force_sigsegv: a signal that can't be delivered ends the program.
-            let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
-            p.kill(SIGSEGV, tf.sp(), tf.pc(), why, true);
-            return;
+            Err(_) => {
+                let why = "no room for a signal frame (stack overflow or bad sigaltstack)";
+                p.kill(SIGSEGV, tf.sp(), tf.pc(), why, true);
+                return;
+            }
         }
         frames += 1;
     }

@@ -360,16 +360,21 @@ pub fn openat2(p: &mut Process, dirfd: u64, pathp: u64, howp: u64, size: u64) ->
 fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, resolve: u64) -> SysResult {
     let acc = flags & O_ACCMODE;
     let cloexec = flags & O_CLOEXEC != 0;
-    // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file.
+    // /proc/self/fd/N, /dev/stdin, ...: another reference to an open file,
+    // or if that can't do what's asked, the file opened afresh (`reopened`).
     // (With `resolve`, they're walked to, as anything else, and so are
     // they when they mustn't be followed: they're links.)
+    let (mut again, mut kept) = (None, None);
     if resolve == 0
         && flags & O_NOFOLLOW == 0
         && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL
         && let Some(fd) = procfs::fd_path(path)
     {
         let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
-        return p.fds.alloc(FdEntry { file, cloexec }, 0);
+        match reopened(&file, flags) {
+            Some((ino, content)) => (again, kept) = (Some(ino), content),
+            None => return p.fds.alloc(FdEntry { file, cloexec }, 0),
+        }
     }
     // RESOLVE_IN_ROOT: "/" is the directory too.
     let base = if resolve & fs::RESOLVE_IN_ROOT != 0 { dir_base(p, dirfd)? } else { base_of(p, dirfd, path)? };
@@ -404,7 +409,10 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
     let creat = flags & O_CREAT != 0;
     let excl = creat && flags & O_EXCL != 0;
     let follow = flags & O_NOFOLLOW == 0 && !excl;
-    let found = fs::lock().lookup_in(base, path, follow, &scope);
+    let mut found = match again {
+        Some(ino) => Ok(ino),
+        None => fs::lock().lookup_in(base, path, follow, &scope),
+    };
     // A descriptor reached through a symlink or a relative path.
     if found == Err(ENOENT)
         && let Some((pid, fd)) = fs::lock().fd_link_in(base, path, follow, &scope)
@@ -427,7 +435,10 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             return Err(EXDEV);
         }
         let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
-        return p.fds.alloc(FdEntry { file, cloexec }, 0);
+        match reopened(&file, flags) {
+            Some((ino, content)) => (found, kept) = (Ok(ino), content),
+            None => return p.fds.alloc(FdEntry { file, cloexec }, 0),
+        }
     }
     let (ino, created) = match found {
         Ok(_) if excl => return Err(EEXIST),
@@ -524,7 +535,8 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             }
             Kind::File(_) | Kind::Unlinked { .. } if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Kind::File(c) => (Some(c.clone()), None, None),
-            Kind::Unlinked { .. } => return Err(ENOENT),
+            // Gone by name: only a descriptor still reaches it.
+            Kind::Unlinked { .. } => (Some(kept.clone().ok_or(ENOENT)?), None, None),
             // Another process's memory isn't reachable (invariant 13): as
             // Linux's mem_open without ptrace_may_access(ATTACH).
             Kind::Proc(ProcFile::Mem) if proc_pid.is_some() => return Err(EACCES),
@@ -669,6 +681,21 @@ fn open_fifo(p: &mut Process, ino: Ino, flags: u32, cloexec: bool) -> SysResult 
         new_file(FileKind::Fifo(FifoFile { ino, read, write }), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC));
     file.lock().pin = Some(pin);
     p.fds.alloc(FdEntry { file, cloexec }, 0)
+}
+
+/// The file to open afresh for `open(/proc/self/fd/N)` with `flags`, if
+/// the open file at N can't do what they ask: Linux's magic link always
+/// opens what it leads to, and an O_PATH descriptor can do nothing else
+/// (reopening one is what it's for: runc, systemd, libpathrs, and Python's
+/// `listdir` of the link), nor a write-only O_TMPFILE read. Any other is
+/// another reference to the open file, as sharing its offset shows.
+/// With the node, its contents, which is all that's left of an unlinked one.
+fn reopened(file: &crate::fd::FileRef, flags: u32) -> Option<(Ino, Option<Content>)> {
+    let f = file.lock();
+    let FileKind::Node(ino) = f.kind else { return None };
+    let acc = flags & O_ACCMODE;
+    let short = f.path_only || (acc != O_WRONLY && !f.readable()) || (acc != O_RDONLY && !f.writable());
+    (flags & O_PATH == 0 && short).then(|| (ino, f.content.clone()))
 }
 
 fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool, denied: u16) -> SysResult {
@@ -1641,6 +1668,15 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let target = match (procfs::fd_path(&path), procfs::other_fd_path(&path)) {
+        // Since 2.6.39: the link an O_PATH | O_NOFOLLOW descriptor holds.
+        _ if path.is_empty() => {
+            if dirfd as i32 == AT_FDCWD {
+                return Err(ENOENT);
+            }
+            let file = p.fds.get_raw(dirfd)?;
+            let FileKind::Node(ino) = file.lock().kind else { return Err(EINVAL) };
+            fs::lock().link_target(ino)?
+        }
         (Some(fd), _) if path.contains("/fd/") => {
             let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
             procfs::fd_link(&file.lock().kind, fd)

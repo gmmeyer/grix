@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -741,10 +742,10 @@ static int nofile(void) {
     if (pid == 0) _exit(fcntl(65535, F_GETFD) == 0 && fcntl(4999, F_GETFD) == 0 ? 0 : 1);
     CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && status == 0);
     // Open files are still limited for all processes together (ENFILE)...
-    static int nulls[8192];
+    static int nulls[60000];
     int n = 0;
-    while (n < 8192 && (nulls[n] = open("/dev/null", O_RDONLY)) >= 0) n++;
-    CHECK(n < 8192 && errno == ENFILE && n > 3000);
+    while (n < 60000 && (nulls[n] = open("/dev/null", O_RDONLY)) >= 0) n++;
+    CHECK(n < 60000 && errno == ENFILE && n > 3000);
     while (n > 0) close(nulls[--n]);
     // ... and tables cost kernel memory: forking a big one, again and
     // again, runs out of it (ENOMEM) before the kernel's heap does.
@@ -1186,6 +1187,196 @@ static int capdrop(void) {
     return 0;
 }
 
+// ---- Round 3: what the hardening and old limits kept from real programs
+
+/// An O_PATH descriptor opened again through its magic link is a new open,
+/// and can do what the descriptor can't (runc, systemd, libpathrs, and
+/// Python's listdir of the link), as a write-only O_TMPFILE read back.
+static int reopen(void) {
+    char link[64], got[16];
+    CHECK(mkdir("/tmp/re", 0755) == 0 && mkdir("/tmp/re/d", 0755) == 0);
+    int fd = open("/tmp/re/f", O_CREAT | O_WRONLY, 0644);
+    CHECK(fd >= 0 && write(fd, "hello", 5) == 5 && close(fd) == 0);
+    CHECK(close(open("/tmp/re/d/g", O_CREAT | O_WRONLY, 0644)) == 0);
+    int path = open("/tmp/re/f", O_PATH), dir = open("/tmp/re/d", O_PATH | O_DIRECTORY);
+    CHECK(path >= 0 && dir >= 0 && read(path, got, 1) == -1 && errno == EBADF);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", path);
+    int r = open(link, O_RDONLY);
+    CHECK(r >= 0 && !(fcntl(r, F_GETFL) & O_PATH));
+    CHECK(read(r, got, 5) == 5 && memcmp(got, "hello", 5) == 0);
+    // Each with its own offset.
+    int r2 = open(link, O_RDONLY);
+    CHECK(r2 >= 0 && read(r2, got, 1) == 1 && got[0] == 'h');
+    int w = open(link, O_WRONLY | O_APPEND);
+    CHECK(w >= 0 && write(w, "!", 1) == 1 && read(r, got, 1) == 1 && got[0] == '!');
+    CHECK(open(link, O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
+    // A file, so it's looked at as one: no reference to what's open.
+    CHECK(chmod("/tmp/re/f", 0) == 0);
+    int root = geteuid() == 0;
+    CHECK(!root || seteuid(1000) == 0);
+    CHECK(open(link, O_RDONLY) == -1 && errno == EACCES);
+    CHECK(!root || seteuid(0) == 0);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dir);
+    DIR *d = opendir(link);
+    CHECK(d != NULL);
+    int seen = 0;
+    for (struct dirent *e; (e = readdir(d));) seen += strcmp(e->d_name, "g") == 0;
+    CHECK(seen == 1 && closedir(d) == 0);
+    CHECK(open(link, O_WRONLY) == -1 && errno == EISDIR);
+    int t = open("/tmp/re", O_TMPFILE | O_WRONLY, 0600);
+    CHECK(t >= 0 && write(t, "x", 1) == 1);
+    snprintf(link, sizeof link, "/proc/self/fd/%d", t);
+    int back = open(link, O_RDONLY);
+    CHECK(back >= 0 && read(back, got, 1) == 1 && got[0] == 'x');
+    // readlinkat with an empty path: the link the descriptor holds.
+    CHECK(symlink("f", "/tmp/re/l") == 0);
+    int l = open("/tmp/re/l", O_PATH | O_NOFOLLOW);
+    CHECK(l >= 0 && readlinkat(l, "", got, sizeof got) == 1 && got[0] == 'f');
+    CHECK(readlinkat(path, "", got, sizeof got) == -1 && errno == EINVAL);
+    CHECK(readlinkat(AT_FDCWD, "", got, sizeof got) == -1 && errno == ENOENT);
+    return 0;
+}
+
+static void nothing(int sig) { (void)sig; }
+
+/// No page for a signal frame ends the program as a fault with no page
+/// does: there's nothing wrong with its stack. Returns only on failure.
+static int framemem(void) {
+    size_t big = 1UL << 32;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    char *p = mmap(NULL, big, PROT_READ | PROT_WRITE, flags, -1, 0), *alt = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE, flags, -1, 0);
+    CHECK(p != MAP_FAILED && alt != MAP_FAILED);
+    stack_t ss = {.ss_sp = alt, .ss_size = 1 << 16};
+    struct sigaction sa = {.sa_handler = nothing, .sa_flags = SA_ONSTACK};
+    CHECK(sigaltstack(&ss, NULL) == 0 && sigaction(SIGUSR1, &sa, NULL) == 0);
+    int zero = open("/dev/zero", O_RDONLY);
+    // read says so where touching the pages would be the end of it.
+    size_t at = 0;
+    for (size_t step = 1 << 20; step >= 4096; step /= 2) {
+        ssize_t r;
+        while (at + step <= big && (r = read(zero, p + at, step)) > 0) at += r;
+    }
+    raise(SIGUSR1);
+    printf("FAILED: the handler ran with no memory left\n");
+    return 1;
+}
+
+/// Go's io.Copy between sockets waits in splice, a pipe for each connection:
+/// none of them may hold room for what hasn't come.
+static int spliceidle(void) {
+    struct rlimit rl = {16384, 16384};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    int sv[2], pf[2];
+    for (int i = 0; i < 1500; i++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && pipe(pf) == 0);
+        CHECK(splice(sv[0], NULL, pf[1], NULL, 65536, SPLICE_F_NONBLOCK) == -1 && errno == EAGAIN);
+    }
+    char b[4096] = {0};
+    CHECK(write(sv[1], "x", 1) == 1 && splice(sv[0], NULL, pf[1], NULL, 65536, SPLICE_F_NONBLOCK) == 1);
+    CHECK(read(pf[0], b, sizeof b) == 1 && b[0] == 'x');
+    CHECK(fcntl(pf[1], F_SETFL, O_NONBLOCK) == 0);
+    for (int i = 0; i < 16; i++) CHECK(write(pf[1], b, sizeof b) == sizeof b);
+    return 0;
+}
+
+/// Thousands of open files in all, of more than one kind.
+static int openfiles(void) {
+    struct rlimit rl = {32768, 32768};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    FILE *f = fopen("/proc/sys/fs/file-max", "r");
+    long max = 0;
+    CHECK(f != NULL && fscanf(f, "%ld", &max) == 1 && max >= 12000 && fclose(f) == 0);
+    int pf[2];
+    for (int i = 0; i < 5000; i++) CHECK(pipe(pf) == 0);
+    for (int i = 0; i < 2000; i++) CHECK(timerfd_create(CLOCK_MONOTONIC, 0) >= 0);
+    return 0;
+}
+
+static void *accept_later(void *arg) {
+    int l = *(int *)arg;
+    usleep(100000);
+    for (int i = 0; i < 3000; i++)
+        if (accept(l, NULL, NULL) < 0) return (void *)1;
+    return NULL;
+}
+
+/// More connects at once than the backlog: on Linux they wait for accept,
+/// and none is refused.
+static int burst(void) {
+    struct rlimit rl = {16384, 16384};
+    CHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(7010), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 8) == 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, accept_later, &l) == 0);
+    for (int i = 0; i < 3000; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(c >= 0 && connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+    }
+    void *failed;
+    CHECK(pthread_join(t, &failed) == 0 && failed == NULL);
+    return 0;
+}
+
+/// As much as glibc's sysconf(_SC_ARG_MAX) says, as `find -exec {} +`
+/// passes, and no more: strings and their pointers count. Ends in
+/// "argmaxed".
+static int argmax(char *self) {
+    enum { LEN = 100, OK = 18000, OVER = 25000 };
+    char **args = calloc(OVER + 3, sizeof *args), *one = malloc(LEN + 1);
+    CHECK(args != NULL && one != NULL);
+    memset(one, 'x', LEN);
+    one[LEN] = 0;
+    args[0] = self;
+    args[1] = "argmaxed";
+    for (int i = 2; i < OVER + 2; i++) args[i] = one;
+    CHECK(execv(self, args) == -1 && errno == E2BIG);
+    args[OK + 2] = NULL;
+    execv(self, args);
+    CHECK(0);
+}
+
+/// More files than 12 MiB of names and nodes hold.
+static int manyfiles(void) {
+    char name[64];
+    CHECK(mkdir("/tmp/many", 0755) == 0);
+    for (int i = 0; i < 50000; i++) {
+        snprintf(name, sizeof name, "/tmp/many/file-%d", i);
+        int fd = open(name, O_CREAT | O_WRONLY, 0644);
+        CHECK(fd >= 0 && close(fd) == 0);
+    }
+    DIR *d = opendir("/tmp/many");
+    CHECK(d != NULL);
+    int seen = 0;
+    while (readdir(d)) seen++;
+    CHECK(seen == 50002 && closedir(d) == 0);
+    return 0;
+}
+
+/// What a big image leaves is the program's: `touch` touches this much.
+static int touch(void) {
+    size_t n = 140 << 20;
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    memset(p, 1, n);
+    return 0;
+}
+
+/// A server behind a forwarded port, past what 256 connections were: each
+/// answers a byte and stays open.
+static int manyconns(void) {
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(8100), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 128) == 0);
+    for (int i = 0; i < 400; i++) {
+        int c = accept(l, NULL, NULL);
+        char b;
+        CHECK(c >= 0 && read(c, &b, 1) == 1 && write(c, &b, 1) == 1);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1219,6 +1410,20 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "passcred") == 0) r = passcred();
         if (strcmp(argv[i], "streamcred") == 0) r = streamcred();
         if (strcmp(argv[i], "capdrop") == 0) r = capdrop();
+        if (strcmp(argv[i], "reopen") == 0) r = reopen();
+        if (strcmp(argv[i], "framemem") == 0) r = framemem();
+        if (strcmp(argv[i], "spliceidle") == 0) r = spliceidle();
+        if (strcmp(argv[i], "openfiles") == 0) r = openfiles();
+        if (strcmp(argv[i], "burst") == 0) r = burst();
+        if (strcmp(argv[i], "argmax") == 0) r = argmax(argv[0]);
+        if (strcmp(argv[i], "manyfiles") == 0) r = manyfiles();
+        if (strcmp(argv[i], "touch") == 0) r = touch();
+        if (strcmp(argv[i], "manyconns") == 0) r = manyconns();
+        // The arguments after it are only there to be counted.
+        if (strcmp(argv[i], "argmaxed") == 0) {
+            printf("argmax %s\n", argc == 18002 ? "ok" : "failed");
+            return argc != 18002;
+        }
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

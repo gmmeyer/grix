@@ -158,7 +158,7 @@ pub fn connect(p: &mut Process, fd: u64, addr: u64, len: u64) -> SysResult {
 pub fn listen(p: &mut Process, fd: u64, backlog: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
-        return with_inet(p, fd, |_, s, _| inet_listen(s, backlog))?;
+        return with_inet(p, fd, |_, s, _| inet_listen(s))?;
     }
     match file.lock().kind {
         FileKind::Netlink(_) => return Err(EOPNOTSUPP),
@@ -919,7 +919,7 @@ fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
     Ok(0)
 }
 
-fn inet_listen(s: &mut Inet, backlog: u64) -> SysResult {
+fn inet_listen(s: &mut Inet) -> SysResult {
     if s.dgram {
         return Err(EOPNOTSUPP);
     }
@@ -930,7 +930,7 @@ fn inet_listen(s: &mut Inet, backlog: u64) -> SysResult {
     }
     let unspecified = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
     let bound = s.bound.unwrap_or(unspecified);
-    let l = Listener::listen(bound.addr, bound.port, (backlog as i32).max(1) as usize, s.v6only)?;
+    let l = Listener::listen(bound.addr, bound.port, s.v6only)?;
     s.bound = Some(SockAddr { port: l.lock().port, ..bound });
     s.state = State::Listening(l);
     Ok(0)

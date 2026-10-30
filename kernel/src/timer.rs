@@ -187,12 +187,15 @@ pub struct Timers {
 /// Every timerfd still open, so the scheduler wakes up for them. A
 /// timerfd belongs to its file, which outlives whoever made it (fork,
 /// SCM_RIGHTS), so no process's list would do. Weak: `add_timerfd` forgets
-/// the closed ones, and there are at most `MAX_OPEN_FILES` others.
+/// the closed ones, and open files are bounded (`fd::max_open_files`).
 static TIMER_FDS: Mutex<Vec<Weak<Mutex<TimerFd>>>> = Mutex::new(Vec::new());
 
 pub fn add_timerfd(fd: &Arc<Mutex<TimerFd>>) {
     let mut fds = TIMER_FDS.lock();
-    fds.retain(|w| w.strong_count() > 0);
+    // Once it's full, not each time: there may be tens of thousands.
+    if fds.len() == fds.capacity() {
+        fds.retain(|w| w.strong_count() > 0);
+    }
     fds.push(Arc::downgrade(fd));
 }
 

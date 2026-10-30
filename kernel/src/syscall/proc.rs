@@ -205,9 +205,6 @@ pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
     Ok(0)
 }
 
-/// The most argv + envp may hold (Linux allows a quarter of the stack).
-const MAX_ARGS: usize = 1 << 20;
-
 /// Read a NULL-terminated array of strings (argv, envp).
 fn read_strings(
     p: &mut Process,
@@ -224,9 +221,9 @@ fn read_strings(
         if s == 0 {
             return Ok(out);
         }
-        let arg = read_cstr(&mut p.aspace, s, MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
+        let arg = read_cstr(&mut p.aspace, s, process::MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
         *total += arg.len() + 1 + 8;
-        if *total > MAX_ARGS {
+        if *total > process::MAX_ARGS {
             return Err(E2BIG);
         }
         // Megabytes of small strings, before `load_program` charges them.

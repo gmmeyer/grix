@@ -4,9 +4,9 @@
 //! share of RAM (`mm::init`), and running out of it is a kernel panic, so
 //! these fail with an errno (ENOMEM, ENOBUFS, EAGAIN) once the budget is
 //! used up: `BASE`, and all of the share of RAM. Filesystem names and nodes
-//! have their own budget (fs.rs). What stays out of both (open files,
-//! processes, locks, queued signals) has a low limit for all processes,
-//! and fits in what's left of the heap.
+//! have their own budget (fs.rs). What stays out of both (processes, locks,
+//! queued signals) has a low limit for all processes, and fits in what's
+//! left of the heap.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use grix_abi::stats::{Limit, Resource};
@@ -51,6 +51,12 @@ impl Charge {
         let mut c = Charge(0);
         c.resize(bytes)?;
         Ok(c)
+    }
+
+    /// A charge for what's made either way, and nothing with no room: what
+    /// the caller's own limit keeps in what's left of the heap.
+    pub fn if_room(bytes: u64) -> Charge {
+        if available() >= bytes { Charge::new(bytes).unwrap_or_default() } else { Charge::default() }
     }
 
     /// Change the amount held. Growing past the budget fails with ENOMEM

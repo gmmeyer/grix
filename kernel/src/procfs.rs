@@ -342,13 +342,13 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         }
         // Allocated, unused (always 0 since 2.6), most.
         ProcFile::FileNr => {
-            let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::MAX_OPEN_FILES);
+            let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::max_open_files());
         }
         ProcFile::AioNr => {
             let _ = writeln!(s, "{}", crate::syscall::aio::aio_nr());
         }
         ProcFile::FileMax => {
-            let _ = writeln!(s, "{}", crate::fd::MAX_OPEN_FILES);
+            let _ = writeln!(s, "{}", crate::fd::max_open_files());
         }
         ProcFile::InodeNr => {
             let _ = writeln!(s, "{}\t0", fs::lock().node_count());

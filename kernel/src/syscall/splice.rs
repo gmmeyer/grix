@@ -259,25 +259,34 @@ pub fn splice(p: &mut Process, fd_in: u64, off_in: u64, fd_out: u64, off_out: u6
     // socket is lost.
     if out_pipe {
         let end = pipe_end(&o, true).ok_or(EBADF)?;
-        let mut pipe = end.pipe.lock();
+        let pipe = end.pipe.lock();
         if pipe.readers == 0 {
             drop(pipe);
             crate::signal::raise(p, crate::signal::SIGPIPE, "SIGPIPE: spliced to a pipe with no readers");
             return Err(EPIPE);
         }
-        want = pipe.reserve(want);
+        want = want.min(pipe.space());
         if want == 0 {
             drop(pipe);
             return would_block(p, nonblock);
         }
     }
-    let data = match peek(&i, &src, want)? {
+    let mut data = match peek(&i, &src, want)? {
         Peeked::Data(d) => d,
         Peeked::End => return Ok(0),
         // The pipe's side waits unless SPLICE_F_NONBLOCK; a socket's as
         // its own O_NONBLOCK says too.
         Peeked::Empty => return would_block(p, nonblock || (!in_pipe && i.nonblocking())),
     };
+    // Only now, for what there is: Go's io.Copy waits here, a pipe for each
+    // idle connection, and room held for nothing is 64 KiB of `kmem` each.
+    if out_pipe {
+        let room = pipe_end(&o, true).ok_or(EBADF)?.pipe.lock().reserve(data.len());
+        data.truncate(room);
+        if room == 0 {
+            return would_block(p, nonblock);
+        }
+    }
     let n = write_out(p, &mut o, oout, &data, nonblock)?;
     consume(&i, &src, n as usize);
     if let Source::File(at) = src {

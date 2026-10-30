@@ -2189,6 +2189,99 @@ fn popular(b: SandboxBuilder, checks: &[&str]) {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// `open(/proc/self/fd/N)` of an O_PATH descriptor opens the file again;
+/// `readlinkat(fd, "")` reads the link it holds.
+#[test]
+fn o_path_descriptors_open_again_through_their_links() {
+    popular(with("popular").allow(Capability::FsWrite), &["reopen"]);
+}
+
+/// A signal frame with no page to go on is out of memory, not a bad stack.
+#[test]
+fn no_memory_for_a_signal_frame() {
+    let out = run(with("popular").memory_mb(256).timeout(Duration::from_secs(120)), &["/bin/popular", "framemem"]);
+    assert_eq!(out.status, ExitStatus::Signaled(9), "{}", out.stdout_str());
+    assert!(out.events.iter().any(|e| e.to_string().contains("out of memory")), "{:?}", out.events);
+    assert!(!out.events.iter().any(|e| e.to_string().contains("signal frame")), "{:?}", out.events);
+    assert_eq!(out.stdout_str(), "");
+}
+
+/// A pipe waiting in splice holds no room for what hasn't come (Go's
+/// io.Copy between sockets, a pipe for each idle connection).
+#[test]
+fn idle_splices_hold_no_kernel_memory() {
+    popular(with("popular").memory_mb(256), &["spliceidle"]);
+}
+
+/// file-max follows the kernel memory budget: a server has two files for
+/// each connection in the guest.
+#[test]
+fn thousands_of_open_files() {
+    popular(with("popular"), &["openfiles"]);
+}
+
+/// More connects than the backlog are queued, never refused.
+#[test]
+fn connects_past_the_backlog_wait_for_accept() {
+    popular(with("popular").allow(Capability::Net).allow(Capability::Threads), &["burst"]);
+}
+
+/// argv and the environment as big as Linux's, and no bigger.
+#[test]
+fn arguments_up_to_arg_max() {
+    popular(with("popular").allow(Capability::Process), &["argmax"]);
+}
+
+/// Names and nodes get a share of a heap that grows with RAM.
+#[test]
+fn more_files_than_the_first_heap_held() {
+    popular(with("popular").allow(Capability::FsWrite), &["manyfiles"]);
+}
+
+/// The heap's share is of what the boot image leaves of RAM: of 1 GiB with
+/// 800 MiB imported, a share of all of it left a program 50 MiB less, as
+/// the JVM in `mvn package` found at 2 GiB, killed.
+#[test]
+fn a_big_image_leaves_its_memory_to_the_program() {
+    let big = std::env::temp_dir().join(format!("grix-big-import-{}", std::process::id()));
+    std::fs::File::create(&big).unwrap().set_len(800 << 20).unwrap();
+    let out = with("popular").import(&big, "/big").map(|b| run(b.memory_mb(1024), &["/bin/popular", "touch"]));
+    std::fs::remove_file(&big).unwrap();
+    let out = out.unwrap();
+    assert_eq!(out.stdout_str(), "touch ok\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Past the 256 connections through the host there were: each is held
+/// open while the next is made.
+#[test]
+fn hundreds_of_connections_through_a_forwarded_port() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sb = with("popular").allow(Capability::Net).forward_listener(listener, 8100).unwrap().build().unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/bin/popular", "manyconns"]).unwrap());
+    let started = std::time::Instant::now();
+    let mut held = Vec::new();
+    while held.len() < 400 {
+        assert!(started.elapsed() < Duration::from_secs(60), "{} connections", held.len());
+        // Until the guest listens, one's closed unanswered: try again.
+        let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut b = [0u8; 1];
+        if c.write_all(b"x").is_ok() && c.read_exact(&mut b).is_ok() {
+            held.push(c);
+        } else {
+            assert!(held.is_empty(), "refused after {} connections", held.len());
+        }
+    }
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "manyconns ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn proc_self_auxv() {
     // Go's x/sys/cpu reads HWCAP there; without it, it reads ID registers

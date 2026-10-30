@@ -94,10 +94,12 @@ pub enum Dev {
 static PAGES_USED: AtomicU64 = AtomicU64::new(0);
 static PAGES_LIMIT: AtomicU64 = AtomicU64::new(0);
 /// Kernel heap bytes (estimated) taken by nodes and names the program
-/// created. The heap is 32 MiB and an allocation failure there is a kernel
-/// panic, so this stays well below it.
+/// created. An allocation failure there is a kernel panic, so this stays
+/// well below the heap: 12 MiB of its first 32 MiB, and a share of what's
+/// added for RAM (`mm::init`). 12 MiB alone are 37,000 files, whatever the
+/// RAM, and `node_modules` can be more than that.
 static META_USED: AtomicU64 = AtomicU64::new(0);
-const META_LIMIT: u64 = 12 << 20;
+static META_LIMIT: AtomicU64 = AtomicU64::new(12 << 20);
 /// Estimated heap cost of a node (the boxed Node, its pin) and of a directory
 /// entry (B-tree slot), on top of the bytes of names and symlink targets.
 const NODE_COST: u64 = core::mem::size_of::<Node>() as u64 + 64;
@@ -121,11 +123,16 @@ pub fn usage() -> (u64, u64) {
 
 /// (bytes of names and nodes in use, the limit)
 pub fn meta_usage() -> (u64, u64) {
-    (META_USED.load(Ordering::Relaxed), META_LIMIT)
+    (META_USED.load(Ordering::Relaxed), META_LIMIT.load(Ordering::Relaxed))
+}
+
+/// `bytes` more of the heap for names and nodes.
+pub fn grow_meta(bytes: u64) {
+    META_LIMIT.fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn charge(bytes: u64) -> Result<(), Errno> {
-    if META_USED.load(Ordering::Relaxed) + bytes > META_LIMIT {
+    if META_USED.load(Ordering::Relaxed) + bytes > META_LIMIT.load(Ordering::Relaxed) {
         crate::stats::hit(Limit::FileMetadata);
         return Err(ENOSPC);
     }
