@@ -1708,16 +1708,20 @@ impl Fs {
     /// `lookup`, as openat2's `resolve` allows.
     pub fn lookup_in(&mut self, start: Ino, path: &str, follow_last: bool, scope: &Scope) -> Result<Ino, Errno> {
         let mut links = 0;
-        self.walk(start, path, follow_last, &mut links, scope)
+        self.walk(start, path, follow_last, false, &mut links, scope)
     }
 
     /// `links` counts every symlink followed in the whole lookup, so a chain
     /// of links that each expand into several more can't make it exponential.
+    /// `onward`: the path goes on after this: what ends it is a directory
+    /// on the way, so a descriptor there is gone through (`through_fd`),
+    /// not named, as `Fs::fd_link` has it when a path ends there.
     fn walk(
         &mut self,
         start: Ino,
         path: &str,
         follow_last: bool,
+        onward: bool,
         links: &mut u32,
         scope: &Scope,
     ) -> Result<Ino, Errno> {
@@ -1748,6 +1752,10 @@ impl Fs {
                     }
                     cur = self.nodes[cur].parent
                 }
+                // /proc/<pid>/fd/N/...: a magic link, on the way somewhere.
+                name if (!last || onward) && self.fd_dir_pid(cur).is_some() => {
+                    cur = self.through_fd(cur, name, links, scope)?;
+                }
                 name => {
                     let child =
                         self.find_child(cur, name)?.ok_or(if name.len() > NAME_MAX { ENAMETOOLONG } else { ENOENT })?;
@@ -1760,7 +1768,7 @@ impl Fs {
                         if *links > MAX_SYMLINKS {
                             return Err(ELOOP);
                         }
-                        cur = self.follow(cur, child, links, scope)?;
+                        cur = self.follow(cur, child, !last || onward, links, scope)?;
                         continue;
                     }
                     cur = child;
@@ -1777,7 +1785,7 @@ impl Fs {
     /// allow: no symlinks at all (ELOOP), no magic ones (ELOOP), none
     /// leaving the mount (EXDEV), and in a scoped lookup no magic ones
     /// (EXDEV, "not currently safe").
-    fn follow(&mut self, dir: Ino, link: Ino, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
+    fn follow(&mut self, dir: Ino, link: Ino, onward: bool, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
         if scope.has(RESOLVE_NO_SYMLINKS) {
             return Err(ELOOP);
         }
@@ -1790,7 +1798,7 @@ impl Fs {
                 return Err(EXDEV);
             }
             // A magic link jumps to what it names, wherever that is.
-            let to = self.walk(dir, &target, true, links, &Scope::NONE)?;
+            let to = self.walk(dir, &target, true, onward, links, &Scope::NONE)?;
             if scope.has(RESOLVE_NO_XDEV) && self.mount_of(to) != self.mount_of(dir) {
                 return Err(EXDEV);
             }
@@ -1803,7 +1811,28 @@ impl Fs {
                 return Err(EXDEV);
             }
         }
-        self.walk(dir, &target, true, links, scope)
+        self.walk(dir, &target, true, onward, links, scope)
+    }
+
+    /// What entry `name` of /proc/<pid>/fd directory `dir` has open, to go
+    /// on from, with `follow`'s rules for a magic link.
+    fn through_fd(&mut self, dir: Ino, name: &str, links: &mut u32, scope: &Scope) -> Result<Ino, Errno> {
+        if scope.has(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) {
+            return Err(ELOOP);
+        }
+        if scope.has(RESOLVE_SCOPED) {
+            return Err(EXDEV);
+        }
+        *links += 1;
+        if *links > MAX_SYMLINKS {
+            return Err(ELOOP);
+        }
+        let pid = self.fd_dir_pid(dir).ok_or(ENOENT)?;
+        let to = crate::fd::walked_node(pid, name.parse().map_err(|_| ENOENT)?)?;
+        if scope.has(RESOLVE_NO_XDEV) && self.mount_of(to) != self.mount_of(dir) {
+            return Err(EXDEV);
+        }
+        Ok(to)
     }
 
     /// Where an absolute path starts: EXDEV beneath a directory, which it
@@ -1865,7 +1894,7 @@ impl Fs {
         let trimmed = path.trim_end_matches('/');
         let (dir, name) = match trimmed.rsplit_once('/') {
             Some(("", name)) => (self.root_of(scope)?, name),
-            Some((dir, name)) => (self.lookup_in(start, dir, true, scope)?, name),
+            Some((dir, name)) => (self.walk(start, dir, true, true, &mut 0, scope)?, name),
             None if trimmed.is_empty() => (self.root_of(scope)?, ""),
             None => (start, trimmed),
         };

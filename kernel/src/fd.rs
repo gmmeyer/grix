@@ -338,6 +338,31 @@ impl Drop for Slots {
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
+/// Each CPU's last `FdTable::walking`. Weak, so it isn't a user of the
+/// table (`FdTable::shared`) and doesn't keep it.
+#[allow(clippy::type_complexity)]
+static WALKING: [Mutex<Option<(u32, Weak<Mutex<Slots>>)>>; grix_abi::machine::MAX_CPUS as usize] =
+    [const { Mutex::new(None) }; grix_abi::machine::MAX_CPUS as usize];
+
+/// The node descriptor `fd` of `pid` has open, for a path going on through
+/// /proc/<pid>/fd/N: ENOENT without such a descriptor (or for another
+/// process's, whose fd directories are only looked at, not walked through),
+/// and ENOTDIR if it's no file with a node.
+pub fn walked_node(pid: u32, fd: u64) -> Result<crate::fs::Ino, Errno> {
+    let walking = WALKING[crate::smp::me()].lock();
+    let table = walking.as_ref().filter(|w| w.0 == pid).and_then(|w| w.1.upgrade()).ok_or(ENOENT)?;
+    drop(walking);
+    let i = FdTable::index(fd).map_err(|_| ENOENT)?;
+    let file = table.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(ENOENT)?.file.clone();
+    // Held already only by this CPU's own caller, which has no business
+    // walking a path through it.
+    let f = file.try_lock().ok_or(ENOENT)?;
+    match f.kind {
+        FileKind::Node(ino) => Ok(ino),
+        _ => Err(ENOTDIR),
+    }
+}
+
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
     OPEN_FILES.fetch_add(1, Ordering::Relaxed);
     Arc::new(Mutex::new(OpenFile {
@@ -488,6 +513,12 @@ impl FdTable {
         let i = Self::index(fd)?;
         self.slots.lock().entries.get_mut(i).and_then(|s| s.as_mut()).ok_or(EBADF)?.cloexec = on;
         Ok(())
+    }
+
+    /// Process `pid`, whose table this is, is about to walk a path:
+    /// `walked_node` needs it, and the path walk has no process to ask.
+    pub fn walking(&self, pid: u32) {
+        *WALKING[crate::smp::me()].lock() = Some((pid, Arc::downgrade(&self.slots)));
     }
 
     /// Install at the lowest free descriptor >= `min`, below the

@@ -64,6 +64,7 @@ fn dir_base(p: &Process, dirfd: u64) -> Result<Ino, Errno> {
 
 /// The directory a path is relative to.
 pub(super) fn base_of(p: &Process, dirfd: u64, path: &str) -> Result<Ino, Errno> {
+    p.fds.walking(p.pid);
     if path.starts_with('/') { Ok(ROOT) } else { dir_base(p, dirfd) }
 }
 
