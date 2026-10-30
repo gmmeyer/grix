@@ -196,7 +196,10 @@ Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 the guest has no TCP/IP stack. A TCP connect becomes `link::ToHost::Connect`
 on `Channel::Link`, the host checks its `NetPolicy` and connects, and data
 flows as `Data` messages with credit-based flow control (`link::WINDOW` per
-connection each way; stdin uses the same scheme). Connections to the
+connection each way; stdin uses the same scheme). Everything the proxy or a build connects to goes through
+`net::reachable`, whose `special` addresses need a rule of their own:
+loopback, link-local, multicast, all of `fc00::/7`, and any IPv6 address
+that carries a special IPv4 one (`embedded_v4`). Connections to the
 guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
 as `Incoming`, for a listener on the guest's address or all of them,
@@ -293,7 +296,8 @@ init and sends the exit signal. Each process has a `/proc/<pid>`
 (`Fs::proc_add` at fork, `fs::proc_gone` once it's reaped; `/proc/self`
 is `process::current_pid`). A zombie's is generated from what
 `procfs::Remains` kept of it (`Zombie::remains`, `fs::proc_zombie`
-makes its `exe`, `cwd` and `root` fail with ENOENT); a pidfd (`FileKind::PidFd`) is just the pid,
+makes its `exe`, `cwd` and `root` fail with ENOENT, and leaves its
+leader alone in `task`, paid for by what its last thread held); a pidfd (`FileKind::PidFd`) is just the pid,
 which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
 caller running. What clone can share between processes is a handle to
@@ -517,8 +521,10 @@ are only bits.
 Shared file mappings and locks: a MAP_SHARED mapping of a file in the
 sandbox maps the file's own frames (`Backing::SharedFile`; the file and
 each mapping hold a reference; a read of a page without a frame maps a
-read-only copy, taken out everywhere once the page gets one,
-`procs::zap_stale`), so it's never copy-on-write, and a file
+read-only copy, marked in `FileData::copied`, a page index of its own,
+and taken out everywhere once the page gets one, `procs::zap_stale`,
+which goes by spans and may take more than it must), so it's never
+copy-on-write, and a file
 that shrinks takes its pages out of every process's mappings
 (`file::zap_shared`): page tables are kernel memory, so another
 process's can be changed without its address space active. A live
@@ -721,7 +727,14 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     heap: frame reference counts are RAM set aside below the boot image
     (`mm::init`), the free list is linked through the free frames, and
     pages of files and shared memory are indexed in frames
-    (`mm::pageindex`; a file's index nodes count as its data).
+    (`mm::pageindex`; a file's index nodes count as its data). Nor does
+    anything that grows with page table entries, which outnumber frames
+    by as many mappings as a program makes of one file: what goes through
+    them waits for its flush in a fixed batch (`aspace::Gather`, and
+    `GATHER_TABLES` for page tables), and `mremap` moves them in place.
+    Nor anything per page of a file that the file doesn't hold a frame
+    for: holes cost a program nothing (`FileData::copied`, in frames, and
+    `STALE`, a fixed list of spans).
     - File data counts pages (`fs::set_limit`), and nodes, names and
       extended attributes count against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc
@@ -746,21 +759,28 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
       `kmem`; ENOMEM), Landlock rules (`landlock::MAX_RULES` in all
       rulesets and domains, each charged to `kmem`; ENOMEM) and layers
-      (`landlock::MAX_LAYERS` per thread; E2BIG). AIO contexts count
-      the events they ask for against `aio::AIO_MAX_NR` (EAGAIN, Linux's
-      aio-max-nr), and each
+      (`landlock::MAX_LAYERS` per thread; E2BIG). Epoll registrations
+      are charged to `kmem` (`fd::Epoll::add`; ENOSPC, Linux's
+      max_user_watches), as one file can be under every descriptor in
+      every instance. AIO contexts count the events they ask for
+      against `aio::AIO_MAX_NR` (EAGAIN, Linux's aio-max-nr), and each
       context and waiting poll is charged to `kmem`. argv and environment copies take a
       `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,
-    and fork copies whatever is per process.
+    and fork copies whatever is per process. A list made for a call stops
+    at what the call can return (`listxattr`).
 11. **`fs::lock()` is not re-entrant**; it panics if this CPU already
     holds it (another CPU's hold is waited for), and `fs::try_lock` fails
     if anyone does. Drop the guard before calling anything that takes it
     (`Process::missing_path`, `procfs::generate`, …). Lock order:
     `OpenFile` → filesystem → `FileData`. Never hold a `FileData` lock
     across `copy_in`/`copy_out`, because a fault may read the same file
-    through a mapping (file.rs uses bounce buffers).
+    through a mapping (file.rs uses bounce buffers). Every other lock is a
+    spinlock that waits for itself, for ever, with no error: two
+    descriptors may be one file (compare with `Arc::ptr_eq` first), and
+    two files are held at once only through `fd::lock_pair`. A guard made
+    in a tuple or an argument lives to the end of the statement.
 12. **User register state never reaches EL1.** `rt_sigreturn` loads every
     register from user memory. It must reject a frame whose pstate names
     another exception level, AArch32 or masked interrupts, and keep only
@@ -774,7 +794,9 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     A process that ended keeps its address space until another process is
     switched in: never free the active one. `/proc/<pid>/mem`
     (`FileKind::ProcMem`) is the caller's own memory only: another's
-    can't be opened, and one inherited across fork reads EIO.
+    can't be opened, one inherited across fork reads EIO, and after
+    execve one reads and writes nothing (`AddressSpace::id`, as Linux's
+    holds the mm it was opened on).
 
 ## Adding a syscall
 

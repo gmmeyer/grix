@@ -651,6 +651,22 @@ up without CAP_SYS_RESOURCE would do.
       full speed there: `kernel/src/arch/x86_64`, `vm_x86.rs`, `x86.yml`
       (round 2, item 19).
 
+## Hardening
+
+- [x] Review of 0.0.38..0.0.46 (`hardening.c`, and the tests from
+      `page_table_entries_cost_no_heap` on in `guest.rs`): page table
+      entries cost no heap, zombies keep only their leader's task entry,
+      tee and splice on one file, reading holes costs no heap, epoll
+      registrations are charged, IPv6's ways to what IPv4 refuses,
+      `--no-outside-links` on hosts that fold names, magic links with
+      O_NOFOLLOW, `Pipe::creds` for bytes that are there, `/proc/self/mem`
+      across execve, exchanges counted in `id_bytes`.
+- [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
+      unlike `fc00::/7`: a default-deny there would break programs that
+      reach a LAN, so it's documented rather than changed.
+- [ ] `sched.rs`, `smp.rs`, `timer.rs` and the kernel's `hostfs.rs` have
+      had only a light security read.
+
 ## Performance and scale
 
 - [x] SMP: more than one vCPU (`--cpus N`, `SandboxBuilder::cpus`): the
