@@ -195,8 +195,9 @@ impl Default for BuildPolicy {
             cache: true,
             step_timeout: Duration::from_secs(1800),
             // Files a step writes live in its memory (half of it at
-            // most), and memory it doesn't touch costs nothing.
-            step_memory_mb: 16 << 10,
+            // most), and memory it doesn't touch costs nothing. Enough
+            // for `apk add chromium`; a step may ask for up to this.
+            step_memory_mb: 4 << 10,
         }
     }
 }
@@ -548,5 +549,10 @@ mod tests {
         assert_eq!(step_memory_mb(base, Some(256), 3000), 812);
         assert_eq!(step_memory_mb(base, Some(2048), 3000), 2048);
         assert_eq!(step_memory_mb(base, Some(8192), 3000), 3000);
+        // By default a step gets what `apk add chromium` takes, and an image
+        // asking for more than that doesn't get it unless the caller says.
+        let limit = BuildPolicy::default().step_memory_mb;
+        assert_eq!(limit, 4096);
+        assert_eq!(step_memory_mb(base, Some(64 << 10), limit), limit);
     }
 }
