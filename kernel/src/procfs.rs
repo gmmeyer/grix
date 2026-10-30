@@ -66,6 +66,8 @@ pub enum ProcFile {
     /// /proc/net/dev and /proc/net/route: the interfaces there are.
     NetDev,
     NetRoute,
+    NetIfInet6,
+    NetIpv6Route,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
 }
@@ -155,7 +157,8 @@ pub const FILES: &[(&str, ProcFile)] = &[
     // lo, and eth0 with `net` (see netlink.rs).
     ("/proc/net/dev", ProcFile::NetDev),
     ("/proc/net/route", ProcFile::NetRoute),
-    ("/proc/net/if_inet6", ProcFile::Text("00000000000000000000000000000001 01 80 10 80       lo\n")),
+    ("/proc/net/if_inet6", ProcFile::NetIfInet6),
+    ("/proc/net/ipv6_route", ProcFile::NetIpv6Route),
     // lo as sysfs shows it (as netlink.rs describes it).
     ("/sys/class/net/lo/address", ProcFile::Text("00:00:00:00:00:00\n")),
     ("/sys/class/net/lo/addr_len", ProcFile::Text("6\n")),
@@ -323,6 +326,8 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         }
         ProcFile::NetDev => crate::netlink::proc_net_dev(&mut s),
         ProcFile::NetRoute => crate::netlink::proc_net_route(&mut s),
+        ProcFile::NetIfInet6 => crate::netlink::proc_net_if_inet6(&mut s),
+        ProcFile::NetIpv6Route => crate::netlink::proc_net_ipv6_route(&mut s),
     }
     Ok(s.into_bytes())
 }

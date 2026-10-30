@@ -2458,6 +2458,7 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
     const FIOGETOWN: u64 = 0x8903;
     const SIOCGPGRP: u64 = 0x8904;
     const SIOCGIFCONF: u64 = 0x8912;
+    const SIOCETHTOOL: u64 = 0x8946;
     // The command is an unsigned int: C callers may pass it sign-extended.
     let req = req as u32 as u64;
     let file = p.fds.get(fd)?;
@@ -2497,6 +2498,20 @@ pub fn ioctl(p: &mut Process, fd: u64, req: u64, arg: u64) -> SysResult {
             copy_out(&mut p.aspace, buf, entries[..fit].as_flattened())?;
         }
         return write_u32(&mut p.aspace, arg, (fit * 40) as u32).map(|_| 0);
+    }
+    if socket && req == SIOCETHTOOL {
+        // struct ifreq with ifr_data pointing at the command's structure.
+        let mut ifr = [0u8; 40];
+        copy_in(&mut p.aspace, arg, &mut ifr)?;
+        let data = u64::from_le_bytes(ifr[16..24].try_into().unwrap());
+        let cmd = read_u32(&mut p.aspace, data)?;
+        let name = ifr[..16].split(|&b| b == 0).next().unwrap_or(&[]);
+        let aspace = &mut p.aspace;
+        let reply = crate::netlink::ethtool(name, cmd, |off, len| {
+            let mut b = alloc::vec![0u8; len];
+            copy_in(aspace, data + off as u64, &mut b).map(|_| b)
+        })?;
+        return copy_out(&mut p.aspace, data, &reply).map(|_| 0);
     }
     if socket && (0x8900..=0x89ff).contains(&req) {
         let mut ifr = [0u8; 40];

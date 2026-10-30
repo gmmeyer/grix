@@ -1180,12 +1180,18 @@ impl Fs {
             // Agent), and it shouldn't go to the host's resolver.
             let [a, b, c, d] = grix_abi::link::HOST_V4;
             let [e, f, g, h] = grix_abi::link::GUEST_V4;
-            let text = alloc::format!(
+            let mut text = alloc::format!(
                 "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n{a}.{b}.{c}.{d}\t{}\n\
                  {e}.{f}.{g}.{h}\t{}\n",
                 grix_abi::link::HOST_NAME,
                 procfs::HOSTNAME
             );
+            // Its IPv6 address too, as Docker writes it for a network with
+            // IPv6 (after the IPv4 one, which lookups of the name try first).
+            if crate::netlink::eth0() {
+                let ip = crate::netlink::ipv6_text(&grix_abi::link::GUEST_V6);
+                text.push_str(&alloc::format!("{ip}\t{}\n", procfs::HOSTNAME));
+            }
             let ino = fs.insert(etc, "hosts", Kind::File(FileData::new(leak(text))), 0o644);
             fs.nodes[ino].generated = true;
         }

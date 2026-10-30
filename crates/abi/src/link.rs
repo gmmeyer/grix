@@ -45,6 +45,17 @@ pub const GUEST_V4: [u8; 4] = [10, 0, 2, 15];
 pub const HOST_V4: [u8; 4] = [10, 0, 2, 2];
 /// The virtual nameserver (`/etc/resolv.conf`).
 pub const DNS_V4: [u8; 4] = [10, 0, 2, 3];
+/// The guest's IPv6 address and the host's, on a unique local network
+/// (fd00::/64, as slirp4netns and Podman lay theirs out). A ULA source
+/// makes RFC 6724's address selection (glibc, musl, Go) prefer IPv4 for
+/// anything global, as the policy table's labels differ, while programs
+/// that look for an IPv6 address before listening on `[::]` find one. The
+/// host's proxy carries IPv6 connections where the host has a route.
+pub const GUEST_V6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15];
+/// `HOST_V4`'s IPv6 twin: the host's own loopback, only when named.
+pub const HOST_V6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
+/// The length of the network's prefix.
+pub const NET_V6_PREFIX: u8 = 64;
 /// A name for `HOST_V4`.
 pub const HOST_NAME: &str = "host.grix.internal";
 

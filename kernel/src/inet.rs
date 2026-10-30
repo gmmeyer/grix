@@ -40,6 +40,23 @@ const DNS_PATIENCE_NS: u64 = 10_000_000_000;
 /// ::1.
 pub const LOOPBACK_V6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
+/// One of the guest's own addresses on eth0 (10.0.2.15, fd00::15).
+pub fn is_own(a: Addr) -> bool {
+    a == Addr::V4(link::GUEST_V4) || a == Addr::V6(link::GUEST_V6)
+}
+
+/// The guest's address a connection or datagram to `to` (not the guest
+/// itself) leaves from, as Linux's route lookup picks it: eth0's IPv6
+/// address for an IPv6 destination, its IPv4 one otherwise. What
+/// getsockname says matters: RFC 6724's sorting (glibc, Go) compares it
+/// with each destination to find which to try first.
+pub fn source_for(to: Addr) -> Addr {
+    match to {
+        Addr::V6(_) if crate::netlink::eth0() => Addr::V6(link::GUEST_V6),
+        _ => Addr::V4(link::GUEST_V4),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SockAddr {
     pub addr: Addr,
@@ -66,7 +83,7 @@ impl SockAddr {
 
     /// The guest itself: loopback, or its own address.
     pub fn is_local(&self) -> bool {
-        self.is_loopback() || self.addr == Addr::V4(link::GUEST_V4)
+        self.is_loopback() || is_own(self.addr)
     }
 
     /// Where a connect to it goes: the unspecified address means loopback,
@@ -240,7 +257,7 @@ impl Conn {
     /// host answers.
     pub fn connect(peer: SockAddr) -> Result<Arc<Mutex<Conn>>, Errno> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) & !link::HOST_ID;
-        let local = SockAddr::v4(link::GUEST_V4, ephemeral_port());
+        let local = SockAddr { addr: source_for(peer.addr), port: ephemeral_port() };
         let c = Conn::register(Conn::new(id, ConnState::Connecting, local, peer)?)?;
         send(ToHost::Connect { id, addr: peer.addr, port: peer.port });
         Ok(c)

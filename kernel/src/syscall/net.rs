@@ -21,6 +21,7 @@ use grix_abi::link::{self, Addr};
 const AF_UNIX: u64 = 1;
 const AF_NETLINK: u64 = netlink::AF_NETLINK as u64;
 const NETLINK_ROUTE: u64 = 0;
+const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
@@ -84,15 +85,17 @@ pub fn socket(p: &mut Process, domain: u64, ty: u64, proto: u64) -> SysResult {
             if !matches!(ty & 0xf, SOCK_RAW | SOCK_DGRAM) {
                 return Err(ESOCKTNOSUPPORT);
             }
-            if proto != NETLINK_ROUTE {
+            if proto != NETLINK_ROUTE && proto != NETLINK_KOBJECT_UEVENT {
                 return p.unimplemented(
                     nr::socket,
                     "socket",
-                    "netlink protocols other than NETLINK_ROUTE",
+                    "netlink protocols other than NETLINK_ROUTE and NETLINK_KOBJECT_UEVENT",
                     EPROTONOSUPPORT,
                 );
             }
-            let file = new_file(FileKind::Netlink(Netlink::new(p.pid)), flags);
+            let mut nl = Netlink::new(p.pid);
+            nl.uevent = proto == NETLINK_KOBJECT_UEVENT;
+            let file = new_file(FileKind::Netlink(nl), flags);
             p.fds.alloc(FdEntry { file, cloexec }, 0)
         }
         // Local IPC, so not gated by `net` (binding to a path needs
@@ -843,7 +846,7 @@ fn inet_bind(p: &mut Process, s: &mut Inet, addr: u64, len: u64) -> SysResult {
     if !s.dgram && (s.bound.is_some() || !matches!(s.state, State::Idle)) {
         return Err(EINVAL);
     }
-    let ours = a.is_unspecified() || a.is_loopback() || a.addr == Addr::V4(link::GUEST_V4);
+    let ours = a.is_unspecified() || a.is_local();
     if !ours {
         return Err(EADDRNOTAVAIL);
     }
@@ -969,7 +972,7 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, addr: u64, len: u
         // UDP socket just to see the route. From now on datagrams come only
         // from there, to the address that route has (a v6 socket's v4
         // one shows as ::ffff:a.b.c.d), unless bind named one.
-        let ours = if to.is_loopback() { to.addr } else { Addr::V4(link::GUEST_V4) };
+        let ours = if to.is_local() { to.addr } else { inet::source_for(to.addr) };
         let u = udp_of(s);
         if !s.addr_bound {
             let port = s.bound.map_or(0, |b| b.port);
@@ -1227,7 +1230,7 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
                     Addr::V4([127, 0, 0, 1])
                 }
             }
-            _ => Addr::V4(link::GUEST_V4),
+            _ => to.addr,
         };
         let from = SockAddr { addr, port: local.port };
         // Nobody serving DNS here: the host's resolver answers, as it

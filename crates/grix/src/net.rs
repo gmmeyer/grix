@@ -298,6 +298,16 @@ fn host_v4() -> IpAddr {
     IpAddr::V4(Ipv4Addr::from(link::HOST_V4))
 }
 
+fn host_v6() -> IpAddr {
+    IpAddr::V6(Ipv6Addr::from(link::HOST_V6))
+}
+
+/// The guest's IPv6 network (`link::GUEST_V6`'s): nothing there but the
+/// guest and the host.
+fn in_guest_v6_net(ip: IpAddr) -> bool {
+    in_net(ip, IpAddr::V6(Ipv6Addr::from(link::GUEST_V6)), link::NET_V6_PREFIX)
+}
+
 /// The address the guest means. A v4-mapped v6 address is its v4 one, so
 /// it gets the same checks.
 fn ip_of(a: Addr) -> IpAddr {
@@ -324,7 +334,7 @@ fn guest_view(peer: SocketAddr) -> Option<(Addr, u16)> {
         return Some((Addr::V4(link::HOST_V4), peer.port()));
     }
     let own = [link::GUEST_V4, link::HOST_V4, link::DNS_V4].map(|a| IpAddr::V4(Ipv4Addr::from(a)));
-    if ip.is_unspecified() || own.contains(&ip) || peer.port() == 0 {
+    if ip.is_unspecified() || own.contains(&ip) || in_guest_v6_net(ip) || peer.port() == 0 {
         return None;
     }
     Some((addr_of(ip), peer.port()))
@@ -353,12 +363,16 @@ impl NetPolicy {
     fn check(&self, ip: IpAddr, port: u16, name: Option<&str>) -> Result<SocketAddr, String> {
         let rules = self.allow.as_deref().unwrap_or(&[]);
         // The host's own services: only for a rule naming exactly that.
-        if ip == host_v4() {
-            let explicit = rules
-                .iter()
-                .any(|r| r.port_ok(port) && (r.matches_name(link::HOST_NAME) || r.host == Pattern::Net(host_v4(), 32)));
+        if ip == host_v4() || ip == host_v6() {
+            let explicit = rules.iter().any(|r| {
+                r.port_ok(port)
+                    && (r.matches_name(link::HOST_NAME)
+                        || r.host == Pattern::Net(host_v4(), 32)
+                        || r.host == Pattern::Net(host_v6(), 128))
+            });
+            let loopback: IpAddr = if ip == host_v4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
             return if explicit {
-                Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+                Ok(SocketAddr::new(loopback, port))
             } else {
                 Err(format!("{ip}:{port} is the host itself; allow it with allow_host(\"{}:{port}\")", link::HOST_NAME))
             };
@@ -367,8 +381,13 @@ impl NetPolicy {
             return Err("DNS over TCP isn't supported".into());
         }
         // The guest's kernel connects its own address itself.
-        if ip == IpAddr::V4(Ipv4Addr::from(link::GUEST_V4)) {
+        if ip == IpAddr::V4(Ipv4Addr::from(link::GUEST_V4)) || ip == IpAddr::V6(Ipv6Addr::from(link::GUEST_V6)) {
             return Err(format!("{ip}:{port} is the guest's own address"));
+        }
+        // The rest of the guest's IPv6 network is no one (and not the
+        // host's own fd00::/64, if it has one).
+        if in_guest_v6_net(ip) {
+            return Err(format!("{ip}:{port} is on the guest's own network, where nothing is"));
         }
         reachable(self.allow.as_deref(), ip, port, name).map(|()| SocketAddr::new(ip, port))
     }
@@ -1365,6 +1384,9 @@ mod tests {
         assert_eq!(host.check(ip("10.0.2.2"), 8000, None), Ok("127.0.0.1:8000".parse().unwrap()));
         assert!(host.check(ip("10.0.2.2"), 8001, None).is_err());
         assert!(policy(&["10.0.2.2/32"]).check(ip("10.0.2.2"), 1, None).is_ok());
+        assert_eq!(host.check(ip("fd00::2"), 8000, None), Ok("[::1]:8000".parse().unwrap()));
+        assert!(open.check(ip("fd00::2"), 8000, None).is_err());
+        assert!(policy(&["fd00::2/128"]).check(ip("fd00::2"), 1, None).is_ok());
         // Broad rules don't open the host, special addresses or the guest.
         let broad = policy(&["0.0.0.0/0", "::/0"]);
         assert!(broad.check(ip("10.0.2.2"), 8000, None).is_err());
@@ -1373,6 +1395,9 @@ mod tests {
         assert!(broad.check(ip("127.0.0.1"), 80, None).is_err());
         assert!(broad.check(ip("fe80::1"), 80, None).is_err());
         assert!(broad.check(ip("10.0.2.15"), 80, None).is_err());
+        assert!(broad.check(ip("fd00::15"), 80, None).is_err());
+        assert!(broad.check(ip("fd00::7"), 80, None).is_err());
+        assert!(broad.check(ip("fd00:0:0:1::7"), 80, None).is_ok());
         assert!(broad.check(ip("1.1.1.1"), 443, None).is_ok());
         assert!(policy(&["169.254.169.254"]).check(ip("169.254.169.254"), 80, None).is_ok());
         assert!(policy(&["127.0.0.0/8"]).check(ip("127.0.0.1"), 80, None).is_ok());
