@@ -603,7 +603,10 @@ stops the whole process when it's sent (or delivered, if it was blocked):
 `smp::runs_here`) with its threads where they were; SIGCONT, whatever its
 action, continues it. `job_report` is for wait's WUNTRACED/WCONTINUED;
 `job_notice` is the parent's SIGCHLD, sent from `procs::reap_others`
-(which can reach the parent). Init stopping is an `Event::Stopped`.
+(which can reach the parent). Both wait for the last CPU to leave it
+(`Process::stopping`, `signal::stopped_all`, from `sched::schedule`): a
+thread runs on in user mode until its CPU's kick lands. Init stopping
+is an `Event::Stopped`.
 
 Terminals (`tty.rs`, `syscall/tty.rs`): a `Tty` is a pseudo-terminal
 pair, its line discipline Linux's N_TTY (`receive` for what the master

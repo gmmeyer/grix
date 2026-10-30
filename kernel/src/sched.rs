@@ -62,6 +62,9 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
         if p.exclusive_wanted && alone {
             crate::ipc::changed();
         }
+        if alone {
+            crate::signal::stopped_all(p);
+        }
     }
     // A timer interrupt that brought an idle CPU here (`irq` takes its own).
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);

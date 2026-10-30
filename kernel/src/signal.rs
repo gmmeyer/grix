@@ -297,15 +297,14 @@ pub static JOBS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// the scheduler passes it over until SIGCONT. Linux doesn't stop orphaned
 /// process groups for SIGTSTP, SIGTTIN and SIGTTOU; here nothing is
 /// orphaned (the host stands for the shell init was started from).
+/// The parent hears of it once no thread runs (`stopped_all`): until a
+/// CPU's kick lands, its thread is still in user mode.
 fn stop(p: &mut Process, sig: u32) {
     if p.stopped {
         return;
     }
     p.stopped = true;
-    let status = 0x7f | (sig as i32) << 8;
-    p.job_report = Some(JobReport::Stopped(sig));
-    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, status));
-    JOBS.store(true, Ordering::Relaxed);
+    p.stopping = Some(sig);
     if p.pid == crate::process::INIT {
         crate::console::event(&grix_abi::wire::Event::Stopped { signal: sig });
     }
@@ -315,6 +314,19 @@ fn stop(p: &mut Process, sig: u32) {
     }
     crate::smp::kick_others(p.pid);
     crate::sched::timer_changed();
+    if !p.running && crate::smp::alone(p.pid) {
+        stopped_all(p);
+    }
+}
+
+/// The last of a stopping process's threads has left its CPU (Linux's last
+/// thread in do_signal_stop): tell the parent.
+pub fn stopped_all(p: &mut Process) {
+    let Some(sig) = p.stopping.take() else { return };
+    let status = 0x7f | (sig as i32) << 8;
+    p.job_report = Some(JobReport::Stopped(sig));
+    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, status));
+    JOBS.store(true, Ordering::Relaxed);
     // A parent's wait4 looks again.
     crate::ipc::changed();
 }
@@ -332,8 +344,11 @@ fn resume(p: &mut Process) {
         return;
     }
     p.stopped = false;
+    // Continued before every thread had stopped: as Linux, wait says it
+    // continued and SIGCHLD that it stopped.
+    let status = p.stopping.take().map_or(0xffff, |sig| 0x7f | (sig as i32) << 8);
     p.job_report = Some(JobReport::Continued);
-    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, 0xffff));
+    p.job_notice = Some(SigInfo::child(SIGCHLD, p.pid, p.uid, status));
     JOBS.store(true, Ordering::Relaxed);
     if p.pid == crate::process::INIT {
         crate::console::event(&grix_abi::wire::Event::Continued);

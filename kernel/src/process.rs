@@ -384,6 +384,9 @@ pub struct Process {
     /// Stopped by a stop signal (job control): none of its threads run
     /// until SIGCONT (`sched::runnable`).
     pub stopped: bool,
+    /// The stop signal, while threads of a stopped process still run on
+    /// other CPUs (`signal::stopped_all`).
+    pub stopping: Option<u32>,
     /// The last stop or continue, until a wait4/waitid with WUNTRACED or
     /// WCONTINUED reports it.
     pub job_report: Option<JobReport>,
@@ -541,6 +544,7 @@ impl Process {
             membarrier_registered: 0,
             uses_signalfd: false,
             stopped: false,
+            stopping: None,
             job_report: None,
             job_notice: None,
             ctty: None,
