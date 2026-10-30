@@ -67,7 +67,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     bound to paths, abstract names, datagrams, seqpackets and SCM_RIGHTS.
     UDP port forwarding (`forward_udp`, `-p 5353:53/udp`): replies leave
     from the forwarded port, only to its recent senders. Left: datagrams
-    over one frame (~4 KiB), SO_PASSCRED.
+    over one frame (~4 KiB).
 14. [x] **Smaller syscalls**: `/proc/<pid>` for every process (`ps`),
     zombies included until they're reaped, pidfds (`pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`,
     `CLONE_PIDFD`, `waitid(P_PIDFD)`, polling), CPU-time timers
@@ -201,8 +201,8 @@ Left, in order of impact:
     default route via 10.0.2.2, in netlink (links, addresses, the main
     table's routes), the interface ioctls, `/proc/net/dev`,
     `/proc/net/route` and `/sys/class/net/eth0`. No device: the host's
-    proxy still carries and checks every connection. Left: an IPv6
-    address on it, counters.
+    proxy still carries and checks every connection. IPv6 too since
+    round 4 (below). Left: counters.
 
 ### Round 4 (2026-10-30): popular software again (COMPAT.md, round 2)
 
@@ -226,33 +226,77 @@ step that runs out of room saying so. Left, in order of impact:
     (`mm::pageindex`). grix-vmm asks Hypervisor.framework for a bigger
     IPA when it needs one. The boot image (imports) must still fit below
     4 GiB.
-32. [ ] **More than 1024 threads** (`process::MAX_THREADS`, all
-    processes; `threads-max` says so). ClickHouse warns about it, and a
-    busy JVM or Go server could reach it. Each thread is a few KiB of
-    kernel heap (its `Thread`, x86_64's boxed XSAVE area, its
-    `/proc/<pid>/task` nodes): raising it means a budget from
-    `kmem` per thread instead of a count, and a bigger kernel heap.
-33. [ ] **`SO_PASSCRED` on streams**: credentials go with datagram and
-    seqpacket messages only (on a stream, or a socket not yet connected,
-    it's reported). Streams would need them per write, kept beside the
-    bytes as SCM_RIGHTS' descriptors are (`Pipe::rights`), and reads
-    stopping where the sender changes, as Linux's do.
-34. [ ] **Landlock** (`landlock_create_ruleset`, reported; Chromium
-    probes it and goes on). A sandbox's own further restriction, like
-    seccomp: rulesets of path and port rights checked in `Fs::walk` and
-    connect/bind. Until then, EOPNOTSUPP ("disabled at boot") would be
-    an honest, quiet answer.
-35. [ ] `/proc/<pid>/task/<tid>`'s files are the process's (grix keeps
-    names, times and state per process): per-thread comm (PR_SET_NAME,
-    writes to `comm`) and CPU times would make `top -H` right.
-36. [ ] Smaller misses Chromium reports: `SIOCETHTOOL` on eth0, a
-    `NETLINK_KOBJECT_UEVENT` socket (udev). Both are optional to it.
-37. [ ] `splice` and `tee` (Go copies between pipes and sockets with
-    them and falls back; the Datadog Agent reports it), and
-    `/proc/<pid>/mem` (cilium/ebpf's kernel version probe in Datadog's
-    system-probe, debuggers): `pread`/`pwrite` at virtual addresses
-    through `uaccess`, only for the process itself or one it may
-    inspect.
+30. [x] **IPv6 on `eth0`** (what round 3's item 30 left): with `net`,
+    `fd00::15/64`, a unique local address (`link::GUEST_V6`, the layout
+    slirp4netns and Podman use), in netlink (addresses; the prefix route,
+    `::1`'s and the default one via `fd00::2`), `/proc/net/if_inet6`,
+    `/proc/net/ipv6_route` and `/etc/hosts`. Programs that ask
+    getaddrinfo with `AI_ADDRCONFIG` before listening on `[::]`
+    (ClickHouse) now do; ClickHouse then finds `0.0.0.0` taken by `[::]`,
+    as under Docker with IPv6, which its `listen_try` makes a warning.
+    The proxy carries IPv6 connections where the host can make them, and
+    the route to a global address leaves from the ULA (getsockname), so
+    RFC 6724's sorting (glibc, musl, Go: fc00::/7's label differs from
+    2000::/3's, while an IPv4 destination's matches its source) still
+    tries IPv4 first: the address doesn't make anything prefer a route
+    the host may not have. `fd00::2` is the host's own loopback when
+    named (`allow_host("fd00::2")`, as `10.0.2.2`); the rest of
+    `fd00::/64` is refused. No link-local address (nothing could use it).
+32. [x] **More than 1024 threads**: each thread takes its kernel state
+    from `kmem` (`process::THREAD_COST`: its `Thread` twice over, as
+    B-tree nodes filled in order stay half full, x86_64's XSAVE box, its
+    `/proc/<pid>/task/<tid>` nodes, which no longer count against file
+    metadata). The heap grows by 1/16 of RAM (at most 128 MiB) from the
+    top of RAM: half for that budget, half for the holes thousands of
+    small allocations leave (measured: 15 MiB free in 30,000 pieces once
+    6,000 threads had gone, none big enough for a pipe's buffer).
+    threads-max (and `pids.max`) is what the budget's share holds: 4405
+    at 512 MiB and 17623 from 2 GiB on (the share stops at 128 MiB) on
+    arm64, fewer on x86_64. clone and
+    fork fail with EAGAIN at either limit (the `threadmax` fixture).
+    Left: ClickHouse still warns below 30,000; a thread's task directory
+    is still real nodes (Linux makes them on lookup), whose slots stay
+    allocated for reuse.
+33. [x] **`SO_PASSCRED` on streams**: a stream's pipe keeps a run per
+    writer (`Pipe::creds`, at most `MAX_CRED_RUNS`, charged); reads with
+    SO_PASSCRED stop where the writer changes and carry SCM_CREDENTIALS,
+    sendmsg's SCM_CREDENTIALS names the writer, and the option set before
+    connect, or on a listener, stays.
+34. [~] **Landlock**: EOPNOTSUPP from all three calls, unreported, as
+    Linux with Landlock disabled at boot (Chromium goes on). The real
+    thing, as seccomp is done: a per-thread domain (an `Arc` chain of
+    layers like `seccomp::State`, kept across fork, clone and execve,
+    only ever added to); `landlock_create_ruleset` an fd holding the
+    handled access (ABI 4: filesystem rights through TRUNCATE,
+    `BIND_TCP` and `CONNECT_TCP`; unknown bits EINVAL; the version
+    query); `landlock_add_rule` with PATH_BENEATH (the parent fd's node,
+    pinned so its slot isn't reused) and NET_PORT; `restrict_self`
+    needing no_new_privs (nobody has CAP_SYS_ADMIN). Checks: every layer
+    that handles an access must have a rule granting it on the node or
+    an ancestor, in every path operation (open's read, write, truncate
+    and directory listing, execve, create by type, unlink and rmdir,
+    rename and link with REFER, truncate, bind on a path), and TCP bind
+    and connect by port; EACCES, never reported as denied (the policy
+    didn't refuse: the program did). About a thousand lines with tests;
+    worth it when a program needs it to start, not as an option.
+35. [x] `/proc/<pid>/task/<tid>`: each thread's own name (`Thread::name`:
+    PR_SET_NAME, `pthread_setname_np`, writes to its `comm` by the
+    process's own threads, EINVAL from others), state (stopped, waiting,
+    or running), signals and CPU time. A fork is named as the thread that
+    made it, a thread as its creator.
+36. [x] `SIOCETHTOOL`: eth0 answers as a container's veth (driver info,
+    link up, 10 Gb/s full duplex, the permanent address), lo only its
+    link; changes EPERM, the rest EOPNOTSUPP. A `NETLINK_KOBJECT_UEVENT`
+    socket binds and hears nothing; what's sent to it gets EPERM back.
+37. [x] `splice`, `tee`, `vmsplice` (copies, a chunk per call: nothing
+    taken from a socket is lost to a full pipe), F_SETPIPE_SZ, and
+    `/proc/<pid>/mem` for the process itself (EIO where unmapped or
+    read-only: no FOLL_FORCE; another's EACCES, and a descriptor
+    inherited across fork EIO).
+
+Also found in the re-runs: Chromium writes `/proc/<pid>/oom_score_adj`
+for its renderers (EACCES, logged): a per-process value that may only go
+up without CAP_SYS_RESOURCE would do.
 
 ## Agent integrations
 
@@ -411,9 +455,9 @@ step that runs out of room saying so. Left, in order of impact:
 - [x] Real file timestamps from the host (make, build caches). Everything
       shows boot time today.
       Imports carry the host's mtime (atime and ctime start there too), and files the program changes get real times.
-- [~] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
+- [x] `sendfile`/`copy_file_range`/`splice`/`tee`. Python `shutil.copyfile`,
       web servers serving static files.
-      `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice` and `tee` are missing.
+      `sendfile` works between files and to stdout/stderr, and `copy_file_range` between files. `splice`, `tee` and `vmsplice`: round 4, item 37.
 - [ ] `openat2`, `name_to_handle_at` (newer tools).
 - [x] `memfd_create`, `/dev/shm` (`shm_open`, POSIX semaphores, multiprocessing).
       `memfd_create` works with seals and needs no `fs_write`. `/dev/shm` is a writable 1777 directory.
@@ -481,8 +525,9 @@ step that runs out of room saying so. Left, in order of impact:
       No capability needed: it only reports `lo`. Interface ioctls (`if_nametoindex`) and `/proc/net/dev` work too, and changing interfaces gets EPERM.
 - [x] AF_UNIX sockets bound to filesystem paths (bind/listen/accept/connect),
       abstract names, datagrams and seqpackets, `SO_PEERCRED`, `SCM_RIGHTS`.
-      Left: `SO_PASSCRED`/`SCM_CREDENTIALS` on receive; a descriptor passed
-      through its own socket stays open (Linux collects those cycles).
+      `SO_PASSCRED`/`SCM_CREDENTIALS` on messages and streams. Left: a
+      descriptor passed through its own socket stays open (Linux collects
+      those cycles).
 - [x] A fast host transport. virtio-console (port 1 of a
       `virtio-serial-device`) carries the framed channel. Networking adds
       `link` messages there.
@@ -519,8 +564,9 @@ step that runs out of room saying so. Left, in order of impact:
       only "unsupported unknown".
 - [x] glibc dynamic executables (Debian/Ubuntu arm64): see round 2, item 9.
 - [ ] `AT_HWCAP2`, `AT_MINSIGSTKSZ`; `HWCAP_CPUID` with emulated ID-register reads.
-- [ ] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
-      and ignore, or implement.
+- [~] `seccomp`/Landlock self-sandboxing (Chrome, systemd services): accept
+      and ignore, or implement. seccomp filters work; Landlock is
+      EOPNOTSUPP (round 4, item 34, with the design).
 - [x] More `prctl` options (`PR_SET_CHILD_SUBREAPER`, `PR_GET_TID_ADDRESS`, …).
       Unknown options are reported as unimplemented.
 - [ ] Newer syscalls as programs need them (`futex_waitv`, …).

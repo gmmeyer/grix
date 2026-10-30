@@ -330,7 +330,8 @@ fn network_interfaces_with_net() {
     // IPv4 still comes first for a name with both (RFC 6724: the ULA's
     // label doesn't match a global address's).
     let hosts = "2001:db8::7\tdual.example\n192.0.2.7\tdual.example\n";
-    let out = run(with("netif").allow(Capability::Net).file("/etc/hosts", hosts, 0o644).unwrap(), &["/bin/netif", "dual"]);
+    let out =
+        run(with("netif").allow(Capability::Net).file("/etc/hosts", hosts, 0o644).unwrap(), &["/bin/netif", "dual"]);
     assert_eq!(out.stdout_str(), "netif dual ok\n");
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);

@@ -370,7 +370,8 @@ impl NetPolicy {
                         || r.host == Pattern::Net(host_v4(), 32)
                         || r.host == Pattern::Net(host_v6(), 128))
             });
-            let loopback: IpAddr = if ip == host_v4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
+            let loopback: IpAddr =
+                if ip == host_v4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
             return if explicit {
                 Ok(SocketAddr::new(loopback, port))
             } else {

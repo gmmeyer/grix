@@ -183,7 +183,13 @@ socket is a `unix::Sock`, found by name in `unix::NAMES` (a path is an
 `fs::Kind::Socket` node whose id is the key, so a reused inode can't be
 reached). Descriptors passed with SCM_RIGHTS are `unix::Rights` (at most
 `MAX_INFLIGHT`), attached to a message or to a stream's byte position
-(`Pipe::rights`); reads stop at them.
+(`Pipe::rights`); reads stop at them. A stream's pipe also keeps who
+wrote what (`Pipe::creds`, a run per writer, at most `MAX_CRED_RUNS`):
+with SO_PASSCRED (`StreamInfo::passcred`, inherited from a listener)
+reads stop where the writer changes and carry SCM_CREDENTIALS.
+splice, tee and vmsplice (`syscall/splice.rs`) copy a chunk at a time,
+looking at the source first and consuming only what the destination
+took.
 
 Networking (`inet.rs`, the AF_INET part of `syscall/net.rs`, host side in
 `crates/grix/src/net.rs` and `dns.rs`, messages in `crates/abi/src/link.rs`):
@@ -214,11 +220,16 @@ Restoring a snapshot forgets them. The guest is 10.0.2.15, the host's own loopba
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.
 Interface listings (`netlink.rs`: netlink, the `SIOCGIF*` ioctls,
-`/proc/net/dev` and `route`; `procfs::ETH0_FILES` for
-`/sys/class/net/eth0`) show `lo`, and with `net` also `eth0`
-(10.0.2.15/24, a made-up MAC, the default route via 10.0.2.2), set at
-boot (`netlink::init`). It's no device: a description of what the
-proxy does, which still decides what sockets reach.
+`SIOCETHTOOL`, `/proc/net/dev`, `route`, `if_inet6` and `ipv6_route`;
+`procfs::ETH0_FILES` for `/sys/class/net/eth0`) show `lo`, and with
+`net` also `eth0` (10.0.2.15/24 and `link::GUEST_V6`, fd00::15/64, a
+made-up MAC, the default routes via 10.0.2.2 and fd00::2), set at boot
+(`netlink::init`). It's no device: a description of what the proxy
+does, which still decides what sockets reach. The IPv6 address is a
+ULA on purpose: a connection to a global address leaves from it
+(`inet::source_for`), and RFC 6724 then sorts IPv4 first; fd00::2 is
+the host's loopback as 10.0.2.2 is, and the rest of fd00::/64 nobody.
+A NETLINK_KOBJECT_UEVENT socket (`Netlink::uevent`) hears nothing.
 
 Live mounts (`hostfs.rs` in the kernel and in `crates/grix/src`, messages
 in `crates/abi/src/hostfs.rs`): directories the host serves while the
@@ -302,7 +313,18 @@ anything). They only matter inside the guest filesystem: root bypasses
 mode bits but not `Node::system`, and nothing honours setuid bits, so
 keep it that way rather than giving uid 0 anything else.
 
-Threads (`sched.rs`): one kernel stack per CPU (`arch::stack`'s
+Threads (`sched.rs`): each takes `process::THREAD_COST` from `kmem`
+for as long as it lives (its `Thread`, x86_64's FP box, its
+`/proc/<pid>/task/<tid>` nodes, which are `prepaid` and stay out of the
+metadata budget); `process::threads_max` is what the heap's share of
+RAM gives (`mm::init`: the heap is 32 MiB plus 1/16 of RAM, at most 128
+MiB more, from the top of the highest RAM region, half of that for
+`kmem`, half for fragmentation), and clone
+and fork fail with EAGAIN at either. A thread has its own name
+(`Thread::name`, zeros meaning the process's, `Process::name` being the
+main thread's), state and CPU time in its task directory, whose
+entries come and go one at a time (`fs::task_changed`). One kernel
+stack per CPU (`arch::stack`'s
 `STACK_SIZE`, which the linker scripts and assembly take from there),
 with that CPU's emergency stack below it. There's no guard page (4 KiB
 mappings there cost contended system calls a fifth of their speed):
@@ -532,9 +554,11 @@ call has to run to make it. A filter can only take away: what it
 refuses isn't a denial and isn't reported, but a kill is (a `Fault`).
 TRAP leaves the registers as they were and forces SIGSYS
 (`signal::force`: fatal if blocked or ignored) with `si_syscall`,
-`si_arch` and the data in `si_errno`. Programs are checked as Linux's
-`bpf_check_classic` and `seccomp_check_filter` check them (only
-forward jumps, so a run ends within its length). TSYNC writes the
+`si_arch` and the data in `si_errno`. Landlock, the other way a
+program restricts itself, answers EOPNOTSUPP to every call (Linux with
+it disabled at boot), unreported; TODO.md item 34 has the design.
+Programs are checked as Linux's `bpf_check_classic` and
+`seccomp_check_filter` check them (only forward jumps, so a run ends within its length). TSYNC writes the
 other threads' state directly: one running on another CPU is in user
 mode and sees it at its next call. User notification is unimplemented
 (reported).
@@ -651,7 +675,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    that can make a blocked I/O call succeed (data, space, closing an end,
    epoll_ctl) must call `ipc::changed()`, or waiters will sleep forever. IRQs
    stay masked in the kernel; don't unmask them.
-10. **The kernel heap is small (32 MiB) and running out of it panics.**
+10. **The kernel heap is small (32 MiB, and 1/16 of RAM: `mm::init`) and
+    running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
     fails with an errno first. Nothing that grows with RAM goes on the
     heap: frame reference counts are RAM set aside below the boot image
@@ -668,7 +693,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       has them) before anything fails.
     - Counts are capped: mappings (`MAX_VMAS`, and `MAX_VMAS_TOTAL` for
       all processes), queued real-time signals, inotify watches, POSIX
-      timers, threads (all processes), descriptors (RLIMIT_NOFILE, at
+      timers, threads (all processes, `process::threads_max`, and each
+      charged `THREAD_COST` to `kmem`), descriptors (RLIMIT_NOFILE, at
       most `fd::MAX_FDS`; a table's slots take a `kmem::Charge`, so
       fork's copies are budgeted too), open files
       (`MAX_OPEN_FILES`, all processes), processes (`MAX_PROCESSES`,
@@ -704,7 +730,9 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
     wait, `finalize`) must not touch its user memory, unless it activates
     that address space first and switches back (fork's `CLONE_CHILD_SETTID`).
     A process that ended keeps its address space until another process is
-    switched in: never free the active one.
+    switched in: never free the active one. `/proc/<pid>/mem`
+    (`FileKind::ProcMem`) is the caller's own memory only: another's
+    can't be opened, and one inherited across fork reads EIO.
 
 ## Adding a syscall
 

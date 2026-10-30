@@ -98,7 +98,7 @@ are new:
 | Program | Version | Image | What ran | Caps | Result | Events and warnings | Fix |
 |---|---|---|---|---|---|---|---|
 | MySQL | 8.4.13 | `mysql:8.4` | `docker-entrypoint.sh mysqld` (initialize, temporary server, real one), client: database, table, rows | n t p w | works | MySQL's own warnings (an empty root password during init, a self-signed CA, `/var/run/mysqld` world-accessible), as under Docker. | |
-| ClickHouse | 25.8.33.6 | `clickhouse/clickhouse-server:25.8` | `clickhouse server`; MergeTree table, a million rows, `sum` | n t p w, 3 GiB, 4 CPUs | works | `get_mempolicy` unimplemented (reported). Warns that `threads-max` (1024: grix's limit for all processes) is low, and that `[::]` listeners fail with "Address family not supported": the guest has no IPv6 address but `::1`, so `getaddrinfo` with `AI_ADDRCONFIG` gives no IPv6 address, as in a Docker container without IPv6. | NUMA policies |
+| ClickHouse | 25.8.33.6 | `clickhouse/clickhouse-server:25.8` | `clickhouse server`; MergeTree table, a million rows, `sum` | n t p w, 3 GiB, 4 CPUs | works | `get_mempolicy` unimplemented (reported). Warned that `threads-max` (1024: grix's limit for all processes) is low, and that `[::]` listeners fail with "Address family not supported": the guest had no IPv6 address but `::1`, so `getaddrinfo` with `AI_ADDRCONFIG` gave no IPv6 address, as in a Docker container without IPv6. Since (0.0.45): it listens on `[::]` (and finds `0.0.0.0` taken by it, as under Docker with IPv6: a warning, by `listen_try`); `threads-max` is 17623 at 3 GiB, still under the 30,000 it wants; "Cannot get pipe capacity" (F_GETPIPE_SZ) is gone. | NUMA policies |
 | Valkey | 8.1.11 | `valkey/valkey:8-alpine` | SET/GET, BGSAVE, INFO | n t p w | works | Warned about `vm.overcommit_memory`, as Redis did. | overcommit |
 | DuckDB | 2.0.0 | `python:3.12-slim` + pip | a million-row aggregate, a table | t w | works | | |
 | Envoy | 1.34.14 | `envoyproxy/envoy:v1.34-latest` | a listener with a direct response, curl from the host through `-p` | n t p w | works | Its own warning about no connection limit. | |
@@ -118,7 +118,7 @@ are new:
 | Consul | 2.1.0 | `hashicorp/consul` | `consul agent -dev`, KV put/get, members | n t p w | works | | |
 | Vault | 2.2.1 | `hashicorp/vault` | `vault server -dev`, KV put/get | n t p w | works | | |
 | Grafana | 13.3.0 | `grafana/grafana` | `/run.sh`, health and search APIs from the host | n t p w, 2 GiB | works | Its background plugin installs ran out of room ("no space left on device"): files live in guest memory. | |
-| Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it goes on), and GPU initialisation fails as in any container without a GPU. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
+| Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left after round 2: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it went on). Since (0.0.45): none reported (Landlock is EOPNOTSUPP, as disabled at boot); it still logs that it can't raise its renderers' `oom_score_adj`, and GPU initialisation fails as in any container without a GPU. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
 | MinIO | | `minio/minio`, `quay.io/minio/minio` | | | not tried | MinIO no longer publishes public images (Docker Hub: 404; quay.io: unauthorized). | |
 
 Caps as above; "3 GiB" is `--mem 3072`, which was the most a guest
@@ -139,6 +139,7 @@ In round 2 (each with its check in `popular.c`, or a test of its own):
 | `prctl`: `PR_SET_MM` EPERM, SVE's EINVAL, unknown options EINVAL, quietly | Alpine's JDK (Kafka, Temurin), Chromium, OpenSearch |
 | `/proc/<pid>/task/<tid>` | headless Chromium, `ps -L`, psutil |
 | `SO_PASSCRED` and `SCM_CREDENTIALS` on message sockets | headless Chromium |
+| Since (0.0.45): IPv6 on `eth0`, threads by a kernel memory budget, `SO_PASSCRED` on streams, per-thread `/proc`, `SIOCETHTOOL`, udev's netlink socket, Landlock's EOPNOTSUPP, `splice`/`tee`/`vmsplice`, `F_SETPIPE_SZ`, `/proc/self/mem` | ClickHouse, headless Chromium, Go's socket copies, the Datadog Agent and system-probe, `top -H` |
 | `capset` that drops every capability (there are none) succeeds; raising one is still denied | headless Chromium |
 | `grix run -e KEY` passes the host's value of KEY, as Docker's does | secrets such as the Datadog API key stay off the command line |
 | A build step that runs out of room says so, and how to ask for more (`memory_mb`) | `apk add chromium` (a bare "Signaled(7)" before) |
@@ -175,21 +176,22 @@ images from registries, run on their own machine).
 
 In order of impact (details in TODO.md):
 
-1. **1024 threads in all** (`process::MAX_THREADS`, and
-   `/proc/sys/kernel/threads-max` says so): ClickHouse warns, and a busy
-   JVM or ClickHouse server could reach it.
-2. **`splice`** is still unimplemented (Go and others fall back; it's
-   reported), and so is **`/proc/self/mem`** (cilium/ebpf's version
-   probe in Datadog's system-probe).
-3. **No IPv6 address on `eth0`**: programs that listen on `[::]` with
-   `AI_ADDRCONFIG` (ClickHouse) skip it, as in a container without IPv6.
-4. **`SO_PASSCRED` on streams**: credentials come only with datagram and
-   seqpacket messages (reported for streams).
-5. **Landlock, ethtool, udev's netlink**: reported by Chromium, which
-   goes on without them.
+1. **threads-max scales with RAM** (each thread's kernel state comes
+   out of a budget that is a share of RAM, at most 64 MiB of it): 4405
+   at 512 MiB, 17623 from 2 GiB on. ClickHouse still warns below 30,000.
+2. **No Landlock**: EOPNOTSUPP, as on a Linux with it disabled at boot
+   (Chromium goes on without it). The design is in TODO.md.
+3. **`oom_score_adj` is read-only** (Chromium logs it for each renderer).
 
-Done since: guests up to 64 GiB (`grix_abi::image::MAX_RAM`), so files
-and heaps past 3 GiB fit. Done in earlier rounds: Linux AIO (io_uring stays ENOSYS on purpose:
+Done since (0.0.45, TODO.md's items 30 and 32 to 37): an IPv6
+address on `eth0` (a ULA, so IPv4 is still tried first for anything
+global), threads beyond 1024, `SO_PASSCRED` on streams, per-thread
+`/proc/<pid>/task/<tid>` (names, state, CPU time), `SIOCETHTOOL` and
+udev's netlink socket, `splice`, `tee`, `vmsplice`, `F_SETPIPE_SZ` and
+`/proc/self/mem`. And in 0.0.43: guests up to 64 GiB
+(`grix_abi::image::MAX_RAM`), so files and heaps past 3 GiB fit.
+
+Done in earlier rounds: Linux AIO (io_uring stays ENOSYS on purpose:
 a second way into every operation, each needing its own gate, and
 blocked by Docker's default seccomp profile too, so programs fall back),
 seccomp filters, and reading ID registers from EL0.

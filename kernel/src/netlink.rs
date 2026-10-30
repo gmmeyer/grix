@@ -438,7 +438,8 @@ struct Route6 {
 fn routes6() -> Vec<Route6> {
     let mut v = Vec::new();
     if eth0() {
-        let net = Route6 { dst: ETH0_NET6, dst_len: link::NET_V6_PREFIX, gateway: None, metric: METRIC_PREFIX6, dev: &ETH0 };
+        let net =
+            Route6 { dst: ETH0_NET6, dst_len: link::NET_V6_PREFIX, gateway: None, metric: METRIC_PREFIX6, dev: &ETH0 };
         v.push(net);
     }
     v.push(Route6 { dst: crate::inet::LOOPBACK_V6, dst_len: 128, gateway: None, metric: METRIC_PREFIX6, dev: &LO });

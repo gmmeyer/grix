@@ -113,9 +113,10 @@ over the Unix socket, and five traces:
   from a cloud provider's metadata (EC2's IMDS here, which the allow-list
   denies), not from the interfaces, so it's expected outside a cloud.
 
-What it still reports: `splice` (unimplemented, Go falls back), `bpf`
-denied, `/proc/self/mem` missing (system-probe's kernel version probe),
-and the cloud metadata and `_grpc_config.localhost` lookups the
+What it still reported in that run: `splice` (unimplemented, Go falls
+back), `bpf` denied, `/proc/self/mem` missing (system-probe's kernel
+version probe; both are there since 0.0.45, not re-run with the Agent
+yet), and the cloud metadata and `_grpc_config.localhost` lookups the
 allow-list denies. system-probe-lite now warns that `CAP_DAC_READ_SEARCH`
 and `CAP_SYS_PTRACE` aren't in its permitted set, as in an unprivileged
 container: dropping capabilities works (there are none), and only
@@ -185,16 +186,17 @@ see below.
   interface ioctls, `/proc/net/dev`, `/proc/net/route`,
   `/sys/class/net/eth0`), with no device behind it: traffic still goes
   through the host's proxy. gohai and the network check see it.
-- **`splice` (76).** Go uses it for pipe and socket copies and falls back
-  on ENOSYS, so the only cost is an `unsupported` event and a slower
-  copy. A pipe-to-anything `splice` through a bounce buffer is moderate
-  work. `sendfile` covers only files today.
+- **`splice` (76)** (done since, 0.0.45): Go used it for pipe and socket
+  copies and fell back on ENOSYS, at the cost of an `unsupported` event
+  and a slower copy. It's a copy through a kernel buffer now, as are
+  `tee` and `vmsplice`.
 - **`mrs` from EL0** (done since): reads of the `ID_AA64*` registers
   are emulated as Linux's `HWCAP_CPUID` does, with values that agree
   with HWCAP.
-- **`/proc/self/mem`** for the process's own memory (`pread` and
-  `pwrite` at virtual addresses through `uaccess`). Debuggers, cilium's
-  version probe and some JITs use it.
+- **`/proc/self/mem`** (done since, 0.0.45) for the process's own memory
+  (`pread` and `pwrite` at virtual addresses through `uaccess`; another
+  process's is refused). Debuggers, cilium's version probe and some JITs
+  use it.
 - **`*.localhost` names.** gRPC looks up the `_grpc_config.localhost`
   TXT record. That goes to the host's resolver, and the allow-list
   denies it, which shows up as a `denied` event. RFC 6761 lets the
