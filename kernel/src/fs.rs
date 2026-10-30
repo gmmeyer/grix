@@ -824,6 +824,8 @@ static FS: Mutex<Option<Fs>> = Mutex::new(None);
 enum Later {
     /// /proc/<pid> goes (`true`), or stays as a zombie's (`false`).
     Proc(u32, bool),
+    /// /proc/<pid>/task lists these threads now.
+    Tasks(u32, Vec<u32>),
     /// /dev/pts/N goes (its master closed).
     PtsHide(u32),
 }
@@ -849,6 +851,12 @@ pub fn proc_gone(pid: u32) {
 /// reaped (`proc_gone`), as on Linux, with what a zombie still has.
 pub fn proc_zombie(pid: u32) {
     later(Later::Proc(pid, false));
+}
+
+/// Process `pid`'s threads are now `tids`: its /proc/<pid>/task follows
+/// (now, or once the filesystem is free).
+pub fn tasks_changed(pid: u32, tids: Vec<u32>) {
+    later(Later::Tasks(pid, tids));
 }
 
 /// Pseudo-terminal `index`'s master closed: /dev/pts/N goes (now, or once
@@ -1206,6 +1214,8 @@ impl Fs {
             }
             let fd = self.add_node(dir, "fd", Kind::Dir(BTreeMap::new()), 0o500, owner)?;
             self.fd_dirs.insert(fd, pid);
+            let task = self.add_node(dir, "task", Kind::Dir(BTreeMap::new()), 0o555, owner)?;
+            self.task_add(task, pid, pid, owner)?;
             for (name, target) in [("exe", exe), ("cwd", cwd), ("root", "/")] {
                 self.add_node(dir, name, Kind::Symlink(target.into()), 0o777, owner)?;
             }
@@ -1213,6 +1223,46 @@ impl Fs {
         })();
         if made.is_err() {
             self.proc_remove(pid);
+        }
+    }
+
+    /// /proc/<pid>/task/<tid>: what Linux shows of each thread, here the
+    /// process's own files (`procfs::TASK_FILES`). Threads are counted by
+    /// the task directory's link count (Chromium's single-thread check).
+    fn task_add(&mut self, task: Ino, pid: u32, tid: u32, owner: (u32, u32)) -> Result<(), Errno> {
+        let dir = self.add_node(task, &alloc::format!("{tid}"), Kind::Dir(BTreeMap::new()), 0o555, owner)?;
+        self.dir_pids.insert(dir, pid);
+        for &(name, file) in procfs::TASK_FILES {
+            self.add_node(dir, name, Kind::Proc(file), 0o444, owner)?;
+        }
+        Ok(())
+    }
+
+    /// Make /proc/<pid>/task list `tids`. Without room for a thread's
+    /// directory (the metadata budget), it isn't listed.
+    fn tasks_set(&mut self, pid: u32, tids: &[u32]) {
+        let Some(&dir) = self.pid_dirs.get(&pid) else { return };
+        let Some(task) = self.child(dir, "task") else { return };
+        let (owner, Kind::Dir(children)) = ((self.nodes[task].uid, self.nodes[task].gid), &self.nodes[task].kind)
+        else {
+            return;
+        };
+        let shown: Vec<(String, Ino)> = children.iter().map(|(n, &i)| (n.clone(), i)).collect();
+        for (name, child) in shown {
+            if !name.parse().is_ok_and(|tid: u32| tids.contains(&tid)) {
+                self.dir_pids.remove(&child);
+                self.remove_tree(child);
+                if let Kind::Dir(children) = &mut self.nodes[task].kind {
+                    children.remove(&name);
+                }
+                release(entry_cost(&name));
+                self.drop_name(child);
+            }
+        }
+        for &tid in tids {
+            if self.child(task, &alloc::format!("{tid}")).is_none() {
+                let _ = self.task_add(task, pid, tid, owner);
+            }
         }
     }
 
@@ -1262,6 +1312,7 @@ impl Fs {
                         self.zombie_dirs.insert(dir);
                     }
                 }
+                Later::Tasks(pid, tids) => self.tasks_set(pid, &tids),
                 Later::PtsHide(index) => self.pts_hide(index),
             }
         }
@@ -1285,6 +1336,7 @@ impl Fs {
         let Kind::Dir(children) = &mut self.nodes[dir].kind else { return };
         for (name, child) in core::mem::take(children) {
             self.fd_dirs.remove(&child);
+            self.dir_pids.remove(&child);
             self.remove_tree(child);
             release(entry_cost(&name));
             self.drop_name(child);

@@ -2085,6 +2085,12 @@ fn prctl_options_linux_refuses() {
 }
 
 #[test]
+fn proc_pid_task() {
+    // Chromium's zygote counts its threads by /proc/self/task's links.
+    popular(with("popular").allow(Capability::Threads), &["tasks"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

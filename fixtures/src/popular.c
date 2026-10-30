@@ -985,6 +985,51 @@ static int prctls(void) {
     return 0;
 }
 
+// /proc/<pid>/task: a directory per thread. Chromium's zygote checks that
+// it's alone by the link count (2 + threads); ps -L and psutil list it.
+static pthread_mutex_t task_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *task_park(void *arg) {
+    *(pid_t *)arg = gettid();
+    pthread_mutex_lock(&task_mu);
+    pthread_mutex_unlock(&task_mu);
+    return NULL;
+}
+
+static int task_count(void) {
+    struct stat st;
+    if (stat("/proc/self/task", &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    for (struct dirent *e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return st.st_nlink == (nlink_t)n + 2 ? n : -1;
+}
+
+static int tasks(void) {
+    CHECK(task_count() == 1);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", getpid());
+    CHECK(slurp(path) > 0 && atoi(buf) == getpid());
+    pthread_mutex_lock(&task_mu);
+    pthread_t t[2];
+    volatile pid_t tid[2] = {0, 0};
+    for (int i = 0; i < 2; i++) CHECK(pthread_create(&t[i], NULL, task_park, (void *)&tid[i]) == 0);
+    while (!tid[0] || !tid[1]) sched_yield();
+    CHECK(task_count() == 3);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/comm", getpid(), tid[1]);
+    CHECK(slurp(path) > 0 && strcmp(buf, "popular\n") == 0);
+    snprintf(path, sizeof path, "/proc/self/task/%d/status", tid[0]);
+    CHECK(slurp(path) > 0 && strstr(buf, "Threads:\t3\n"));
+    pthread_mutex_unlock(&task_mu);
+    for (int i = 0; i < 2; i++) CHECK(pthread_join(t[i], NULL) == 0);
+    CHECK(task_count() == 1);
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid[0]);
+    struct stat st;
+    CHECK(stat(path, &st) == -1 && errno == ENOENT);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -1014,6 +1059,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "schedprio") == 0) r = schedprio();
         if (strcmp(argv[i], "numa") == 0) r = numa();
         if (strcmp(argv[i], "prctls") == 0) r = prctls();
+        if (strcmp(argv[i], "tasks") == 0) r = tasks();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

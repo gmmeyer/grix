@@ -166,6 +166,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     t.sigmask = sigmask;
     p.threads.insert(tid, t);
     crate::procs::thread_added();
+    crate::fs::tasks_changed(p.pid, p.threads.keys().copied().collect());
     p.runq.push_back(tid);
     p.timer_dirty = true;
     crate::stats::peak(Resource::Threads, threads as u64 + 1);
@@ -188,6 +189,7 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
         p.terminate(process::exited(code));
         return Err(EBLOCKED);
     }
+    crate::fs::tasks_changed(p.pid, p.threads.keys().copied().collect());
     if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
         futex_wake(p, t.clear_child_tid, 1, u32::MAX);
     }

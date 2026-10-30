@@ -91,6 +91,11 @@ pub const PID_FILES: &[(&str, ProcFile)] = &[
     ("oom_score_adj", ProcFile::Text("0\n")),
 ];
 
+/// What /proc/<pid>/task/<tid> has: the process's, as grix keeps names,
+/// times and state per process.
+pub const TASK_FILES: &[(&str, ProcFile)] =
+    &[("stat", ProcFile::Stat), ("status", ProcFile::Status), ("statm", ProcFile::Statm), ("comm", ProcFile::Comm)];
+
 /// Files of /proc/<pid> that are its owner's (0400), and that another
 /// process may open only if it may inspect this one: Linux's environ and
 /// auxv, which need ptrace_may_access(PTRACE_MODE_READ_FSCREDS).
