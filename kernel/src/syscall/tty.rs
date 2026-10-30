@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use super::file::would_block;
 use super::table::nr;
 use crate::errno::*;
-use crate::fd::{FdEntry, FileKind, O_ACCMODE, O_CLOEXEC, O_WRONLY, new_file};
+use crate::fd::{FdEntry, FileKind, O_ACCMODE, O_CLOEXEC, new_file};
 use crate::fs::{self, Dev, Ino};
 use crate::process::Process;
 use crate::signal::{self, SIG_IGN, SIGTTIN, SIGTTOU};
@@ -273,7 +273,7 @@ pub fn ioctl(p: &mut Process, fd: u64, tty: TtyRef, master: bool, req: u64, arg:
             if let Some(c) = &p.ctty {
                 return if Arc::ptr_eq(c, &tty) { Ok(0) } else { Err(EPERM) };
             }
-            let readable = p.fds.get(fd)?.lock().flags & O_ACCMODE != O_WRONLY;
+            let readable = p.fds.get(fd)?.lock().readable();
             if !readable && p.uid != 0 {
                 return Err(EPERM);
             }

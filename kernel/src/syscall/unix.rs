@@ -367,7 +367,7 @@ pub fn read_control(p: &mut Process, control: u64, len: u64) -> Result<Control, 
             (SOL_SOCKET, SCM_RIGHTS) => {
                 for c in b[off + 16..off + clen].as_chunks::<4>().0 {
                     let fd = i32::from_le_bytes(*c);
-                    files.push(p.fds.get(fd as u64)?);
+                    files.push(p.fds.get_raw(fd as u64)?);
                     if files.len() > unix::SCM_MAX_FD {
                         return Err(EINVAL);
                     }

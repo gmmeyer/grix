@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use super::file::{Src, pipe_read, pipe_write, would_block, write_content_at};
 use crate::errno::*;
-use crate::fd::{FifoFile, FileKind, FileRef, O_ACCMODE, O_APPEND, O_RDONLY, O_WRONLY, OpenFile, lock_pair};
+use crate::fd::{FifoFile, FileKind, FileRef, O_APPEND, OpenFile, lock_pair};
 use crate::inet::State;
 use crate::ipc::PipeEnd;
 use crate::process::Process;
@@ -193,11 +193,9 @@ fn write_out(p: &mut Process, f: &mut OpenFile, off: Option<u64>, data: &[u8], n
 /// The two files, checked for reading and writing.
 fn files(p: &Process, fd_in: u64, fd_out: u64) -> Result<(FileRef, FileRef), Errno> {
     let (fin, fout) = (p.fds.get(fd_in)?, p.fds.get(fd_out)?);
-    let readable = |f: &OpenFile| !f.path_only && f.flags & O_ACCMODE != O_WRONLY;
-    let writable = |f: &OpenFile| !f.path_only && f.flags & O_ACCMODE != O_RDONLY;
     // (One statement each: they may be one file.)
-    let r = readable(&fin.lock());
-    let w = writable(&fout.lock());
+    let r = fin.lock().readable();
+    let w = fout.lock().writable();
     if !r || !w {
         return Err(EBADF);
     }
@@ -330,8 +328,8 @@ pub fn vmsplice(p: &mut Process, fd: u64, iov: u64, nr_segs: u64, flags: u64) ->
     }
     let file = p.fds.get(fd)?;
     let f = file.lock();
-    let write = f.flags & O_ACCMODE != O_RDONLY;
-    let Some(end) = pipe_end(&f, write) else { return Err(EBADF) };
+    let write = f.writable();
+    let Some(end) = pipe_end(&f, write).filter(|_| write || f.readable()) else { return Err(EBADF) };
     if nr_segs > 1024 {
         return Err(EINVAL);
     }

@@ -2,7 +2,7 @@
 //! NUMA policies (mbind, set_mempolicy, get_mempolicy).
 
 use crate::errno::*;
-use crate::fd::{FileKind, O_ACCMODE, O_RDWR, O_WRONLY};
+use crate::fd::FileKind;
 use crate::mm::aspace::{Backing, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_up};
@@ -64,10 +64,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
     } else {
         let file = p.fds.get(fd)?;
         let f = file.lock();
-        if f.path_only {
-            return Err(EBADF);
-        }
-        if f.flags & O_ACCMODE == O_WRONLY {
+        if !f.readable() {
             return Err(EACCES);
         }
         match (&f.kind, &f.content) {
@@ -78,7 +75,7 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
                     return Err(EOVERFLOW);
                 }
                 let ino = *ino;
-                let rdwr = f.flags & O_ACCMODE == O_RDWR;
+                let rdwr = f.writable();
                 if shared && prot.write && !rdwr {
                     return Err(EACCES);
                 }

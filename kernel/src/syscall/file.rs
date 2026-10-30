@@ -52,7 +52,7 @@ fn dir_base(p: &Process, dirfd: u64) -> Result<Ino, Errno> {
     if dirfd as i32 == AT_FDCWD {
         return Ok(p.cwd());
     }
-    let f = p.fds.get(dirfd)?;
+    let f = p.fds.get_raw(dirfd)?;
     let f = f.lock();
     match f.kind {
         FileKind::Node(ino) if fs::lock().is_dir(ino) => Ok(ino),
@@ -152,10 +152,16 @@ pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     if fd as i32 == AT_FDCWD {
         return Ok(p.cwd());
     }
-    match p.fds.get(fd)?.lock().kind {
+    match p.fds.get_raw(fd)?.lock().kind {
         FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(FifoFile { ino, .. }) => Ok(ino),
         _ => Err(EINVAL),
     }
+}
+
+/// `fd_node`, for the f* calls, which (fdget) don't take O_PATH.
+fn open_fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
+    p.fds.get(fd)?;
+    fd_node(p, fd).map_err(|_| EBADF)
 }
 
 /// `f` of another process, if the caller may look at its descriptors.
@@ -189,7 +195,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
     if fd as i32 == AT_FDCWD {
         return Ok(fs::lock().stat(p.cwd()));
     }
-    let f = p.fds.get(fd)?;
+    let f = p.fds.get_raw(fd)?;
     let f = f.lock();
     let boot = time::boot_realtime_ns();
     let anon = |ino: u64, mode: u32, size: u64| StatInfo {
@@ -354,7 +360,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL
         && let Some(fd) = procfs::fd_path(path)
     {
-        let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+        let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     // RESOLVE_IN_ROOT: "/" is the directory too.
@@ -412,7 +418,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         if follow && resolve & (fs::RESOLVE_NO_XDEV | fs::RESOLVE_BENEATH | fs::RESOLVE_IN_ROOT) != 0 {
             return Err(EXDEV);
         }
-        let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+        let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     let (ino, created) = match found {
@@ -708,7 +714,7 @@ pub fn fsync(p: &mut Process, fd: u64) -> SysResult {
 }
 
 pub fn close(p: &mut Process, fd: u64) -> SysResult {
-    if let Ok(file) = p.fds.get(fd) {
+    if let Ok(file) = p.fds.get_raw(fd) {
         closing(p, &file);
     }
     p.fds.close(fd).map(|_| 0)
@@ -738,7 +744,7 @@ pub fn close_range(p: &mut Process, first: u64, last: u64, flags: u64) -> SysRes
         if flags & CLOSE_RANGE_CLOEXEC != 0 {
             let _ = p.fds.set_cloexec(fd, true);
         } else {
-            if let Ok(file) = p.fds.get(fd) {
+            if let Ok(file) = p.fds.get_raw(fd) {
                 closing(p, &file);
             }
             let _ = p.fds.close(fd);
@@ -750,7 +756,7 @@ pub fn close_range(p: &mut Process, first: u64, last: u64, flags: u64) -> SysRes
 // ---------------------------------------------------------------- read/write
 
 fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option<u64>) -> SysResult {
-    if f.path_only || f.flags & O_ACCMODE == O_WRONLY {
+    if !f.readable() {
         return Err(EBADF);
     }
     let count = count.min(MAX_RW);
@@ -998,7 +1004,7 @@ pub(super) fn write_content_at(
 
 /// write/pwrite. `at` is pwrite's offset; O_APPEND overrides it, as on Linux.
 fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option<u64>) -> SysResult {
-    if f.path_only || f.flags & O_ACCMODE == O_RDONLY {
+    if !f.writable() {
         return Err(EBADF);
     }
     let count = count.min(MAX_RW);
@@ -1624,11 +1630,11 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let target = match (procfs::fd_path(&path), procfs::other_fd_path(&path)) {
         (Some(fd), _) if path.contains("/fd/") => {
-            let file = p.fds.get(fd).map_err(|_| ENOENT)?;
+            let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
             procfs::fd_link(&file.lock().kind, fd)
         }
         (_, Some((pid, fd))) => with_other(p, pid, |q| {
-            let file = q.fds.get(fd).map_err(|_| ENOENT)?;
+            let file = q.fds.get_raw(fd).map_err(|_| ENOENT)?;
             Ok(procfs::fd_link(&file.lock().kind, fd))
         })?,
         _ => {
@@ -1976,7 +1982,7 @@ fn writable_file(p: &Process, fd: u64, not_file: Errno) -> Result<(Ino, Content)
     let file = p.fds.get(fd)?;
     let f = file.lock();
     match (&f.kind, &f.content) {
-        (FileKind::Node(ino), Some(c)) if f.flags & O_ACCMODE != O_RDONLY && !f.path_only => Ok((*ino, c.clone())),
+        (FileKind::Node(ino), Some(c)) if f.writable() => Ok((*ino, c.clone())),
         (FileKind::Node(_), Some(_)) => Err(EBADF),
         (FileKind::Pipe(_) | FileKind::Fifo(_) | FileKind::Socket(_) | FileKind::Inet(_), _) => Err(ESPIPE),
         _ => Err(not_file),
@@ -1984,7 +1990,10 @@ fn writable_file(p: &Process, fd: u64, not_file: Errno) -> Result<(Ino, Content)
 }
 
 pub fn ftruncate(p: &mut Process, fd: u64, len: u64) -> SysResult {
-    let (ino, c) = writable_file(p, fd, EINVAL).map_err(|e| if e == ESPIPE { EINVAL } else { e })?;
+    // Open for writing or not, EINVAL as Linux's do_ftruncate; only a
+    // descriptor that isn't there (or is O_PATH) is EBADF.
+    p.fds.get(fd)?;
+    let (ino, c) = writable_file(p, fd, EINVAL).map_err(|e| if matches!(e, ESPIPE | EBADF) { EINVAL } else { e })?;
     // Landlock decided at open (hook_file_truncate).
     if p.fds.get(fd)?.lock().landlock_denied & landlock::TRUNCATE != 0 {
         return Err(EACCES);
@@ -2025,7 +2034,7 @@ fn set_mode(p: &mut Process, ino: Ino, mode: u64) -> SysResult {
 }
 
 pub fn fchmod(p: &mut Process, fd: u64, mode: u64) -> SysResult {
-    let ino = fd_node(p, fd).map_err(|_| EBADF)?;
+    let ino = open_fd_node(p, fd)?;
     set_mode(p, ino, mode)
 }
 
@@ -2081,7 +2090,7 @@ fn set_owner(p: &mut Process, ino: Ino, uid: u64, gid: u64) -> SysResult {
 }
 
 pub fn fchown(p: &mut Process, fd: u64, uid: u64, gid: u64) -> SysResult {
-    let ino = fd_node(p, fd).map_err(|_| EBADF)?;
+    let ino = open_fd_node(p, fd)?;
     set_owner(p, ino, uid, gid)
 }
 
@@ -2100,7 +2109,7 @@ pub fn utimensat(p: &mut Process, dirfd: u64, pathp: u64, times: u64, flags: u64
         return Err(EINVAL);
     }
     // A NULL path means dirfd itself (futimens).
-    let ino = if pathp == 0 { fd_node(p, dirfd).map_err(|_| EBADF)? } else { at_node(p, dirfd, pathp, flags)? };
+    let ino = if pathp == 0 { open_fd_node(p, dirfd)? } else { at_node(p, dirfd, pathp, flags)? };
     let now = time::realtime_ns();
     let mut set = [Some(now), Some(now)];
     let mut explicit = false;
@@ -2135,9 +2144,9 @@ pub fn utimensat(p: &mut Process, dirfd: u64, pathp: u64, times: u64, flags: u64
 fn fd_content(p: &Process, fd: u64, write: bool) -> Result<(crate::fd::FileRef, Content, Ino), Errno> {
     let file = p.fds.get(fd)?;
     let f = file.lock();
-    let mode_ok = if write { f.flags & O_ACCMODE != O_RDONLY } else { f.flags & O_ACCMODE != O_WRONLY };
+    let mode_ok = if write { f.writable() } else { f.readable() };
     let r = match (&f.kind, &f.content) {
-        (FileKind::Node(ino), Some(c)) if mode_ok && !f.path_only => Ok((c.clone(), *ino)),
+        (FileKind::Node(ino), Some(c)) if mode_ok => Ok((c.clone(), *ino)),
         (FileKind::Node(_), Some(_)) => Err(EBADF),
         _ => Err(EINVAL),
     };
@@ -2209,7 +2218,7 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
     let count = count.min(MAX_RW);
     let out = p.fds.get(out_fd)?;
     let mut o = out.lock();
-    if o.flags & O_ACCMODE == O_RDONLY {
+    if !o.writable() {
         return Err(EBADF);
     }
     let nonblock = o.nonblocking();
@@ -2327,7 +2336,7 @@ pub fn copy_file_range(
 // ---------------------------------------------------------------- descriptors
 
 pub fn dup(p: &mut Process, fd: u64) -> SysResult {
-    let file = p.fds.get(fd)?;
+    let file = p.fds.get_raw(fd)?;
     p.fds.alloc(FdEntry { file, cloexec: false }, 0)
 }
 
@@ -2335,8 +2344,8 @@ pub fn dup3(p: &mut Process, old: u64, new: u64, flags: u64) -> SysResult {
     if old == new || flags & !(O_CLOEXEC as u64) != 0 {
         return Err(EINVAL);
     }
-    let file = p.fds.get(old)?;
-    if let Ok(replaced) = p.fds.get(new) {
+    let file = p.fds.get_raw(old)?;
+    if let Ok(replaced) = p.fds.get_raw(new) {
         closing(p, &replaced);
     }
     p.fds.set(new, FdEntry { file, cloexec: flags != 0 })?;
@@ -2358,9 +2367,6 @@ pub fn flock(p: &mut Process, fd: u64, op: u64) -> SysResult {
     let file = p.fds.get(fd)?;
     let (key, id) = {
         let f = file.lock();
-        if f.path_only {
-            return Err(EBADF);
-        }
         (f.lock_key(), f.id())
     };
     match locks::flock(key, locks::Owner::File(id), p.pid, write)? {
@@ -2404,13 +2410,10 @@ fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         _ => return Err(EINVAL),
     };
     let file = p.fds.get(fd)?;
-    let (key, id, acc, offset, size) = {
+    let (key, id, readable, writable, offset, size) = {
         let f = file.lock();
-        if f.path_only {
-            return Err(EBADF);
-        }
         let size = f.content.as_ref().map_or(0, |c| c.lock().len());
-        (f.lock_key(), f.id(), f.flags & O_ACCMODE, f.offset, size)
+        (f.lock_key(), f.id(), f.readable(), f.writable(), f.offset, size)
     };
     let base: i64 = match whence {
         0 => 0,
@@ -2448,7 +2451,7 @@ fn record_lock(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         return copy_out(&mut p.aspace, arg, &b).map(|_| 0);
     }
-    if (write == Some(false) && acc == O_WRONLY) || (write == Some(true) && acc == O_RDONLY) {
+    if (write == Some(false) && !readable) || (write == Some(true) && !writable) {
         return Err(EBADF);
     }
     match locks::set_range(key, owner, p.pid, write, s, e)? {
@@ -2522,9 +2525,14 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_GETPIPE_SZ: u64 = 1032;
     const F_ADD_SEALS: u64 = 1033;
     const F_GET_SEALS: u64 = 1034;
+    let file = p.fds.get_raw(fd)?;
+    // What an O_PATH descriptor can do (Linux's check_fcntl_cmd).
+    let path_only = file.lock().path_only;
+    if path_only && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+        return Err(EBADF);
+    }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let file = p.fds.get(fd)?;
             // Not at or above RLIMIT_NOFILE (f_dupfd).
             if arg >= p.fds.limit() as u64 {
                 return Err(EINVAL);
@@ -2533,9 +2541,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         F_GETFD => Ok(p.fds.cloexec(fd)? as u64),
         F_SETFD => p.fds.set_cloexec(fd, arg & 1 != 0).map(|_| 0),
-        F_GETFL => Ok(p.fds.get(fd)?.lock().flags as u64),
+        F_GETFL => Ok((file.lock().flags | if path_only { O_PATH } else { 0 }) as u64),
         F_SETFL => {
-            let file = p.fds.get(fd)?;
             let mut f = file.lock();
             let was = f.flags;
             f.flags = (f.flags & !SETFL_MASK) | (arg as u32 & SETFL_MASK);
@@ -2551,7 +2558,6 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         // A pipe's capacity (Linux's pipe_fcntl): a power of two pages,
         // at most pipe-max-size, and no less than what it holds.
         F_SETPIPE_SZ | F_GETPIPE_SZ => {
-            let file = p.fds.get(fd)?;
             let f = file.lock();
             let end = match &f.kind {
                 FileKind::Pipe(end) => end,
@@ -2578,9 +2584,8 @@ pub fn fcntl(p: &mut Process, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         // memfd seals: only sealable files (memfds) have them.
         F_ADD_SEALS | F_GET_SEALS => {
-            let file = p.fds.get(fd)?;
             let f = file.lock();
-            let writable = f.flags & O_ACCMODE != O_RDONLY;
+            let writable = f.writable();
             let c = f.content.clone().ok_or(EINVAL)?;
             drop(f);
             let mut data = c.lock();
@@ -3194,7 +3199,7 @@ pub fn name_to_handle_at(p: &mut Process, dirfd: u64, pathp: u64, flags: u64) ->
 }
 
 pub fn fstatfs(p: &mut Process, fd: u64, buf: u64) -> SysResult {
-    p.fds.get(fd)?;
+    p.fds.get_raw(fd)?;
     let b = statfs_bytes(p);
     copy_out(&mut p.aspace, buf, &b).map(|_| 0)
 }
@@ -3233,16 +3238,13 @@ fn xattr_name(p: &mut Process, namep: u64) -> Result<(Vec<u8>, XattrNs), Errno> 
 }
 
 /// The node an xattr call is about: a path, followed unless it's an l*
-/// call, or a descriptor's file (EBADF for O_PATH, as fdget; EOPNOTSUPP
-/// for pipes, sockets and the like, which keep none).
+/// call, or a descriptor's file (EOPNOTSUPP for pipes, sockets and the
+/// like, which keep none).
 fn xattr_node(p: &mut Process, n: u32, target: u64) -> Result<Ino, Errno> {
     match n {
         nr::fgetxattr | nr::flistxattr | nr::fsetxattr | nr::fremovexattr => {
             let file = p.fds.get(target)?;
             let f = file.lock();
-            if f.path_only {
-                return Err(EBADF);
-            }
             match &f.kind {
                 FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(FifoFile { ino, .. }) => Ok(*ino),
                 FileKind::Pty(end) => Ok(end.ino),

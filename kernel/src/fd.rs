@@ -157,7 +157,7 @@ pub struct OpenFile {
     pub offset: u64,
     /// Access mode and status flags (O_APPEND, O_NONBLOCK, ...).
     pub flags: u32,
-    /// Opened with O_PATH: only usable as a dirfd / for fstat.
+    /// Opened with O_PATH: only `FdTable::get_raw` finds it.
     pub path_only: bool,
     /// A regular file's contents, held so they outlive an unlink.
     pub content: Option<Content>,
@@ -191,6 +191,18 @@ impl Drop for OpenFile {
 impl OpenFile {
     pub fn nonblocking(&self) -> bool {
         self.flags & O_NONBLOCK != 0
+    }
+
+    /// Open for reading (Linux's FMODE_READ). Access mode 3 is neither
+    /// this nor `writable`: it's for ioctls, and asks Landlock for no
+    /// rights at open, so it must never read or write.
+    pub fn readable(&self) -> bool {
+        !self.path_only && matches!(self.flags & O_ACCMODE, O_RDONLY | O_RDWR)
+    }
+
+    /// Open for writing (Linux's FMODE_WRITE).
+    pub fn writable(&self) -> bool {
+        !self.path_only && matches!(self.flags & O_ACCMODE, O_WRONLY | O_RDWR)
     }
 
     /// The open file description, as a lock owner.
@@ -449,7 +461,20 @@ impl FdTable {
         usize::try_from(fd as i32).map_err(|_| EBADF)
     }
 
+    /// The file at `fd`, as Linux's fdget: an O_PATH descriptor is EBADF
+    /// to everything but the few calls that take one (`get_raw`).
     pub fn get(&self, fd: u64) -> Result<FileRef, Errno> {
+        let file = self.get_raw(fd)?;
+        let path_only = file.lock().path_only;
+        if path_only {
+            return Err(EBADF);
+        }
+        Ok(file)
+    }
+
+    /// The file at `fd`, O_PATH or not (Linux's fdget_raw): for what only
+    /// uses the descriptor's name, as a dirfd, fstat, dup or SCM_RIGHTS do.
+    pub fn get_raw(&self, fd: u64) -> Result<FileRef, Errno> {
         let i = Self::index(fd)?;
         Ok(self.slots.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(EBADF)?.file.clone())
     }

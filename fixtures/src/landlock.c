@@ -196,7 +196,11 @@ static void version_and_errors(void) {
     struct path_beneath pb = {READ_FILE, dir};
     FAILS(add(rs, RULE_PATH_BENEATH, &pb, 1), EINVAL);
     FAILS(add(rs, 3, &pb, 0), EINVAL);
-    FAILS(add(dir, RULE_PATH_BENEATH, &pb, 0), EBADFD);
+    // Not a ruleset; and an O_PATH descriptor isn't one to look at (fdget).
+    int other = open("/tmp", O_RDONLY | O_DIRECTORY);
+    FAILS(add(other, RULE_PATH_BENEATH, &pb, 0), EBADFD);
+    close(other);
+    FAILS(add(dir, RULE_PATH_BENEATH, &pb, 0), EBADF);
     FAILS(add(-1, RULE_PATH_BENEATH, &pb, 0), EBADF);
     FAILS(add(rs, RULE_PATH_BENEATH, NULL, 0), EFAULT);
     pb.allowed = 0;
@@ -240,8 +244,11 @@ static void version_and_errors(void) {
 }
 
 static void restrict_errors(void) {
-    int fd = open("/tmp", O_PATH);
+    int fd = open("/tmp", O_RDONLY | O_DIRECTORY);
     FAILS(restrict_self(fd, 0), EBADFD);
+    close(fd);
+    fd = open("/tmp", O_PATH);
+    FAILS(restrict_self(fd, 0), EBADF);
     FAILS(restrict_self(-1, 0), EBADF);
     close(fd);
 }

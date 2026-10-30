@@ -516,14 +516,14 @@ pub fn pidfd_getfd(p: &mut Process, pidfd: u64, fd: u64, flags: u64) -> SysResul
     }
     let pid = pidfd_pid(p, pidfd)?;
     let file = if pid == p.pid {
-        p.fds.get(fd)?
+        p.fds.get_raw(fd)?
     } else {
         let procs = PROCS.lock();
         let q = procs.others.get(&pid).ok_or(ESRCH)?;
         if !crate::procs::may_inspect(p, q, true) {
             return Err(EPERM);
         }
-        q.fds.get(fd)?
+        q.fds.get_raw(fd)?
     };
     p.fds.alloc(FdEntry { file, cloexec: true }, 0)
 }

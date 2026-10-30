@@ -231,6 +231,7 @@ pub fn open_access(d: &Domain, fs: &Fs, ino: Ino, dir: Ino, acc: u32) -> Result<
         O_RDONLY => read,
         O_WRONLY => WRITE_FILE,
         O_RDWR => read | WRITE_FILE,
+        // Neither reads nor writes (`OpenFile::readable`), as on Linux.
         _ => 0,
     };
     let later = TRUNCATE | if matches!(kind, Kind::Dev(_)) { IOCTL_DEV } else { 0 };
@@ -536,7 +537,7 @@ pub fn add_rule(p: &mut Process, fd: u64, ty: u64, attr: u64, flags: u64) -> Sys
             let allowed = allowed as u16;
             // Any descriptor of a node, O_PATH ones too; not pipes, sockets
             // or anonymous files (EBADFD, as Linux's get_path_from_fd).
-            let file = p.fds.get(parent_fd as i64 as u64)?;
+            let file = p.fds.get_raw(parent_fd as i64 as u64)?;
             let ino = match &file.lock().kind {
                 FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(crate::fd::FifoFile { ino, .. }) => *ino,
                 FileKind::Pty(end) => end.ino,
