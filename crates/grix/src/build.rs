@@ -405,7 +405,7 @@ fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     ]
     .map(|p| p.to_vec());
     let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    crate::treecache::key("build-step-v2", &parts)
+    crate::treecache::key("build-step-v3", &parts)
 }
 
 /// Run one build step in `image` and take the file tree it leaves (or

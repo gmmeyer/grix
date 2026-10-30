@@ -583,8 +583,12 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set `key` to `value` in the program's environment, in place of
+    /// any value it had (the image's, or an earlier call's).
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.push((key.into(), value.into()));
+        let key = key.into();
+        self.env.retain(|(k, _)| *k != key);
+        self.env.push((key, value.into()));
         self
     }
 
@@ -994,6 +998,11 @@ impl SandboxBuilder {
         if let Some(user) = &image.config.user {
             (self.uid, self.gid) = crate::container::resolve_user(user, &image.files)?;
         }
+        // What Docker puts in a container's environment unless the image
+        // sets it (the image's own environment comes after this).
+        let home = crate::container::home_dir(self.uid, &image.files);
+        self = self.env("HOME", home);
+        self = self.env("HOSTNAME", grix_abi::HOSTNAME);
         self.kernel = image.kernel_path()?;
         Ok(self)
     }

@@ -201,8 +201,10 @@ struct RunArgs {
     /// Grant a capability (fs_write, threads, process, net). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
-    /// Set an environment variable KEY=VALUE. Repeatable.
-    #[arg(short, long = "env", value_name = "KEY=VALUE")]
+    /// Set an environment variable KEY=VALUE, or KEY to pass on the
+    /// host's value of KEY (if it's set, as Docker's `-e KEY`: a secret
+    /// stays off the command line). Repeatable.
+    #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
     /// Working directory inside the sandbox.
     #[arg(long)]
@@ -694,8 +696,15 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);
     }
     for kv in &args.env {
-        let (k, v) = kv.split_once('=').with_context(|| format!("--env {kv:?} must be KEY=VALUE"))?;
-        b = b.env(k, v);
+        match kv.split_once('=') {
+            Some((k, v)) => b = b.env(k, v),
+            None => {
+                if let Some(v) = std::env::var_os(kv) {
+                    let v = v.into_string().map_err(|_| anyhow::anyhow!("--env {kv}: the host's value isn't UTF-8"))?;
+                    b = b.env(kv, &v);
+                }
+            }
+        }
     }
     if let Some(cwd) = &args.cwd {
         b = b.cwd(cwd);

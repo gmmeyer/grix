@@ -17,7 +17,7 @@ use crate::process::{Ids, Process};
 use crate::procs::Zombie;
 use crate::time;
 
-pub const HOSTNAME: &str = "grix";
+pub const HOSTNAME: &str = grix_abi::HOSTNAME;
 pub const RELEASE: &str = "6.1.0-grix";
 pub const VERSION: &str = "#1 SMP grix";
 

@@ -93,6 +93,18 @@ pub(crate) fn resolve_user(
     Ok((uid, gid))
 }
 
+/// `uid`'s home directory in `files`' /etc/passwd, as Docker sets HOME:
+/// `/` if it has no entry there.
+pub(crate) fn home_dir(uid: u32, files: &BTreeMap<String, Node>) -> String {
+    let Some(Node::File { data, .. }) = files.get("/etc/passwd") else { return "/".into() };
+    String::from_utf8_lossy(data)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|e| e.len() > 5 && e[2].parse() == Ok(uid) && !e[5].is_empty())
+        .map_or_else(|| "/".into(), |e| e[5].to_string())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Header {
     abi: u32,

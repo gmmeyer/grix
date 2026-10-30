@@ -604,7 +604,7 @@ from = "oci:{}"
 command = ["/bin/sh", "/app/hello.sh"]
 cwd = "/app"
 capabilities = ["process"]
-run = ["echo built > /app/stamp", "rm /etc/motd"]
+run = ["echo built > /app/stamp", "rm /etc/motd", "echo $HOME > /app/home"]
 
 [env]
 GREETING = "hi"
@@ -678,6 +678,17 @@ content = "a note"
     assert!(out.events.is_empty(), "{:?}", out.events);
     let out = sb.run(&["uname", "-m"]).unwrap();
     assert_eq!(out.stdout_str(), format!("{}\n", grix::Arch::from_env().name()));
+    // Docker's HOME (root's, from the image's /etc/passwd, for build
+    // steps too) and HOSTNAME; a variable set for the run replaces the
+    // image's, never beside it (a program's getenv takes the first).
+    let out = sb.run(&["cat", "/app/home"]).unwrap();
+    assert_eq!(out.stdout_str(), "/root\n");
+    let sb2 = Sandbox::builder().image(&image).unwrap().env("GREETING", "bye").build().unwrap();
+    let out = sb2.run(&["env"]).unwrap();
+    let env = out.stdout_str();
+    assert!(env.contains("HOME=/root\n") && env.contains("HOSTNAME=grix\n"), "{env}");
+    assert_eq!(env.matches("GREETING=").count(), 1, "{env}");
+    assert!(env.contains("GREETING=bye\n"), "{env}");
     assert_eq!(image.arch().unwrap(), grix::Arch::from_env());
 
     // An image is one architecture's: a build for another refuses this
@@ -3481,6 +3492,25 @@ fn metrics_while_a_sandbox_runs() {
     let text = metrics.render();
     assert!(text.contains("grix_events_total{kind=\"denied\",capability=\"net\"} 1\n"), "{text}");
     assert!(text.contains("grix_runs_started_total 2\n"), "{text}");
+}
+
+/// `grix run -e KEY` passes the host's value of KEY, as Docker's does: a
+/// secret stays off the command line. One the host hasn't set is left out.
+#[test]
+fn the_cli_passes_variables_by_name() {
+    use std::process::Command;
+    let busybox = format!("{}:/bin/busybox", fixture("alpine/bin/busybox.static").display());
+    let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+        .args(["run", "-i", &busybox, "-e", "GRIX_TEST_SECRET", "-e", "GRIX_TEST_UNSET", "-e", "A=1"])
+        .args(["--", "/bin/busybox", "env"])
+        .env("GRIX_TEST_SECRET", "s3cret")
+        .env_remove("GRIX_TEST_UNSET")
+        .output()
+        .unwrap();
+    let env = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.contains("GRIX_TEST_SECRET=s3cret\n") && env.contains("A=1\n"), "{env}");
+    assert!(!env.contains("GRIX_TEST_UNSET"), "{env}");
 }
 
 /// `grix run` as a container's command: output as it comes, events as they

@@ -18,6 +18,10 @@ extern crate alloc;
 /// version. Bump it with any change the other side couldn't read.
 pub const ABI_VERSION: u32 = 10;
 
+/// The sandbox's host name (uname, /etc/hostname, and Docker's HOSTNAME
+/// in an image's environment).
+pub const HOSTNAME: &str = "grix";
+
 /// The kernel says which ABI it speaks with these bytes in its binary
 /// (`MARK` then `ABI_VERSION`, little-endian), so a host can tell before
 /// booting it: an image's kernel may come from anywhere.
