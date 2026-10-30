@@ -529,8 +529,9 @@ impl Server {
                     // Each id now names what the other did.
                     let a = self.by_name.remove(&(from_dir, from.to_string()));
                     let b = self.by_name.remove(&(to_dir, to.to_string()));
-                    for (id, dir, name) in [(a, to_dir, to), (b, from_dir, from)] {
+                    for (id, dir, name, was) in [(a, to_dir, to, from), (b, from_dir, from, to)] {
                         if let Some(id) = id {
+                            self.id_bytes = (self.id_bytes + name.len()).saturating_sub(was.len());
                             self.nodes.insert(id, Node { parent: dir, name: name.to_string() });
                             self.by_name.insert((dir, name.to_string()), id);
                         }
@@ -944,6 +945,39 @@ mod tests {
         assert_eq!(s.id(1, &long(n)), Err(ENOMEM));
         s.forget(1, &long(0));
         assert!(s.id(1, &long(n)).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An id that takes a longer name by RENAME_EXCHANGE counts it: a short
+    /// name swapped with a long one the host has but gave no id, over and
+    /// over, is what a hostile kernel would keep the host's memory with.
+    #[test]
+    fn exchanges_count_ids_bytes() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let long = "l".repeat(255);
+        std::fs::write(root.join("s"), "").unwrap();
+        std::fs::write(root.join(&long), "").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        let swap = |s: &mut Server, from: &str, to: &str| {
+            let r = Request::Rename { from_dir: 1, from, to_dir: 1, to, noreplace: false, exchange: true };
+            req(s, r);
+        };
+        let id = s.id(1, "s").unwrap();
+        assert_eq!(s.id_bytes, 1);
+        swap(&mut s, "s", &long);
+        assert_eq!(s.by_name.get(&(1, long.clone())), Some(&id));
+        assert_eq!(s.id_bytes, 255);
+        // Both known: the two together stay what they were.
+        s.id(1, "s").unwrap();
+        assert_eq!(s.id_bytes, 256);
+        swap(&mut s, "s", &long);
+        assert_eq!(s.id_bytes, 256);
+        s.forget(1, &long);
+        s.forget(1, "s");
+        assert_eq!(s.id_bytes, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
