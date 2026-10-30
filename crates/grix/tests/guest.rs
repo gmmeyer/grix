@@ -1951,6 +1951,30 @@ fn waiters_wake_when_a_process_ends() {
     }
 }
 
+/// Writes that need the console's interrupts go on while timers fire and
+/// the CPUs go from idle to spinning (x86_64 may take two vectors at once
+/// as it idles, and each is left in service until it's acknowledged).
+#[test]
+fn console_interrupts_survive_timers_around_idle() {
+    for cpus in [1, 4] {
+        let b = with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        let mut seen = 0;
+        // A host that takes a while over each 32 KiB, so the console's ring
+        // fills and the writer waits for its interrupts.
+        let slow = |_: Stream, bytes: &[u8]| {
+            if (seen + bytes.len()) >> 15 != seen >> 15 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            seen += bytes.len();
+        };
+        let out = b.build().unwrap().run_streaming(&["/bin/wakeups", "console", "2"], slow).unwrap();
+        assert!(out.stderr_str().ends_with("console ok\n"), "{cpus} CPUs: {}", out.stderr_str());
+        assert_eq!(out.status, ExitStatus::Exited(0), "{cpus} CPUs: {}", out.stderr_str());
+        assert!(out.stdout.iter().all(|&b| b == b'w' || b == b'\n'));
+        assert!(out.events.is_empty(), "{cpus} CPUs: {:?}", out.events);
+    }
+}
+
 // ---------------------------------------------------------------- pipes, eventfd, epoll
 
 #[test]
@@ -4328,6 +4352,24 @@ fn kernel_stack_overflow_is_reported() {
             assert!(attempt < 5, "always CPU 0: {}", out.kernel_log);
         }
     }
+}
+
+/// x86_64 can take two vectors around `hlt`: a device's, and just before
+/// its `cli` a timer's above it. Both are in service, and the device's must
+/// not wait until the CPU next idles, which holds up the console's every
+/// interrupt (rarely enough that `console_interrupts_survive_timers_around_
+/// idle` only sometimes sees it): a debug kernel arranges it. arm64's GIC
+/// keeps what isn't acknowledged, and the hook does nothing there.
+#[test]
+fn a_device_interrupt_beneath_a_timer_is_not_left_behind() {
+    if !x86_64_guest() {
+        return;
+    }
+    let kernel = debug_kernel();
+    let out = run(with("wakeups").kernel(&kernel), &["/bin/wakeups", "beneath"]);
+    assert_eq!(out.stdout_str(), "beneath ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 /// x86_64 programs run through an x86_64 translator (here Alpine's static

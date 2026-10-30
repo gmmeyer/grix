@@ -590,9 +590,7 @@ pub fn finish(tf: &mut TrapFrame) {
             wait();
         }
         lock();
-        if let Some(id) = irq::ack() {
-            crate::sched::handle_interrupt(id);
-        }
+        crate::sched::interrupts();
     }
     unlock();
 }

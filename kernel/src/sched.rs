@@ -390,8 +390,22 @@ fn waiting_for_signal(p: Option<&mut Process>, procs: &mut Procs) -> bool {
 /// `Stat::TimerIdle`).
 static TIMER_FIRED: [AtomicBool; MAX_CPUS as usize] = [const { AtomicBool::new(false) }; MAX_CPUS as usize];
 
+/// Handle what interrupted this CPU: one interrupt, or every one x86_64
+/// took while it idled (`irq::more`). Returns whether there was any.
+pub fn interrupts() -> bool {
+    let mut any = false;
+    while let Some(id) = irq::ack() {
+        handle_interrupt(id);
+        any = true;
+        if !irq::more() {
+            break;
+        }
+    }
+    any
+}
+
 /// Handle an acknowledged interrupt and signal its end.
-pub fn handle_interrupt(id: u32) {
+fn handle_interrupt(id: u32) {
     match id {
         irq::TIMER_INTID => {
             smp::note(smp::Stat::Timer, 1);
@@ -512,8 +526,9 @@ fn arm(own: Option<u64>, all: Option<u64>) {
 
 /// An interrupt while user code was running.
 pub fn irq(tf: &mut TrapFrame) {
-    let Some(id) = irq::ack() else { return };
-    handle_interrupt(id);
+    if !interrupts() {
+        return;
+    }
     let mut guard = process::running().lock();
     // Its thread (or its process) ended while it ran (on another CPU's
     // say): `smp::finish` schedules.

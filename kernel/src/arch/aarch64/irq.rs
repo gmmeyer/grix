@@ -114,6 +114,12 @@ pub fn ack() -> Option<u32> {
     (id < SPURIOUS).then_some(id)
 }
 
+/// Is another interrupt already taken, that only `ack` will give? Never:
+/// the GIC keeps what hasn't been acknowledged, and interrupts us for it.
+pub fn more() -> bool {
+    false
+}
+
 pub fn eoi(id: u32) {
     unsafe { asm!("msr S3_0_C12_C12_1, {}", "isb", in(reg) id as u64) }; // ICC_EOIR1_EL1
 }

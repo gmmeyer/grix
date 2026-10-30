@@ -379,6 +379,8 @@ pub fn cpu_number() -> usize {
 /// none can come between it and `hlt`; one that comes is noted
 /// (`irq::taken`) for `irq::ack`.
 pub fn wait_for_interrupt() {
+    #[cfg(debug_assertions)]
+    irq::take_device_beneath();
     // SAFETY: interrupts on for the halt only.
     unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }

@@ -130,6 +130,30 @@ pub fn start_ap(cpu: u32, vector: u8) {
     }
 }
 
+/// Debug builds only: the GSI (and 1) of a device whose interrupt the next
+/// wait is to take first, for what comes next to land on top of
+/// (`STACK_OVERFLOW_TEST`).
+#[cfg(debug_assertions)]
+static BENEATH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(debug_assertions)]
+pub fn device_beneath_next_wake(gsi: u32) {
+    BENEATH.store(gsi + 1, Ordering::Relaxed);
+}
+
+/// Take it, as if it had come just as this CPU woke: what wakes it, a
+/// timer's or a kick's, is above it and gets in too, which only otherwise
+/// happens in the instant before the idle loop's `cli`.
+#[cfg(debug_assertions)]
+pub fn take_device_beneath() {
+    let gsi = BENEATH.swap(0, Ordering::Relaxed);
+    if gsi != 0 {
+        send_ipi(lapic_id(), DEVICE_VECTOR + gsi - 1);
+        // SAFETY: interrupts on for one instruction.
+        unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
+    }
+}
+
 /// A vector was delivered to this CPU (by a trap, or in the idle loop).
 pub fn taken(vector: u8) {
     PENDING[me()][vector as usize / 64].fetch_or(1 << (vector % 64), Ordering::Relaxed);
@@ -167,6 +191,15 @@ pub fn ack() -> Option<u32> {
         }
     }
     None
+}
+
+/// Is another vector noted that `ack` will give? Any is in service in the
+/// APIC, and blocks its priority class until its `eoi`: nothing but `ack`
+/// will ever look at it. A CPU idling takes a device's interrupt and then,
+/// in the moment before its `cli`, a timer's or a kick's, which is above
+/// it, so one wake-up can bring two.
+pub fn more() -> bool {
+    PENDING[me()].iter().any(|w| w.load(Ordering::Relaxed) != 0)
 }
 
 /// The end of an interrupt (the APIC's highest in service: they're taken

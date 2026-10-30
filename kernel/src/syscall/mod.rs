@@ -33,7 +33,10 @@ pub(crate) const AT_FDCWD: i32 = -100;
 /// Debug builds only: a call no Linux has, which runs this CPU's kernel
 /// stack 1 KiB past its bottom, then returns (its first argument 0) or
 /// faults there (1), for the test that either is reported
-/// (`kernel_stack_overflow_is_reported`, with fixtures/src/kstack.c).
+/// (`kernel_stack_overflow_is_reported`, with fixtures/src/kstack.c). And
+/// x86_64's next idle wait starts with the console's vector in service
+/// (3, `irq::take_device_beneath`), for
+/// `a_device_interrupt_beneath_a_timer_is_not_left_behind`.
 #[cfg(debug_assertions)]
 const STACK_OVERFLOW_TEST: u64 = 0x6772_6978;
 
@@ -56,6 +59,11 @@ pub fn handle(tf: &mut TrapFrame) {
     let a = tf.syscall_args();
     #[cfg(debug_assertions)]
     if n == STACK_OVERFLOW_TEST {
+        if a[0] == 3 {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::irq::device_beneath_next_wake(crate::console::irq());
+            return;
+        }
         let bottom = crate::arch::stack_bottom(crate::smp::me());
         overflow_stack(bottom - 1024, a[0] == 1);
         return;

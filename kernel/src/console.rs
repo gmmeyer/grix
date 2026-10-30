@@ -213,6 +213,12 @@ pub fn start(stdin_from_host: bool) {
 
 /// Handle interrupt `id` if it's the console's: move received frames into
 /// the stdin buffer, and wake writers when output room comes back.
+/// The console's interrupt, for a debug kernel's test hook.
+#[cfg(all(debug_assertions, target_arch = "x86_64"))]
+pub fn irq() -> u32 {
+    CONSOLE.lock().as_ref().map_or(0, |c| c.dev.irq)
+}
+
 pub fn interrupt(id: u32) -> bool {
     let mut guard = CONSOLE.lock();
     let Some(c) = guard.as_mut().filter(|c| c.dev.irq == id) else { return false };
