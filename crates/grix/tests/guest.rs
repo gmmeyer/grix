@@ -3828,6 +3828,11 @@ fn threads_run_in_parallel_on_more_cpus() {
     let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "cow"]);
     assert_eq!(out.stdout_str(), "cow ok\n", "{:?}", out.status);
     assert_eq!(out.status, ExitStatus::Exited(0));
+    // MADV_DONTNEED while a thread writes the page that ends a batch of
+    // the kernel's frees: both see it in one place afterwards.
+    let out = run(b().cpus(4).timeout(Duration::from_secs(60)), &["/bin/smp", "discard"]);
+    assert_eq!(out.stdout_str(), "discard ok\n", "{:?}\n{}", out.status, out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
     // The CPU count is checked.
     assert!(Sandbox::builder().cpus(0).build().is_err());
     assert!(Sandbox::builder().cpus(9).build().is_err());

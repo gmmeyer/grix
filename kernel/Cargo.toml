@@ -1,7 +1,7 @@
 [package]
 name = "grix-kernel"
 description = "grix guest kernel: runs one Linux program with a capability-scoped syscall layer"
-version = "0.0.49"
+version = "0.0.50"
 edition = "2024"
 license = "MIT"
 

@@ -258,6 +258,8 @@ impl Gather {
         Gather { root, span: Span::new(), pages: [0; GATHER], n: 0 }
     }
 
+    /// `pa`, mapped at `va` by an entry that's clear already: the flush
+    /// and free may be now.
     fn add(&mut self, va: u64, pa: u64) {
         self.span.add(va);
         self.pages[self.n] = pa;
@@ -284,8 +286,11 @@ impl Gather {
 fn discard_in(pt: &mut PageTable, start: u64, end: u64) {
     let mut gather = Gather::new(pt.root);
     pt.for_each_mapped(start, end, |va, pte| unsafe {
-        gather.add(va, *pte & ADDR_MASK);
+        // Cleared first: adding it may flush and free the batch, and until
+        // it's cleared any CPU's next touch of it would map it again.
+        let pa = *pte & ADDR_MASK;
         *pte = 0;
+        gather.add(va, pa);
     });
     gather.finish();
 }

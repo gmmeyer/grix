@@ -11,6 +11,10 @@
 //   smp cow      threads write while main forks again and again: each
 //                child sees a consistent snapshot, the parent's reader
 //                never sees a page as it was (prints "cow ok")
+//   smp discard  one thread keeps writing a page while another gives the
+//                pages up (MADV_DONTNEED) again and again, then that page
+//                is where both see it: no CPU keeps a mapping of a page
+//                that went (prints "discard ok")
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -169,6 +173,55 @@ static int cow(long cpus) {
     return 0;
 }
 
+// smp discard. The page that ends a batch of the kernel's frees (each
+// resident page in turn: the 256th, and it's the last here) is the one
+// written: it must be gone from every TLB with the rest. The word written
+// isn't the first, which a free frame's may be the kernel's.
+#define DISCARD_PAGES 256
+static _Atomic unsigned long discard_want, discard_got;
+static _Atomic int discard_done;
+
+static void *discard_writer(void *arg) {
+    volatile unsigned long *w = (volatile unsigned long *)arg + 1;
+    unsigned long round = 0;
+    while (!atomic_load(&discard_done)) {
+        // Keep it in this CPU's TLB, whatever the other thread is doing.
+        while (atomic_load(&discard_want) == round && !atomic_load(&discard_done)) *w = round;
+        round = atomic_load(&discard_want);
+        *w = round;
+        atomic_store(&discard_got, round);
+    }
+    return 0;
+}
+
+static int discard(void) {
+    char *p = mmap(0, DISCARD_PAGES * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(p != MAP_FAILED);
+    char *last = p + (DISCARD_PAGES - 1) * 4096;
+    pthread_t t;
+    CHECK(pthread_create(&t, 0, discard_writer, last) == 0);
+    unsigned long round = 0;
+    for (double t0 = now(); now() - t0 < 2.0;) {
+        for (int i = 0; i < DISCARD_PAGES; i++) p[i * 4096] = 1;
+        CHECK(madvise(p, DISCARD_PAGES * 4096, MADV_DONTNEED) == 0);
+        atomic_store(&discard_want, ++round);
+        while (atomic_load(&discard_got) != round) {
+        }
+        // What the other thread just wrote, if it wrote it here.
+        unsigned long seen = ((volatile unsigned long *)last)[1];
+        if (seen != round) {
+            printf("FAILED: round %lu: the page holds %lu\n", round, seen);
+            return 1;
+        }
+    }
+    atomic_store(&discard_done, 1);
+    pthread_join(t, 0);
+    CHECK(round > 0);
+    fprintf(stderr, "discard: %lu rounds\n", round);
+    printf("discard ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "exec-done") == 0) {
         printf("exec ok\n");
@@ -187,6 +240,7 @@ int main(int argc, char **argv) {
         exit(3);
     }
     if (argc > 1 && strcmp(argv[1], "cow") == 0) return cow(cpus);
+    if (argc > 1 && strcmp(argv[1], "discard") == 0) return discard();
     if (argc > 1 && strcmp(argv[1], "fork") == 0) {
         // The child is another process: the spinning thread's CPU has to
         // give way for it to run at all.
