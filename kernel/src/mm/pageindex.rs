@@ -151,6 +151,27 @@ impl PageIndex {
         Some(())
     }
 
+    /// Take page `idx` out, if it's there. Its nodes stay, for later.
+    pub fn remove(&mut self, idx: u64) -> bool {
+        if self.root == 0 || idx >= self.span() {
+            return false;
+        }
+        let mut at = self.root;
+        for level in (1..self.levels).rev() {
+            at = get(at, (idx >> (BITS * level)) % FANOUT);
+            if at == 0 {
+                return false;
+            }
+        }
+        let i = idx % FANOUT;
+        let there = get(at, i) != 0;
+        if there {
+            set(at, i, 0);
+            self.len -= 1;
+        }
+        there
+    }
+
     /// Take out every page from `keep` on, passing each frame to `each`.
     pub fn remove_from(&mut self, keep: u64, each: &mut dyn FnMut(u64)) {
         if self.root == 0 {

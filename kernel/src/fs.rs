@@ -161,9 +161,14 @@ pub struct FileData {
     live_maps: Vec<Weak<()>>,
     writable_maps: Vec<Weak<()>>,
     /// Pages a shared mapping read before the file had a frame for them:
-    /// it got a read-only copy, which must go once there's a frame
-    /// (`STALE`).
-    copied: alloc::collections::BTreeSet<u64>,
+    /// each got a read-only copy, which must go once there's a frame
+    /// (`STALE`). In frames, not on the heap: a program can read a hole a
+    /// page at a time and madvise the copies away, in a file as long as
+    /// it likes. The entries are just marks (`COPIED`).
+    copied: PageIndex,
+    /// Too many to mark, or no frame to do it with: which pages have
+    /// copies isn't known, so the next frame the file gets takes them all.
+    copied_unknown: bool,
     /// memfd seals (F_SEAL_*); `None` for files that can't be sealed.
     pub seals: Option<u32>,
     /// A live mount's file: the host's id for it. Its bytes are on the host
@@ -201,7 +206,8 @@ impl FileData {
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
             writable_maps: Vec::new(),
-            copied: alloc::collections::BTreeSet::new(),
+            copied: PageIndex::new(),
+            copied_unknown: false,
             seals: None,
             remote: None,
             unlinked: false,
@@ -218,7 +224,8 @@ impl FileData {
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
             writable_maps: Vec::new(),
-            copied: alloc::collections::BTreeSet::new(),
+            copied: PageIndex::new(),
+            copied_unknown: false,
             seals: None,
             remote: Some(id),
             unlinked: false,
@@ -304,7 +311,14 @@ impl FileData {
 
     /// A shared mapping took a read-only copy of page `idx`.
     pub fn copied_page(&mut self, idx: u64) {
-        self.copied.insert(idx);
+        if self.copied_unknown || self.copied.get(idx).is_some() {
+            return;
+        }
+        // Marks can do without memory better than the program can.
+        if self.copied.nodes() >= COPIED_NODES || self.copied.insert(idx, COPIED).is_none() {
+            self.copied.remove_from(0, &mut |_| {});
+            self.copied_unknown = true;
+        }
     }
 
     /// Is the file's memory mapped MAP_SHARED anywhere?
@@ -403,9 +417,10 @@ impl FileData {
             free_page(pa);
             return Err(ENOSPC);
         }
-        if self.copied.remove(&idx) {
-            STALE.lock().push((self.id(), idx));
-            STALE_ANY.store(true, Ordering::Release);
+        if core::mem::take(&mut self.copied_unknown) {
+            stale(self.id(), 0, u64::MAX);
+        } else if self.copied.remove(idx) {
+            stale(self.id(), idx, idx + 1);
         }
         Ok(pa)
     }
@@ -530,7 +545,7 @@ impl FileData {
     pub fn truncate(&mut self, len: u64) -> Result<(), Errno> {
         // (The mappings' copies past the end go with `zap_file`.)
         let keep = len.div_ceil(PAGE_SIZE);
-        let _ = self.copied.split_off(&keep);
+        self.copied.remove_from(keep, &mut |_| {});
         if let Some(id) = self.remote {
             if !self.cow {
                 hostfs::set_len(id, len)?;
@@ -558,28 +573,72 @@ impl FileData {
 impl Drop for FileData {
     fn drop(&mut self) {
         self.free_pages(0);
+        self.copied.remove_from(0, &mut |_| {});
         if let Some(id) = self.remote.filter(|_| self.unlinked) {
             hostfs::release(id);
         }
     }
 }
 
-/// Pages (file, index) that got a frame while shared mappings had
+/// What `FileData::copied` holds of a page.
+const COPIED: u64 = 1;
+/// The most frames `FileData::copied` takes: 8 GiB of a file's pages, if
+/// they're together.
+const COPIED_NODES: u64 = 4096;
+
+/// Spans of files' pages that got a frame while shared mappings had
 /// read-only copies of them: `procs::zap_stale` takes the copies out, so
-/// they fault onto the frame.
-static STALE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// they fault onto the frames. One span per file, and past `MAX_STALE`
+/// files, all of them: more goes than had to, which does no harm, as a
+/// mapping's pages can go any time and the next access brings them back.
+#[derive(Clone, Copy)]
+pub struct Stale {
+    spans: [(usize, u64, u64); MAX_STALE],
+    n: usize,
+    all: bool,
+}
+
+const MAX_STALE: usize = 32;
+
+impl Stale {
+    /// The pages (first, end) of file `id` whose copies go.
+    pub fn of(&self, id: usize) -> impl Iterator<Item = (u64, u64)> {
+        let all = self.all.then_some((0, u64::MAX));
+        let spans = self.spans[..self.n].iter().filter(move |s| !self.all && s.0 == id).map(|s| (s.1, s.2));
+        all.into_iter().chain(spans)
+    }
+}
+
+static STALE: Mutex<Stale> = Mutex::new(Stale { spans: [(0, 0, 0); MAX_STALE], n: 0, all: false });
 static STALE_ANY: AtomicBool = AtomicBool::new(false);
+
+fn stale(file: usize, first: u64, end: u64) {
+    let mut guard = STALE.lock();
+    let s = &mut *guard;
+    if let Some(span) = s.spans[..s.n].iter_mut().find(|span| span.0 == file) {
+        (span.1, span.2) = (span.1.min(first), span.2.max(end));
+    } else if s.n < MAX_STALE {
+        s.spans[s.n] = (file, first, end);
+        s.n += 1;
+    } else {
+        s.all = true;
+    }
+    STALE_ANY.store(true, Ordering::Release);
+}
 
 /// Has `take_stale` anything?
 pub fn stale_pending() -> bool {
     STALE_ANY.load(Ordering::Acquire)
 }
 
-pub fn take_stale() -> Vec<(usize, u64)> {
+pub fn take_stale() -> Option<Stale> {
     if !STALE_ANY.swap(false, Ordering::Acquire) {
-        return Vec::new();
+        return None;
     }
-    core::mem::take(&mut *STALE.lock())
+    let mut s = STALE.lock();
+    let taken = *s;
+    (s.n, s.all) = (0, false);
+    Some(taken)
 }
 
 fn page(pa: u64) -> &'static [u8] {

@@ -333,8 +333,18 @@ static int do_holefill(long pages) {
     CHECK(more[0] == 'y' && more[PAGE] == 0);
     CHECK(pwrite(fd, "z", 1, len + PAGE) == 1);
     CHECK(more[PAGE] == 'z' && more[0] == 'y');
-    // Past a truncate, and back: a hole again.
-    CHECK(ftruncate(fd, len + PAGE) == 0);
+    // Holes too far apart for the kernel to mark them all (a frame for
+    // every 2 MiB): a write still reaches a mapping's copy.
+    long far = 16L << 30;
+    CHECK(ftruncate(fd, far) == 0);
+    unsigned char *all = mmap(NULL, far, PROT_READ, MAP_SHARED, fd, 0);
+    CHECK(all != MAP_FAILED);
+    for (long at = 0; at < far; at += 2L << 20) sum += all[at];
+    CHECK(all[far - PAGE] == 0);
+    CHECK(pwrite(fd, "w", 1, 2 * len) == 1);
+    CHECK(all[2 * len] == 'w' && all[far - PAGE] == 0);
+    CHECK(pwrite(fd, "e", 1, far - PAGE) == 1);
+    CHECK(all[far - PAGE] == 'e');
     printf("holes filled\n");
     return 0;
 }

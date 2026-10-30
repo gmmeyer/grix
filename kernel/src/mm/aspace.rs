@@ -12,7 +12,7 @@ use super::paging::{self, ADDR_MASK, PageTable, Prot};
 use super::{PAGE_SIZE, frame, p2v, page_down};
 use crate::arch;
 use crate::errno::*;
-use crate::fs::{Content, Ino};
+use crate::fs::{Content, Ino, Stale};
 
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = crate::arch::USER_TOP;
@@ -668,18 +668,19 @@ impl AddressSpace {
         })
     }
 
-    /// Pages that got a frame since this address space's shared mappings
-    /// took read-only copies of them ((file id, page index), from
-    /// `fs::take_stale`): the copies go, and the next access maps the frame.
-    pub fn zap_stale(&mut self, stale: &[(usize, u64)]) {
+    /// Pages (from `fs::take_stale`) that this address space's shared
+    /// mappings may hold read-only copies of, one of which got a frame:
+    /// they go, and the next access maps the frame, or a copy again.
+    pub fn zap_stale(&mut self, stale: &Stale) {
         for v in self.vmas.values() {
             let Backing::SharedFile { data, offset, .. } = &v.backing else { continue };
             let id = data.lock().id();
-            for &(file, idx) in stale {
-                let at = idx * PAGE_SIZE;
-                if file == id && at >= *offset && at - offset < v.end - v.start {
-                    let va = v.start + (at - offset);
-                    discard_in(&mut self.pt, va, va + PAGE_SIZE);
+            let mapped = offset.saturating_add(v.end - v.start);
+            for (first, end) in stale.of(id) {
+                let lo = first.saturating_mul(PAGE_SIZE).max(*offset);
+                let hi = end.saturating_mul(PAGE_SIZE).min(mapped);
+                if lo < hi {
+                    discard_in(&mut self.pt, v.start + (lo - offset), v.start + (hi - offset));
                 }
             }
         }

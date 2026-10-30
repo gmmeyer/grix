@@ -3334,26 +3334,33 @@ pub fn getxattr(p: &mut Process, n: u32, target: u64, namep: u64, valuep: u64, s
 /// simple_xattr_list; nodes that keep none list none.
 pub fn listxattr(p: &mut Process, n: u32, target: u64, listp: u64, size: u64) -> SysResult {
     let ino = xattr_node(p, n, target)?;
-    let mut list = Vec::new();
+    // Names are charged to the metadata budget, one node may have them
+    // all, and the list is no use past what can be returned: only that is
+    // made (for a size of 0, just its length).
+    let room = size.min(fs::XATTR_LIST_MAX as u64);
+    let (mut list, mut total) = (Vec::new(), 0);
     {
         let fs = fs::lock();
         if fs.xattr_home(ino) == fs::XattrHome::Here {
             for name in fs.xattr_names(ino) {
                 if p.uid == 0 || !name.starts_with(b"trusted.") {
-                    list.extend_from_slice(name);
-                    list.push(0);
+                    total += name.len() as u64 + 1;
+                    if total <= room {
+                        list.extend_from_slice(name);
+                        list.push(0);
+                    }
                 }
             }
         }
     }
     if size != 0 {
-        if list.len() as u64 > size {
+        if total > room {
             // More than any list may be: E2BIG, not "try a bigger buffer".
             return Err(if size >= fs::XATTR_LIST_MAX as u64 { E2BIG } else { ERANGE });
         }
         copy_out(&mut p.aspace, listp, &list)?;
     }
-    Ok(list.len() as u64)
+    Ok(total)
 }
 
 /// removexattr, lremovexattr, fremovexattr.

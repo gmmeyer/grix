@@ -4189,3 +4189,26 @@ fn epoll_registrations_have_a_budget() {
     let b = with("hardening").timeout(Duration::from_secs(120));
     hardened(b, &["epolls", "500"], "refused after a while");
 }
+
+/// Reading a hole in a shared file costs the program nothing it keeps, and
+/// the pages needn't exist: a read and a madvise, millions of times, in 256
+/// MiB. What the kernel keeps of that doesn't grow; the mappings still see
+/// each page get its frame, in this process and another.
+#[test]
+fn reading_holes_costs_no_heap() {
+    // (More of them than are marked, too.)
+    let b = with("hardening").memory_mb(256).timeout(Duration::from_secs(600));
+    hardened(b, &["holes", "6000000"], "read 6000000 holes");
+    for cpus in [1, 4] {
+        let b = with("hardening").allow(Capability::Process).cpus(cpus).timeout(Duration::from_secs(120));
+        hardened(b, &["holefill", "4096"], "holes filled");
+    }
+}
+
+/// One node may have as many names as the metadata budget holds: the list
+/// is made only as far as it can be returned (E2BIG past XATTR_LIST_MAX).
+#[test]
+fn xattr_lists_are_bounded() {
+    let b = with("hardening").allow(Capability::FsWrite).timeout(Duration::from_secs(120));
+    hardened(b, &["xattrs", "5000"], "lists refused");
+}
