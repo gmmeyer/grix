@@ -8,6 +8,15 @@
 #       run -i ./hello:/bin/hello -- /bin/hello
 #
 # grix needs nothing from the container but /tmp: no shell, no libc, no QEMU.
+#
+# Where there's no KVM (most cloud VMs, and so most Kubernetes nodes), the
+# `emulated` target adds QEMU: grix uses KVM when the container has
+# /dev/kvm, and QEMU's emulator, many times slower, when it doesn't.
+#
+#   docker build --target emulated -t grix:emulated .
+#
+# In Kubernetes, a pod gets /dev/kvm from a device plugin, not KubeVirt:
+# see examples/kubernetes.
 
 FROM rust:1-alpine AS build
 # Set for releases: no paths from the build machine in the binaries.
@@ -25,6 +34,21 @@ RUN cargo build --release -p grix -p grix-vmm \
     && cp kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel /out/bin/ \
     && cp kernel/target/x86_64-unknown-none/release/grix-kernel /out/bin/grix-kernel-x86_64 \
     && chmod 1777 /out/tmp
+
+# The same with QEMU for both architectures (the host's, without KVM, and
+# images for the other). Not the last stage: `docker build` alone still
+# makes the one below.
+FROM alpine:3 AS emulated
+# QEMU's firmware is for machines that boot one: grix's kernel is loaded
+# directly, with no more than microvm's (qboot, and the PVH loader; older
+# QEMUs call qboot bios-microvm.bin).
+RUN apk add --no-cache qemu-system-aarch64 qemu-system-x86_64 \
+    && find /usr/share/qemu -mindepth 1 -maxdepth 1 \
+        ! -name qboot.rom ! -name bios-microvm.bin ! -name pvh.bin -exec rm -rf {} +
+COPY --from=build /out/bin/ /usr/local/bin/
+ENV TMPDIR=/tmp
+ENTRYPOINT ["/usr/local/bin/grix"]
+CMD ["--help"]
 
 FROM scratch
 COPY --from=build /out/ /

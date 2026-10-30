@@ -505,7 +505,7 @@ guest makes up is `other`), so no program can make the series grow.
 ### In a container
 
 `grix run` can be a container's command, as for a server in Kubernetes
-(the container needs `/dev/kvm`; see the `Dockerfile`):
+(the `Dockerfile` makes grix's image):
 
 ```sh
 grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threads --image app.grix
@@ -522,6 +522,38 @@ grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threa
   failed).
 - The container's memory limit needs room for the guest's (`--mem`, 512
   MiB by default) and grix's own.
+- To run the machine in grix-vmm, the container needs `/dev/kvm` (`docker
+  run --device /dev/kvm`). Without it, grix emulates the machine in QEMU,
+  which the `Dockerfile`'s `emulated` target adds (`docker build --target
+  emulated -t grix:emulated .`). That runs anywhere, but CPU-bound code is
+  about 10–25× slower, and QEMU doesn't count its emulator as a security
+  boundary, so the container is the boundary to rely on. `grix run -v`
+  prints which one a run uses: `an x86_64 machine in grix-vmm`, or `in
+  qemu-system-x86_64 (tcg)`.
+
+### In Kubernetes
+
+There's no need for KubeVirt: grix's VM runs inside an ordinary pod,
+and the pod only needs `/dev/kvm`, which a device plugin provides.
+`examples/kubernetes` has one, and a Deployment whose pods ask for it:
+
+```sh
+kubectl apply -f examples/kubernetes/kvm-device-plugin.yaml   # once per cluster
+kubectl apply -f examples/kubernetes/grix.yaml                # with your image in it
+```
+
+- `kvm-device-plugin.yaml` runs squat/generic-device-plugin on every node,
+  unprivileged. It offers `devic.es/kvm` where the node has `/dev/kvm`,
+  and a pod with `devic.es/kvm: 1` in its limits gets `/dev/kvm` and none
+  of the node's other devices. `grix.yaml`'s pod has no capabilities and a
+  read-only root (`GRIX_CACHE` on an `emptyDir`). A privileged pod with a
+  `hostPath` of `/dev/kvm` works too, but then the pod has the whole node.
+- Pods that ask for `devic.es/kvm` go only to nodes with KVM: bare-metal
+  machines, or VMs with nested virtualization, which most clouds offer
+  only on some machine types. Where nodes have no KVM, use the `emulated`
+  image without the limit, and it runs on any node.
+- grix listens on a published port before the program does, so make the
+  readiness probe ask the program (`httpGet`), not just open the port.
 
 ## Images
 
@@ -759,9 +791,12 @@ disk, and only the imported files in its memory. The guest kernel's policy
 checks are what make the sandbox *least privilege* and *observable*, but they
 aren't the only wall.
 
-Where it runs (arm64 macOS and Linux), the VMM is grix's own: small, and
-confined itself, so a guest that escaped the hypervisor into it would
-still have no files or network. Elsewhere it's QEMU, which is large.
+Where it runs (arm64 macOS 15+, and Linux with KVM), the VMM is grix's own:
+small, and confined itself, so a guest that escaped the hypervisor into it
+would still have no files or network. Elsewhere it's QEMU, which is large.
+Without hardware virtualization there's no hypervisor either: QEMU's
+emulator (TCG) isn't a security boundary by QEMU's own account, so the
+walls are grix's kernel and whatever holds QEMU, such as a container.
 Either way, don't treat grix as hardened against a determined attacker yet:
 it hasn't had an outside security review.
 
@@ -848,7 +883,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat and 
   src/syscall/     Linux syscall table (+ capability gates) and implementations
 fixtures/          C (src/, built with zig) and Go (go/) test programs; build/ also gets Alpine runtimes
 tools/alpine.py    Alpine package resolver for building importable root filesystems
-examples/          example manifests
+examples/          example manifests, and Kubernetes manifests (kubernetes/)
 ```
 
 See [AGENTS.md](AGENTS.md) for contributor and agent guidelines.

@@ -393,21 +393,42 @@ pub(crate) fn run(
     }
     let vmm = cfg.vmm.as_ref().unwrap_or(&cfg.qemu);
     let child = cmd.spawn().with_context(|| {
-        if cfg.vmm.is_none() {
-            // QEMU is the fallback; say what would have made it unnecessary.
-            format!(
-                "starting {} (grix runs its own VMM instead on arm64 macOS 15+, and on arm64 Linux with \
-                 /dev/kvm: in a container, pass --device /dev/kvm)",
+        if cfg.vmm.is_some() {
+            return format!("starting {}", vmm.display());
+        }
+        // QEMU is the fallback; say what would have made it unnecessary.
+        match kvm_error(cfg.arch) {
+            Some(e) => {
+                // Missing or not allowed is what a container without it sees.
+                let hint = match e.kind() {
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied => {
+                        "; in a container, pass --device /dev/kvm, or in Kubernetes ask a KVM device plugin \
+                         for it: see the README"
+                    }
+                    _ => "",
+                };
+                format!("starting {} (grix runs its own VMM instead on KVM, but /dev/kvm: {e}{hint})", vmm.display())
+            }
+            None => format!(
+                "starting {} (grix runs its own VMM instead for the host's own architecture, on arm64 \
+                 macOS 15+ and on Linux with KVM)",
                 vmm.display()
-            )
-        } else {
-            format!("starting {}", vmm.display())
+            ),
         }
     })?;
     let mut child = ChildGuard(child, false);
     let uart = accept_uart(&listener, &mut child.0)?;
     drop(listener);
     run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
+}
+
+/// Why this host's KVM can't run `arch`'s guests in grix-vmm: opening
+/// /dev/kvm failed. None if KVM isn't what's missing.
+fn kvm_error(arch: crate::sandbox::Arch) -> Option<std::io::Error> {
+    if !cfg!(target_os = "linux") || arch != crate::sandbox::Arch::host() {
+        return None;
+    }
+    std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").err()
 }
 
 /// QEMU's command line for the machine.

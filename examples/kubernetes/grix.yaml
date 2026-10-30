@@ -1,0 +1,89 @@
+# A server in grix on Kubernetes: the program in app.grix, its port 8000 on
+# the pod's 8080, and grix's metrics on 9090. The container image is grix's
+# (docker build -t grix . in this repository) with the app in it:
+#
+#   FROM grix
+#   COPY app.grix /app.grix
+#
+# It asks for /dev/kvm (kvm-device-plugin.yaml), so it goes to nodes with
+# KVM and runs in grix's own VMM. For nodes without KVM, build FROM
+# grix:emulated (docker build --target emulated -t grix:emulated .) and take
+# the devic.es/kvm limit out: grix then emulates the machine in QEMU, many
+# times slower, and the pod is the boundary to rely on.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grix-app
+  labels:
+    app.kubernetes.io/name: grix-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grix-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grix-app
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: app
+        image: registry.example.com/grix-app:latest
+        # net is granted here, not by the image (--allow-host limits where
+        # the program connects). SIGTERM goes to the program, and grix exits
+        # as it does.
+        args: [run, --timeout, "0", --metrics, "0.0.0.0:9090", -p, "0.0.0.0:8080:8000", -a, net, --image, /app.grix]
+        env:
+        # The root filesystem is read-only: grix caches the image's kernel here.
+        - name: GRIX_CACHE
+          value: /tmp/grix-cache
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: metrics
+          containerPort: 9090
+        # grix listens on 8080 before the program does, so ask the program.
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+        resources:
+          # The guest's memory (512 MiB unless --mem says) and grix's own.
+          requests:
+            cpu: 500m
+            memory: 768Mi
+          limits:
+            memory: 768Mi
+            devic.es/kvm: 1
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grix-app
+  labels:
+    app.kubernetes.io/name: grix-app
+spec:
+  selector:
+    app.kubernetes.io/name: grix-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  - name: metrics
+    port: 9090
+    targetPort: metrics
