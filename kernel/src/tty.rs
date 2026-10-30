@@ -815,6 +815,8 @@ pub fn get(index: u32) -> Option<TtyRef> {
 
 /// TTY mode's terminal: /dev/pts/0, its master side the host.
 static CONSOLE_TTY: Mutex<Option<TtyRef>> = Mutex::new(None);
+/// There is one (TTY mode).
+static CONSOLE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Make the console's terminal at boot, and the slave the program's stdio
 /// is (owned by the program's user, as login would make it).
@@ -825,6 +827,7 @@ pub fn console_terminal(rows: u16, cols: u16, uid: u32, gid: u32) -> (TtyRef, cr
     let ino = crate::fs::lock().pts_show(index, (uid, gid));
     let file = crate::fd::new_file(FileKind::Pty(PtyEnd::new(tty.clone(), false, ino)), crate::fd::O_RDWR);
     *CONSOLE_TTY.lock() = Some(tty.clone());
+    CONSOLE_MODE.store(true, Ordering::Relaxed);
     (tty, file)
 }
 
@@ -932,6 +935,12 @@ enum Pending {
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 static WORK: AtomicBool = AtomicBool::new(false);
+
+/// Has `service` anything to do? In TTY mode, always: it moves the
+/// console's input in.
+pub fn service_due() -> bool {
+    WORK.load(Ordering::Relaxed) || CONSOLE_MODE.load(Ordering::Relaxed)
+}
 
 /// Hang up the terminals whose master closed (Linux's tty_vhangup of the
 /// slave): its session leader gets SIGHUP and SIGCONT, and nobody in the

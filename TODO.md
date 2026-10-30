@@ -101,8 +101,15 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
     rather than every CPU being interrupted for each; each CPU has its
     own running-process slot, an idle CPU takes none, and the filesystem
     lock knows its holder; a kernel entry moves a pointer to its process,
-    not the process (three times the system calls a second). Next (phase
-    2): scheduler state kept as it changes, then a reader/writer lock. On macOS an idle
+    not the process; and the scheduler keeps what it looked through every
+    process for (threads waiting to run, the next deadline, whether I/O
+    waiters need waking) as it changes, so an entry with nothing new costs
+    the same beside 32 idle processes as alone (getppid 1.85M a second to
+    6.1M on one thread, a futex ping-pong 1.2M to 2.9M on four CPUs).
+    Next (phase 2): a reader/writer lock with per-process check-out.
+    x86_64's 64 KiB kernel stacks are nearly full: a secondary CPU's
+    reaches 57 KiB in smpbench (arm64's 20), and a build with debug
+    assertions overflows them. On macOS an idle
     vCPU wakes ~0.5 ms late for a 1 ms timer (the host's timer
     coalescing, in grix-vmm and QEMU alike): a kqueue timer with
     NOTE_CRITICAL in grix-vmm might fix it.

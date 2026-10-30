@@ -71,6 +71,14 @@ pub fn may_inspect_creds(p: &Process, quid: u32, qgid: u32, qids: &Ids, real: bo
 /// A process has ended and may need finishing off (`reap_others`).
 pub static DYING: AtomicBool = AtomicBool::new(false);
 
+/// Has `reap_others` anything to do? (Without the process table.)
+pub fn housekeeping_due() -> bool {
+    DYING.load(Ordering::Relaxed)
+        || signal::JOBS.load(Ordering::Relaxed)
+        || crate::fs::stale_pending()
+        || crate::tty::service_due()
+}
+
 /// Live processes (not finished off yet) and their threads, counted as
 /// they come and go, wherever they are: in `PROCS` or a CPU's slot.
 static LIVE: AtomicUsize = AtomicUsize::new(0);

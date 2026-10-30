@@ -74,7 +74,7 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
     procs::reap_others(slot.as_deref_mut(), &mut procs);
     // A timer interrupt that brought an idle CPU here (`irq` takes its own).
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
-    if !poll(slot.as_deref_mut(), &mut procs) && timer {
+    if !poll(slot.as_deref_mut(), &mut procs, timer) && timer {
         smp::note(smp::Stat::TimerIdle, 1);
     }
     // Others may have ended just now too (a timer's signal, the host's).
@@ -134,6 +134,9 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
 /// the first, and looks at it last.
 fn pick(p: Option<&Process>, procs: &Procs, alone: bool) -> Option<u32> {
     let takes = |q: &Process, alone: bool| runnable(q) && (smp::runs_here(q) || alone);
+    if process::queued() == p.map_or(0, |p| p.runq.len()) {
+        return p.filter(|p| takes(p, alone)).map(|p| p.pid);
+    }
     let start = p.map(|p| p.pid).or_else(|| procs.others.keys().next().copied()).unwrap_or(0);
     let others = procs.others.range(start + 1..).chain(procs.others.range(..=start));
     others
@@ -148,26 +151,85 @@ pub fn runnable(q: &Process) -> bool {
     !q.runq.is_empty() && !q.stopped
 }
 
-/// Another process has threads waiting to run.
-pub fn others_wait(procs: &Procs) -> bool {
-    procs.others.values().any(|q| runnable(q))
+/// Another process than `p` (this CPU's) has threads waiting to run.
+fn others_wait(p: &Process, procs: &Procs) -> bool {
+    process::queued() > p.runq.len() && procs.others.values().any(|q| runnable(q))
+}
+
+/// No sleeping thread's or timer's deadline anywhere is earlier than this,
+/// so until then nothing need look at every process for one (0: not
+/// known, count them again). A deadline is added with `deadline_at`, and a
+/// timer that changes says so (`deadlines_changed`); one that goes leaves
+/// it early, which costs an interrupt that finds nothing, after which
+/// they're counted again (`poll`).
+static EARLIEST: AtomicU64 = AtomicU64::new(0);
+/// A process may have a CPU-time timer, whose deadline moves as its
+/// threads run (`timer::cpu_deadline`): while one may, every poll and
+/// timer update looks at every process.
+static CPU_TIMED: AtomicBool = AtomicBool::new(true);
+
+/// In `EARLIEST`: no deadline at all. A real one is kept between this and
+/// 0 (`clamp`), so a thread that sleeps forever (a saturated timeout)
+/// still has one.
+const NONE: u64 = u64::MAX;
+
+fn clamp(deadline: u64) -> u64 {
+    deadline.clamp(1, NONE - 1)
+}
+
+/// A thread sleeps until `deadline`.
+pub fn deadline_at(deadline: u64) {
+    EARLIEST.fetch_min(clamp(deadline), Ordering::Relaxed);
+}
+
+/// A timer was set, changed, or may fire again (its signal taken, its
+/// timerfd read): count the deadlines again.
+pub fn deadlines_changed() {
+    EARLIEST.store(0, Ordering::Relaxed);
+}
+
+/// `q`'s earliest deadline, but for its CPU-time timers (`NONE`: none).
+fn deadline_of(q: &Process) -> u64 {
+    let sleepers = q.threads.values().filter_map(|t| t.wait?.deadline);
+    sleepers.chain(q.timers.next_deadline()).min().map_or(NONE, clamp)
 }
 
 /// Everything due, in every process: timers, I/O waiters, expired
-/// deadlines. Returns whether anything woke.
-fn poll(mut p: Option<&mut Process>, procs: &mut Procs) -> bool {
+/// deadlines. Returns whether anything woke. `timer`: a timer interrupt
+/// brought this CPU here. Only what may be due is looked at: deadlines
+/// once the earliest has come (or a timer fired), I/O waiters once I/O
+/// state changed.
+fn poll(mut p: Option<&mut Process>, procs: &mut Procs, timer: bool) -> bool {
     let mut woke = false;
     for sig in console::take_host_signals() {
         woke |= from_host(p.as_deref_mut(), procs, sig);
     }
+    let earliest = EARLIEST.load(Ordering::Relaxed);
+    let mut timers = timer || CPU_TIMED.load(Ordering::Relaxed) || time::monotonic_ns() >= earliest;
     // Until I/O state stops changing (a timer can fire a timerfd), so every
     // waiter has seen the generation `idle` compares against.
     loop {
         let generation = crate::ipc::generation();
+        let io = generation != POLLED.load(Ordering::Relaxed);
+        if !timers && !io {
+            return woke;
+        }
+        let (mut next, mut cpu_timed) = (NONE, false);
         for q in procs.each(p.as_deref_mut()) {
-            woke |= crate::timer::fire(q);
-            woke |= q.wake_io_waiters();
-            woke |= wake_expired(q);
+            if timers {
+                woke |= crate::timer::fire(q);
+                woke |= wake_expired(q);
+                next = next.min(deadline_of(q));
+                cpu_timed |= crate::timer::cpu_timed(q);
+            }
+            if io {
+                woke |= q.wake_io_waiters();
+            }
+        }
+        if timers {
+            EARLIEST.store(next, Ordering::Relaxed);
+            CPU_TIMED.store(cpu_timed, Ordering::Relaxed);
+            timers = false;
         }
         crate::fasync::deliver(p.as_deref_mut(), procs);
         if crate::ipc::generation() == generation {
@@ -177,8 +239,9 @@ fn poll(mut p: Option<&mut Process>, procs: &mut Procs) -> bool {
     }
 }
 
-/// The I/O generation the last `poll` left everyone at.
-static POLLED: AtomicU64 = AtomicU64::new(0);
+/// The I/O generation every I/O waiter has seen (the last `poll` or
+/// `wake_io_everywhere` left everyone at).
+static POLLED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub fn polled() -> u64 {
     POLLED.load(Ordering::Relaxed)
@@ -204,9 +267,14 @@ fn from_host(mut p: Option<&mut Process>, procs: &mut Procs, sig: u32) -> bool {
 }
 
 /// After a syscall: if I/O state changed, wake waiters in every process,
-/// not just this one (a pipe's reader may be another process).
+/// not just this one (a pipe's reader may be another process). Nothing to
+/// do (the usual case) takes no lock and looks at no other process.
 pub fn wake_io_everywhere(p: &mut Process) {
     p.wake_io_waiters();
+    let generation = crate::ipc::generation();
+    if generation == POLLED.load(Ordering::Relaxed) && !procs::housekeeping_due() {
+        return;
+    }
     let mut procs = PROCS.lock();
     procs::reap_others(Some(&mut *p), &mut procs);
     crate::fasync::deliver(Some(&mut *p), &mut procs);
@@ -214,6 +282,8 @@ pub fn wake_io_everywhere(p: &mut Process) {
     for q in procs.others_mut() {
         woke |= q.wake_io_waiters();
     }
+    // As of before `deliver`, whose signals may change it again.
+    POLLED.store(generation, Ordering::Relaxed);
     if woke {
         p.timer_dirty = true;
     }
@@ -239,7 +309,13 @@ fn wake_expired(p: &mut Process) -> bool {
 /// wake.
 fn idle(mut p: Option<&mut Process>, procs: &mut Procs) {
     let others_running = smp::others_running();
-    match earliest_deadline(p.as_deref_mut(), procs) {
+    // Whether anyone can ever wake rests on there being no deadline: not
+    // one `EARLIEST` still holds of a wait that ended early (a timed wait
+    // woken), which would put a deadlock off until then.
+    if !others_running {
+        deadlines_changed();
+    }
+    match earliest(p.as_deref_mut(), procs) {
         Some(deadline) => arm(None, Some(deadline)),
         // The host can still wake whoever waits for I/O, and a thread
         // waiting for a signal may get one: a RunControl's, or the SIGTERM
@@ -300,15 +376,31 @@ pub fn handle_interrupt(id: u32) {
 }
 
 /// The next time something needs the CPU, anywhere: a sleeping thread's
-/// deadline or a timer.
-fn earliest_deadline(p: Option<&mut Process>, procs: &mut Procs) -> Option<u64> {
-    procs
-        .each(p)
-        .filter_map(|q| {
-            let sleepers = q.threads.values().filter_map(|t| t.wait?.deadline);
-            sleepers.chain(q.timers.next_deadline()).chain(crate::timer::cpu_deadline(q)).min()
-        })
-        .min()
+/// deadline or a timer (perhaps sooner: see `EARLIEST`). `None`: there's
+/// none at all.
+fn earliest(p: Option<&mut Process>, procs: &mut Procs) -> Option<u64> {
+    let known = EARLIEST.load(Ordering::Relaxed);
+    if known != 0 && !CPU_TIMED.load(Ordering::Relaxed) {
+        return (known != NONE).then_some(known);
+    }
+    let (mut next, mut cpu, mut cpu_timed) = (NONE, NONE, false);
+    for q in procs.each(p) {
+        next = next.min(deadline_of(q));
+        cpu = cpu.min(crate::timer::cpu_deadline(q).map_or(NONE, clamp));
+        cpu_timed |= crate::timer::cpu_timed(q);
+    }
+    EARLIEST.store(next, Ordering::Relaxed);
+    CPU_TIMED.store(cpu_timed, Ordering::Relaxed);
+    Some(next.min(cpu)).filter(|&t| t != NONE)
+}
+
+/// `earliest`, taking the process table only if it must look.
+fn earliest_from(p: &mut Process) -> Option<u64> {
+    let known = EARLIEST.load(Ordering::Relaxed);
+    if known != 0 && !CPU_TIMED.load(Ordering::Relaxed) {
+        return (known != NONE).then_some(known);
+    }
+    earliest(Some(p), &mut PROCS.lock())
 }
 
 fn deadlock(p: Option<&mut Process>, procs: &mut Procs) -> ! {
@@ -347,10 +439,10 @@ pub fn update_timer(p: &mut Process) {
     if keeper != me && p.running && !smp::has_thread(keeper) {
         KEEPER.store(me, Ordering::Relaxed);
     }
-    let mut procs = PROCS.lock();
-    let slice_end = (runnable(p) || others_wait(&procs)).then(|| p.slice_start + SLICE_NS);
+    let others = process::queued() > p.runq.len() && others_wait(p, &PROCS.lock());
+    let slice_end = (runnable(p) || others).then(|| p.slice_start + SLICE_NS);
     let own = slice_end.into_iter().chain(crate::timer::cpu_deadline(p)).min();
-    arm(own, earliest_deadline(Some(p), &mut procs));
+    arm(own, earliest_from(p));
 }
 
 /// The CPU whose timer keeps everyone's deadlines (sleepers', timers'),
@@ -398,9 +490,9 @@ pub fn irq(tf: &mut TrapFrame) {
     let (woke, others_runnable) = {
         let mut procs = PROCS.lock();
         procs::reap_others(Some(&mut *p), &mut procs);
-        let woke = poll(Some(&mut *p), &mut procs);
+        let woke = poll(Some(&mut *p), &mut procs, timer);
         procs::reap_others(Some(&mut *p), &mut procs);
-        (woke, others_wait(&procs))
+        (woke, others_wait(p, &procs))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
     let preempt = p.resched || (runnable(p) || others_runnable) && (slice_over || woke);

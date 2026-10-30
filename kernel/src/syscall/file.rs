@@ -684,6 +684,7 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
             }
             // Consumed: the timer re-arms (see timer.rs).
             p.timer_dirty = true;
+            crate::sched::deadlines_changed();
             copy_out(&mut p.aspace, buf, &ticks.to_le_bytes()).map(|_| 8)
         }
         FileKind::Generated(data) => {

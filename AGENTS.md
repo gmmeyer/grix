@@ -311,7 +311,17 @@ process's CPU-time timers, and a deadline only if it comes before the
 timekeeper's timer (`sched::arm`). Whichever CPU's timer fires looks at
 everything again, so a deadline is never missed. A CPU-time
 timer's deadline is in CPU time, a wake-up only while its threads run
-(`timer::cpu_deadline`). The vDSO (`vdso.rs`, a page every process
+(`timer::cpu_deadline`). Nothing looks through every process for a
+deadline unless one may be due: `sched::EARLIEST` is no later than any
+sleeper's or timer's (a thread that sleeps lowers it, in `Process::block`;
+a timer set, its signal taken or its timerfd read resets it,
+`sched::deadlines_changed`, and the next look counts them again), and
+while a CPU-time timer is armed (`CPU_TIMED`) every look looks. Anything
+new that sets a deadline must do one or the other, or its sleeper wakes
+only when something else comes due. So too I/O waiters are looked for
+only once the I/O generation has moved past the one they all saw
+(`sched::POLLED`), and the threads waiting to run are counted
+(`process::queued`, kept by `RunQ`). The vDSO (`vdso.rs`, a page every process
 shares) reads the clocks without a system call from a page only the
 kernel writes (`vdso::publish`); the kernel's clock uses the same
 `(ticks * mult) >> 32`, so keep the two in step.

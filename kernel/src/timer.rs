@@ -236,6 +236,13 @@ pub fn cpu_deadline(p: &Process) -> Option<u64> {
     itimers.chain(posix).min().map(|wait| now.saturating_add(wait))
 }
 
+/// Has `p` an armed CPU-time timer (whose deadline `cpu_deadline` must
+/// work out again as its threads come and go)?
+pub fn cpu_timed(p: &Process) -> bool {
+    p.timers.cpu_itimers.iter().any(|i| i.next.is_some())
+        || p.timers.posix.values().any(|t| t.cpu.is_some() && t.timing.next.is_some())
+}
+
 /// Queue a timer's signal. Returns whether it was queued; an ignored one
 /// backs its timer off to a minimum period instead.
 fn send_timer_signal(p: &mut Process, target: Target, info: SigInfo, id: u32) -> bool {
@@ -328,6 +335,7 @@ pub fn fire(p: &mut Process) -> bool {
 /// the timer re-arm. Returns whether its deadline must be programmed again.
 pub fn delivered(p: &mut Process, info: &mut SigInfo) -> bool {
     let Some(id) = info.timer else { return false };
+    crate::sched::deadlines_changed();
     let now = clock_of(p, id);
     let timers = &mut p.timers;
     match id {
@@ -357,6 +365,7 @@ pub fn delivered(p: &mut Process, info: &mut SigInfo) -> bool {
 /// Signals were discarded (now ignored, or their thread exited): timers
 /// whose signal is gone must re-arm.
 pub fn resync(p: &mut Process) {
+    crate::sched::deadlines_changed();
     let ids: Vec<u32> = p.timers.posix.iter().filter(|(_, t)| t.pending).map(|(&id, _)| id).collect();
     for id in ids {
         if signal::queued_timer_signal(p, id).is_none() {

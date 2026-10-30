@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use grix_abi::image::Image;
 use grix_abi::policy::{DenyAction, Policy};
 use grix_abi::wire::{Event, ExitKind};
@@ -307,7 +307,7 @@ pub struct Process {
     /// The running thread. Its live state is in the CPU, not in `threads`.
     pub current: u32,
     /// Runnable threads other than `current`, in round-robin order.
-    pub runq: VecDeque<u32>,
+    pub runq: RunQ,
     /// Futex wait queues: address -> (tid, bitset) in FIFO order.
     pub futexes: BTreeMap<u64, VecDeque<(u32, u32)>>,
     /// When the current thread's time slice started (monotonic ns).
@@ -362,6 +362,50 @@ pub struct Share {
 pub enum JobReport {
     Stopped(u32),
     Continued,
+}
+
+/// Threads waiting to run, in every process's `RunQ` (stopped ones' too):
+/// when there are none, nothing need look at every process to find one.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn queued() -> usize {
+    QUEUED.load(Ordering::Relaxed)
+}
+
+/// A process's run queue, counted in `QUEUED`.
+#[derive(Default)]
+pub struct RunQ(VecDeque<u32>);
+
+impl RunQ {
+    pub fn push_back(&mut self, tid: u32) {
+        self.0.push_back(tid);
+        QUEUED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pop_front(&mut self) -> Option<u32> {
+        let tid = self.0.pop_front()?;
+        QUEUED.fetch_sub(1, Ordering::Relaxed);
+        Some(tid)
+    }
+
+    pub fn clear(&mut self) {
+        QUEUED.fetch_sub(self.0.len(), Ordering::Relaxed);
+        self.0.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for RunQ {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 const N: usize = grix_abi::machine::MAX_CPUS as usize;
@@ -429,7 +473,7 @@ impl Process {
             args_charge: Default::default(),
             threads: BTreeMap::from([(pid, Thread::new(pid))]),
             current: pid,
-            runq: VecDeque::new(),
+            runq: RunQ::default(),
             futexes: BTreeMap::new(),
             slice_start: 0,
             resched: false,
@@ -534,6 +578,9 @@ impl Process {
         t.wait = Some(Wait { on, deadline, timeout_ret, rerun: false });
         t.restart_deadline = deadline;
         self.timer_dirty = true;
+        if let Some(deadline) = deadline {
+            crate::sched::deadline_at(deadline);
+        }
         Err(EBLOCKED)
     }
 

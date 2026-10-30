@@ -3282,6 +3282,14 @@ fn smp_counters_and_benchmark() {
             assert!(runs.iter().any(|r| r["mode"] == mode), "{mode}: {stdout}");
         }
     }
+    // Beside idle processes (each a sleeper and a pipe's reader), which
+    // end when it does.
+    let out = run(b().cpus(4), &["/bin/smpbench", "-t", "50", "-b", "4", "syscall", "futex"]);
+    let stdout = out.stdout_str();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
+    assert_eq!(stdout.lines().filter(|l| l.starts_with("smpbench mode=") && l.contains(" bg=4 ")).count(), 4, "{stdout}");
     // A header, a line per CPU, and their sum.
     let out = run(with("cat").cpus(2), &["/bin/cat", "/proc/grix/smp"]);
     let stdout = out.stdout_str();

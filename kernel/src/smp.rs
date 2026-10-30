@@ -269,9 +269,10 @@ pub fn unlock() {
                 procs.others.insert(p.pid, p);
             }
         }
-        // Idle CPUs for the threads waiting to run.
+        // Idle CPUs for the threads waiting to run (looked for only if
+        // there are any).
         let idle = (0..online()).filter(|&i| i != me && cpus[i].tid.is_none()).count();
-        if idle > 0 {
+        if idle > 0 && process::queued() > 0 {
             let mut want: usize = procs
                 .others
                 .values()

@@ -544,6 +544,11 @@ impl Drop for FileData {
 static STALE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 static STALE_ANY: AtomicBool = AtomicBool::new(false);
 
+/// Has `take_stale` anything?
+pub fn stale_pending() -> bool {
+    STALE_ANY.load(Ordering::Acquire)
+}
+
 pub fn take_stale() -> Vec<(usize, u64)> {
     if !STALE_ANY.swap(false, Ordering::Acquire) {
         return Vec::new();
