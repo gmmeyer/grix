@@ -121,8 +121,8 @@ are new:
 | Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it goes on), and GPU initialisation fails as in any container without a GPU. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
 | MinIO | | `minio/minio`, `quay.io/minio/minio` | | | not tried | MinIO no longer publishes public images (Docker Hub: 404; quay.io: unauthorized). | |
 
-Caps as above; "3 GiB" is `--mem 3072`, the most a guest has (see
-"What's left").
+Caps as above; "3 GiB" is `--mem 3072`, which was the most a guest
+had when these ran (64 GiB now).
 
 The Datadog Agent was run again too (DATADOG.md).
 
@@ -175,28 +175,21 @@ images from registries, run on their own machine).
 
 In order of impact (details in TODO.md):
 
-1. **Guest memory is at most 3 GiB** (`grix_abi::image::MAX_RAM`: the
-   kernel maps physical memory linearly below 4 GiB). The sandbox's
-   files live in that memory too, so Grafana's plugin downloads ran out
-   of room at 2 GiB, an `apk add chromium` build step needed
-   `memory_mb = 4096` (it dies of SIGBUS on a full file system without
-   it, and the build's error now says it ran out of room), and
-   Elasticsearch and OpenSearch need small heaps. Bigger guests need
-   the kernel to map memory above 4 GiB.
-2. **1024 threads in all** (`process::MAX_THREADS`, and
+1. **1024 threads in all** (`process::MAX_THREADS`, and
    `/proc/sys/kernel/threads-max` says so): ClickHouse warns, and a busy
    JVM or ClickHouse server could reach it.
-3. **`splice`** is still unimplemented (Go and others fall back; it's
+2. **`splice`** is still unimplemented (Go and others fall back; it's
    reported), and so is **`/proc/self/mem`** (cilium/ebpf's version
    probe in Datadog's system-probe).
-4. **No IPv6 address on `eth0`**: programs that listen on `[::]` with
+3. **No IPv6 address on `eth0`**: programs that listen on `[::]` with
    `AI_ADDRCONFIG` (ClickHouse) skip it, as in a container without IPv6.
-5. **`SO_PASSCRED` on streams**: credentials come only with datagram and
+4. **`SO_PASSCRED` on streams**: credentials come only with datagram and
    seqpacket messages (reported for streams).
-6. **Landlock, ethtool, udev's netlink**: reported by Chromium, which
+5. **Landlock, ethtool, udev's netlink**: reported by Chromium, which
    goes on without them.
 
-Done in earlier rounds: Linux AIO (io_uring stays ENOSYS on purpose:
+Done since: guests up to 64 GiB (`grix_abi::image::MAX_RAM`), so files
+and heaps past 3 GiB fit. Done in earlier rounds: Linux AIO (io_uring stays ENOSYS on purpose:
 a second way into every operation, each needing its own gate, and
 blocked by Docker's default seccomp profile too, so programs fall back),
 seccomp filters, and reading ID registers from EL0.

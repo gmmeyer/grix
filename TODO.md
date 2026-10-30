@@ -216,21 +216,16 @@ in images (and `run -e KEY`), item 29's sysctls,
 sockets and `capset` that drops everything (Chromium), and a build
 step that runs out of room saying so. Left, in order of impact:
 
-31. [ ] **Guests bigger than 3 GiB** (`grix_abi::image::MAX_RAM`). The
-    kernel maps physical memory linearly, and RAM starts at 1 GiB on
-    arm64 (`0x4000_0000`) and must stay below the 32-bit hole on
-    x86_64 (microvm), so 3 GiB is all there is. The sandbox's files live
-    in that memory (half of it at most), so it bounds both: Grafana's
-    plugin downloads hit ENOSPC at 2 GiB, Elasticsearch and OpenSearch
-    need small heaps, and ClickHouse or a JVM build can't have 8 GiB.
-    What it would take: RAM in two regions (below 4 GiB and from 4 GiB
-    up, as QEMU's microvm and KVM's layouts put it), described in the
-    boot image's header (`grix_abi::machine`), the kernel's linear map
-    and frame allocator taking both (`mm/frame.rs`, both architectures'
-    page-table setup in `boot.S`), and grix-vmm and the QEMU command
-    making the second region. Without it, a writable layer on the host
-    (files written to disk instead of guest memory) would at least take
-    files out of the budget.
+31. [x] **Guests bigger than 3 GiB**: up to 64 GiB (`grix_abi::image::MAX_RAM`).
+    RAM is in two regions on x86_64 (below 3 GiB and from 4 GiB, as
+    `microvm` puts it) and runs on past 4 GiB on arm64
+    (`grix_abi::machine::ram_regions`); the kernel maps what's past 4 GiB
+    at boot (`arch::map_ram`) and hands those frames out first. What
+    grew with RAM on the kernel heap is in RAM: frame reference counts,
+    the free list, and the page indexes of files and shared memory
+    (`mm::pageindex`). grix-vmm asks Hypervisor.framework for a bigger
+    IPA when it needs one. The boot image (imports) must still fit below
+    4 GiB.
 32. [ ] **More than 1024 threads** (`process::MAX_THREADS`, all
     processes; `threads-max` says so). ClickHouse warns about it, and a
     busy JVM or Go server could reach it. Each thread is a few KiB of
