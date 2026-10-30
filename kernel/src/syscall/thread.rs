@@ -7,6 +7,7 @@ use grix_abi::stats::{Limit, Resource};
 use super::{require, table::nr};
 use crate::arch::{self, TrapFrame};
 use crate::errno::*;
+use crate::futex::Word;
 use crate::process::{self, Process, Thread, WaitOn};
 use crate::time;
 use crate::uaccess::*;
@@ -257,9 +258,8 @@ pub fn futex_wake(p: &mut Process, addr: u64, n: u32, bitset: u32) -> u32 {
     }
     for &tid in &woken {
         // A futex_waitv returns the index of the word that woke it.
-        let index =
-            p.threads.get(&tid).and_then(|t| t.futexv.as_ref()).and_then(|v| v.addrs.iter().position(|&a| a == addr));
-        p.wake(tid, Some(index.unwrap_or(0) as u64));
+        let index = p.futexv_index(tid, Word::Private(addr));
+        p.wake(tid, Some(index));
     }
     woken.len() as u32
 }
@@ -286,14 +286,7 @@ fn futex_requeue(p: &mut Process, from: u64, to: u64, n: u32) -> u32 {
         p.futexes.insert(from, q);
     }
     for &(tid, _) in &moved {
-        let Some(t) = p.threads.get_mut(&tid) else { continue };
-        match (t.wait.as_mut(), t.futexv.as_mut()) {
-            (Some(w), Some(v)) if w.on == WaitOn::FutexV => {
-                v.addrs.iter_mut().filter(|a| **a == from).for_each(|a| *a = to);
-            }
-            (Some(w), _) => w.on = WaitOn::Futex(to),
-            _ => {}
-        }
+        p.futex_moved(tid, Word::Private(from), Word::Private(to));
     }
     let count = moved.len() as u32;
     p.futexes.entry(to).or_default().extend(moved);
@@ -446,7 +439,7 @@ pub fn futex_waitv(p: &mut Process, waiters: u64, count: u64, flags: u64, timeou
         if val > u32::MAX as u64 {
             return Err(EINVAL);
         }
-        words.push((addr, val as u32));
+        words.push((addr, val as u32, wflags & PRIVATE != 0));
     }
     let deadline = match timeout {
         0 => None,
@@ -459,20 +452,26 @@ pub fn futex_waitv(p: &mut Process, waiters: u64, count: u64, flags: u64, timeou
             }
         }
     };
-    for &(addr, val) in &words {
+    for &(addr, val, _) in &words {
         if read_u32(&mut p.aspace, addr)? != val {
             return Err(EAGAIN);
         }
     }
+    let queued = core::mem::size_of::<Word>() as u64 + crate::futex::COST;
+    let charge = crate::kmem::Charge::new(words.len() as u64 * queued)?;
+    let words: Vec<Word> = words
+        .iter()
+        .map(|&(addr, _, private)| word_key(p, private, addr).map_or(Word::Private(addr), Word::Shared))
+        .collect();
     // One queue entry per distinct word: a word given twice wakes as its first.
-    let addrs: Vec<u64> = words.iter().map(|w| w.0).collect();
-    let charge = crate::kmem::Charge::new(addrs.len() as u64 * 16)?;
     let tid = p.current;
-    for (i, &addr) in addrs.iter().enumerate() {
-        if !addrs[..i].contains(&addr) {
-            p.futexes.entry(addr).or_default().push_back((tid, u32::MAX));
+    for (i, &word) in words.iter().enumerate() {
+        match word {
+            _ if words[..i].contains(&word) => {}
+            Word::Private(addr) => p.futexes.entry(addr).or_default().push_back((tid, u32::MAX)),
+            Word::Shared(key) => crate::futex::enqueue(key, p.pid, tid, u32::MAX),
         }
     }
-    p.cur().futexv = Some(process::FutexV { addrs, _charge: charge });
+    p.cur().futexv = Some(process::FutexV { words, _charge: charge });
     p.block(WaitOn::FutexV, deadline, Err(ETIMEDOUT))
 }

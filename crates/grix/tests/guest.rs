@@ -2404,10 +2404,11 @@ fn futex_waitv_waits_on_several_words() {
     // futex_waitv: the index of the word that woke it, requeues, absolute
     // deadlines on either clock, EINTR from a handler, and EINVAL for
     // what Linux refuses.
-    let out = run(with("futexv").allow(Capability::Threads), &["/bin/futexv"]);
+    let b = with("futexv").allow(Capability::Threads).allow(Capability::Process);
+    let out = run(b, &["/bin/futexv"]);
     assert_eq!(
         out.stdout_str(),
-        "arguments ok\nwoken by word 2\nrequeued and woken\ninterrupted\nfutexv ok\n",
+        "arguments ok\nwoken by word 2\nrequeued and woken\ninterrupted\nshared words\nfutexv ok\n",
         "{}",
         out.kernel_log
     );

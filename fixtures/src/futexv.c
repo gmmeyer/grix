@@ -11,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -170,6 +172,47 @@ int main(void) {
     CHECK(waitv(w, 128, 0, &past, CLOCK_MONOTONIC) == -1 && errno == ETIMEDOUT);
     many[5] = 1;
     CHECK(waitv(w, 128, 0, NULL, 0) == -1 && errno == EAGAIN);
+
+    // Without FUTEX2_PRIVATE a word in memory processes share is the same
+    // word in each, however it's mapped: another process's wake reaches
+    // this wait, with the index of its word, and a requeue moves it.
+    uint32_t *shared = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(shared != MAP_FAILED);
+    for (int round = 0; round < 3; round++) {
+        uint32_t *other = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        CHECK(other != MAP_FAILED);
+        set(&w[0], &many[0], many[0]);
+        set(&w[1], &other[0], 0);
+        set(&w[2], &shared[1], 0);
+        w[1].flags = w[2].flags = FUTEX2_SIZE_U32;
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            // Each round's way of waking, from the child.
+            for (int i = 0; i < (round == 2 ? 20 : 2000); i++) {
+                long n = round == 0   ? syscall(SYS_futex, &shared[1], FUTEX_WAKE, 1, 0, 0, 0)
+                         : round == 1 ? syscall(SYS_futex, &shared[1], FUTEX_CMP_REQUEUE, 0, 1, &shared[2], 0)
+                                      : syscall(SYS_futex, &many[0], FUTEX_WAKE, 1, 0, 0, 0);
+                if (n == 1) break;
+                usleep(1000);
+            }
+            if (round == 1) CHECK(syscall(SYS_futex, &shared[2], FUTEX_WAKE, 1, 0, 0, 0) == 1);
+            _exit(0);
+        }
+        struct timespec later;
+        clock_gettime(CLOCK_MONOTONIC, &later);
+        later.tv_sec += round == 2 ? 0 : 30;
+        later.tv_nsec = round == 2 ? later.tv_nsec + 100000000 : later.tv_nsec;
+        if (later.tv_nsec >= 1000000000) later.tv_sec++, later.tv_nsec -= 1000000000;
+        long r = waitv(w, 3, 0, &later, CLOCK_MONOTONIC);
+        // A private word on another process's memory wakes nobody here.
+        if (round == 2) CHECK(r == -1 && errno == ETIMEDOUT);
+        else CHECK(r == 2);
+        int st;
+        CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        CHECK(munmap(other, 4096) == 0);
+    }
+    printf("shared words\n");
     printf("futexv ok\n");
     return 0;
 }

@@ -10,9 +10,6 @@ shows progress).
 
 ## Next up
 
-- [ ] `futex_waitv`'s words are the process's: shared ones reach
-      `futex.rs` only through FUTEX_WAIT.
-
 Order: small kernel-only items first, then the ones that need host
 support too, then the big ones. Re-probed 2026-10-26: Python (tempfile,
 pip, sqlite), Node (fs), `git init` and Go now pass.

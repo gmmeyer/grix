@@ -19,6 +19,7 @@ use crate::elf;
 use crate::errno::*;
 use crate::fd::FdTable;
 use crate::fs::{self, Ino, Kind, ROOT};
+use crate::futex::Word;
 use crate::mm::PAGE_SIZE;
 pub use crate::mm::aspace::Access;
 use crate::mm::aspace::{
@@ -197,7 +198,7 @@ pub struct Thread {
 
 /// futex_waitv's words, charged to kmem (up to 128 per thread).
 pub struct FutexV {
-    pub addrs: Vec<u64>,
+    pub words: Vec<crate::futex::Word>,
     pub _charge: crate::kmem::Charge,
 }
 
@@ -730,25 +731,51 @@ impl Process {
     pub fn cancel_wait(&mut self, tid: u32) -> Option<Wait> {
         let t = self.threads.get_mut(&tid)?;
         let w = t.wait.take()?;
-        let addrs = match w.on {
-            WaitOn::Futex(addr) => alloc::vec![addr],
-            WaitOn::SharedFutex(key) => {
-                crate::futex::leave(key, tid);
-                Vec::new()
-            }
-            WaitOn::FutexV => t.futexv.take().map(|v| v.addrs).unwrap_or_default(),
+        let words = match w.on {
+            WaitOn::Futex(addr) => alloc::vec![Word::Private(addr)],
+            WaitOn::SharedFutex(key) => alloc::vec![Word::Shared(key)],
+            WaitOn::FutexV => t.futexv.take().map(|v| v.words).unwrap_or_default(),
             _ => Vec::new(),
         };
-        for addr in addrs {
-            if let Some(q) = self.futexes.get_mut(&addr) {
-                q.retain(|&(t, _)| t != tid);
-                if q.is_empty() {
-                    self.futexes.remove(&addr);
+        for word in words {
+            match word {
+                Word::Private(addr) => {
+                    if let Some(q) = self.futexes.get_mut(&addr) {
+                        q.retain(|&(t, _)| t != tid);
+                        if q.is_empty() {
+                            self.futexes.remove(&addr);
+                        }
+                    }
                 }
+                Word::Shared(key) => crate::futex::leave(key, tid),
             }
         }
         crate::sched::timer_changed();
         Some(w)
+    }
+
+    /// What a wake of `word` returns to `tid`: the index a futex_waitv
+    /// waits for it at, 0 for any other wait.
+    pub fn futexv_index(&self, tid: u32, word: Word) -> u64 {
+        let v = self.threads.get(&tid).and_then(|t| t.futexv.as_ref());
+        v.and_then(|v| v.words.iter().position(|&w| w == word)).unwrap_or(0) as u64
+    }
+
+    /// A requeue moved `tid`'s wait on `from` to `to`.
+    pub fn futex_moved(&mut self, tid: u32, from: Word, to: Word) {
+        let Some(t) = self.threads.get_mut(&tid) else { return };
+        match (t.wait.as_mut(), t.futexv.as_mut()) {
+            (Some(w), Some(v)) if w.on == WaitOn::FutexV => {
+                v.words.iter_mut().filter(|w| **w == from).for_each(|w| *w = to);
+            }
+            (Some(w), _) => {
+                w.on = match to {
+                    Word::Private(addr) => WaitOn::Futex(addr),
+                    Word::Shared(key) => WaitOn::SharedFutex(key),
+                }
+            }
+            _ => {}
+        }
     }
 
     fn first_report(&mut self, kind: u8, nr: u32, detail: &str) -> bool {

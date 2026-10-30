@@ -5,7 +5,7 @@
 //! process (`Process::futexes`, for every other word): process-shared
 //! semaphores and mutexes (PostgreSQL's LWLocks, Python's multiprocessing)
 //! never woke anyone else's waiter before this, which one CPU hardly
-//! showed. futex_waitv's words stay the process's.
+//! showed. A futex_waitv queues here one entry per such word.
 //!
 //! Every queue is under the kernel lock, and a waiter is a blocked thread,
 //! paid for by it (`COST`, in `process::THREAD_COST`).
@@ -17,7 +17,7 @@ use spin::Mutex;
 
 use crate::mm::PAGE_SIZE;
 use crate::mm::aspace::{AddressSpace, Backing};
-use crate::process::{Process, WaitOn};
+use crate::process::Process;
 use crate::procs::PROCS;
 
 /// A shared word: the object it's in, and the byte in that. A waiter's
@@ -27,6 +27,14 @@ use crate::procs::PROCS;
 pub struct Key {
     object: usize,
     at: u64,
+}
+
+/// One of a futex_waitv's words, as `WaitOn::Futex` or `SharedFutex` would
+/// have it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Word {
+    Private(u64),
+    Shared(Key),
 }
 
 #[derive(Clone, Copy)]
@@ -114,7 +122,10 @@ fn take(key: Key, n: u32, bitset: u32) -> Vec<Waiter> {
 pub fn wake(p: &mut Process, key: Key, n: u32, bitset: u32) -> u32 {
     let taken = take(key, n, bitset);
     for w in &taken {
-        on_process(p, w.pid, |q| q.wake(w.tid, Some(0)));
+        on_process(p, w.pid, |q| {
+            let index = q.futexv_index(w.tid, Word::Shared(key));
+            q.wake(w.tid, Some(index));
+        });
     }
     taken.len() as u32
 }
@@ -126,11 +137,7 @@ pub fn requeue(p: &mut Process, from: Key, to: Key, n: u32) -> u32 {
         return 0;
     }
     for w in &moved {
-        on_process(p, w.pid, |q| {
-            if let Some(wait) = q.threads.get_mut(&w.tid).and_then(|t| t.wait.as_mut()) {
-                wait.on = WaitOn::SharedFutex(to);
-            }
-        });
+        on_process(p, w.pid, |q| q.futex_moved(w.tid, Word::Shared(from), Word::Shared(to)));
     }
     QUEUES.lock().entry(to).or_default().extend(moved.iter().copied());
     moved.len() as u32
