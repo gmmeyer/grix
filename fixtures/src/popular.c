@@ -1370,10 +1370,17 @@ static int manyconns(void) {
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(8100), .sin_addr.s_addr = htonl(INADDR_ANY)};
     int l = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 128) == 0);
-    for (int i = 0; i < 400; i++) {
+    // Only the test's count: tools on the host probe new ports.
+    for (int i = 0; i < 400;) {
         int c = accept(l, NULL, NULL);
         char b;
-        CHECK(c >= 0 && read(c, &b, 1) == 1 && write(c, &b, 1) == 1);
+        CHECK(c >= 0);
+        if (read(c, &b, 1) == 1 && b == 'x') {
+            CHECK(write(c, &b, 1) == 1);
+            i++;
+        } else {
+            close(c);
+        }
     }
     return 0;
 }

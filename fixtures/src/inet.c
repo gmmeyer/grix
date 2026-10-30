@@ -289,11 +289,17 @@ static int server_pair(int lo_port, int port) {
     a.sin_port = htons(port);
     CHECK(inet_pton(AF_INET, "10.0.2.15", &a.sin_addr) == 1);
     CHECK(bind(g, (struct sockaddr *)&a, sizeof a) == 0 && listen(g, 8) == 0);
-    int c = accept(g, 0, 0);
-    CHECK(c >= 0);
+    // Only the test's "ping": tools on the host probe new ports.
+    int c;
     char line[64];
-    int got = 0;
-    while (got < (int)sizeof line - 1 && (got == 0 || line[got - 1] != '\n')) {
+    for (;;) {
+        c = accept(g, 0, 0);
+        CHECK(c >= 0);
+        if (read(c, line, 1) == 1 && line[0] == 'p') break;
+        close(c);
+    }
+    int got = 1;
+    while (got < (int)sizeof line - 1 && line[got - 1] != '\n') {
         ssize_t n = read(c, line + got, 1);
         CHECK(n == 1);
         got++;
