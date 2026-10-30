@@ -586,7 +586,7 @@ pub fn finish(tf: &mut TrapFrame) {
             continue;
         }
         // Checking on the host may itself have freed room for a writer.
-        let quiet = crate::ipc::generation() == crate::sched::polled();
+        let quiet = crate::sched::quiet();
         check_stack();
         unlock_idle();
         if quiet {

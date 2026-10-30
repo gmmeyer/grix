@@ -1906,6 +1906,51 @@ fn deadlocks_are_reported_instead_of_hanging() {
     );
 }
 
+/// A real deadlock is still one just after a process ended, which moved
+/// the I/O state: the parent looks again, and then nothing can wake it.
+#[test]
+fn deadlocks_are_reported_after_a_process_ends() {
+    for cpus in [1, 4] {
+        let b = || with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        for (mode, stdout, on) in [("deadwait", "reaped\n", "1 on futexes"), ("deadread", "", "1 on I/O")] {
+            let out = run(b(), &["/bin/wakeups", mode]);
+            assert_eq!(out.stdout_str(), stdout, "{mode}");
+            assert_eq!(out.status, ExitStatus::Signaled(9), "{mode}: {}", out.stdout_str());
+            assert!(
+                matches!(&out.events[..], [GuestEvent::Fault { signal: 9, detail, .. }]
+                    if detail.starts_with("deadlock") && detail.contains(on)),
+                "{mode}: {:?}",
+                out.events
+            );
+        }
+    }
+}
+
+/// What a process's end changes reaches whoever waits for it, however it
+/// ended, and whatever else the CPUs are doing: a parent alone in wait() is
+/// no deadlock when a timer ends its child, and a thread or process that
+/// spins, with no system call to bring the kernel round, doesn't keep the
+/// waiter from running.
+#[test]
+fn waiters_wake_when_a_process_ends() {
+    for cpus in [1, 4] {
+        let b = || with("wakeups").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        for mode in ["alarm", "killtimer", "timers", "killwait", "killpipe", "timerspin"] {
+            let out = run(b(), &["/bin/wakeups", mode]);
+            assert_eq!(out.stdout_str(), format!("{mode} ok\n"), "{cpus} CPUs: {:?}", out.events);
+            assert_eq!(out.status, ExitStatus::Exited(0), "{mode}, {cpus} CPUs");
+            // What timers do to children is reported; nothing else is.
+            assert!(
+                out.events
+                    .iter()
+                    .all(|e| matches!(e, GuestEvent::Fault { detail, .. } if detail.starts_with("process "))),
+                "{mode}, {cpus} CPUs: {:?}",
+                out.events
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------- pipes, eventfd, epoll
 
 #[test]

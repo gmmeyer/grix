@@ -58,37 +58,23 @@ pub fn schedule(slot: &mut Option<alloc::boxed::Box<Process>>, tf: &mut TrapFram
         p.running = false;
         p.current = smp::NO_THREAD;
         alone = smp::alone(p.pid);
-        if p.exit_status.is_some() && !p.dead {
-            if alone {
-                procs::finalize(p, None, &mut procs);
-            } else {
-                // Its threads on other CPUs stop; the last CPU finishes it off.
-                smp::kick_others(p.pid);
-            }
-        }
         // The other CPUs have left: whoever waited for that (execve) goes on.
         if p.exclusive_wanted && alone {
             crate::ipc::changed();
         }
     }
-    procs::reap_others(slot.as_deref_mut(), &mut procs);
     // A timer interrupt that brought an idle CPU here (`irq` takes its own).
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
-    if !poll(slot.as_deref_mut(), &mut procs, timer) && timer {
+    if !settle(slot.as_deref_mut(), &mut procs, timer) && timer {
         smp::note(smp::Stat::TimerIdle, 1);
     }
-    // Others may have ended just now too (a timer's signal, the host's).
-    procs::reap_others(slot.as_deref_mut(), &mut procs);
-    if let Some(p) = slot.as_deref_mut() {
-        // The process may have ended just now (a timer's signal, the host's).
-        if p.exit_status.is_some() && !p.dead && alone {
-            procs::finalize(p, None, &mut procs);
-        }
-        // Other CPUs running a process that wants to be alone (execve, its
-        // end) or has stopped leave it.
-        if !alone && !smp::runs_here(p) {
-            smp::kick_others(p.pid);
-        }
+    // Other CPUs running a process that wants to be alone (execve, its end)
+    // or has stopped leave it; with an ended one, the last finishes it off.
+    if let Some(p) = slot.as_deref_mut()
+        && !alone
+        && !smp::runs_here(p)
+    {
+        smp::kick_others(p.pid);
     }
     crate::stats::tasks(procs.count(), procs::threads());
     let Some(next) = pick(slot.as_deref(), &procs, alone) else {
@@ -245,12 +231,52 @@ fn poll(mut p: Option<&mut Process>, procs: &mut Procs, timer: bool) -> bool {
     }
 }
 
-/// The I/O generation every I/O waiter has seen (the last `poll` or
-/// `wake_io_everywhere` left everyone at).
+/// The I/O generation every I/O waiter has seen: what the last `poll` left
+/// everyone at.
 static POLLED: AtomicU64 = AtomicU64::new(u64::MAX);
 
-pub fn polled() -> u64 {
-    POLLED.load(Ordering::Relaxed)
+/// Has every I/O waiter seen the I/O state as it is now?
+pub fn quiet() -> bool {
+    crate::ipc::generation() == POLLED.load(Ordering::Relaxed)
+}
+
+/// Finish off what has ended: this CPU's process, unless a thread of it
+/// still runs (here, or on another CPU, which then does it), and others.
+fn end_processes(mut p: Option<&mut Process>, procs: &mut Procs) {
+    if let Some(p) = p.as_deref_mut()
+        && p.exit_status.is_some()
+        && !p.dead
+        && !p.running
+        && smp::alone(p.pid)
+    {
+        procs::finalize(p, None, procs);
+    }
+    procs::reap_others(p, procs);
+}
+
+/// Bring everything up to date, so that what's seen next is what is: the
+/// ended finished off, what's due fired, and every waiter told of all that
+/// changed. Returns whether anything woke. Nothing decides what can run
+/// (`pick`, and `idle`, which may call it a deadlock) or goes back to user
+/// mode (where no timer may be set, and nothing else may ever look) without
+/// this, or `quiet` saying there's no need. Each step can make work for
+/// the others: `poll`'s timers end processes, and a process's end changes
+/// what waiters see (wait4, pipes it held, pidfds). So it's the generation
+/// that says when it's over, not an order of steps. A process that ended
+/// and can't be finished off yet (on another CPU) moves nothing, which
+/// that CPU sees to when it does.
+fn settle(mut p: Option<&mut Process>, procs: &mut Procs, mut timer: bool) -> bool {
+    let mut woke = false;
+    loop {
+        end_processes(p.as_deref_mut(), procs);
+        woke |= poll(p.as_deref_mut(), procs, timer);
+        timer = false;
+        // Others may have ended just now (a timer's signal, the host's).
+        end_processes(p.as_deref_mut(), procs);
+        if quiet() {
+            return woke;
+        }
+    }
 }
 
 /// A signal from the host: to the program's process group, as a terminal
@@ -272,25 +298,13 @@ fn from_host(mut p: Option<&mut Process>, procs: &mut Procs, sig: u32) -> bool {
     sent
 }
 
-/// After a syscall: if I/O state changed, wake waiters in every process,
-/// not just this one (a pipe's reader may be another process). Nothing to
-/// do (the usual case) takes no lock and looks at no other process.
+/// After a syscall: if I/O state changed or a process has ended, wake
+/// waiters in every process, this one too (a pipe's reader may be another
+/// process, and a thread here may be waiting for what this call ended).
+/// Nothing to do (the usual case) takes no lock and looks at no other
+/// process.
 pub fn wake_io_everywhere(p: &mut Process) {
-    p.wake_io_waiters();
-    let generation = crate::ipc::generation();
-    if generation == POLLED.load(Ordering::Relaxed) && !procs::housekeeping_due() {
-        return;
-    }
-    let mut procs = PROCS.lock();
-    procs::reap_others(Some(&mut *p), &mut procs);
-    crate::fasync::deliver(Some(&mut *p), &mut procs);
-    let mut woke = false;
-    for q in procs.others_mut() {
-        woke |= q.wake_io_waiters();
-    }
-    // As of before `deliver`, whose signals may change it again.
-    POLLED.store(generation, Ordering::Relaxed);
-    if woke {
+    if (!quiet() || procs::housekeeping_due()) && settle(Some(&mut *p), &mut PROCS.lock(), false) {
         p.timer_dirty = true;
     }
 }
@@ -325,10 +339,14 @@ fn idle(mut p: Option<&mut Process>, procs: &mut Procs) {
         Some(deadline) => arm(None, Some(deadline)),
         // The host can still wake whoever waits for I/O, and a thread
         // waiting for a signal may get one: a RunControl's, or the SIGTERM
-        // the time limit sends. Threads on other CPUs may wake anyone.
+        // the time limit sends. Threads on other CPUs may wake anyone. And
+        // nothing can be said while I/O state has moved past what waiters
+        // saw (asking the host may just have moved it): `smp::finish`
+        // comes back.
         None if others_running
             || waiting_for_input(p.as_deref_mut(), procs)
-            || waiting_for_signal(p.as_deref_mut(), procs) =>
+            || waiting_for_signal(p.as_deref_mut(), procs)
+            || !quiet() =>
         {
             arm(None, None)
         }
@@ -495,9 +513,7 @@ pub fn irq(tf: &mut TrapFrame) {
     let timer = TIMER_FIRED[smp::me()].swap(false, Ordering::Relaxed);
     let (woke, others_runnable) = {
         let mut procs = PROCS.lock();
-        procs::reap_others(Some(&mut *p), &mut procs);
-        let woke = poll(Some(&mut *p), &mut procs, timer);
-        procs::reap_others(Some(&mut *p), &mut procs);
+        let woke = settle(Some(&mut *p), &mut procs, timer);
         (woke, others_wait(p, &procs))
     };
     let slice_over = time::monotonic_ns() >= p.slice_start + SLICE_NS;
