@@ -907,6 +907,17 @@ static int xattrcopied(void) {
     return copied("/tmp/dst") || copied("/tmp/t/src");
 }
 
+// Settings programs read and warn about: Redis wants overcommit_memory 1
+// (grix takes memory only as it's touched, never reserving it), Chromium
+// reads inotify's limits; each says what grix does.
+static int sysctls(void) {
+    CHECK(slurp("/proc/sys/vm/overcommit_memory") > 0 && strcmp(buf, "1\n") == 0);
+    CHECK(slurp("/proc/sys/vm/max_map_count") > 0 && strcmp(buf, "32768\n") == 0);
+    CHECK(slurp("/proc/sys/fs/inotify/max_user_watches") > 0 && strcmp(buf, "8192\n") == 0);
+    CHECK(slurp("/proc/sys/fs/inotify/max_queued_events") > 0 && strcmp(buf, "16384\n") == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         int r = 1;
@@ -932,6 +943,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "xattrro") == 0) r = xattrro();
         if (strcmp(argv[i], "xattrmounts") == 0) r = xattrmounts();
         if (strcmp(argv[i], "xattrcopied") == 0) r = xattrcopied();
+        if (strcmp(argv[i], "sysctls") == 0) r = sysctls();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {
             r = argvlayout(argc, argv);

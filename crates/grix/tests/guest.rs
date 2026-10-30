@@ -2060,6 +2060,13 @@ fn arguments_and_environment_in_linux_order() {
 }
 
 #[test]
+fn sysctls_say_what_grix_does() {
+    // Redis warned that overcommit_memory wasn't 1; Chromium reads
+    // inotify's limits.
+    popular(with("popular"), &["sysctls"]);
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

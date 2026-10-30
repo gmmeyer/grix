@@ -122,8 +122,10 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/kernel/ngroups_max", ProcFile::Text("65536\n")),
     ("/proc/sys/kernel/random/uuid", ProcFile::RandomUuid),
     ("/proc/sys/kernel/random/boot_id", ProcFile::BootId),
-    ("/proc/sys/vm/overcommit_memory", ProcFile::Text("0\n")),
-    ("/proc/sys/vm/max_map_count", ProcFile::Text("65530\n")),
+    // Linux's "always overcommit": nothing is reserved at mmap or fork,
+    // and memory is only taken as it's touched (Redis warns otherwise).
+    ("/proc/sys/vm/overcommit_memory", ProcFile::Text("1\n")),
+    ("/proc/sys/vm/max_map_count", ProcFile::Text("32768\n")), // mm::aspace::MAX_VMAS
     ("/proc/sys/vm/mmap_min_addr", ProcFile::Text("65536\n")), // syscall::mem::MMAP_MIN_ADDR
     ("/proc/sys/fs/file-max", ProcFile::FileMax),
     ("/proc/sys/fs/file-nr", ProcFile::FileNr),
@@ -143,6 +145,8 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/diskstats", ProcFile::Text("")),
     ("/proc/partitions", ProcFile::Text("major minor  #blocks  name\n\n")),
     ("/proc/sys/net/core/somaxconn", ProcFile::Text("4096\n")),
+    ("/proc/sys/fs/inotify/max_user_watches", ProcFile::Text("8192\n")), // inotify::MAX_WATCHES
+    ("/proc/sys/fs/inotify/max_queued_events", ProcFile::Text("16384\n")), // inotify::MAX_QUEUED
     // lo, and eth0 with `net` (see netlink.rs).
     ("/proc/net/dev", ProcFile::NetDev),
     ("/proc/net/route", ProcFile::NetRoute),
