@@ -263,23 +263,21 @@ step that runs out of room saying so. Left, in order of impact:
     SO_PASSCRED stop where the writer changes and carry SCM_CREDENTIALS,
     sendmsg's SCM_CREDENTIALS names the writer, and the option set before
     connect, or on a listener, stays.
-34. [~] **Landlock**: EOPNOTSUPP from all three calls, unreported, as
-    Linux with Landlock disabled at boot (Chromium goes on). The real
-    thing, as seccomp is done: a per-thread domain (an `Arc` chain of
-    layers like `seccomp::State`, kept across fork, clone and execve,
-    only ever added to); `landlock_create_ruleset` an fd holding the
-    handled access (ABI 4: filesystem rights through TRUNCATE,
-    `BIND_TCP` and `CONNECT_TCP`; unknown bits EINVAL; the version
-    query); `landlock_add_rule` with PATH_BENEATH (the parent fd's node,
-    pinned so its slot isn't reused) and NET_PORT; `restrict_self`
-    needing no_new_privs (nobody has CAP_SYS_ADMIN). Checks: every layer
-    that handles an access must have a rule granting it on the node or
-    an ancestor, in every path operation (open's read, write, truncate
-    and directory listing, execve, create by type, unlink and rmdir,
-    rename and link with REFER, truncate, bind on a path), and TCP bind
-    and connect by port; EACCES, never reported as denied (the policy
-    didn't refuse: the program did). About a thousand lines with tests;
-    worth it when a program needs it to start, not as an option.
+34. [x] **Landlock**: ABI 5, as Linux's security/landlock
+    (`landlock.rs`; AGENTS.md): rulesets as descriptors, path and port
+    rules, layers on each thread (at most 16, kept by fork, clone and
+    execve), EACCES and EXDEV, never reported. Filesystem rights through
+    REFER, TRUNCATE and IOCTL_DEV, TCP bind and connect by port, and no
+    looking into processes outside the domain. Left: ABI 6's scoping of
+    abstract sockets and signals (domains already compare, `scope_le`:
+    signals need a check where `kill` picks a receiver, sockets the
+    domain of who bound the name). A descriptor of a generated /proc
+    file is EBADFD as a rule's parent (`O_PATH` works); a memfd is taken
+    (Linux: EBADFD). A rule on a live mount's file holds for that name
+    alone: each name there is a node of its own, and the host says
+    nothing of inodes (its other names just stay refused). Moves within
+    a mount walk up through the mount point, as Linux's check ends up
+    doing, so the tree counts as one mount.
 35. [x] `/proc/<pid>/task/<tid>`: each thread's own name (`Thread::name`:
     PR_SET_NAME, `pthread_setname_np`, writes to its `comm` by the
     process's own threads, EINVAL from others), state (stopped, waiting,

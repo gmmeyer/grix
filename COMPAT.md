@@ -118,7 +118,7 @@ are new:
 | Consul | 2.1.0 | `hashicorp/consul` | `consul agent -dev`, KV put/get, members | n t p w | works | | |
 | Vault | 2.2.1 | `hashicorp/vault` | `vault server -dev`, KV put/get | n t p w | works | | |
 | Grafana | 13.3.0 | `grafana/grafana` | `/run.sh`, health and search APIs from the host | n t p w, 2 GiB | works | Its background plugin installs ran out of room ("no space left on device"): files live in guest memory. | |
-| Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left after round 2: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it went on). Since (0.0.45): none reported (Landlock is EOPNOTSUPP, as disabled at boot); it still logs that it can't raise its renderers' `oom_score_adj`, and GPU initialisation fails as in any container without a GPU. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
+| Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left after round 2: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it went on). Since (0.0.45): none reported; it still logs that it can't raise its renderers' `oom_score_adj`, and GPU initialisation fails as in any container without a GPU. Since (0.0.48): it runs with a Landlock domain around it, `/` read-only and what it writes writable. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
 | MinIO | | `minio/minio`, `quay.io/minio/minio` | | | not tried | MinIO no longer publishes public images (Docker Hub: 404; quay.io: unauthorized). | |
 
 Caps as above; "3 GiB" is `--mem 3072`, which was the most a guest
@@ -139,7 +139,7 @@ In round 2 (each with its check in `popular.c`, or a test of its own):
 | `prctl`: `PR_SET_MM` EPERM, SVE's EINVAL, unknown options EINVAL, quietly | Alpine's JDK (Kafka, Temurin), Chromium, OpenSearch |
 | `/proc/<pid>/task/<tid>` | headless Chromium, `ps -L`, psutil |
 | `SO_PASSCRED` and `SCM_CREDENTIALS` on message sockets | headless Chromium |
-| Since (0.0.45): IPv6 on `eth0`, threads by a kernel memory budget, `SO_PASSCRED` on streams, per-thread `/proc`, `SIOCETHTOOL`, udev's netlink socket, Landlock's EOPNOTSUPP, `splice`/`tee`/`vmsplice`, `F_SETPIPE_SZ`, `/proc/self/mem` | ClickHouse, headless Chromium, Go's socket copies, the Datadog Agent and system-probe, `top -H` |
+| Since (0.0.45): IPv6 on `eth0`, threads by a kernel memory budget, `SO_PASSCRED` on streams, per-thread `/proc`, `SIOCETHTOOL`, udev's netlink socket, `splice`/`tee`/`vmsplice`, `F_SETPIPE_SZ`, `/proc/self/mem` | ClickHouse, headless Chromium, Go's socket copies, the Datadog Agent and system-probe, `top -H` |
 | `capset` that drops every capability (there are none) succeeds; raising one is still denied | headless Chromium |
 | `grix run -e KEY` passes the host's value of KEY, as Docker's does | secrets such as the Datadog API key stay off the command line |
 | A build step that runs out of room says so, and how to ask for more (`memory_mb`) | `apk add chromium` (a bare "Signaled(7)" before) |
@@ -179,9 +179,13 @@ In order of impact (details in TODO.md):
 1. **threads-max scales with RAM** (each thread's kernel state comes
    out of a budget that is a share of RAM, at most 64 MiB of it): 4405
    at 512 MiB, 17623 from 2 GiB on. ClickHouse still warns below 30,000.
-2. **No Landlock**: EOPNOTSUPP, as on a Linux with it disabled at boot
-   (Chromium goes on without it). The design is in TODO.md.
-3. **`oom_score_adj` is read-only** (Chromium logs it for each renderer).
+2. **`oom_score_adj` is read-only** (Chromium logs it for each renderer).
+3. **Landlock stops at ABI 5**: no scoping of abstract sockets and
+   signals (ABI 6); libraries ask for the version and use what's there.
+
+Done since (0.0.48, TODO.md's item 34): Landlock, ABI 5: a program's
+own restrictions on files and TCP ports (go-landlock's rules, on every
+thread; Chromium under a domain).
 
 Done since (0.0.45, TODO.md's items 30 and 32 to 37): an IPv6
 address on `eth0` (a ULA, so IPv4 is still tried first for anything

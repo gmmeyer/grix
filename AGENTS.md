@@ -570,6 +570,38 @@ other threads' state directly: one running on another CPU is in user
 mode and sees it at its next call. User notification is unimplemented
 (reported).
 
+Landlock (`landlock.rs`): a program's rules on itself, to ABI 5
+(filesystem rights through TRUNCATE and IOCTL_DEV, TCP ports; not ABI
+6's scoping). As with seccomp, the policy comes first: every check
+stands after the handler's `require`, so what the policy refuses is
+denied and reported, and what Landlock refuses is EACCES (EXDEV for a
+move only REFER stops), never reported. A ruleset is a descriptor
+(`FileKind::Landlock`); `restrict_self` merges it into a new immutable
+`Domain` (`Thread::landlock`, an `Arc` shared by fork, clone and
+execve), each layer's rights and every rule by object, each saying what
+each layer grants. `landlock::domain` is the fast path: one test of
+`Process::landlocked` without one. A layer with any filesystem right
+handles REFER too, so moving between directories is EXDEV unless a rule
+grants it. Checks are Linux's: layer masks unmasked from the node up (`Domain::walk`, under the caller's
+`fs::lock()`: `check` takes it, `check_in` and the rest are given it,
+so never call `check` holding it), and `check_refer` is
+current_check_refer_path with the tree as one mount. A rule holds its
+node by `Ino`, pinned: a pinned node is never idle to `Fs::evict`, so a
+live mount's directories with rules (and those above) stay, and
+`copy_up` keeps the slot. A file's path decides what's above it
+(`Fs::found_in`), as a dentry's parent does: `Node::parent` is only the
+first name's. (On a live mount each name is a node of its own, so a rule
+on a file there holds for that name alone.) Links and renames go through
+`check_refer`, an exchange both ways, after what Linux checks first: a
+move across mounts is EXDEV (`Fs::crosses_mount`), and a change on a
+read-only mount EROFS (`landlock::domain_changing`). What matters after the open is decided at open
+(`OpenFile::landlock_denied`, TRUNCATE and IOCTL_DEV, inverted so a file
+made any other way has them). A new way to make, remove, open, execute
+or move a node, or to bind or connect a TCP socket, needs its check.
+`/proc/self/fd/N` isn't re-checked: it's the same open file here
+(`procfs::fd_path`), not a new open. `landlock::may_inspect` keeps a
+domain out of processes outside it, as Linux's ptrace hook.
+
 Linux AIO (`syscall/aio.rs`): a context is a ring in the program's
 memory, Linux's `struct aio_ring` at the context's id (libaio reads it;
 a shared mapping that io_destroy unmaps only if it's still the ring),
@@ -712,8 +744,11 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
       `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
-      `kmem`; ENOMEM). AIO contexts count the events they ask for
-      against `aio::AIO_MAX_NR` (EAGAIN, Linux's aio-max-nr), and each
+      `kmem`; ENOMEM), Landlock rules (`landlock::MAX_RULES` in all
+      rulesets and domains, each charged to `kmem`; ENOMEM) and layers
+      (`landlock::MAX_LAYERS` per thread; E2BIG). AIO contexts count
+      the events they ask for against `aio::AIO_MAX_NR` (EAGAIN, Linux's
+      aio-max-nr), and each
       context and waiting poll is charged to `kmem`. argv and environment copies take a
       `kmem::Charge`.
 
