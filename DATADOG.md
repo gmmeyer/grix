@@ -8,11 +8,13 @@ collection. They report to Datadog with a real API key, through an
 allow-list that reaches only Datadog's intake. The pieces that need
 eBPF or Linux capabilities (system-probe's network, USM and security
 modules, and the security-agent) disable themselves, because grix denies
-`bpf` and `capset` by design.
+`bpf`, and no process has a capability to use.
 
 Tested with `datadog/agent:7` (7.85.0, linux/arm64, Ubuntu 24.04 base,
 Go 1.26) on grix-vmm (Hypervisor.framework, arm64 macOS). The kernel
-fixes are also tested on the x86_64 kernel.
+fixes are also tested on the x86_64 kernel. Run again on 2026-10-30
+(grix 0.0.41 and the second compatibility round): still yes, and the
+guest's `eth0` is what the Agent sees (see "Again, with eth0").
 
 ## Running it
 
@@ -26,13 +28,16 @@ TOML
 grix build -o agent.grix
 
 set -a; . ./.env; set +a          # DATADOG_API_KEY=...; never echo it
+export DD_API_KEY="$DATADOG_API_KEY"
 grix run --image agent.grix --mem 2048 --cpus 4 --timeout 3600 -a net \
   --allow-host '*.datadoghq.com' --allow-host '*.datadog.pool.ntp.org:123' \
-  -e DD_API_KEY="$DATADOG_API_KEY" -e DD_SITE=datadoghq.com -e DD_HOSTNAME=grix-test \
+  -e DD_API_KEY -e DD_SITE=datadoghq.com -e DD_HOSTNAME=grix-test \
   -e DD_APM_ENABLED=true -e DD_PROCESS_CONFIG_PROCESS_COLLECTION_ENABLED=true \
   -i ./conf.d:/conf.d               # optional: check configs, as with Docker's /conf.d
 ```
 
+- `-e DD_API_KEY` without a value passes the host's, as Docker's `-e`
+  does, so the key is never on a command line (or in `ps`).
 - `*.datadoghq.com` covers the metrics intake (`7-85-0-app.agent.…`),
   `process.…`, `trace.agent.…` and remote config (`config.…:8042`). The
   NTP check needs UDP 123 to `*.datadog.pool.ntp.org`.
@@ -80,6 +85,42 @@ forwarder's success counts.
 | http_check, tcp_check (Python) | OK | OK | through the allow-list |
 | cloud_hostinfo, discovery, container_image, container_lifecycle | OK | OK | nothing to report outside a cloud or container runtime |
 
+## Again, with eth0 (2026-10-30)
+
+The same run (s6 entrypoint, the key passed by name, `conf.d` with the
+Python checks plus `network.d`: the image enables no network check in a
+container), for two minutes, with five DogStatsD packets over UDP, one
+over the Unix socket, and five traces:
+
+- `agent health`: PASS, 18 healthy components. The forwarder's
+  successful transactions: `series_v3` 8, `check_run_v1` 8, `intake` 4,
+  `metadata_v1` 6, `process` 13; none failed. The API key never appeared
+  in anything the run wrote.
+- Every check `[OK]`: cpu, disk, file_handle, io, load, memory,
+  **network**, ntp, uptime, telemetry, cloud_hostinfo, container_image,
+  container_lifecycle, discovery, and the Python ones (directory,
+  http_check, tcp_check, linux_proc_extras, process, system_core,
+  system_swap).
+- DogStatsD counted the UDP and Unix socket packets; the trace-loader
+  started the trace-agent on the first connection and all five traces
+  got 200.
+- **"not connected to the network" is gone.** gohai's network metadata,
+  run as outside a container (`DOCKER_DD_AGENT` unset), is `eth0`,
+  10.0.2.15 in 10.0.2.0/24, MAC 52:54:00:12:34:56. In the container
+  image it's `null`, as under Docker: gohai collects network metadata in
+  a container only when it sees a `docker0` (host networking).
+- The process check still logs `no network ID detected`: that ID comes
+  from a cloud provider's metadata (EC2's IMDS here, which the allow-list
+  denies), not from the interfaces, so it's expected outside a cloud.
+
+What it still reports: `splice` (unimplemented, Go falls back), `bpf`
+denied, `/proc/self/mem` missing (system-probe's kernel version probe),
+and the cloud metadata and `_grpc_config.localhost` lookups the
+allow-list denies. system-probe-lite now warns that `CAP_DAC_READ_SEARCH`
+and `CAP_SYS_PTRACE` aren't in its permitted set, as in an unprivileged
+container: dropping capabilities works (there are none), and only
+asking for one is denied.
+
 ## What broke, and what was fixed
 
 In the order the Agent hit them:
@@ -121,9 +162,9 @@ In the order the Agent hit them:
 The following need `bpf()`, and grix denies it (`Privileged`):
 system-probe's network performance monitoring, universal service
 monitoring, OOM-kill and TCP-queue-length checks, and the security-agent
-(CWS, runtime security). The same goes for capability changes
-(`capset`: system-probe-lite logs that it can't drop capabilities and
-carries on). These components detect this and disable themselves. Making
+(CWS, runtime security). The same goes for capabilities: no process
+has any (capget says so), so dropping them all succeeds and asking for
+one is denied (system-probe-lite warns and carries on). These components detect this and disable themselves. Making
 them work would mean an in-kernel eBPF verifier and the kprobes they
 attach to. That is out of scope for a sandbox whose point is a small
 kernel surface. In the s6 run, `system-probe` exits 0 with nothing
@@ -137,23 +178,20 @@ see below.
 
 ### Worth doing next
 
-- **Network interfaces** (done since). Without `net` the guest has only
-  `lo`, and gohai's network metadata reported `not connected to the
-  network`, the process check found no network ID, and the network check
-  had only `lo`. With `net` the guest now shows `eth0`, 10.0.2.15/24 and
-  the default route via 10.0.2.2 (netlink, the interface ioctls,
-  `/proc/net/dev`, `/proc/net/route`, `/sys/class/net/eth0`), with no
-  device behind it: traffic still goes through the host's proxy.
+- **Network interfaces** (done since, and checked on 2026-10-30).
+  Without `net` the guest has only `lo`, and gohai's network metadata
+  reported `not connected to the network`. With `net` the guest shows
+  `eth0`, 10.0.2.15/24 and the default route via 10.0.2.2 (netlink, the
+  interface ioctls, `/proc/net/dev`, `/proc/net/route`,
+  `/sys/class/net/eth0`), with no device behind it: traffic still goes
+  through the host's proxy. gohai and the network check see it.
 - **`splice` (76).** Go uses it for pipe and socket copies and falls back
   on ENOSYS, so the only cost is an `unsupported` event and a slower
   copy. A pipe-to-anything `splice` through a bounce buffer is moderate
   work. `sendfile` covers only files today.
-- **`mrs` from EL0.** Linux emulates reads of the `ID_AA64*` registers
-  (`HWCAP_CPUID`). grix doesn't advertise `HWCAP_CPUID`, so well-behaved
-  programs don't try. But code that keys off the kernel version, as
-  x/sys/cpu did, gets SIGILL. Emulating the trap (EC 0x18, or an
-  undefined instruction at EL0 that decodes as `mrs`) with Linux's
-  sanitised values would close this for good.
+- **`mrs` from EL0** (done since): reads of the `ID_AA64*` registers
+  are emulated as Linux's `HWCAP_CPUID` does, with values that agree
+  with HWCAP.
 - **`/proc/self/mem`** for the process's own memory (`pread` and
   `pwrite` at virtual addresses through `uaccess`). Debuggers, cilium's
   version probe and some JITs use it.

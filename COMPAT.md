@@ -1,32 +1,35 @@
 # Popular software in grix
 
-A survey of widely used Linux software, run from the official Docker Hub
-images (`grix build` from a Grixfile with `from = "..."`, then `grix run
---image ... --json`), on 2026-10-29. arm64 guests ran in grix-vmm
-(Hypervisor.framework, Apple silicon); x86_64 guests in QEMU microvm
-(emulated), from linux/amd64 images and Alpine x86_64 packages. Each
-program got only the
+A survey of widely used Linux software, run from the official images
+(`grix build` from a Grixfile with `from = "..."`, then `grix run
+--image ... --json`). arm64 guests ran in grix-vmm (Hypervisor.framework,
+Apple silicon); x86_64 guests in QEMU microvm (emulated), from
+linux/amd64 images and Alpine x86_64 packages. Each program got only the
 capabilities in its row. Servers were driven from the host through a
 forwarded port (`-p`) or from inside the guest.
 
-"Before" is grix 0.0.22; "now" is this series on top of 0.0.32 (which
-brought images per architecture, named pipes, `/proc/<pid>/auxv`, a
-named sandbox in images' empty `/etc/hosts`, and connects to the
-unspecified address, some of them found here too). Every failure fixed
-here has a check in `fixtures/src/popular.c` and an end-to-end test in
-`crates/grix/tests/guest.rs`.
+Two rounds so far. The first (2026-10-29) took grix 0.0.22 to 0.0.33
+and is the "Results" table. The second (2026-10-30, on 0.0.41) re-ran
+every program in it and surveyed 23 more: databases, proxies, build
+tools, runtimes, services and headless Chromium ("Round 2" below).
+Every failure fixed in either has a check in `fixtures/src/popular.c`
+and an end-to-end test in `crates/grix/tests/guest.rs`.
 
 ## Summary
 
 | | Programs |
 |---|---|
-| Works | nginx, Apache httpd, Caddy, HAProxy, Traefik, PostgreSQL, MariaDB, Redis, Memcached, MongoDB (mongod and mongosh), SQLite, RabbitMQ, etcd, Prometheus, Elasticsearch (with its ML module), Python, Node, Ruby, PHP (CLI and FPM), Java (javac and a program), Go (`go build`), Rust (`cargo build`), Perl, git, curl, wget, jq, ripgrep, gcc/make, OpenSSL, ssh-keygen, tar/gzip/xz/bzip2, rsync, vim, bash, zsh, busybox, coreutils/findutils, file, ps, less, supervisord, cron |
+| Works | nginx, Apache httpd, Caddy, HAProxy, Traefik, Envoy, PostgreSQL, MySQL, MariaDB, Redis, Valkey, Memcached, MongoDB (mongod and mongosh), ClickHouse, SQLite, DuckDB, InfluxDB, Elasticsearch (with its ML module), OpenSearch, RabbitMQ, Kafka (KRaft), NATS (JetStream), etcd, Consul, Vault, Prometheus, Grafana, Python (FastAPI with uvicorn workers, pandas), Node (Express, TypeScript, esbuild), Bun, Deno, Ruby (Sinatra, Puma in cluster mode), PHP (CLI and FPM), Java (javac, Jetty), Maven, Gradle, .NET SDK (`dotnet new` and `dotnet run`), Go (`go build`), Rust (`cargo build`), Perl, headless Chromium, git, curl, wget, jq, ripgrep, gcc/make, OpenSSL, ssh-keygen, tar/gzip/xz/bzip2, rsync, vim, bash, zsh, busybox, coreutils/findutils, file, ps, less, supervisord, cron |
 | Partly | none |
-| Breaks | none of the programs tried |
+| Breaks | none of the programs tried (MinIO's images are no longer public: not tried) |
 
-Of these, ten failed before this round: nginx (no workers, empty
+Of these, ten failed before the first round: nginx (no workers, empty
 responses), PostgreSQL, Redis, Caddy, Traefik, etcd (v3 API), RabbitMQ,
 MongoDB's shell, Elasticsearch, and curl in Ubuntu 20.04-based images.
+Four more failed in the second: `go build` in the golang image (no
+HOME), the .NET SDK (MSBuild's thread priorities), headless Chromium
+(its zygote: `/proc/self/task`, `capset`, `SO_PASSCRED`) and Grafana's
+plugin downloads (out of room: see "What's left").
 
 ## Results
 
@@ -41,9 +44,9 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | Traefik | 3.7.16 | `traefik:v3` | file provider routing to its own API, curl from the host | n t | works | SIGILL, as Caddy. | Fixed: auxv |
 | PostgreSQL | 17.11 | `postgres:17-alpine` | `docker-entrypoint.sh postgres` (initdb, temporary server, real one), psql: table, 10,000 rows, index | n t p w | works | initdb: `shmget` not implemented (the postmaster's System V interlock segment). | Fixed: System V shm |
 | MariaDB | 11.8.9 | `mariadb:11` | `docker-entrypoint.sh mariadbd`, client: database, table, rows | n t p w | works | Works; it listens on 0.0.0.0 and `::` (needed `IPV6_V6ONLY`). io_uring and `io_setup` were ENOSYS (reported), and it fell back to synchronous I/O; it has Linux AIO now (io_uring stays ENOSYS, as under Docker's default seccomp profile). | |
-| Redis | 7.4.12 | `redis:7-alpine` | `redis-server`, PING/SET/GET/BGSAVE from the host, SIGINT shutdown | n t p w | works | 1. Exited: its arm64 copy-on-write bug check forks and reads `Shared_Dirty` in `/proc/self/smaps`, which didn't exist. 2. `bind: Address in use`: `[::]:6379` with `IPV6_V6ONLY` beside `0.0.0.0:6379`. It warned that `maxclients` dropped to 992 (`RLIMIT_NOFILE` was 1024/1024); it still warns about `vm.overcommit_memory`. | Fixed: smaps, `IPV6_V6ONLY`, `RLIMIT_NOFILE` |
+| Redis | 7.4.12 | `redis:7-alpine` | `redis-server`, PING/SET/GET/BGSAVE from the host, SIGINT shutdown | n t p w | works | 1. Exited: its arm64 copy-on-write bug check forks and reads `Shared_Dirty` in `/proc/self/smaps`, which didn't exist. 2. `bind: Address in use`: `[::]:6379` with `IPV6_V6ONLY` beside `0.0.0.0:6379`. It warned that `maxclients` dropped to 992 (`RLIMIT_NOFILE` was 1024/1024), and that `vm.overcommit_memory` wasn't 1. Round 2: no warnings. | Fixed: smaps, `IPV6_V6ONLY`, `RLIMIT_NOFILE`, `overcommit_memory` |
 | Memcached | 1.6.45 | `memcached:alpine` | `memcached -u root`, set/get/stats from the host | n t | works | | |
-| MongoDB | 7.0.45, mongosh 2.14.0 | `mongo:7` | `mongod`, mongosh: insert, index, query | n t p w | works | mongosh died of SIGSEGV: the strings at the top of the stack were in reverse order within argv and environ, so libuv's process title came out with a negative length and wrote past the stack. | Fixed: the stack's strings |
+| MongoDB | 7.0.45, mongosh 2.14.0 | `mongo:7` | `mongod`, mongosh: insert, index, query | n t p w | works | mongosh died of SIGSEGV: the strings at the top of the stack were in reverse order within argv and environ, so libuv's process title came out with a negative length and wrote past the stack. Round 2: mongod warns that the soft `RLIMIT_NOFILE` (1024) is below 64000, as under Docker's default. | Fixed: the stack's strings |
 | SQLite | 3.40.1 | `debian:bookworm` | `sqlite3` create/insert/select; Python's sqlite3 | w | works | | |
 | Elasticsearch | 8.15.3 | `elasticsearch:8.15.3` | single node, index and search a document, cluster health | n t p w | works | 1. `UnknownHostException: grix` (the hostname didn't resolve). 2. curl aborted: glibc 2.31's getaddrinfo asserts on a UDP socket reconnected after `connect(AF_UNSPEC)`. 3. The ML controller needs named pipes, which 0.0.32 has: its `controller` runs and `_ml/info` answers. seccomp was unimplemented (it warned and went on); it installs its filter now. | Fixed: the sandbox's name, UDP `AF_UNSPEC`, named pipes (0.0.32) |
 | RabbitMQ | 3.13.7 (Erlang/OTP 26.2.5) | `rabbitmq:3-alpine` | `rabbitmq-server`, `rabbitmqctl add_vhost`, AMQP handshake | n t p w | works | Every BEAM died of SIGSEGV: Erlang's JIT cleans the cache (`dc cvau`) on the executable view of its code before touching it, and grix took that fault for a write. | Fixed: cache maintenance faults |
@@ -53,8 +56,8 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | Node | 22.23.4 | `node:22-alpine` | crypto, timers | t | works | | |
 | Ruby | 3.3.13 | `ruby:3.3-alpine` | json, digest, a thread | t | works | | |
 | PHP | 8.3.36 | `php:8.3-cli-alpine`, `php:8.3-fpm-alpine` | CLI; php-fpm with workers (setuid `www-data`) answering a FastCGI request | n t p w | works | | |
-| Java | Temurin 21.0.13 | `eclipse-temurin:21-jdk-alpine` | `java -version`; `javac` and a program (thread pool, SHA-256) | t p (w for javac) | works | `java` re-executes itself, so it needs `process`. | |
-| Go | 1.23.12 | `golang:1.23-alpine` | `go build` of a program with goroutines and an httptest server, then run it | n t p w | works | | |
+| Java | Temurin 21.0.13 | `eclipse-temurin:21-jdk-alpine` | `java -version`; `javac` and a program (thread pool, SHA-256) | t p (w for javac) | works | `java` re-executes itself, so it needs `process`. Round 2: with its output on a pipe it calls `prctl(PR_SET_MM)`, reported as unimplemented; now EPERM, as under Docker. | Fixed: prctl |
+| Go | 1.23.12 | `golang:1.23-alpine` | `go build` of a program with goroutines and an httptest server, then run it | n t p w | works | Round 2: "GOCACHE is not defined and neither $XDG_CACHE_HOME nor $HOME are defined": images got no HOME, which Docker sets. | Fixed: HOME |
 | Rust | cargo 1.99.1 | `rust:alpine` | `cargo build --release` of a threaded program, then run it | t p w | works | Called `pwritev2` (fell back). | Fixed: `preadv2` |
 | Perl | 5.44.0 | `perl:5-slim` | Digest::SHA, JSON::PP | — | works | | |
 | git | 2.39.5 | `debian:bookworm` + apt | init, commit, branch, merge, log | p w | works | | |
@@ -79,16 +82,68 @@ x86_64 kernel wherever they are (here in QEMU, emulated):
 | Program | Image | Result |
 |---|---|---|
 | nginx (a request from inside, and `nginx -s quit`) | `nginx:alpine` | works |
-| Redis (SET/GET, BGSAVE) | `redis:7-alpine` | works |
+| Redis (SET/GET, BGSAVE) | `redis:7-alpine` | works (round 2: no overcommit warning) |
 
 Earlier, from an Alpine x86_64 root (`tools/alpine.py --arch x86_64`):
 nginx (v4 and v6 listeners, a static file through `sendfile`),
 PostgreSQL 17 (initdb, pg_ctl, psql), git, jq, sqlite3, Perl 5.40 and
 Ruby 3.4 all work.
 
+## Round 2 (2026-10-30)
+
+On 0.0.41 and this series. Every program above was run again, with the
+same tasks; all work, and the notes in their rows say what changed. These
+are new:
+
+| Program | Version | Image | What ran | Caps | Result | Events and warnings | Fix |
+|---|---|---|---|---|---|---|---|
+| MySQL | 8.4.13 | `mysql:8.4` | `docker-entrypoint.sh mysqld` (initialize, temporary server, real one), client: database, table, rows | n t p w | works | MySQL's own warnings (an empty root password during init, a self-signed CA, `/var/run/mysqld` world-accessible), as under Docker. | |
+| ClickHouse | 25.8.33.6 | `clickhouse/clickhouse-server:25.8` | `clickhouse server`; MergeTree table, a million rows, `sum` | n t p w, 3 GiB, 4 CPUs | works | `get_mempolicy` unimplemented (reported). Warns that `threads-max` (1024: grix's limit for all processes) is low, and that `[::]` listeners fail with "Address family not supported": the guest has no IPv6 address but `::1`, so `getaddrinfo` with `AI_ADDRCONFIG` gives no IPv6 address, as in a Docker container without IPv6. | NUMA policies |
+| Valkey | 8.1.11 | `valkey/valkey:8-alpine` | SET/GET, BGSAVE, INFO | n t p w | works | Warned about `vm.overcommit_memory`, as Redis did. | overcommit |
+| DuckDB | 2.0.0 | `python:3.12-slim` + pip | a million-row aggregate, a table | t w | works | | |
+| Envoy | 1.34.14 | `envoyproxy/envoy:v1.34-latest` | a listener with a direct response, curl from the host through `-p` | n t p w | works | Its own warning about no connection limit. | |
+| Jetty | 12.1.14 (Temurin 21.0.13) | `jetty:12-jdk21` | `start.jar` with the http module, a request | n t p w | works | | |
+| Maven | 3.10.0 | `maven:3-eclipse-temurin-21` | `mvn package` of a project with a dependency from Maven Central, then run it | n t p w | works | | |
+| Gradle | 8.14.6 | `gradle:8-jdk21` | `gradle run` of an application (Kotlin DSL, Maven Central), no daemon | n t p w | works | | |
+| .NET SDK | 8.0.427 (runtime 8.0.33) | `mcr.microsoft.com/dotnet/sdk:8.0` | `dotnet new console`, `dotnet run` | n t p w, 3 GiB, 4 CPUs | works | MSBuild failed: `Thread.set_Priority` threw, as `sched_get_priority_min/max` were ENOSYS; also `get_mempolicy`. | sched priorities, NUMA policies |
+| Bun | 1.4.4 | `oven/bun:1` | `Bun.serve` and `fetch`, `bun add` from npm | n t p w | works | | |
+| Deno | 2.9.8 | `denoland/deno` | `Deno.serve` and `fetch` | n t p w | works | | |
+| Node web stack | 22.23.4 | `node:22-alpine` + npm | Express, `tsc`, esbuild, `npm view` | n t p w | works | | |
+| Ruby web stack | 3.3.13 | `ruby:3.3-alpine` + gems | Sinatra, Puma with two workers | n t p w | works | | |
+| Python web stack | 3.12.16 | `python:3.12-slim` + pip | FastAPI under uvicorn with two workers; pandas and NumPy | n t p w | works | `mbind` unimplemented (reported). | NUMA policies |
+| InfluxDB | 2.9.1 | `influxdb:2-alpine` | `influxd`, `influx setup`, write and query | n t p w | works | | |
+| OpenSearch | 2.19.7 | `opensearchproject/opensearch:2` | single node, security plugin off, index a document, cluster health | n t p w, 3 GiB, 4 CPUs | works | A made-up `prctl` option (its seccomp self-test) was reported as unimplemented. | prctl |
+| Kafka (KRaft) | 3.9.1 | `apache/kafka:3.9.1` | the image's broker, create a topic, produce and consume a message | n t p w | works | `prctl(PR_SET_MM)` from its Alpine JDK (reported). | prctl |
+| NATS | 2.15.2 | `nats:alpine` | `nats-server -js`, SUB/PUB/PING over a socket | n t p w | works | | |
+| Consul | 2.1.0 | `hashicorp/consul` | `consul agent -dev`, KV put/get, members | n t p w | works | | |
+| Vault | 2.2.1 | `hashicorp/vault` | `vault server -dev`, KV put/get | n t p w | works | | |
+| Grafana | 13.3.0 | `grafana/grafana` | `/run.sh`, health and search APIs from the host | n t p w, 2 GiB | works | Its background plugin installs ran out of room ("no space left on device"): files live in guest memory. | |
+| Chromium (headless) | 136.0.7103.113 | `alpine:3.21` + apk | `--headless --dump-dom` of a page that runs JavaScript; `--screenshot` | n t p w, 3 GiB, 4 CPUs | works | Its zygote aborted: no `/proc/self/task` (it counts its threads by the link count), then `capset` to drop capabilities was denied, then the children's pids never came (`SO_PASSCRED` did nothing). Left: `landlock_create_ruleset`, `SIOCETHTOOL` and a `NETLINK_KOBJECT_UEVENT` socket (reported; it goes on), and GPU initialisation fails as in any container without a GPU. | `/proc/<pid>/task`, capset, SO_PASSCRED, prctl |
+| MinIO | | `minio/minio`, `quay.io/minio/minio` | | | not tried | MinIO no longer publishes public images (Docker Hub: 404; quay.io: unauthorized). | |
+
+Caps as above; "3 GiB" is `--mem 3072`, the most a guest has (see
+"What's left").
+
+The Datadog Agent was run again too (DATADOG.md).
+
 ## What was fixed
 
-In this series (each with its check in `popular.c`):
+In round 2 (each with its check in `popular.c`, or a test of its own):
+
+| Fix | Programs |
+|---|---|
+| Docker's HOME (the image user's home in its `/etc/passwd`) and HOSTNAME, for runs and build steps; a variable set for a run replaces the image's instead of following it (getenv took the image's) | `go build` (GOCACHE), pip, npm, cargo and git's caches and configs |
+| `/proc/sys/vm/overcommit_memory` is 1 (grix takes memory only as it's touched), `max_map_count` the real cap, inotify's limits | Redis and Valkey (no more warning), Chromium |
+| `sched_get_priority_max/min`; real-time policies EPERM, as without CAP_SYS_NICE | the .NET SDK (MSBuild) |
+| `mbind`, `set_mempolicy`, `get_mempolicy` for one NUMA node | ClickHouse, .NET, NumPy, Chromium |
+| `prctl`: `PR_SET_MM` EPERM, SVE's EINVAL, unknown options EINVAL, quietly | Alpine's JDK (Kafka, Temurin), Chromium, OpenSearch |
+| `/proc/<pid>/task/<tid>` | headless Chromium, `ps -L`, psutil |
+| `SO_PASSCRED` and `SCM_CREDENTIALS` on message sockets | headless Chromium |
+| `capset` that drops every capability (there are none) succeeds; raising one is still denied | headless Chromium |
+| `grix run -e KEY` passes the host's value of KEY, as Docker's does | secrets such as the Datadog API key stay off the command line |
+| A build step that runs out of room says so, and how to ask for more (`memory_mb`) | `apk add chromium` (a bare "Signaled(7)" before) |
+
+In round 1 (each with its check in `popular.c`):
 
 | Fix | Commit | Programs |
 |---|---|---|
@@ -118,19 +173,33 @@ images from registries, run on their own machine).
 
 ## What's left
 
-In order of impact (details in TODO.md, "Round 3"):
+In order of impact (details in TODO.md):
 
-1. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
-   `io_getevents`, ...: requests complete as they're submitted).
-   **io_uring** stays ENOSYS, on purpose and unreported (programs probe it): it is a
-   second way into every operation (each would need its own gate), and
-   Docker's default seccomp profile blocks it too, so programs (MariaDB,
-   nginx, libuv) are used to falling back to AIO or plain calls.
-2. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
-   mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
-3. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`
-   of `ID_AA64*`, `MIDR_EL1`, `MPIDR_EL1`, `REVIDR_EL1` emulated as
-   Linux's `HWCAP_CPUID`, sanitized to what HWCAP advertises).
+1. **Guest memory is at most 3 GiB** (`grix_abi::image::MAX_RAM`: the
+   kernel maps physical memory linearly below 4 GiB). The sandbox's
+   files live in that memory too, so Grafana's plugin downloads ran out
+   of room at 2 GiB, an `apk add chromium` build step needed
+   `memory_mb = 4096` (it dies of SIGBUS on a full file system without
+   it, and the build's error now says it ran out of room), and
+   Elasticsearch and OpenSearch need small heaps. Bigger guests need
+   the kernel to map memory above 4 GiB.
+2. **1024 threads in all** (`process::MAX_THREADS`, and
+   `/proc/sys/kernel/threads-max` says so): ClickHouse warns, and a busy
+   JVM or ClickHouse server could reach it.
+3. **`splice`** is still unimplemented (Go and others fall back; it's
+   reported), and so is **`/proc/self/mem`** (cilium/ebpf's version
+   probe in Datadog's system-probe).
+4. **No IPv6 address on `eth0`**: programs that listen on `[::]` with
+   `AI_ADDRCONFIG` (ClickHouse) skip it, as in a container without IPv6.
+5. **`SO_PASSCRED` on streams**: credentials come only with datagram and
+   seqpacket messages (reported for streams).
+6. **Landlock, ethtool, udev's netlink**: reported by Chromium, which
+   goes on without them.
 
-Denied by design (nothing in this survey needed them): `mount`, raw
-sockets, ptrace, module loading.
+Done in earlier rounds: Linux AIO (io_uring stays ENOSYS on purpose:
+a second way into every operation, each needing its own gate, and
+blocked by Docker's default seccomp profile too, so programs fall back),
+seccomp filters, and reading ID registers from EL0.
+
+Denied by design (nothing in either round needed them): `mount`, raw
+sockets, ptrace, module loading, eBPF.

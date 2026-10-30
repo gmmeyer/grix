@@ -192,9 +192,10 @@ Left, in order of impact:
     values, and has `HWCAP_CPUID`); MIDR as /proc/cpuinfo shows it,
     MPIDR as Linux's safe value. Left: more HWCAPs (ID_AA64ISAR1's
     LRCPC, JSCVT, FCMA, ...; HWCAP2), which would show there too.
-29. [ ] `/proc/sys/vm/overcommit_memory` says 0, so Redis warns that a
-    background save may fail; what grix actually does (memory is only
-    taken as it's touched) is closer to 1.
+29. [x] `/proc/sys/vm/overcommit_memory` says 1, Linux's "always
+    overcommit", which is what grix does (memory is only taken as it's
+    touched); Redis and Valkey no longer warn. `max_map_count` is the
+    real cap (`MAX_VMAS`), and inotify's limits are there (Chromium).
 30. [x] **A guest interface with `net`** (DATADOG.md: the Agent's "not
     connected to the network"): `eth0`, 10.0.2.15/24, up, and the
     default route via 10.0.2.2, in netlink (links, addresses, the main
@@ -202,6 +203,61 @@ Left, in order of impact:
     `/proc/net/route` and `/sys/class/net/eth0`. No device: the host's
     proxy still carries and checks every connection. Left: an IPv6
     address on it, counters.
+
+### Round 4 (2026-10-30): popular software again (COMPAT.md, round 2)
+
+COMPAT.md's programs again, and 23 more (MySQL, ClickHouse, Valkey,
+DuckDB, Envoy, Jetty, Maven, Gradle, the .NET SDK, Bun, Deno, Kafka,
+NATS, Consul, Vault, InfluxDB, OpenSearch, Grafana, headless Chromium,
+web stacks on Node, Ruby and Python). Done: Docker's HOME and HOSTNAME
+in images (and `run -e KEY`), item 29's sysctls,
+`sched_get_priority_max/min` (.NET), NUMA policies for one node,
+`prctl`'s refusals, `/proc/<pid>/task`, `SO_PASSCRED` on message
+sockets and `capset` that drops everything (Chromium), and a build
+step that runs out of room saying so. Left, in order of impact:
+
+31. [ ] **Guests bigger than 3 GiB** (`grix_abi::image::MAX_RAM`). The
+    kernel maps physical memory linearly, and RAM starts at 1 GiB on
+    arm64 (`0x4000_0000`) and must stay below the 32-bit hole on
+    x86_64 (microvm), so 3 GiB is all there is. The sandbox's files live
+    in that memory (half of it at most), so it bounds both: Grafana's
+    plugin downloads hit ENOSPC at 2 GiB, Elasticsearch and OpenSearch
+    need small heaps, and ClickHouse or a JVM build can't have 8 GiB.
+    What it would take: RAM in two regions (below 4 GiB and from 4 GiB
+    up, as QEMU's microvm and KVM's layouts put it), described in the
+    boot image's header (`grix_abi::machine`), the kernel's linear map
+    and frame allocator taking both (`mm/frame.rs`, both architectures'
+    page-table setup in `boot.S`), and grix-vmm and the QEMU command
+    making the second region. Without it, a writable layer on the host
+    (files written to disk instead of guest memory) would at least take
+    files out of the budget.
+32. [ ] **More than 1024 threads** (`process::MAX_THREADS`, all
+    processes; `threads-max` says so). ClickHouse warns about it, and a
+    busy JVM or Go server could reach it. Each thread is a few KiB of
+    kernel heap (its `Thread`, x86_64's boxed XSAVE area, its
+    `/proc/<pid>/task` nodes): raising it means a budget from
+    `kmem` per thread instead of a count, and a bigger kernel heap.
+33. [ ] **`SO_PASSCRED` on streams**: credentials go with datagram and
+    seqpacket messages only (on a stream, or a socket not yet connected,
+    it's reported). Streams would need them per write, kept beside the
+    bytes as SCM_RIGHTS' descriptors are (`Pipe::rights`), and reads
+    stopping where the sender changes, as Linux's do.
+34. [ ] **Landlock** (`landlock_create_ruleset`, reported; Chromium
+    probes it and goes on). A sandbox's own further restriction, like
+    seccomp: rulesets of path and port rights checked in `Fs::walk` and
+    connect/bind. Until then, EOPNOTSUPP ("disabled at boot") would be
+    an honest, quiet answer.
+35. [ ] `/proc/<pid>/task/<tid>`'s files are the process's (grix keeps
+    names, times and state per process): per-thread comm (PR_SET_NAME,
+    writes to `comm`) and CPU times would make `top -H` right.
+36. [ ] Smaller misses Chromium reports: `SIOCETHTOOL` on eth0, a
+    `NETLINK_KOBJECT_UEVENT` socket (udev). Both are optional to it.
+37. [ ] `splice` and `tee` (Go copies between pipes and sockets with
+    them and falls back; the Datadog Agent reports it), and
+    `/proc/<pid>/mem` (cilium/ebpf's kernel version probe in Datadog's
+    system-probe, debuggers): `pread`/`pwrite` at virtual addresses
+    through `uaccess`, only for the process itself or one it may
+    inspect.
 
 ## Agent integrations
 
