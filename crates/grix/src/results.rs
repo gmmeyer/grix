@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::{Export, ExportState, MountState, RunOutput};
+use crate::{Export, ExportState, Links, MountState, RunOutput};
 
 /// Exports' destinations, checked before the run so its results have
 /// somewhere to go: each can take an export, none takes two, and none is
@@ -29,7 +29,7 @@ pub fn check_destinations(exports: &[(String, PathBuf)], mounted: &[PathBuf]) ->
         }
         parents.push(parent);
     }
-    Ok(Destinations { exports: exports.to_vec(), parents })
+    Ok(Destinations { exports: exports.to_vec(), parents, links: Links::Any })
 }
 
 fn parent_of(dest: &Path) -> &Path {
@@ -41,9 +41,16 @@ pub struct Destinations {
     exports: Vec<(String, PathBuf)>,
     /// Each destination's directory, resolved when it was checked.
     parents: Vec<PathBuf>,
+    links: Links,
 }
 
 impl Destinations {
+    /// Which symbolic links the exports may have ([`Export::write_to_with`]).
+    pub fn links(mut self, links: Links) -> Self {
+        self.links = links;
+        self
+    }
+
     /// Write each exported directory to its host path. Partial exports are
     /// written too, with a note; a missing one isn't. A destination whose
     /// directory now resolves elsewhere (a link a mount's changes put in
@@ -73,7 +80,7 @@ impl Destinations {
                 ok = false;
                 continue;
             }
-            match export.write_to(host) {
+            match export.write_to_with(host, self.links) {
                 Ok(()) if quiet && note.is_empty() => {}
                 Ok(()) => {
                     let n = export.entries.len();

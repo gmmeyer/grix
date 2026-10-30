@@ -442,7 +442,12 @@ up without CAP_SYS_RESOURCE would do.
       Mounts do this: the kernel compares each node with what was imported and sends new and changed entries and the topmost removed paths.
 - [x] Exports after a timeout: the host would have to ask the guest to stop (see signals from the host).
       A timeout sends SIGTERM first; a program that ends within the grace period sends its exports.
-- [ ] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
+- [x] An option for `write_to` to refuse symlinks that point outside the export (like Python tarfile's `data` filter).
+      `Export::write_to_with(dest, Links::Inside)`, `Destinations::links`,
+      `grix run --no-outside-links`: a link that is absolute or leads out,
+      followed through the export's own links, fails it before anything
+      is written (`exports_with_links_inside_only`). Not yet in Grixfiles,
+      MCP or Python.
 - [x] Read-write host directory mounts, gated by policy.
       Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.
 - [ ] Live mounts: a file the host replaces while the program has it open can show the new contents once the host's descriptor for it ages out (it reopens by name). Pin descriptors for files the guest has open (Open/Close requests).

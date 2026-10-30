@@ -180,6 +180,11 @@ struct RunArgs {
     /// not exist yet, or be empty). Repeatable.
     #[arg(short = 'x', long = "export", value_name = "GUEST:HOST")]
     exports: Vec<String>,
+    /// Refuse an export holding a symbolic link that is absolute or leads
+    /// out of it (as Python tarfile's `data` filter does): nothing of it is
+    /// written.
+    #[arg(long)]
+    no_outside_links: bool,
     /// Mount host directory HOST at GUEST: live and read-write (rw, the
     /// default, grants fs_write), live and read-only (ro), with the
     /// changes applied when the program ends (on-exit, grants fs_write), or
@@ -419,7 +424,7 @@ fn run(args: RunArgs) -> Result<i32> {
                 bail!("the snapshot doesn't export {guest} (it exports {:?})", snap.exports());
             }
         }
-        let exports = grix::results::check_destinations(&exports, &[])?;
+        let exports = grix::results::check_destinations(&exports, &[])?.links(links_of(&args));
         // A snapshot taken in TTY mode is a terminal's (`-t` is then ours).
         let tty = snap.tty();
         if args.tty && !tty {
@@ -620,6 +625,11 @@ fn write_stream(stream: Stream, data: &[u8]) {
 }
 
 /// `--arch`'s architecture, if given.
+/// The links exports may have (`--no-outside-links`).
+fn links_of(args: &RunArgs) -> grix::Links {
+    if args.no_outside_links { grix::Links::Inside } else { grix::Links::Any }
+}
+
 fn parse_arch(name: Option<&str>) -> Result<Option<grix::Arch>> {
     name.map(|a| grix::Arch::parse(a).with_context(|| format!("--arch {a}: aarch64 (arm64) or x86_64 (amd64)")))
         .transpose()
@@ -680,7 +690,7 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
         mounted.push(PathBuf::from(host));
     }
     // Before the run, so its results have somewhere to go.
-    let exports = grix::results::check_destinations(&exports, &mounted)?;
+    let exports = grix::results::check_destinations(&exports, &mounted)?.links(links_of(args));
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }

@@ -1219,6 +1219,47 @@ fn waiting_for_a_host_signal_is_not_a_deadlock() {
 
 // ---------------------------------------------------------------- real-world binaries (Alpine)
 
+#[test]
+fn exports_with_links_inside_only() {
+    // The program's links are its own business, unless asked: with
+    // `Links::Inside` an export with a link out of it (absolute, `..`
+    // past its top, or out through another of its links) isn't written.
+    let script = |links: &str| {
+        let b = "/bin/busybox";
+        format!(
+            "{b} mkdir -p /out/d && echo hi > /out/d/f && cd /out && {b} ln -s d/f inside && {b} ln -s d up && {b} {links}"
+        )
+    };
+    let sb = |links: &str| {
+        let b = Sandbox::builder()
+            .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+            .unwrap()
+            .allow(Capability::FsWrite)
+            .allow(Capability::Process)
+            .export("/out")
+            .unwrap();
+        run(b, &["/bin/busybox", "sh", "-c", &script(links)])
+    };
+    let dest = temp_dir("export-links");
+    let ok = sb("ln -s up/../d/f again");
+    assert_eq!(ok.status, ExitStatus::Exited(0), "{}", ok.stderr_str());
+    assert!(ok.events.is_empty(), "{:?}", ok.events);
+    ok.export("/out").unwrap().write_to_with(dest.join("ok"), grix::Links::Inside).unwrap();
+    assert_eq!(std::fs::read(dest.join("ok/again")).unwrap(), b"hi\n");
+    for bad in ["ln -s /etc/passwd p", "ln -s ../../x d/x", "ln -s up/../.. out"] {
+        let out = sb(bad);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());
+        let ex = out.export("/out").unwrap();
+        let err = ex.write_to_with(dest.join("bad"), grix::Links::Inside).unwrap_err();
+        assert!(format!("{err:#}").contains("outside it"), "{err:#}");
+        assert!(!dest.join("bad").exists());
+        // As they are, they're written (never followed).
+        ex.write_to(dest.join("bad")).unwrap();
+        std::fs::remove_dir_all(dest.join("bad")).unwrap();
+    }
+    std::fs::remove_dir_all(&dest).unwrap();
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("grix-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);

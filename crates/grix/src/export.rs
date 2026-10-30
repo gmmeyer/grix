@@ -5,7 +5,7 @@
 //! against a budget, paths must stay inside their directory, and writing
 //! never follows a link or touches anything it didn't create.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -84,6 +84,59 @@ fn summaries<S: serde::Serializer>(entries: &[ExportEntry], s: S) -> Result<S::O
     }))
 }
 
+/// What [`Export::write_to_with`] makes of symbolic links.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Links {
+    /// As they are, wherever they point (they're never followed while
+    /// writing, but whatever reads the tree later may).
+    #[default]
+    Any,
+    /// Only links that stay inside the exported tree: a relative target
+    /// that, followed through the tree's own links, never leaves it, as
+    /// Python tarfile's `data` filter allows. Anything else fails the
+    /// whole export before it's written.
+    Inside,
+}
+
+/// Where `target`, the target of the link at `link`, leads in the tree
+/// whose links are `links`: `None` if it leaves the tree, is absolute,
+/// or goes through more than 40 links (Linux's limit).
+fn resolve_inside(links: &BTreeMap<&str, &str>, link: &str, target: &str) -> Option<Vec<String>> {
+    let mut at: Vec<String> = link.split('/').map(String::from).collect();
+    at.pop();
+    let mut pending: Vec<String> = Vec::new();
+    let push_target = |pending: &mut Vec<String>, t: &str| -> bool {
+        if t.starts_with('/') {
+            return false;
+        }
+        pending.extend(t.split('/').rev().map(String::from));
+        true
+    };
+    if !push_target(&mut pending, target) {
+        return None;
+    }
+    let mut hops = 0;
+    while let Some(c) = pending.pop() {
+        match c.as_str() {
+            "" | "." => {}
+            ".." => {
+                at.pop()?;
+            }
+            name => {
+                at.push(name.to_string());
+                if let Some(t) = links.get(at.join("/").as_str()) {
+                    hops += 1;
+                    if hops > 40 || !push_target(&mut pending, t) {
+                        return None;
+                    }
+                    at.pop();
+                }
+            }
+        }
+    }
+    Some(at)
+}
+
 /// A path the guest may name inside an export: plain components only.
 fn valid_path(path: &str) -> bool {
     !path.is_empty() && path.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\0'))
@@ -122,6 +175,14 @@ impl Export {
     /// into place, so if anything fails (say, two names a case-insensitive
     /// filesystem sees as one) nothing is left behind.
     pub fn write_to(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.write_to_with(dest, Links::Any)
+    }
+
+    /// [`write_to`](Export::write_to), with `links` saying which symbolic
+    /// links may be written: with [`Links::Inside`], a link that is
+    /// absolute or leads out of the tree (`../..`, or through another of
+    /// its links) fails the export, and nothing is written.
+    pub fn write_to_with(&self, dest: impl AsRef<Path>, links: Links) -> Result<()> {
         let dest = dest.as_ref();
         // Check the whole tree first: every parent is a directory listed
         // before it, and nothing appears twice.
@@ -144,6 +205,21 @@ impl Export {
                     bail!("export of {} has a bad link target at {:?}", self.dir, e.path)
                 }
                 _ => {}
+            }
+        }
+        if links == Links::Inside {
+            let all: BTreeMap<&str, &str> = self
+                .entries
+                .iter()
+                .filter_map(|e| match &e.content {
+                    ExportContent::Symlink(t) => Some((e.path.as_str(), t.as_str())),
+                    _ => None,
+                })
+                .collect();
+            for (path, target) in &all {
+                if resolve_inside(&all, path, target).is_none() {
+                    bail!("export of {} has a link {path:?} to {target:?}, outside it", self.dir);
+                }
             }
         }
         Self::check_destination(dest)?;
@@ -655,6 +731,51 @@ mod tests {
         assert!(Export::check_destination(base.join("alias")).is_err());
         assert!(Export::check_destination(base.join("fresh")).is_ok());
         fs::set_permissions(base.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn links_inside_only() {
+        let t = SystemTime::UNIX_EPOCH;
+        let e = |path: &str, content| ExportEntry { path: path.into(), mode: 0o755, mtime: t, content };
+        let link = |path: &str, target: &str| e(path, ExportContent::Symlink(target.into()));
+        let tree = |more: Vec<ExportEntry>| {
+            let mut entries = vec![e("d", ExportContent::Dir), e("d/e", ExportContent::Dir)];
+            entries.extend(more);
+            Export { dir: "/out".into(), state: ExportState::Complete, entries }
+        };
+        let base = std::env::temp_dir().join(format!("grix-export-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        let fine = [
+            link("a", "d"),
+            link("d/e/up", "../.."),
+            link("d/b", "e/../../a/e"),
+            link("d/e/c", "../../d/b/up/d"),
+            link("dangling", "d/nothing/../e"),
+            link("dot", "."),
+        ];
+        let ok = tree(fine.to_vec());
+        ok.write_to_with(base.join("ok"), Links::Inside).unwrap();
+        assert_eq!(fs::read_link(base.join("ok/d/e/up")).unwrap(), Path::new("../.."));
+        for bad in [
+            vec![link("a", "/etc/passwd")],
+            vec![link("a", "..")],
+            vec![link("d/e/x", "../../../x")],
+            // Out through another link: each alone looks harmless.
+            vec![link("d/up", ".."), link("d/e/out", "../up/..")],
+            vec![link("d/e/up", "../.."), link("x", "d/e/up/..")],
+            // A loop never resolves.
+            vec![link("p", "q"), link("q", "p")],
+        ] {
+            let dest = base.join("bad");
+            let ex = tree(bad.clone());
+            assert!(ex.write_to_with(&dest, Links::Inside).is_err(), "{bad:?}");
+            assert!(!dest.exists());
+            // As they are, they're written.
+            ex.write_to(&dest).unwrap();
+            fs::remove_dir_all(&dest).unwrap();
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 }
