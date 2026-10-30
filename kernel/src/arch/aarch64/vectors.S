@@ -3,11 +3,31 @@
 // Every exception saves a TrapFrame (x0-x30, sp_el0, elr_el1, spsr_el1) on the
 // kernel stack and calls `trap_handler(frame, kind)`. `kind` is the vector
 // index: 0-3 current EL/SP0, 4-7 current EL/SPx, 8-11 lower EL AArch64, 12-15 AArch32.
+//
+// One taken in the kernel first checks there's room for its frame on this
+// CPU's stack, above its canary (arch/stack.rs): with none, it's an
+// overflow, reported from the emergency stack below. tpidr_el1 is the
+// lowest sp with room (boot.S, set_stack_limit); tpidrro_el0 holds x0
+// meanwhile, cleared before anything returns to EL0.
 
 .equ FRAME_SIZE, 272
 
 .macro VENTRY kind
     .balign 128
+    sub     sp, sp, #FRAME_SIZE
+    stp     x0, x1, [sp, #0]
+    mov     x0, #\kind
+    b       trap_common
+.endm
+
+.macro VENTRY_EL1 kind
+    .balign 128
+    msr     tpidrro_el0, x0
+    mrs     x0, tpidr_el1
+    cmp     sp, x0
+    mrs     x0, tpidrro_el0
+    msr     tpidrro_el0, xzr
+    b.lo    stack_overflow
     sub     sp, sp, #FRAME_SIZE
     stp     x0, x1, [sp, #0]
     mov     x0, #\kind
@@ -22,10 +42,10 @@ exception_vectors:
     VENTRY 1
     VENTRY 2
     VENTRY 3
-    VENTRY 4
-    VENTRY 5
-    VENTRY 6
-    VENTRY 7
+    VENTRY_EL1 4
+    VENTRY_EL1 5
+    VENTRY_EL1 6
+    VENTRY_EL1 7
     VENTRY 8
     VENTRY 9
     VENTRY 10
@@ -34,6 +54,19 @@ exception_vectors:
     VENTRY 13
     VENTRY 14
     VENTRY 15
+
+// An exception in the kernel with this CPU's stack used up: on to its
+// emergency stack, just below it, to report it (`stack_overflow_report`
+// in mod.rs, with the sp it came in at). No more checks: whatever
+// happens there is an exception like any other.
+stack_overflow:
+    mov     x1, sp
+    mrs     x0, tpidr_el1
+    msr     tpidr_el1, xzr
+    sub     x0, x0, #(FRAME_SIZE + 256)  // the stack's bottom (CANARY_SIZE)
+    mov     sp, x0
+    mov     x0, x1
+    bl      stack_overflow_report
 
 trap_common:
     stp     x2, x3, [sp, #16]

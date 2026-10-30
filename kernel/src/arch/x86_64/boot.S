@@ -160,7 +160,8 @@ ap_high:
     shrl $24, %ebx
     movl %ebx, %edi
     leaq 1(%rbx), %rax
-    shlq $16, %rax              // STACK_SIZE
+    movabsq $__stack_slot, %rcx
+    imulq %rcx, %rax
     movabsq $__stacks, %rsi
     addq %rax, %rsi
     subq $192, %rsi             // size_of::<TrapFrame>()

@@ -3277,6 +3277,12 @@ fn smp_counters_and_benchmark() {
                 "sleeper" => assert!(n("wakeups") > 0 && n("timer") > 0, "{stdout}"),
                 _ => {}
             }
+            // The deepest any CPU's kernel stack has been, fork and clone
+            // among the deepest paths: under half of its 128 KiB. About
+            // 16 KiB on both architectures (a debug kernel's, 41);
+            // x86_64's was 57 while a thread, its XSAVE area inline, was
+            // copied up and down them.
+            assert!(n("stack_max") > 0 && n("stack_max") < 64 << 10, "{stdout}");
         }
         for mode in MODES {
             assert!(runs.iter().any(|r| r["mode"] == mode), "{mode}: {stdout}");
@@ -3301,6 +3307,69 @@ fn smp_counters_and_benchmark() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         assert_eq!((fields.len(), fields[0]), (width, first), "{stdout}");
         assert!(fields[1..].iter().all(|f| f.parse::<u64>().is_ok()), "{stdout}");
+    }
+}
+
+/// A debug build of the kernel for the guest's architecture, built here:
+/// its frames are bigger than a release build's, and it has the hook
+/// `kernel_stack_overflow_is_reported` uses.
+fn debug_kernel() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernel");
+    let target = match grix::Arch::from_env() {
+        grix::Arch::Aarch64 => "aarch64-unknown-none-softfloat",
+        grix::Arch::X86_64 => "x86_64-unknown-none",
+    };
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "--quiet", "--target", target])
+        .current_dir(&dir)
+        .status()
+        .expect("running cargo for the debug kernel");
+    assert!(status.success(), "building the debug kernel failed");
+    dir.join("target").join(target).join("debug/grix-kernel")
+}
+
+/// Running past the end of a CPU's kernel stack is reported, as a panic
+/// that says so, whether the kernel then returns (its canary, checked on
+/// the way back to user mode, was written) or takes an exception down
+/// there; it ran into that CPU's emergency stack, not the next CPU's
+/// stack. A debug kernel does it on purpose (release builds have no such
+/// call), on CPU 0 and on another; and first runs the deepest paths
+/// smpbench takes on every CPU, with room to spare.
+#[test]
+fn kernel_stack_overflow_is_reported() {
+    let kernel = debug_kernel();
+    let b = |name: &str, cpus: u32| with(name).kernel(&kernel).cpus(cpus).allow(Capability::Threads);
+    let out = run(b("smpbench", 4).allow(Capability::Process), &["/bin/smpbench", "-t", "50", "-s"]);
+    let stdout = out.stdout_str();
+    assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}");
+    assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
+    let deepest = stdout.rsplit_once(" stack_max=").and_then(|(_, n)| n.split_whitespace().next()?.parse::<u64>().ok());
+    assert!(deepest.is_some_and(|n| n < 64 << 10), "{stdout}");
+    for (cpus, how) in [(1, "return"), (4, "return"), (1, "fault"), (4, "fault")] {
+        let threads = cpus.to_string();
+        let argv: &[&str] = if how == "fault" { &["/bin/kstack", &threads, how] } else { &["/bin/kstack", &threads] };
+        // Seen by the canary on the way back, or by the exception.
+        let says = if how == "fault" { " at " } else { " (its canary " };
+        // The CPU the kernel names. With 4, the fixture calls from a
+        // thread it saw on another than CPU 0, but the thread may move
+        // before its call: then again.
+        for attempt in 1.. {
+            let out = b("kstack", cpus).build().unwrap().run(argv).unwrap();
+            assert_eq!(out.status, ExitStatus::KernelPanic, "{}{}", out.stdout_str(), out.kernel_log);
+            assert!(out.stdout_str().starts_with("overflowing on cpu "), "{}", out.stdout_str());
+            let cpu: u32 = out
+                .kernel_log
+                .split_once("kernel stack overflow on CPU ")
+                .and_then(|(_, rest)| rest.split_once(says))
+                .and_then(|(n, _)| n.parse().ok())
+                .unwrap_or_else(|| panic!("{}", out.kernel_log));
+            if cpus == 1 || cpu != 0 {
+                assert!(cpu < cpus, "{}", out.kernel_log);
+                break;
+            }
+            assert!(attempt < 5, "always CPU 0: {}", out.kernel_log);
+        }
     }
 }
 

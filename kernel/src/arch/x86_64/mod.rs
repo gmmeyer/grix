@@ -12,6 +12,8 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
+use super::stack::{self, emergency_stack_top};
+use super::stack_top;
 use crate::signal::{self, *};
 use crate::{process, sched, syscall};
 
@@ -234,24 +236,10 @@ unsafe extern "C" {
     fn load_cpu_tables(gdtr: *const u8, idtr: *const u8, tss: u16);
     static isr_table: [u64; 256];
     fn syscall_entry();
-    static __stacks: u8;
-    static __df_stack_top: u8;
     fn boot_pml4_phys() -> u64;
     fn ap_trampoline_phys() -> u64;
     fn ap_trampoline_len() -> u64;
     fn empty_pml4_phys() -> u64;
-}
-
-const STACK_SIZE: u64 = 0x10000;
-
-/// Top of CPU `cpu`'s kernel stack (they're laid out in the linker script).
-pub fn stack_top(cpu: usize) -> u64 {
-    (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
-}
-
-/// The lowest address of CPU `cpu`'s kernel stack.
-pub fn stack_bottom(cpu: usize) -> u64 {
-    stack_top(cpu) - STACK_SIZE
 }
 
 /// Where a secondary CPU starts (physical): the trampoline's copy
@@ -482,14 +470,24 @@ extern "C" fn trap_entry(tf: &mut TrapFrame) {
             irq::taken(tf.vector as u8);
             return;
         }
+        // Taken with the stack into its canary.
+        if stack::overflowed(cpu_number(), tf.rsp) {
+            panic!(
+                "kernel stack overflow on CPU {} at {:#x}, rsp {:#x}, cr2 {:#x}",
+                cpu_number(),
+                tf.rip,
+                tf.rsp,
+                cr2()
+            );
+        }
         // The callers, by frame pointer, while they're on a kernel stack.
         let mut trace = [0u64; 8];
-        let (mut fp, stacks) = (tf.rbp, (&raw const __stacks) as u64);
+        let mut fp = tf.rbp;
         for slot in trace.iter_mut() {
-            if fp < stacks || fp >= stack_top(MAX_CPUS - 1) || fp & 7 != 0 {
+            if !stack::on_a_stack(fp) || !stack::on_a_stack(fp + 8) || fp & 7 != 0 {
                 break;
             }
-            // SAFETY: inside the kernel stacks, which are mapped.
+            // SAFETY: inside a kernel stack, which is mapped.
             unsafe {
                 *slot = ((fp + 8) as *const u64).read();
                 fp = (fp as *const u64).read();
@@ -979,7 +977,9 @@ fn init_cpu(cpu: usize) {
     let top = stack_top(cpu);
     tss[1].store(top as u32, Ordering::Relaxed); // rsp0
     tss[2].store((top >> 32) as u32, Ordering::Relaxed);
-    let df = (&raw const __df_stack_top) as u64 - cpu as u64 * 0x1000;
+    // A double fault on the emergency stack (the stack may be what
+    // faulted).
+    let df = emergency_stack_top(cpu);
     tss[9].store(df as u32, Ordering::Relaxed); // ist1
     tss[10].store((df >> 32) as u32, Ordering::Relaxed);
     tss[25].store(104 << 16, Ordering::Relaxed); // no I/O bitmap

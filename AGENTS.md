@@ -295,8 +295,20 @@ anything). They only matter inside the guest filesystem: root bypasses
 mode bits but not `Node::system`, and nothing honours setuid bits, so
 keep it that way rather than giving uid 0 anything else.
 
-Threads (`sched.rs`): one kernel stack per CPU. Each thread keeps its user
-registers, TLS and FP/SIMD state in `process::Thread`. A syscall that must
+Threads (`sched.rs`): one kernel stack per CPU (`arch::stack`'s
+`STACK_SIZE`, which the linker scripts and assembly take from there),
+with that CPU's emergency stack below it. There's no guard page (4 KiB
+mappings there cost contended system calls a fifth of their speed):
+the lowest `CANARY_SIZE` bytes of each stack are painted and checked on
+every way back to user mode and before the idle wait
+(`smp::check_stack`), and an exception taken that low is reported too
+(arm64's vectors check sp against `tpidr_el1` before pushing a frame
+and move to the emergency stack), all as "kernel stack overflow on CPU
+n". `stack_max` in /proc/grix/smp is each CPU's high-water mark (about
+16 KiB in release builds): keep big things off the stack, and remember
+that a `Thread` is moved by value (x86_64's FP state is boxed for that,
+`arch::ThreadFp`). Each thread keeps its user registers, TLS and FP/SIMD
+state in `process::Thread`. A syscall that must
 wait calls `Process::block` (futex/sleep) or `Process::block_io` (I/O) and
 returns `EBLOCKED`. `schedule()` then saves the trapped state and loads
 another thread's state into the trap frame. I/O waits are *restarted*: when

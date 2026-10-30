@@ -183,6 +183,26 @@ pub fn stack_used(cpu: usize) -> u64 {
     top - at
 }
 
+/// Panic if this CPU's kernel stack has run into its canary: its lowest
+/// `arch::CANARY_SIZE` bytes, painted at boot, which nothing may use
+/// (there's no guard page, `arch::stack`). On every way back to user mode
+/// and before the idle wait, so an overflow is reported before anything
+/// else runs on the CPU; it has written only into this CPU's emergency
+/// stack, below.
+pub fn check_stack() {
+    let cpu = me();
+    let bottom = arch::stack_bottom(cpu);
+    // A word of each cache line: four loads, on every return to user mode.
+    let mut changed = 0;
+    for at in (bottom..bottom + arch::CANARY_SIZE).step_by(64) {
+        // SAFETY: inside this CPU's stack, which is mapped.
+        changed |= unsafe { (at as *const u64).read_volatile() } ^ STACK_PAINT;
+    }
+    if changed != 0 {
+        panic!("kernel stack overflow on CPU {cpu} (its canary at {bottom:#x} was written)");
+    }
+}
+
 /// /proc/grix/smp: a header, a line per CPU, and their sum.
 pub fn stats(s: &mut alloc::string::String) {
     use core::fmt::Write;
@@ -499,6 +519,7 @@ fn kick(cpu: usize) {
 /// no thread (it parked, or idles), wait for something to run without
 /// holding anything, and load it into `tf`. Then give the kernel back.
 pub fn finish(tf: &mut TrapFrame) {
+    check_stack();
     // Schedule before waiting: a CPU whose thread just ended may have
     // others to run.
     loop {
@@ -527,6 +548,7 @@ pub fn finish(tf: &mut TrapFrame) {
         }
         // Checking on the host may itself have freed room for a writer.
         let quiet = crate::ipc::generation() == crate::sched::polled();
+        check_stack();
         unlock_idle();
         if quiet {
             wait();

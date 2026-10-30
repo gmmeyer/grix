@@ -2,6 +2,7 @@
 
 use core::arch::{asm, global_asm};
 
+use super::stack_top;
 use crate::signal::{self, *};
 use crate::{process, sched, syscall};
 
@@ -108,21 +109,8 @@ unsafe extern "C" {
     fn return_to_frame_asm(frame: *const TrapFrame) -> !;
     fn fpsimd_save(state: *mut FpState);
     fn fpsimd_restore(state: *const FpState);
-    static __stacks: u8;
     fn secondary_entry_addr() -> u64;
     fn empty_l0_addr() -> u64;
-}
-
-const STACK_SIZE: u64 = 0x10000;
-
-/// Top of CPU `cpu`'s kernel stack (they're laid out in the linker script).
-pub fn stack_top(cpu: usize) -> u64 {
-    (&raw const __stacks) as u64 + (cpu as u64 + 1) * STACK_SIZE
-}
-
-/// The lowest address of CPU `cpu`'s kernel stack.
-pub fn stack_bottom(cpu: usize) -> u64 {
-    stack_top(cpu) - STACK_SIZE
 }
 
 /// Where a secondary CPU starts (physical: its MMU is off).
@@ -275,6 +263,11 @@ const EC_BRK: u64 = 0x3c;
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     if !matches!(kind, 5 | 8 | 9) {
+        // Taken into the canary with room left for the frame.
+        let sp = tf as *const TrapFrame as u64 + core::mem::size_of::<TrapFrame>() as u64;
+        if super::stack::overflowed(cpu_number(), sp) {
+            panic!("kernel stack overflow on CPU {} at {:#x}, sp {sp:#x}, far {:#x}", cpu_number(), tf.elr, far());
+        }
         panic!(
             "unexpected exception: kind={kind} esr={:#x} far={:#x} elr={:#x} lr={:#x} sp_el0={:#x}",
             esr(),
@@ -306,6 +299,16 @@ extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
     }
     // Something to run (waiting for it if need be), and the kernel back.
     crate::smp::finish(tf);
+}
+
+/// An exception in the kernel with no room for its frame on this CPU's
+/// stack (vectors.S): on the emergency stack, `sp` the one it came in at.
+#[unsafe(no_mangle)]
+extern "C" fn stack_overflow_report(sp: u64) -> ! {
+    let elr: u64;
+    // SAFETY: reading a system register.
+    unsafe { asm!("mrs {}, elr_el1", out(reg) elr) };
+    panic!("kernel stack overflow on CPU {} at {elr:#x}, sp {sp:#x}, far {:#x}, esr {:#x}", cpu_number(), far(), esr());
 }
 
 fn el0_sync(tf: &mut TrapFrame) {

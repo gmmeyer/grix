@@ -29,10 +29,36 @@ use table::{Gate, nr};
 /// execve's dirfd for "relative to the working directory".
 pub(crate) const AT_FDCWD: i32 = -100;
 
+/// Debug builds only: a call no Linux has, which runs this CPU's kernel
+/// stack 1 KiB past its bottom, then returns (its first argument 0) or
+/// faults there (1), for the test that either is reported
+/// (`kernel_stack_overflow_is_reported`, with fixtures/src/kstack.c).
+#[cfg(debug_assertions)]
+const STACK_OVERFLOW_TEST: u64 = 0x6772_6978;
+
+#[cfg(debug_assertions)]
+fn overflow_stack(to: u64, fault: bool) -> u64 {
+    let frame = core::hint::black_box([to; 64]);
+    if (&raw const frame) as u64 > to {
+        return overflow_stack(to, fault) ^ frame[63];
+    }
+    if fault {
+        // SAFETY: none; it faults (nothing is mapped at 8), on purpose.
+        return unsafe { (8 as *const u64).read_volatile() };
+    }
+    frame[0]
+}
+
 pub fn handle(tf: &mut TrapFrame) {
     crate::stats::syscall();
     let n = tf.syscall_nr();
     let a = tf.syscall_args();
+    #[cfg(debug_assertions)]
+    if n == STACK_OVERFLOW_TEST {
+        let bottom = crate::arch::stack_bottom(crate::smp::me());
+        overflow_stack(bottom - 1024, a[0] == 1);
+        return;
+    }
     let mut guard = process::running().lock();
     let p = guard.as_mut().expect("syscall without a process");
     // A rewound call is running again: no longer something a signal must

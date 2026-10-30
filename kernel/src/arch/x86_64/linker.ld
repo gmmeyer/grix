@@ -63,16 +63,14 @@ SECTIONS
     } :kernel
 
     . = ALIGN(4096);
-    /* A 64 KiB kernel stack per CPU (grix_abi::machine::MAX_CPUS); CPU 0's first. */
+    /* Each CPU's emergency stack and kernel stack
+     * (grix_abi::machine::MAX_CPUS of them; the sizes are arch/stack.rs's). */
     .stack (NOLOAD) : AT(ADDR(.stack) - KERNEL_OFFSET) {
         __stacks = .;
-        . += 0x10000;
-        __stack_top = .;
-        . += 0x10000 * 7;
-        /* A page per CPU for double faults (IST 1), CPU 0's at the top. */
-        . += 0x1000 * 8;
-        __df_stack_top = .;
+        . += __stacks_size;
     } :kernel
+    /* CPU 0's, which it boots on. */
+    __stack_top = __stacks + __stack_slot;
 
     . = ALIGN(4096);
     __kernel_end = .;

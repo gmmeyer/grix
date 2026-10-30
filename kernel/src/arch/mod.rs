@@ -3,6 +3,9 @@
 //! about registers on it. Everything outside `arch` is the same on every
 //! architecture.
 
+mod stack;
+pub use stack::{CANARY_SIZE, stack_bottom, stack_top};
+
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]

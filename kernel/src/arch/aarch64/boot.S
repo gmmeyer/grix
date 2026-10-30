@@ -40,6 +40,7 @@ _start:
     add     x4, x4, #1
     cmp     x4, #4
     b.ne    3b
+
     // The tables reach memory before any CPU (this one, or one started
     // later with its caches off) walks them.
     dsb     sy
@@ -49,6 +50,7 @@ _start:
     // Now running with the MMU on (still via the identity map).
     ldr     x0, =__stack_top
     mov     sp, x0
+    bl      set_stack_limit
 
     ldr     x0, =__bss_start
     ldr     x1, =__bss_end
@@ -72,6 +74,8 @@ secondary_entry:
     mov     x19, x0                     // this CPU's stack (high half)
     bl      drop_to_el1
     bl      mmu_on
+    mov     x0, x19
+    bl      set_stack_limit
     // The top 272 bytes are the frame its threads start from (and traps
     // from EL0 save theirs in); Rust runs below them.
     sub     x19, x19, #272
@@ -103,6 +107,16 @@ drop_to_el1:
     msr     elr_el2, x30
     eret
 1:  ret
+
+// The lowest sp an exception may come in at, with room below for its
+// frame above the canary (vectors.S checks it), for this CPU's stack,
+// whose top is x0.
+set_stack_limit:
+    ldr     x1, =__stack_size
+    sub     x1, x0, x1
+    add     x1, x1, #(272 + 256)        // FRAME_SIZE + CANARY_SIZE
+    msr     tpidr_el1, x1
+    ret
 
 // Turn the MMU on with the boot tables (identity-mapped code keeps running).
 mmu_on:
