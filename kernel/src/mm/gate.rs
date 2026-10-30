@@ -42,8 +42,9 @@ pub struct Mm(Arc<Inner>, u64);
 pub struct Inner {
     /// The CPU holding the gate, or `FREE`.
     holder: AtomicUsize,
-    /// The kernel lock's holder waits for it (`lock`): fast entries leave
-    /// it be (`lock_fast`), so a stream of them can't keep it waiting.
+    /// The kernel lock's holder waits for it (`lock`): fast entries don't
+    /// try for it meanwhile (`lock_fast`), so a stream of them can't keep
+    /// it waiting.
     wanted: AtomicBool,
     aspace: UnsafeCell<AddressSpace>,
 }
@@ -130,17 +131,15 @@ impl Inner {
         self.taken(me);
     }
 
-    /// For a fast entry: false (not taken) if the kernel lock's holder
-    /// wants it, then or while this waits.
-    pub fn lock_fast(&self) -> bool {
+    /// For a fast entry: after the kernel lock's holder, if it wants it.
+    pub fn lock_fast(&self) {
         let me = crate::smp::me();
         loop {
-            if self.wanted.load(Ordering::Relaxed) {
-                return false;
-            }
-            if self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if !self.wanted.load(Ordering::Relaxed)
+                && self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            {
                 self.taken(me);
-                return true;
+                return;
             }
             core::hint::spin_loop();
         }
