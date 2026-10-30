@@ -13,7 +13,7 @@ use grix_abi::policy::{DenyAction, Policy};
 use grix_abi::wire::{Event, ExitKind};
 use spin::Mutex;
 
-use crate::arch::{self, FpState, TrapFrame};
+use crate::arch::{self, TrapFrame};
 use crate::console::{self, klog};
 use crate::elf;
 use crate::errno::*;
@@ -109,7 +109,10 @@ pub struct Thread {
     /// User registers, valid while the thread is not running.
     pub regs: TrapFrame,
     pub tls: u64,
-    pub fp: FpState,
+    /// Boxed on x86_64 (`arch::ThreadFp`): its XSAVE area is 2.7 KiB, and
+    /// a `Thread` is moved by value (fork, clone, the B-tree's nodes),
+    /// each move a copy on the kernel stack.
+    pub fp: arch::ThreadFp,
     /// `Some` while blocked.
     pub wait: Option<Wait>,
     /// set_tid_address / CLONE_CHILD_CLEARTID: zeroed and futex-woken on exit.
@@ -161,7 +164,7 @@ impl Thread {
             tid,
             regs: TrapFrame::default(),
             tls: 0,
-            fp: FpState::default(),
+            fp: Default::default(),
             wait: None,
             clear_child_tid: 0,
             sigmask: 0,

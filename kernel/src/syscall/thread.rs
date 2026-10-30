@@ -5,7 +5,7 @@ use grix_abi::policy::Capability;
 use grix_abi::stats::{Limit, Resource};
 
 use super::{require, table::nr};
-use crate::arch::{self, FpState, TrapFrame};
+use crate::arch::{self, TrapFrame};
 use crate::errno::*;
 use crate::process::{self, MAX_THREADS, Process, Thread, WaitOn};
 use crate::time;
@@ -147,8 +147,6 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if args.stack != 0 {
         regs.set_sp(args.stack);
     }
-    let mut fp = FpState::default();
-    arch::save_fp(&mut fp);
     if flags & CLONE_PARENT_SETTID != 0 {
         write_u32(&mut p.aspace, args.parent_tid, tid)?;
     }
@@ -160,7 +158,7 @@ fn do_clone(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     let mut t = Thread::new(tid);
     t.seccomp = seccomp;
     t.regs = regs;
-    t.fp = fp;
+    arch::save_fp(&mut t.fp);
     t.tls = if flags & CLONE_SETTLS != 0 { args.tls } else { arch::tls() };
     t.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
     t.sigmask = sigmask;

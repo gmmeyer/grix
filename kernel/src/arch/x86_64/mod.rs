@@ -168,6 +168,10 @@ pub struct FpState {
     pub area: [u8; FP_AREA],
 }
 
+/// A thread's FP state as `process::Thread` holds it: boxed, as a
+/// `Thread` is moved by value and this is 2.7 KiB (arm64's is inline).
+pub type ThreadFp = alloc::boxed::Box<FpState>;
+
 impl Default for FpState {
     /// The state a new program starts with (as `fninit` and Linux leave
     /// it): FCW 0x37f, MXCSR 0x1f80 (every exception masked), and an

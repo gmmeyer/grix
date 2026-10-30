@@ -99,6 +99,10 @@ pub struct FpState {
     pub fpsr: u64,
 }
 
+/// A thread's FP state as `process::Thread` holds it: inline, as it's
+/// 528 bytes (x86_64's is boxed).
+pub type ThreadFp = FpState;
+
 unsafe extern "C" {
     fn enter_user_asm(entry: u64, sp: u64, kernel_stack_top: u64) -> !;
     fn return_to_frame_asm(frame: *const TrapFrame) -> !;
