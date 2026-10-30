@@ -230,6 +230,27 @@ pub fn lock_pair<'a>(a: &'a FileRef, b: &'a FileRef) -> (MutexGuard<'a, OpenFile
 #[derive(Default)]
 pub struct Epoll {
     pub interest: BTreeMap<u64, Registration>,
+    /// One file can be under every descriptor, in every instance, so
+    /// neither limit bounds these: the heap's budget does.
+    charge: crate::kmem::Charge,
+}
+
+/// A registration, twice over: B-tree nodes are half full when filled in
+/// order.
+const REGISTRATION_COST: u64 = 2 * core::mem::size_of::<(u64, Registration)>() as u64;
+
+impl Epoll {
+    /// ENOSPC with no room, as Linux's fs.epoll.max_user_watches.
+    pub fn add(&mut self, key: u64, reg: Registration) -> Result<(), Errno> {
+        self.charge.resize((self.interest.len() as u64 + 1) * REGISTRATION_COST).map_err(|_| ENOSPC)?;
+        self.interest.insert(key, reg);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: u64) {
+        self.interest.remove(&key);
+        let _ = self.charge.resize(self.interest.len() as u64 * REGISTRATION_COST);
+    }
 }
 
 pub struct Registration {

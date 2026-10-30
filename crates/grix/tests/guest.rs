@@ -4182,3 +4182,10 @@ fn tee_and_splice_with_one_file_or_crossing() {
     hardened(b.timeout(Duration::from_secs(180)), &["teecross", "20000"], "tee crossed 20000 times");
 }
 
+/// One file under every descriptor, in instance after instance of epoll:
+/// no file limit counts that, so the kernel's budget does (ENOSPC).
+#[test]
+fn epoll_registrations_have_a_budget() {
+    let b = with("hardening").timeout(Duration::from_secs(120));
+    hardened(b, &["epolls", "500"], "refused after a while");
+}

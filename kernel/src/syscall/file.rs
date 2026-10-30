@@ -3051,12 +3051,9 @@ pub fn epoll_ctl(p: &mut Process, epfd: u64, op: u64, fd: u64, eventp: u64) -> S
     match op {
         ADD if live => return Err(EEXIST),
         ADD => {
-            e.interest
-                .insert(key, Registration { file: Arc::downgrade(&target), events, data, reported_version: None });
+            e.add(key, Registration { file: Arc::downgrade(&target), events, data, reported_version: None })?;
         }
-        DEL if live => {
-            e.interest.remove(&key);
-        }
+        DEL if live => e.remove(key),
         MOD if live => {
             let r = e.interest.get_mut(&key).unwrap();
             r.events = events;
@@ -3109,7 +3106,7 @@ pub fn epoll_wait(p: &mut Process, epfd: u64, evp: u64, max: u64, timeout: Optio
             out.extend_from_slice(&crate::arch::abi::epoll_event(ready, reg.data));
         }
         for fd in dead {
-            e.interest.remove(&fd);
+            e.remove(fd);
         }
     }
     if !out.is_empty() || timeout == Some(0) {
