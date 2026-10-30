@@ -692,6 +692,13 @@ static FLUSHED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// memory before it has the lock, and catches up then (`tlb_sync`), so it
 /// isn't waited for.
 pub fn flush_tlb(root: u64, start: u64, end: u64) {
+    flush(root, start, end, false);
+}
+
+/// `flush_tlb`, waiting for CPUs in the kernel too if `every`: they catch
+/// up as they spin for the kernel lock (`tlb_sync`), the only place one
+/// with this root can be while this CPU has the lock.
+fn flush(root: u64, start: u64, end: u64, every: bool) {
     let me = cpu_number() % MAX_CPUS;
     crate::smp::note_on(me, crate::smp::Stat::Flush, 1);
     if ROOTS[me].load(Ordering::Relaxed) == root {
@@ -710,10 +717,12 @@ pub fn flush_tlb(root: u64, start: u64, end: u64) {
     let want = FLUSH_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     let online = crate::smp::online().min(MAX_CPUS);
     let mut sent = [false; MAX_CPUS];
+    let mut asked = [false; MAX_CPUS];
     for (cpu, sent) in sent.iter_mut().enumerate().take(online) {
         if cpu == me || ROOTS[cpu].load(Ordering::Relaxed) != root {
             continue;
         }
+        asked[cpu] = true;
         // Asked before looking (as it says it's in the kernel before it
         // looks, in `tlb_sync`): one of the two sees the other.
         WANTED[cpu].fetch_max(want, Ordering::SeqCst);
@@ -723,8 +732,8 @@ pub fn flush_tlb(root: u64, start: u64, end: u64) {
         }
     }
     let start = counter();
-    for (cpu, _) in sent.iter().enumerate().filter(|(_, s)| **s) {
-        while FLUSHED[cpu].load(Ordering::Acquire) < want && !crate::smp::in_kernel(cpu) {
+    for cpu in (0..MAX_CPUS).filter(|&cpu| sent[cpu] || every && asked[cpu]) {
+        while FLUSHED[cpu].load(Ordering::Acquire) < want && (every || !crate::smp::in_kernel(cpu)) {
             core::hint::spin_loop();
         }
     }
@@ -744,19 +753,23 @@ fn flush_ipi() {
     irq::eoi(irq::FLUSH_INTID);
 }
 
-/// With the kernel lock, before any user memory: the flushes asked of
-/// this CPU that it missed while it couldn't take their IPI.
 /// The tables that covered `vas` (one address each) are out of `root`:
 /// no TLB or paging-structure cache may lead to them before they're
 /// freed. An INVLPG of an address drops the paging-structure caches'
-/// entries for it too, and a CR3 load all of them, so `flush_tlb` over
-/// the addresses does.
+/// entries for it too, and a CR3 load all of them, so a flush over the
+/// addresses does, on every CPU with that root, those in the kernel too:
+/// the walker of one that hasn't caught up may still follow a cached entry
+/// into a table, speculatively, whatever the CPU is running, and set an
+/// accessed bit in what's become someone else's page.
 pub fn flush_tables(root: u64, vas: &[u64]) {
     if let (Some(&lo), Some(&hi)) = (vas.iter().min(), vas.iter().max()) {
-        flush_tlb(root, lo, hi + 4096);
+        flush(root, lo, hi + 4096, true);
     }
 }
 
+/// Before any user memory, with the kernel lock (and while waiting for
+/// it: `flush_tables` waits for that): the flushes asked of this CPU that
+/// it missed while it couldn't take their IPI.
 pub fn tlb_sync() {
     let me = cpu_number() % MAX_CPUS;
     let want = WANTED[me].load(Ordering::SeqCst);

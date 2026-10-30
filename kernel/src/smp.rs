@@ -395,6 +395,8 @@ fn acquire() {
                 }
             }
         }
+        // The lock's holder may be waiting for this (`flush_tables`).
+        arch::tlb_sync();
         core::hint::spin_loop();
     }
 }
