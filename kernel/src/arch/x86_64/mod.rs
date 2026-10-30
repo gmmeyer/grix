@@ -25,7 +25,7 @@ pub mod uart;
 
 /// Where this machine's RAM, boot image and devices are (QEMU `microvm`'s).
 pub mod machine {
-    pub use grix_abi::machine::x86_64::{IMAGE_BASE, RAM_BASE, VIRTIO, VIRTIO_SLOTS, VIRTIO_STRIDE};
+    pub use grix_abi::machine::x86_64::{IMAGE_BASE, VIRTIO, VIRTIO_SLOTS, VIRTIO_STRIDE, ram_regions};
     /// Transport `i` interrupts on GSI `VIRTIO_IRQ + i` (`irq::ack`'s id).
     pub const VIRTIO_IRQ: u32 = grix_abi::machine::x86_64::VIRTIO_GSI;
 }
@@ -872,9 +872,8 @@ pub(crate) struct PerCpu {
     cpu: AtomicU64,
 }
 
-static PER_CPU: [PerCpu; MAX_CPUS] = [const {
-    PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0), cpu: AtomicU64::new(0) }
-}; MAX_CPUS];
+static PER_CPU: [PerCpu; MAX_CPUS] =
+    [const { PerCpu { kernel_rsp: AtomicU64::new(0), user_rsp: AtomicU64::new(0), cpu: AtomicU64::new(0) } }; MAX_CPUS];
 
 /// Set the CPU up, before anything else: segments, traps, `syscall`, the
 /// FPU and the clock (boot.S calls it on CPU 0).
@@ -1017,6 +1016,31 @@ fn init_cpu(cpu: usize) {
     // KERNEL_GS_BASE until the return to user mode swaps them.
     wrmsr(MSR_GS_BASE, pc as *const PerCpu as u64);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+}
+
+/// Map physical `start..end` (RAM past the 4 GiB boot.S maps) in the
+/// kernel's half, as boot.S maps the rest: 2 MiB pages, in page
+/// directories from `table` (zeroed), one per GiB. Nothing was there, so
+/// there's nothing to flush, and every root shares the kernel's half.
+pub fn map_ram(start: u64, end: u64, table: &mut dyn FnMut() -> u64) {
+    const GIB: u64 = 1 << 30;
+    const ADDR: u64 = 0x000f_ffff_ffff_f000;
+    let pml4 = crate::mm::p2v(kernel_root()) as *const u64;
+    // SAFETY: the boot tables, mapped linearly: the high half's PML4
+    // entry is boot.S's PDPT, and its entries past 4 GiB are empty.
+    unsafe {
+        let pdpt = crate::mm::p2v(pml4.add(256).read() & ADDR) as *mut u64;
+        for i in start / GIB..end.div_ceil(GIB) {
+            assert!(i < 512, "RAM beyond what one PDPT maps");
+            let pd = table();
+            let entries = crate::mm::p2v(pd) as *mut u64;
+            for j in 0..512 {
+                // Present, writable, large.
+                entries.add(j as usize).write((i * GIB + (j << 21)) | 0x83);
+            }
+            pdpt.add(i as usize).write(pd | 3);
+        }
+    }
 }
 
 /// The boot page tables' root (physical): the kernel's half of every root.

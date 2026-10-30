@@ -194,7 +194,9 @@ impl Default for BuildPolicy {
             local_registries: true,
             cache: true,
             step_timeout: Duration::from_secs(1800),
-            step_memory_mb: 3000,
+            // Files a step writes live in its memory (half of it at
+            // most), and memory it doesn't touch costs nothing.
+            step_memory_mb: 16 << 10,
         }
     }
 }
@@ -306,7 +308,11 @@ impl Grixfile {
                 config.capabilities.push(name.clone());
             }
         }
-        if self.memory_mb.is_some() {
+        if let Some(mb) = self.memory_mb {
+            let max = grix_abi::image::MAX_RAM >> 20;
+            if mb == 0 || mb > max {
+                bail!("memory_mb = {mb}: a sandbox has 1 to {max} MiB");
+            }
             config.memory_mb = self.memory_mb;
         }
         for c in &self.copies {

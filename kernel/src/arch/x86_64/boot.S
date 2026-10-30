@@ -2,7 +2,8 @@
 // below): 32-bit protected mode, flat segments, paging off, at physical
 // addresses. We map the first 4 GiB (RAM and the devices) twice with 2 MiB
 // pages, at 0 (until we've jumped) and at KERNEL_OFFSET (linker.ld), turn
-// long mode on, and go to the high half. Nothing here is global: the low
+// long mode on, and go to the high half (RAM past 4 GiB is mapped there
+// later, `arch::map_ram`). Nothing here is global: the low
 // mapping must not outlive the boot (or a secondary CPU's: they come the
 // same way, below, and leave the boot tables for the empty root at once).
 

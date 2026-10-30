@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use grix_abi::image::{self, HEADER_LEN, MAX_RAM};
-use grix_abi::machine::x86_64::{IMAGE_BASE, RAM_BASE, UART_PORT, VIRTIO, VIRTIO_GSI, VIRTIO_STRIDE, VMM_PORT};
+use grix_abi::machine::x86_64::{IMAGE_BASE, UART_PORT, VIRTIO, VIRTIO_GSI, VIRTIO_STRIDE, VMM_PORT, ram_regions};
 
 use crate::Args;
 use crate::console::{Console, Line};
@@ -67,7 +67,7 @@ impl Machine {
         if ram == 0 || ram > MAX_RAM {
             return Err(format!("--mem {} is outside 1..={} MiB", args.mem_mb, MAX_RAM >> 20));
         }
-        let mem = GuestMemory::new(RAM_BASE, ram as usize).map_err(|e| format!("allocating RAM: {e}"))?;
+        let mem = GuestMemory::new(ram_regions(ram)).map_err(|e| format!("allocating RAM: {e}"))?;
         let kernel = std::fs::read(&args.kernel).map_err(|e| format!("reading {}: {e}", args.kernel.display()))?;
         let entry = load_kernel(&mem, &kernel)?;
         let img = std::fs::read(&args.image).map_err(|e| format!("reading {}: {e}", args.image.display()))?;
@@ -160,7 +160,7 @@ fn load_kernel(mem: &GuestMemory, elf: &[u8]) -> Result<u64, String> {
                 let memsz = u64_at(ph + 0x28).ok_or_else(bad)?;
                 // The rest of memsz is zero already (fresh memory).
                 let end = paddr.checked_add(memsz).ok_or_else(bad)?;
-                if paddr < mem.base() || end > mem.base() + mem.size() as u64 || !mem.write(paddr, data) {
+                if !mem.contains(paddr, (end - paddr) as usize) || !mem.write(paddr, data) {
                     return Err(format!("the kernel segment at {paddr:#x} doesn't fit in RAM"));
                 }
             }
@@ -216,8 +216,8 @@ pub fn run(args: &Args) -> Result<(), String> {
         return Err(format!("the snapshot is of {} vCPUs, not {}", s.cpus(), args.cpus));
     }
     // SAFETY: `m.mem` is never unmapped, and lives until the process ends.
-    let (vm, mut cpus) =
-        unsafe { kvm_x86::Vm::create(m.mem.host(), m.mem.size(), m.entry, args.cpus) }.map_err(|e| e.to_string())?;
+    let (vm, mut cpus) = unsafe { kvm_x86::Vm::create(&m.mem.regions().collect::<Vec<_>>(), m.entry, args.cpus) }
+        .map_err(|e| e.to_string())?;
     let irq_fd = vm.irq_fd();
     let line: Line = Box::new(move |level| kvm_x86::set_irq(irq_fd, VIRTIO_GSI, level));
     let console = match &restored {

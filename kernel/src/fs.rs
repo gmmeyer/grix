@@ -26,6 +26,7 @@ use spin::{Mutex, MutexGuard};
 use crate::console::klog;
 use crate::errno::*;
 use crate::hostfs;
+use crate::mm::pageindex::PageIndex;
 use crate::mm::{PAGE_SIZE, frame, p2v};
 use crate::procfs::{self, ProcFile};
 
@@ -143,8 +144,9 @@ fn entry_cost(name: &str) -> u64 {
 /// page by frames holding written data. Bytes past both read as zero.
 pub struct FileData {
     base: &'static [u8],
-    /// Page index -> physical address of a frame owned by this file.
-    pages: BTreeMap<u64, u64>,
+    /// Page index -> physical address of a frame owned by this file. Its
+    /// nodes count as file data (`nodes`).
+    pages: PageIndex,
     len: u64,
     /// A live mount's file's MAP_SHARED mappings, which see a copy taken
     /// when each page faulted in (writes don't reach them).
@@ -190,7 +192,7 @@ impl FileData {
     pub fn new(base: &'static [u8]) -> Content {
         Arc::new(Mutex::new(FileData {
             base,
-            pages: BTreeMap::new(),
+            pages: PageIndex::new(),
             len: base.len() as u64,
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
@@ -207,7 +209,7 @@ impl FileData {
     pub fn remote(id: u64, size: u64) -> Content {
         Arc::new(Mutex::new(FileData {
             base: &[],
-            pages: BTreeMap::new(),
+            pages: PageIndex::new(),
             len: size,
             shared_maps: Vec::new(),
             live_maps: Vec::new(),
@@ -334,8 +336,8 @@ impl FileData {
             let (idx, in_page) = (pos / PAGE_SIZE, (pos % PAGE_SIZE) as usize);
             let k = (n - done).min(PAGE_SIZE as usize - in_page);
             let dst = &mut out[done..done + k];
-            match self.pages.get(&idx) {
-                Some(&pa) => dst.copy_from_slice(&page(pa)[in_page..in_page + k]),
+            match self.pages.get(idx) {
+                Some(pa) => dst.copy_from_slice(&page(pa)[in_page..in_page + k]),
                 None => {
                     let from = (pos as usize).min(self.base.len());
                     let avail = (self.base.len() - from).min(k);
@@ -366,19 +368,20 @@ impl FileData {
         if write && self.cow {
             self.make_local(u64::MAX).map_err(|_| FaultError::Io)?;
         }
-        match self.pages.get(&idx) {
-            Some(&pa) => Ok(Some(pa)),
+        match self.pages.get(idx) {
+            Some(pa) => Ok(Some(pa)),
             None if write => self.frame_of(idx).map(Some).map_err(|_| FaultError::Io),
             None => Ok(None),
         }
     }
 
     fn frame_of(&mut self, idx: u64) -> Result<u64, Errno> {
-        if let Some(&pa) = self.pages.get(&idx) {
+        if let Some(pa) = self.pages.get(idx) {
             return Ok(pa);
         }
+        // The page, and the index's nodes for it.
         let (used, limit) = usage();
-        if used >= limit {
+        if used + 1 + self.pages.nodes_needed(idx) > limit {
             crate::stats::hit(Limit::FileData);
             return Err(ENOSPC);
         }
@@ -389,7 +392,13 @@ impl FileData {
         let start = ((idx * PAGE_SIZE) as usize).min(self.base.len());
         let end = (start + PAGE_SIZE as usize).min(self.base.len());
         p[..end - start].copy_from_slice(&self.base[start..end]);
-        self.pages.insert(idx, pa);
+        let nodes = self.pages.nodes();
+        let inserted = self.pages.insert(idx, pa);
+        self.count_nodes(nodes);
+        if inserted.is_none() {
+            free_page(pa);
+            return Err(ENOSPC);
+        }
         if self.copied.remove(&idx) {
             STALE.lock().push((self.id(), idx));
             STALE_ANY.store(true, Ordering::Release);
@@ -478,9 +487,7 @@ impl FileData {
                 Ok(())
             }
             Err(e) => {
-                for (_, pa) in core::mem::take(&mut self.pages) {
-                    free_page(pa);
-                }
+                self.free_pages(0);
                 (self.remote, self.len, self.cow) = (Some(id), old_len, true);
                 Err(e)
             }
@@ -491,6 +498,25 @@ impl FileData {
     pub fn set_size(&mut self, size: u64) {
         if self.remote.is_some() && !self.cow {
             self.len = size;
+        }
+    }
+
+    /// Free the pages from `keep` on.
+    fn free_pages(&mut self, keep: u64) {
+        let nodes = self.pages.nodes();
+        self.pages.remove_from(keep, &mut free_page);
+        self.count_nodes(nodes);
+    }
+
+    /// The index had `before` nodes: they're file data too, so a sparse
+    /// file's can't take more than the limit allows.
+    fn count_nodes(&self, before: u64) {
+        let now = self.pages.nodes();
+        if now > before {
+            let pages = PAGES_USED.fetch_add(now - before, Ordering::Relaxed) + now - before;
+            crate::stats::peak(Resource::FileData, pages * PAGE_SIZE);
+        } else {
+            PAGES_USED.fetch_sub(before - now, Ordering::Relaxed);
         }
     }
 
@@ -512,11 +538,9 @@ impl FileData {
         }
         if len < self.len {
             let keep = len.div_ceil(PAGE_SIZE);
-            for (_, pa) in self.pages.split_off(&keep) {
-                free_page(pa);
-            }
+            self.free_pages(keep);
             if !len.is_multiple_of(PAGE_SIZE)
-                && let Some(&pa) = self.pages.get(&(len / PAGE_SIZE))
+                && let Some(pa) = self.pages.get(len / PAGE_SIZE)
             {
                 page_mut(pa)[(len % PAGE_SIZE) as usize..].fill(0);
             }
@@ -529,9 +553,7 @@ impl FileData {
 
 impl Drop for FileData {
     fn drop(&mut self) {
-        for &pa in self.pages.values() {
-            free_page(pa);
-        }
+        self.free_pages(0);
         if let Some(id) = self.remote.filter(|_| self.unlinked) {
             hostfs::release(id);
         }

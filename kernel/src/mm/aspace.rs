@@ -122,47 +122,30 @@ pub struct Sysv {
 
 /// The pages of a MAP_SHARED anonymous mapping (or a System V segment),
 /// made as they're first touched. Holds a reference to each (every
-/// mapping holds its own). Their addresses are kept in chunks of
-/// `SHARED_CHUNK` (2 MiB of the mapping each), charged to the kernel
-/// memory budget: a program can touch a lot of shared memory.
+/// mapping holds its own). Their addresses are in a `PageIndex`, in
+/// frames: a program can touch as much shared memory as RAM.
 #[derive(Debug, Default)]
-pub struct SharedPages(Mutex<SharedChunks>);
-
-const SHARED_CHUNK: usize = 512;
-/// A chunk's page that has no frame yet.
-const NO_FRAME: u64 = u64::MAX;
-
-#[derive(Debug, Default)]
-struct SharedChunks {
-    chunks: BTreeMap<u64, alloc::boxed::Box<[u64; SHARED_CHUNK]>>,
-    charge: crate::kmem::Charge,
-}
+pub struct SharedPages(Mutex<super::pageindex::PageIndex>);
 
 impl SharedPages {
     /// Page `idx`'s frame, made if it has none.
     fn frame(&self, idx: u64) -> Result<u64, FaultError> {
-        let mut s = self.0.lock();
-        let (chunk, i) = (idx / SHARED_CHUNK as u64, (idx % SHARED_CHUNK as u64) as usize);
-        if !s.chunks.contains_key(&chunk) {
-            let bytes = s.charge.bytes() + (SHARED_CHUNK * 8) as u64;
-            s.charge.resize(bytes).map_err(|_| FaultError::OutOfMemory)?;
-            s.chunks.insert(chunk, alloc::boxed::Box::new([NO_FRAME; SHARED_CHUNK]));
+        let mut pages = self.0.lock();
+        if let Some(pa) = pages.get(idx) {
+            return Ok(pa);
         }
-        let slot = &mut s.chunks.get_mut(&chunk).unwrap()[i];
-        if *slot == NO_FRAME {
-            *slot = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+        let pa = frame::alloc().ok_or(FaultError::OutOfMemory)?;
+        if pages.insert(idx, pa).is_none() {
+            frame::free(pa);
+            return Err(FaultError::OutOfMemory);
         }
-        Ok(*slot)
+        Ok(pa)
     }
 }
 
 impl Drop for SharedPages {
     fn drop(&mut self) {
-        for chunk in self.0.get_mut().chunks.values() {
-            for &pa in chunk.iter().filter(|&&pa| pa != NO_FRAME) {
-                frame::free(pa);
-            }
-        }
+        self.0.get_mut().remove_from(0, &mut frame::free);
     }
 }
 

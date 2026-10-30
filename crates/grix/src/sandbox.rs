@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use grix_abi::image::{IMAGE_BASE, Image, MAX_ENTRIES, MAX_RAM, RAM_BASE};
+use grix_abi::image::{IMAGE_BASE, Image, LOW_RAM, MAX_ENTRIES, MAX_RAM, RAM_BASE};
 use grix_abi::machine;
 use grix_abi::policy::{Capability, DenyAction, Policy};
 use grix_abi::stats::Stats as GuestStats;
@@ -1112,13 +1112,15 @@ impl SandboxBuilder {
         if self.files.len() > MAX_ENTRIES {
             bail!("{} files, directories and links imported: at most {MAX_ENTRIES} fit", self.files.len());
         }
-        let ram = self.memory_mb << 20;
-        let needed = RESERVED_LOW + image::imported_bytes(&self.files) + MIN_FREE;
+        let ram = self.memory_mb.saturating_mul(1 << 20);
+        let imported = image::imported_bytes(&self.files);
+        check_imports_fit(imported, "imports")?;
+        let needed = RESERVED_LOW + imported + MIN_FREE;
         if ram < needed {
             bail!(
                 "memory_mb = {} is too small for {} MiB of imports (need at least {} MiB)",
                 self.memory_mb,
-                image::imported_bytes(&self.files) >> 20,
+                imported >> 20,
                 needed.div_ceil(1 << 20)
             );
         }
@@ -1130,6 +1132,20 @@ impl SandboxBuilder {
         }
         Ok(Sandbox { cfg: self })
     }
+}
+
+/// The boot image holds what's imported, and must fit below 4 GiB of guest
+/// memory however much RAM there is (`image::LOW_RAM`).
+fn check_imports_fit(imported: u64, what: &str) -> Result<()> {
+    if RESERVED_LOW + imported > LOW_RAM {
+        bail!(
+            "{} MiB of {what}: they're in the boot image, which must fit below 4 GiB of guest memory, so at most \
+             {} MiB can be (mount big directories live instead)",
+            imported >> 20,
+            (LOW_RAM - RESERVED_LOW) >> 20
+        );
+    }
+    Ok(())
 }
 
 /// A reusable sandbox configuration. Each [`run`](Sandbox::run) boots a fresh VM.
@@ -1215,6 +1231,7 @@ impl Sandbox {
                  (mount a smaller directory)"
             );
         }
+        check_imports_fit(imported, "imports and mounts")?;
         let needed = RESERVED_LOW + imported + MIN_FREE;
         if cfg.memory_mb << 20 < needed {
             bail!(

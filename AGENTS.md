@@ -67,6 +67,13 @@ physical `0x4800_0000` and the kernel at `0x4020_0000`. The kernel
 (`0xFFFF_0000_0000_0000 + phys`), builds a read-only in-memory filesystem from
 the image (`fs.rs`, writable in guest memory with `fs_write`), loads the ELF
 (`elf.rs`, `process.rs`), and drops to EL0.
+RAM is in the regions `grix_abi::machine::ram_regions` gives for its size
+(up to `image::MAX_RAM`, 64 GiB): on arm64 one, from 1 GiB on past 4 GiB;
+on x86_64 up to 3 GiB below the devices and the rest from 4 GiB, as
+QEMU's `microvm` puts it. boot.S maps the first 4 GiB and `arch::map_ram`
+the rest; the boot image must fit below 4 GiB (`image::LOW_RAM`), and
+grix-vmm's `GuestMemory` is one mapping for every region, as is a
+snapshot's RAM. Frames above 4 GiB are handed out first.
 After that, every bit of kernel work happens in an exception handler
 (`arch/aarch64/mod.rs` → `syscall/`, demand paging in `mm/aspace.rs`, or the timer
 interrupt in `sched.rs`). Everything the guest says goes out as frames
@@ -436,7 +443,8 @@ own registers, as only its thread may on Hypervisor.framework; on KVM a
 kick is `immediate_exit` plus a signal, and a vCPU first finishes its last
 exit with a `KVM_RUN` that runs nothing, `kvm::Cpu::complete`), then,
 holding the console's lock so its threads can't touch guest memory, writes
-the vCPUs, GIC, console device and RAM to its fd 3 and exits, or answers
+the vCPUs, GIC, console device and RAM (its regions one after another,
+zero pages left as holes) to its fd 3 and exits, or answers
 `SNAPSHOT_RETRY` if input is on its way and lets them all go on. What a
 vCPU's and the GIC's state are is the hypervisor's (`snapshot_hvf.rs`; on
 KVM, `snapshot_kvm.rs`: every register `KVM_GET_REG_LIST` names and the
@@ -645,7 +653,11 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    stay masked in the kernel; don't unmask them.
 10. **The kernel heap is small (32 MiB) and running out of it panics.**
     Anything a program can make the kernel allocate needs a budget that
-    fails with an errno first:
+    fails with an errno first. Nothing that grows with RAM goes on the
+    heap: frame reference counts are RAM set aside below the boot image
+    (`mm::init`), the free list is linked through the free frames, and
+    pages of files and shared memory are indexed in frames
+    (`mm::pageindex`; a file's index nodes count as its data).
     - File data counts pages (`fs::set_limit`), and nodes, names and
       extended attributes count against `META_LIMIT` (ENOSPC).
     - Buffers held for a program (pipes, netlink replies, generated /proc

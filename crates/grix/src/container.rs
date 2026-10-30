@@ -115,7 +115,7 @@ struct Header {
 /// The most an image's kernel may be.
 const MAX_KERNEL: u64 = 256 << 20;
 /// The most an image's files may hold, and how many: more than can boot.
-const MAX_BYTES: u64 = grix_abi::image::MAX_RAM;
+const MAX_BYTES: u64 = grix_abi::image::LOW_RAM;
 const MAX_FILES: usize = 1_000_000;
 
 /// A kernel that speaks this host's ABI (its marker says).

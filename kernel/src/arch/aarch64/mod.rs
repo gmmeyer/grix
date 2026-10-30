@@ -12,8 +12,8 @@ pub mod pte;
 
 /// Where this machine's RAM, boot image and devices are (QEMU `virt`'s).
 pub mod machine {
-    pub use grix_abi::image::{IMAGE_BASE, RAM_BASE};
-    pub use grix_abi::machine::{VIRTIO, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE};
+    pub use grix_abi::image::IMAGE_BASE;
+    pub use grix_abi::machine::{VIRTIO, VIRTIO_IRQ, VIRTIO_SLOTS, VIRTIO_STRIDE, ram_regions};
 }
 pub mod sigframe;
 pub mod uart;
@@ -111,6 +111,27 @@ unsafe extern "C" {
     fn fpsimd_restore(state: *const FpState);
     fn secondary_entry_addr() -> u64;
     fn empty_l0_addr() -> u64;
+    fn boot_l1_addr() -> u64;
+}
+
+/// Map physical `start..end` (RAM past the 4 GiB boot.S maps) in the
+/// kernel's half, as boot.S maps RAM: 1 GiB blocks in its level 1 table.
+/// Nothing was there, so there's nothing to flush. (`_table` gives page
+/// tables, which x86_64 needs.)
+pub fn map_ram(start: u64, end: u64, _table: &mut dyn FnMut() -> u64) {
+    const GIB: u64 = 1 << 30;
+    // Normal WB (MAIR idx 1), inner shareable, AF, UXN; EL1-only.
+    const BLOCK: u64 = 0x0040_0000_0000_0705;
+    let l1 = crate::mm::p2v(unsafe { boot_l1_addr() }) as *mut u64;
+    for i in start / GIB..end.div_ceil(GIB) {
+        assert!(i < 512, "RAM beyond what one level 1 table maps");
+        // SAFETY: the boot tables' level 1 table, mapped linearly; the
+        // entry was empty.
+        unsafe { l1.add(i as usize).write_volatile((i * GIB) | BLOCK) };
+    }
+    // The entries reach memory before any table walk (this CPU's, or one
+    // started later) looks for them.
+    unsafe { asm!("dsb ish", "isb") };
 }
 
 /// Where a secondary CPU starts (physical: its MMU is off).

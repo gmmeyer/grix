@@ -21,18 +21,27 @@ pub fn init_heap(pa: u64, size: u64) {
     }
 }
 
+/// Frames from `regions`, highest first (a guest with RAM above 4 GiB
+/// uses it from the start, so it's never the untried part), then freed
+/// ones again. Nothing here is on the heap, which RAM would outgrow: the
+/// free list is linked through the free frames themselves, and the counts
+/// are an array of RAM set aside below the boot image (`mm::init`).
 struct Frames {
     regions: Vec<(u64, u64)>,
     region: usize,
     next: u64,
-    free: Vec<u64>,
+    /// The last frame freed (`NONE`: none), whose first word is the one
+    /// freed before it.
+    free: u64,
     total: u64,
     in_use: u64,
     /// How many mappings hold each frame (indexed from `base`): forked
     /// processes share pages copy-on-write until one of them writes.
-    refs: Vec<u16>,
+    refs: &'static mut [u16],
     base: u64,
 }
+
+const NONE: u64 = u64::MAX;
 
 impl Frames {
     fn refs(&mut self, pa: u64) -> &mut u16 {
@@ -45,14 +54,28 @@ static FRAMES: Mutex<Option<Frames>> = Mutex::new(None);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static IN_USE: AtomicU64 = AtomicU64::new(0);
 
-pub fn init(regions: &[(u64, u64)]) {
+/// Bytes of counts `init` needs for frames from `base` to `top`.
+pub fn refs_bytes(base: u64, top: u64) -> u64 {
+    (top - base) / PAGE_SIZE * core::mem::size_of::<u16>() as u64
+}
+
+/// Hand out the frames of `regions` (in that order), counting references
+/// in `refs_pa` (`refs_bytes(base, top)` of RAM, mapped and unused), for
+/// frames from `base` to `top`.
+pub fn init(regions: &[(u64, u64)], refs_pa: u64, base: u64, top: u64) {
     let regions: Vec<(u64, u64)> = regions.iter().copied().filter(|(s, e)| s < e).collect();
+    assert!(regions.iter().all(|&(s, e)| base <= s && e <= top), "frames outside RAM");
     let total = regions.iter().map(|(s, e)| (e - s) / PAGE_SIZE).sum();
     let next = regions.first().map_or(0, |r| r.0);
-    let base = regions.iter().map(|r| r.0).min().unwrap_or(0);
-    let top = regions.iter().map(|r| r.1).max().unwrap_or(0);
-    let refs = alloc::vec![0; ((top - base) / PAGE_SIZE) as usize];
-    *FRAMES.lock() = Some(Frames { regions, region: 0, next, free: Vec::new(), total, in_use: 0, refs, base });
+    let len = ((top - base) / PAGE_SIZE) as usize;
+    // SAFETY: the caller set the range aside for this, and it's mapped
+    // linearly; it's zeroed here, as a snapshot's restore keeps it.
+    let refs = unsafe {
+        let p = p2v(refs_pa) as *mut u16;
+        core::ptr::write_bytes(p, 0, len);
+        core::slice::from_raw_parts_mut(p, len)
+    };
+    *FRAMES.lock() = Some(Frames { regions, region: 0, next, free: NONE, total, in_use: 0, refs, base });
     TOTAL.store(total, Ordering::Relaxed);
 }
 
@@ -61,21 +84,28 @@ pub fn alloc() -> Option<u64> {
     let pa = {
         let mut guard = FRAMES.lock();
         let f = guard.as_mut()?;
-        let pa = match f.free.pop() {
-            Some(pa) => pa,
-            None => loop {
-                let Some(&(start, end)) = f.regions.get(f.region) else {
+        let pa = match f.free {
+            NONE => loop {
+                let Some(&(_, end)) = f.regions.get(f.region) else {
                     crate::stats::hit(Limit::Memory);
                     return None;
                 };
-                f.next = f.next.max(start);
                 if f.next + PAGE_SIZE <= end {
                     let pa = f.next;
                     f.next += PAGE_SIZE;
                     break pa;
                 }
                 f.region += 1;
+                if let Some(&(start, _)) = f.regions.get(f.region) {
+                    f.next = start;
+                }
             },
+            pa => {
+                // SAFETY: a free frame, mapped linearly: its first word
+                // links the list.
+                f.free = unsafe { (p2v(pa) as *const u64).read() };
+                pa
+            }
         };
         f.in_use += 1;
         IN_USE.store(f.in_use, Ordering::Relaxed);
@@ -95,7 +125,9 @@ pub fn free(pa: u64) {
     assert!(*refs > 0, "freeing free frame {pa:#x}");
     *refs -= 1;
     if *refs == 0 {
-        f.free.push(pa);
+        // SAFETY: the frame is free now, and mapped linearly.
+        unsafe { (p2v(pa) as *mut u64).write(f.free) };
+        f.free = pa;
         f.in_use -= 1;
         IN_USE.store(f.in_use, Ordering::Relaxed);
     }

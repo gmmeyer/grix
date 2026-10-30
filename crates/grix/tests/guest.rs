@@ -472,6 +472,76 @@ fn filesystem_size_limit() {
     assert!(data.peak >= mib << 20 && data.peak <= data.limit, "{data:?}");
 }
 
+/// The tests of guests bigger than 3 GiB touch gigabytes each: one at a
+/// time, so they fit on a CI runner's 16 GB.
+static BIG_GUEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn big_guest() -> std::sync::MutexGuard<'static, ()> {
+    BIG_GUEST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn guests_bigger_than_3_gib() {
+    let _one = big_guest();
+    // RAM past 4 GiB of guest physical memory (arm64's from 1 GiB runs on
+    // past it; x86_64's past 3 GiB is from 4 GiB): 5 GiB touched in a
+    // 6 GiB guest, and checked. The frames above 4 GiB go first.
+    let b = with("bigmem").memory_mb(6144).timeout(Duration::from_secs(300));
+    let out = run(b.clone(), &["/bin/bigmem", "mem", "5120"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.stdout_str(), "mem 5120 MiB, 0 bad pages\n");
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    let memory = out.guest_stats.expect("the kernel's report").usage(Resource::Memory);
+    assert!(memory.peak >= 5 << 30 && memory.limit > 5 << 30, "{memory:?}");
+    // Shared memory's pages are indexed in frames, not the kernel's heap.
+    let out = run(b.allow(Capability::Process), &["/bin/bigmem", "shared", "1024"]);
+    assert_eq!(out.stdout_str(), "shared 1024 MiB, 0 bad pages\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // More than there is room for, said clearly.
+    let err = with("bigmem").memory_mb((64 << 10) + 1).build().err().unwrap().to_string();
+    assert!(err.contains("exceeds the 65536 MiB limit"), "{err}");
+}
+
+#[test]
+fn files_past_what_3_gib_held() {
+    let _one = big_guest();
+    // Half of a 5 GiB guest for files: a 2 GiB one (more than the old
+    // 3 GiB's half), read back, a sparse one, and then as much as fits.
+    let b = with("bigmem").memory_mb(5120).allow(Capability::FsWrite).timeout(Duration::from_secs(300));
+    let out = run(b, &["/bin/bigmem", "file", "2048", "/tmp/big"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+    let stdout = out.stdout_str();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[..2], ["file 2048 MiB, 0 bad pages", "sparse ok"], "{stdout}");
+    let more: u64 = lines[2].strip_prefix("filled ").unwrap().strip_suffix(" MiB more").unwrap().parse().unwrap();
+    assert!((2300..=2560).contains(&(2048 + more)), "{stdout}");
+    let stats = out.guest_stats.expect("the kernel's report");
+    assert!(stats.hits(Limit::FileData) > 0, "{stats:?}");
+    let data = stats.usage(Resource::FileData);
+    assert!(data.peak <= data.limit && data.limit <= 2560 << 20, "{data:?}");
+}
+
+#[test]
+fn snapshots_of_guests_bigger_than_3_gib() {
+    let _one = big_guest();
+    // 1 GiB filled in a 4.5 GiB guest, so above 4 GiB, before the
+    // snapshot: each run from it finds it as it was.
+    let b = with("bigmem").cpus(1).memory_mb(4608).timeout(Duration::from_secs(120));
+    if b.vmm_path().is_none() {
+        return; // snapshots_resume_where_the_program_waited checks the error
+    }
+    let dir = temp_dir("snapshot-big");
+    let snap = b.build().unwrap().snapshot(&["/bin/bigmem", "wait", "1024"], dir.join("big.snap")).unwrap();
+    assert_eq!(snap.memory_mb(), 4608);
+    for word in ["one", "two"] {
+        let out = snap.run(format!("{word}\n")).unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{}{}", out.stdout_str(), out.kernel_log);
+        assert_eq!(out.stdout_str(), format!("{word}\n0 bad pages\n"));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn filesystem_metadata_limit() {
     // Names and nodes are bounded too: ENOSPC instead of exhausting kernel memory.
@@ -3384,7 +3454,11 @@ fn smp_counters_and_benchmark() {
     assert_eq!(out.status, ExitStatus::Exited(0), "{stdout}");
     assert!(out.events.is_empty(), "{:?}", out.events);
     assert!(stdout.ends_with("smpbench ok\n"), "{stdout}");
-    assert_eq!(stdout.lines().filter(|l| l.starts_with("smpbench mode=") && l.contains(" bg=4 ")).count(), 4, "{stdout}");
+    assert_eq!(
+        stdout.lines().filter(|l| l.starts_with("smpbench mode=") && l.contains(" bg=4 ")).count(),
+        4,
+        "{stdout}"
+    );
     // A header, a line per CPU, and their sum.
     let out = run(with("cat").cpus(2), &["/bin/cat", "/proc/grix/smp"]);
     let stdout = out.stdout_str();

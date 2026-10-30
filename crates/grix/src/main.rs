@@ -983,6 +983,10 @@ fn mcp(args: McpArgs) -> Result<i32> {
         config.max_timeout = Duration::from_secs(s);
     }
     if let Some(mb) = args.max_mem {
+        let max = grix_abi::image::MAX_RAM >> 20;
+        if mb == 0 || mb > max {
+            bail!("--max-mem {mb}: a sandbox has 1 to {max} MiB");
+        }
         config.max_memory_mb = mb;
     }
     if let Some(n) = args.max_cpus {

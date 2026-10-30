@@ -32,7 +32,8 @@ mkdir -p "$INITRD/bin" "$INITRD/dev" "$INITRD/proc" "$INITRD/tmp" "$INITRD/fixtu
 cp "$ROOT/target/$TARGET/release/grix" "$ROOT/target/$TARGET/release/grix-vmm" "$INITRD/bin/"
 cp "$ROOT/fixtures/build/alpine/bin/busybox.static" "$INITRD/bin/busybox"
 cp "$ROOT/kernel/target/aarch64-unknown-none-softfloat/release/grix-kernel" "$INITRD/grix-kernel"
-cp "$ROOT/fixtures/build/hello" "$ROOT/fixtures/build/threads" "$ROOT/fixtures/build/smp" "$INITRD/fixtures/"
+cp "$ROOT/fixtures/build/hello" "$ROOT/fixtures/build/threads" "$ROOT/fixtures/build/smp" "$ROOT/fixtures/build/bigmem" \
+    "$INITRD/fixtures/"
 cat > "$INITRD/init" <<'EOF'
 #!/bin/busybox sh
 export PATH=/bin GRIX_KERNEL=/grix-kernel TMPDIR=/tmp
@@ -56,6 +57,10 @@ echo two | grix run --snapshot /tmp/sh.snap
 grix snapshot -o /tmp/smp.snap --cpus 2 -a threads -a process -i /bin/busybox:/bin/busybox -i /fixtures/smp:/bin/smp -- \
     /bin/busybox sh -c '/bin/smp >/dev/null; read line; echo "smp snap got $line"; /bin/smp'
 echo three | grix run --snapshot /tmp/smp.snap
+# A guest bigger than 3 GiB (RAM past 4 GiB), and a snapshot of one.
+grix run --mem 6144 -i /fixtures/bigmem:/bin/bigmem -- /bin/bigmem mem 4096
+grix snapshot -o /tmp/big.snap --mem 4608 -i /fixtures/bigmem:/bin/bigmem -- /bin/bigmem wait 1024
+echo big | grix run --snapshot /tmp/big.snap | busybox tr '\n' ' '; echo
 echo KVM-TEST-DONE
 busybox poweroff -f
 EOF
@@ -63,7 +68,7 @@ chmod +x "$INITRD/init"
 (cd "$INITRD" && find . | cpio -o -H newc 2>/dev/null | gzip -1 > "$OUT/initrd.gz")
 
 LOG=$OUT/console.log
-"$QEMU" -machine virt,virtualization=on,gic-version=3 -accel hvf -cpu host -smp 2 -m 2048 \
+"$QEMU" -machine virt,virtualization=on,gic-version=3 -accel hvf -cpu host -smp 2 -m 8192 \
     -nographic -no-reboot -kernel "$OUT/linux/boot/vmlinuz-virt" -initrd "$OUT/initrd.gz" \
     -append "console=ttyAMA0 rdinit=/init quiet" < /dev/null > "$LOG" 2>&1 || true
 
@@ -84,6 +89,8 @@ check "snap got one"
 check "snap got two"
 check "smp snap got three"
 [ "$(grep -c "smp ok cpus=2" "$LOG")" = 2 ] && echo "ok: smp ok cpus=2 after a restore" || { echo "MISSING: smp after a restore"; fail=1; }
+check "mem 4096 MiB, 0 bad pages"
+check "big 0 bad pages"
 check "KVM-TEST-DONE"
 [ $fail = 0 ] || { echo "--- $LOG"; tail -40 "$LOG"; exit 1; }
 echo "grix on KVM: all good"
