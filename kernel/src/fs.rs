@@ -1046,6 +1046,7 @@ const NOBODY: usize = usize::MAX;
 /// same CPU (held further up the call stack) is a kernel bug that would
 /// otherwise hang.
 pub fn lock() -> FsGuard {
+    debug_assert!(!crate::fast::active(), "a fast entry took the filesystem lock");
     assert!(HOLDER.load(Ordering::Relaxed) != crate::smp::me(), "filesystem lock taken twice");
     let g = FS.lock();
     assert!(g.is_some(), "fs not initialised");

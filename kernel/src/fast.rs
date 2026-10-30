@@ -101,6 +101,29 @@ unsafe impl Sync for Slot {}
 
 static SLOTS: [Slot; MAX_CPUS as usize] = [const { Slot(UnsafeCell::new(EMPTY)) }; MAX_CPUS as usize];
 
+/// Is this CPU in a fast entry? (Debug builds, for assertions where one
+/// mustn't go: the kernel lock, the filesystem, every process.)
+#[cfg(debug_assertions)]
+static ACTIVE: [core::sync::atomic::AtomicBool; MAX_CPUS as usize] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS as usize];
+
+pub fn active() -> bool {
+    #[cfg(debug_assertions)]
+    return ACTIVE[smp::me()].load(Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// Mark a fast entry's start and end (debug builds).
+fn mark(on: bool) {
+    #[cfg(debug_assertions)]
+    {
+        debug_assert!(!on || gate::none_held(), "a fast entry started holding an address space's gate");
+        ACTIVE[smp::me()].store(on, Ordering::Relaxed);
+    }
+    let _ = on;
+}
+
 /// This CPU's snapshot.
 #[allow(clippy::mut_from_ref)]
 fn here() -> &'static mut Snapshot {
@@ -131,7 +154,13 @@ pub fn update(running: Option<(&Process, u32)>) {
 /// A system call: done (true, its result in `tf`), or left for the usual
 /// path. Nothing is locked, and nothing but `tf` and counters written.
 pub fn syscall(tf: &mut TrapFrame) -> bool {
-    let s = here();
+    mark(true);
+    let done = syscall_from(here(), tf);
+    mark(false);
+    done
+}
+
+fn syscall_from(s: &Snapshot, tf: &mut TrapFrame) -> bool {
     if !s.calls || s.generation != GENERATION.load(Ordering::Acquire) {
         return false;
     }
@@ -161,6 +190,7 @@ pub fn syscall(tf: &mut TrapFrame) -> bool {
 /// present.
 pub fn fault(va: u64, access: Access) -> bool {
     let Some(mm) = here().mm.as_ref() else { return false };
+    mark(true);
     smp::fast_enter();
     mm.lock();
     // Flushes of this address space happen with its gate held: any this
@@ -170,6 +200,7 @@ pub fn fault(va: u64, access: Access) -> bool {
     let done = unsafe { mm.get() }.fast_fault(va, access);
     smp::fast_leave();
     mm.unlock();
+    mark(false);
     if done {
         crate::stats::page_fault();
         smp::note(Stat::Fault, 1);

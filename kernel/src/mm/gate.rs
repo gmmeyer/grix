@@ -20,6 +20,20 @@ use super::aspace::AddressSpace;
 
 const FREE: usize = usize::MAX;
 
+/// Gates each CPU holds (debug builds: `none_held`).
+#[cfg(debug_assertions)]
+static HELD: [AtomicUsize; grix_abi::machine::MAX_CPUS as usize] =
+    [const { AtomicUsize::new(0) }; grix_abi::machine::MAX_CPUS as usize];
+
+/// Does this CPU hold no gate? (As it must when it goes back to user mode
+/// or starts a fast entry. Always true in release builds.)
+pub fn none_held() -> bool {
+    #[cfg(debug_assertions)]
+    return HELD[crate::smp::me()].load(Ordering::Relaxed) == 0;
+    #[cfg(not(debug_assertions))]
+    true
+}
+
 /// The address space's gate and contents, and its page table's root (which
 /// never changes), kept here too so the CPUs that switch to it don't read
 /// another cache line for it.
@@ -97,10 +111,14 @@ impl Inner {
         while self.holder.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        #[cfg(debug_assertions)]
+        HELD[me].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn unlock(&self) {
         debug_assert!(self.held(), "address space gate released by a CPU without it");
+        #[cfg(debug_assertions)]
+        HELD[crate::smp::me()].fetch_sub(1, Ordering::Relaxed);
         self.holder.store(FREE, Ordering::Release);
     }
 

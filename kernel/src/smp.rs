@@ -269,6 +269,7 @@ pub fn enter(why: Stat) {
 /// schedules from no process (`sched::schedule`), so it never holds one
 /// another CPU may want.
 pub fn lock() {
+    debug_assert!(!crate::fast::active(), "a fast entry took the kernel lock");
     let cpu = me();
     IN_KERNEL[cpu].store(true, Ordering::SeqCst);
     ENTRIES[cpu].fetch_add(1, Ordering::SeqCst);
@@ -380,6 +381,8 @@ pub fn unlock() {
         }
     }
     note_on(me, Stat::LockHeld, arch::counter().wrapping_sub(TAKEN[me].load(Ordering::Relaxed)));
+    // Back to user mode (or idle) holding no address space's gate.
+    debug_assert!(crate::mm::gate::none_held(), "CPU {me} left the kernel holding an address space's gate");
     IN_KERNEL[me].store(false, Ordering::SeqCst);
     // Only the holder changes it while it's held: the next turn, free.
     let served = LOCK.load(Ordering::Relaxed) as u32;

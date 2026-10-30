@@ -140,6 +140,7 @@ impl Procs {
     /// `all`, from a CPU that may have no process (`cur`: its own, if any).
     pub fn each<'a>(&'a mut self, cur: Option<&'a mut Process>) -> impl Iterator<Item = &'a mut Process> {
         debug_assert!(crate::smp::exclusive(), "another CPU has a process checked out");
+        debug_assert!(!crate::fast::active(), "a fast entry looked at every process");
         cur.into_iter().filter(|p| !p.dead).chain(self.others_mut())
     }
 }
