@@ -40,7 +40,7 @@ Caps: n = `net`, t = `threads`, p = `process`, w = `fs_write`.
 | HAProxy | 3.4.7 | `haproxy:alpine` | frontend → backend on loopback, curl from the host | n t | works | | |
 | Traefik | 3.7.16 | `traefik:v3` | file provider routing to its own API, curl from the host | n t | works | SIGILL, as Caddy. | Fixed: auxv |
 | PostgreSQL | 17.11 | `postgres:17-alpine` | `docker-entrypoint.sh postgres` (initdb, temporary server, real one), psql: table, 10,000 rows, index | n t p w | works | initdb: `shmget` not implemented (the postmaster's System V interlock segment). | Fixed: System V shm |
-| MariaDB | 11.8.9 | `mariadb:11` | `docker-entrypoint.sh mariadbd`, client: database, table, rows | n t p w | works | Works; it listens on 0.0.0.0 and `::` (needed `IPV6_V6ONLY`). io_uring and `io_setup` are ENOSYS (reported); it falls back to synchronous I/O. | |
+| MariaDB | 11.8.9 | `mariadb:11` | `docker-entrypoint.sh mariadbd`, client: database, table, rows | n t p w | works | Works; it listens on 0.0.0.0 and `::` (needed `IPV6_V6ONLY`). io_uring and `io_setup` were ENOSYS (reported), and it fell back to synchronous I/O; it has Linux AIO now (io_uring stays ENOSYS, as under Docker's default seccomp profile). | |
 | Redis | 7.4.12 | `redis:7-alpine` | `redis-server`, PING/SET/GET/BGSAVE from the host, SIGINT shutdown | n t p w | works | 1. Exited: its arm64 copy-on-write bug check forks and reads `Shared_Dirty` in `/proc/self/smaps`, which didn't exist. 2. `bind: Address in use`: `[::]:6379` with `IPV6_V6ONLY` beside `0.0.0.0:6379`. Still warns that `maxclients` drops to 992 (`RLIMIT_NOFILE` is 1024/1024) and about `vm.overcommit_memory`. | Fixed: smaps, `IPV6_V6ONLY` |
 | Memcached | 1.6.45 | `memcached:alpine` | `memcached -u root`, set/get/stats from the host | n t | works | | |
 | MongoDB | 7.0.45, mongosh 2.14.0 | `mongo:7` | `mongod`, mongosh: insert, index, query | n t p w | works | mongosh died of SIGSEGV: the strings at the top of the stack were in reverse order within argv and environ, so libuv's process title came out with a negative length and wrote past the stack. | Fixed: the stack's strings |
@@ -121,8 +121,12 @@ In order of impact (details in TODO.md, "Round 3"):
 2. **`RLIMIT_NOFILE` above 1024**: Redis lowers `maxclients` to 992;
    busy servers want more descriptors.
 3. **xattrs** (`cp -a`, `tar --xattrs`, `setcap` metadata).
-4. **Linux AIO** (`io_setup`) and **io_uring**: MariaDB and nginx fall
-   back.
+4. ~~**Linux AIO**~~: done after the survey (`io_setup`, `io_submit`,
+   `io_getevents`, ...: requests complete as they're submitted).
+   **io_uring** stays ENOSYS, on purpose and unreported (programs probe it): it is a
+   second way into every operation (each would need its own gate), and
+   Docker's default seccomp profile blocks it too, so programs (MariaDB,
+   nginx, libuv) are used to falling back to AIO or plain calls.
 5. ~~**seccomp filters**~~: done after the survey (`seccomp(2)`, strict
    mode and classic-BPF filters, TSYNC); Elasticsearch installs its own.
 6. ~~**Reading ID registers from EL0**~~: done after the survey (`mrs`

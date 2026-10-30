@@ -34,6 +34,11 @@ macro_rules! syscalls {
 
 #[cfg(target_arch = "aarch64")]
 syscalls! {
+    0 io_setup Core; // AIO on descriptors the program has
+    1 io_destroy Core;
+    2 io_submit Core;
+    3 io_cancel Core;
+    4 io_getevents Core;
     5 setxattr Cap(FsWrite);
     6 lsetxattr Cap(FsWrite);
     7 fsetxattr Cap(FsWrite);
@@ -259,9 +264,12 @@ syscalls! {
     286 preadv2 Core;
     287 pwritev2 Core;
     291 statx Core;
+    292 io_pgetevents Core;
     293 rseq Core;
     424 pidfd_send_signal Cap(Process);
-    425 io_uring_setup Core;
+    425 io_uring_setup Core; // ENOSYS on purpose (misc.rs)
+    426 io_uring_enter Core;
+    427 io_uring_register Core;
     434 pidfd_open Cap(Process);
     435 clone3 Core; // gated by flags: threads vs process
     438 pidfd_getfd Cap(Process);
@@ -462,6 +470,11 @@ syscalls! {
     202 futex Core;
     203 sched_setaffinity Core;
     204 sched_getaffinity Core;
+    206 io_setup Core; // AIO on descriptors the program has
+    207 io_destroy Core;
+    208 io_getevents Core;
+    209 io_submit Core;
+    210 io_cancel Core;
     213 epoll_create Core;
     217 getdents64 Core;
     218 set_tid_address Core;
@@ -547,9 +560,12 @@ syscalls! {
     327 preadv2 Core;
     328 pwritev2 Core;
     332 statx Core;
+    333 io_pgetevents Core;
     334 rseq Core;
     424 pidfd_send_signal Cap(Process);
-    425 io_uring_setup Core;
+    425 io_uring_setup Core; // ENOSYS on purpose (misc.rs)
+    426 io_uring_enter Core;
+    427 io_uring_register Core;
     434 pidfd_open Cap(Process);
     435 clone3 Core; // gated by flags: threads vs process
     436 close_range Core;

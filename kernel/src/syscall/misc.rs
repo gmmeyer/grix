@@ -152,8 +152,14 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
         }
         nr::membarrier => membarrier(p, a[0], a[1]),
         nr::mincore => mincore(p, a[0], a[1], a[2]),
-        // glibc probes rseq and libuv probes io_uring; both cope with ENOSYS.
-        nr::rseq | nr::io_uring_setup => Err(ENOSYS),
+        // glibc probes rseq, and copes with ENOSYS.
+        nr::rseq => Err(ENOSYS),
+        // io_uring is left out on purpose: a second way into every
+        // operation, each needing its own gate, and Docker's default seccomp
+        // profile blocks it too. Programs that use it (libuv, MariaDB, nginx)
+        // probe it and fall back to plain calls or AIO, so it isn't reported:
+        // libuv alone would put an event in every Node run.
+        nr::io_uring_setup | nr::io_uring_enter | nr::io_uring_register => Err(ENOSYS),
 
         _ => p.unimplemented(n, name, "", ENOSYS),
     }

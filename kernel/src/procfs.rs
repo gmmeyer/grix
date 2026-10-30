@@ -49,6 +49,8 @@ pub enum ProcFile {
     Vmstat,
     /// /proc/sys/fs/file-nr and file-max.
     FileNr,
+    /// /proc/sys/fs/aio-nr.
+    AioNr,
     FileMax,
     InodeNr,
     Interrupts,
@@ -122,6 +124,8 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/sys/vm/mmap_min_addr", ProcFile::Text("65536\n")), // syscall::mem::MMAP_MIN_ADDR
     ("/proc/sys/fs/file-max", ProcFile::FileMax),
     ("/proc/sys/fs/file-nr", ProcFile::FileNr),
+    ("/proc/sys/fs/aio-nr", ProcFile::AioNr),
+    ("/proc/sys/fs/aio-max-nr", ProcFile::Text("65536\n")),
     ("/proc/sys/fs/inode-nr", ProcFile::InodeNr),
     ("/proc/sys/fs/nr_open", ProcFile::Text("1024\n")),
     // Linux 6.1's last capability, CAP_CHECKPOINT_RESTORE (libcap and Go's
@@ -258,6 +262,9 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         // Allocated, unused (always 0 since 2.6), most.
         ProcFile::FileNr => {
             let _ = writeln!(s, "{}\t0\t{}", crate::fd::open_files(), crate::fd::MAX_OPEN_FILES);
+        }
+        ProcFile::AioNr => {
+            let _ = writeln!(s, "{}", crate::syscall::aio::aio_nr());
         }
         ProcFile::FileMax => {
             let _ = writeln!(s, "{}", crate::fd::MAX_OPEN_FILES);

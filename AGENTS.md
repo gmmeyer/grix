@@ -478,6 +478,19 @@ other threads' state directly: one running on another CPU is in user
 mode and sees it at its next call. User notification is unimplemented
 (reported).
 
+Linux AIO (`syscall/aio.rs`): a context is a ring in the program's
+memory, Linux's `struct aio_ring` at the context's id (libaio reads it;
+a shared mapping that io_destroy unmaps only if it's still the ring),
+in `Process::aio` (threads share it; fork and execve leave it behind).
+Reads, writes and syncs are done in io_submit (`file::aio_rw`, never
+waiting: a stream that isn't ready gets EAGAIN) and their events
+written to the ring then; polls wait in the context and complete at the
+process's next system call with the file ready (`aio::complete_polls`
+from `syscall::handle`), since only the running process's ring is
+reachable. io_getevents waits with `block_io_rerun`, so anything that
+completes one calls `ipc::changed()`. io_uring is unimplemented on
+purpose (TODO.md).
+
 Signals (`signal.rs`): actions are per process; masks, pending queues and
 sigaltstacks are per thread. `kill` picks a receiver like Linux (the main
 thread first, then any thread that doesn't block the signal) and queues it
@@ -599,7 +612,9 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       AF_UNIX sockets (`unix::MAX_INFLIGHT`; message queues take a
       `kmem::Charge`) and seccomp filters (`seccomp::MAX_FILTERS` and
       `MAX_INSNS_TOTAL` in all processes, each filter charged to
-      `kmem`; ENOMEM). argv and environment copies take a
+      `kmem`; ENOMEM). AIO contexts count the events they ask for
+      against `aio::AIO_MAX_NR` (EAGAIN, Linux's aio-max-nr), and each
+      context and waiting poll is charged to `kmem`. argv and environment copies take a
       `kmem::Charge`.
 
     Limits must be global, not per object: a program can open many objects,

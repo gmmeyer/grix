@@ -2024,6 +2024,21 @@ fn seccomp_filters() {
 }
 
 #[test]
+fn linux_aio() {
+    // io_setup, io_submit (reads, writes, syncs, polls), io_getevents and
+    // io_pgetevents (waits, timeouts, signals), io_cancel, io_destroy; the
+    // ring in the program's memory, eventfds, Linux's errors and the
+    // global budget. io_uring is ENOSYS, quietly (programs probe it).
+    for cpus in [1, 4] {
+        let b = with("aio").allow(Capability::FsWrite).allow(Capability::Threads).allow(Capability::Process);
+        let out = run(b.cpus(cpus), &["/bin/aio"]);
+        assert_eq!(out.stdout_str(), "aio ok\n", "{cpus} CPUs\n{}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+}
+
+#[test]
 fn clone_sharing_flags() {
     // CLONE_FILES, CLONE_FS, CLONE_SIGHAND (with vfork), CLONE_PARENT and
     // CLONE_CLEAR_SIGHAND, by clone and clone3; unsharing by execve and

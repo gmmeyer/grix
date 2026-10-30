@@ -278,6 +278,8 @@ pub fn execve(
     }
     p.runq.clear();
     p.futexes.clear();
+    // AIO contexts belong to the old address space (Linux's exit_aio).
+    p.aio = Default::default();
     t.tid = p.pid;
     t.clear_child_tid = 0;
     t.robust_list = 0;

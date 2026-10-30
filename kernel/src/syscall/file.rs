@@ -1041,7 +1041,7 @@ pub fn pwrite(p: &mut Process, fd: u64, buf: u64, count: u64, off: u64) -> SysRe
     }
 }
 
-fn iovecs(p: &mut Process, iov: u64, cnt: u64) -> Result<Vec<(u64, u64)>, Errno> {
+pub(super) fn iovecs(p: &mut Process, iov: u64, cnt: u64) -> Result<Vec<(u64, u64)>, Errno> {
     if cnt > 1024 {
         return Err(EINVAL);
     }
@@ -1089,12 +1089,18 @@ fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Opti
             return Err(EINVAL);
         }
     }
+    let bufs = iovecs(p, iov, cnt)?;
+    vectored_bufs(p, f, bufs, at, write)
+}
+
+/// The buffers `bufs`, one after another, until one comes up short.
+fn vectored_bufs(p: &mut Process, f: &mut OpenFile, bufs: Vec<(u64, u64)>, at: Option<u64>, write: bool) -> SysResult {
     // A blocking writev to stdout/stderr resumes after what it sent before
     // it waited (`Thread::io_done`), like write.
     let resumes = write && matches!(f.kind, FileKind::Stdout | FileKind::Stderr);
     let mut skip = if resumes { core::mem::take(&mut p.cur().io_done) } else { 0 };
     let mut total = 0;
-    for (base, len) in iovecs(p, iov, cnt)? {
+    for (base, len) in bufs {
         let sent = skip.min(len);
         skip -= sent;
         total += sent;
@@ -1126,6 +1132,48 @@ fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Opti
         }
     }
     Ok(total)
+}
+
+/// Does `f` have positions (pread's, lseek's)? Streams don't.
+pub(super) fn seekable(f: &OpenFile) -> bool {
+    matches!(f.kind, FileKind::Node(_) | FileKind::Generated(_) | FileKind::Dev(..))
+}
+
+/// An AIO read or write (`aio`), into or from `bufs`: at `at` on a file
+/// with positions, at the stream's own on others (Linux ignores a
+/// stream's offset), with `extra` status flags (RWF_APPEND's O_APPEND).
+/// It never waits: a request is done before io_submit returns, so a
+/// pipe, socket or terminal that isn't ready completes with EAGAIN, as
+/// with RWF_NOWAIT (IOCB_CMD_POLL is how to wait for one).
+pub(super) fn aio_rw(
+    p: &mut Process,
+    file: &crate::fd::FileRef,
+    bufs: Vec<(u64, u64)>,
+    at: Option<u64>,
+    write: bool,
+    extra: u32,
+) -> SysResult {
+    // A datagram or seqpacket socket: all the buffers are one message, as
+    // in `vectored`.
+    let r = if let Some(sock) = super::unix::sock_of(file) {
+        if write {
+            super::unix::send_msg(p, &sock, &bufs, 0, true, None, None)
+        } else {
+            super::unix::recv_msg(p, &sock, &bufs, 0, true).map(|r| r.n)
+        }
+    } else {
+        let mut f = file.lock();
+        let added = (extra | O_NONBLOCK) & !f.flags;
+        f.flags |= added;
+        let r = vectored_bufs(p, &mut f, bufs, at, write);
+        f.flags &= !added;
+        r
+    };
+    if r == Err(EBLOCKED) {
+        p.cur().wait = None;
+        return Err(EAGAIN);
+    }
+    r
 }
 
 pub fn readv(p: &mut Process, fd: u64, iov: u64, cnt: u64) -> SysResult {
@@ -2399,7 +2447,7 @@ const POLLNVAL: u16 = 0x20;
 const POLLRDNORM: u16 = 0x40;
 const POLLWRNORM: u16 = 0x100;
 
-fn readiness(p: &Process, fd: u64) -> Result<u32, Errno> {
+pub(super) fn readiness(p: &Process, fd: u64) -> Result<u32, Errno> {
     Ok(poll_kind(p, &p.fds.get(fd)?.lock().kind).0)
 }
 

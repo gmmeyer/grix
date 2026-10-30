@@ -1,5 +1,6 @@
 //! Linux syscall ABI. Each syscall is checked against the policy before it runs.
 
+pub mod aio;
 mod file;
 mod mem;
 mod misc;
@@ -44,6 +45,11 @@ pub fn handle(tf: &mut TrapFrame) {
     t.call = call;
     if t.fifo_wait.as_ref().is_some_and(|w| w.call != call) {
         t.fifo_wait = None;
+    }
+    // AIO polls whose files are ready complete (into the ring, which only
+    // this process's own calls can reach).
+    if p.aio.polling() {
+        aio::complete_polls(p);
     }
     // A seccomp filter's SECCOMP_RET_TRAP leaves the registers as they
     // were (Linux's syscall_rollback): no result to set.
@@ -231,6 +237,15 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::sync => Ok(0),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),
         nr::flock => file::flock(p, a[0], a[1]),
+        nr::io_setup => aio::io_setup(p, a[0], a[1]),
+        nr::io_destroy => aio::io_destroy(p, a[0]),
+        nr::io_submit => aio::io_submit(p, a[0], a[1], a[2]),
+        nr::io_cancel => aio::io_cancel(p, a[0], a[1], a[2]),
+        nr::io_getevents => aio::io_getevents(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::io_pgetevents => {
+            signal::pselect_mask(p, a[5])?;
+            aio::io_getevents(p, a[0], a[1], a[2], a[3], a[4])
+        }
 
         // sockets
         nr::socketpair => net::socketpair(p, a[0], a[1], a[2], a[3]),

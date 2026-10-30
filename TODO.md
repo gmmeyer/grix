@@ -145,10 +145,24 @@ Left, in order of impact:
     descriptor table that grows with use, with the global open-file cap
     still the bound (ENFILE).
 25. [ ] **xattrs** (`cp -a`, `tar --xattrs`): unsupported `setxattr`.
-26. [ ] **Linux AIO** (`io_setup`, ...) and **io_uring**: MariaDB and
-    nginx fall back to synchronous I/O. io_uring is a large surface
-    (its own submission paths for every operation, each needing its
-    gate); AIO on in-memory files could complete at submission.
+26. [x] **Linux AIO**: `io_setup`, `io_destroy`, `io_submit` (pread,
+    pwrite, preadv, pwritev, fsync, fdsync, poll), `io_cancel`,
+    `io_getevents`, `io_pgetevents`. Reads, writes and syncs complete as
+    they're submitted, into Linux's ring in the program's memory (libaio
+    and user-space reapers read it); a pipe or socket that isn't ready
+    completes with EAGAIN rather than waiting in io_submit as Linux
+    would. Polls wait, and complete at the process's next system call
+    with the file ready (io_getevents, or epoll on their eventfd).
+    Budgeted as Linux's aio-max-nr (65536 events, EAGAIN), each context
+    and poll charged to kmem.
+    **io_uring stays unimplemented** (ENOSYS, not reported), deliberately:
+    it is a large second surface (its own submission paths for every
+    operation, each needing its own gate, and shared rings the kernel
+    would read while the program runs), and Docker's default seccomp
+    profile blocks it, so the programs that use it (MariaDB, nginx,
+    libuv) already fall back to AIO or plain calls. It isn't reported:
+    they probe it (libuv as every Node program starts), so a report would
+    say nothing about a missing feature.
 27. [x] **seccomp filters**: `seccomp(2)` and `prctl(PR_SET_SECCOMP)`,
     strict mode and classic BPF checked and run as Linux does (every
     action, stacking, TSYNC, inherited across fork, threads and

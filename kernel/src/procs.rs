@@ -106,6 +106,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     // Its POSIX locks go with its descriptor table, unless another process
     // (CLONE_FILES) still uses that.
     dead.fds = FdTable::empty();
+    dead.aio = Default::default();
     dead.threads.clear();
     dead.runq.clear();
     dead.futexes.clear();

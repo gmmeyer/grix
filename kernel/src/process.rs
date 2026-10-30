@@ -340,6 +340,8 @@ pub struct Process {
     pub job_notice: Option<crate::signal::SigInfo>,
     /// The controlling terminal (the session's, inherited across fork).
     pub ctty: Option<crate::tty::TtyRef>,
+    /// AIO contexts (io_setup), shared by its threads, not inherited.
+    pub aio: crate::syscall::aio::Contexts,
 }
 
 /// What a child made by clone shares with its parent instead of copying.
@@ -431,6 +433,7 @@ impl Process {
             job_report: None,
             job_notice: None,
             ctty: None,
+            aio: Default::default(),
         }
     }
 
