@@ -308,13 +308,22 @@ fn send(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
     }
 }
 
-/// `send` with descriptors attached (SCM_RIGHTS on a connected stream).
-fn send_rights(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64, r: crate::unix::Rights) -> SysResult {
+/// `send` with descriptors attached (SCM_RIGHTS on a connected stream),
+/// or credentials (SCM_CREDENTIALS).
+fn send_rights(
+    p: &mut Process,
+    file: &FileRef,
+    buf: u64,
+    len: u64,
+    flags: u64,
+    r: Option<crate::unix::Rights>,
+    cred: Option<crate::unix::Cred>,
+) -> SysResult {
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
     match &s.tx {
-        Some(tx) => super::unix::send_stream(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0, Some(r)),
+        Some(tx) => super::unix::send_stream(p, tx, buf, len, nonblock, flags & MSG_NOSIGNAL == 0, r, cred),
         None => Err(EPIPE),
     }
 }
@@ -323,8 +332,13 @@ fn recv(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
+    let peek = flags & MSG_PEEK != 0;
     match &s.rx {
-        Some(rx) => pipe_read(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0),
+        // With SO_PASSCRED, one writer's bytes at a time.
+        Some(rx) if super::unix::stream_passcred(s) => {
+            super::unix::recv_stream(p, rx, buf, len, nonblock, peek, &mut Vec::new(), Some(&mut None))
+        }
+        Some(rx) => pipe_read(p, rx, buf, len, nonblock, peek),
         None => Ok(0),
     }
 }
@@ -427,18 +441,21 @@ pub fn sendmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         return Err(EISCONN);
     }
     let mut total = 0;
-    // A stream's messages carry no credentials here.
+    // A stream's bytes carry who wrote them: SCM_CREDENTIALS's, or the
+    // sender's.
+    let cred = control.cred;
     let mut rights = control.rights;
     for (i, (base, len)) in iovecs(p, m.iov, m.iovlen)?.into_iter().enumerate() {
         // Only the first chunk may block, so a partial result is returned rather than lost.
         let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
         // Descriptors go with the first byte sent.
         let sent = match rights.take() {
-            Some(r) if len > 0 => send_rights(p, &file, base, len, flags, r),
+            Some(r) if len > 0 => send_rights(p, &file, base, len, flags, Some(r), cred),
             Some(r) => {
                 rights = Some(r);
                 Ok(0)
             }
+            None if cred.is_some() => send_rights(p, &file, base, len, flags, None, cred),
             None => send(p, &file, base, len, flags),
         };
         match sent {
@@ -548,10 +565,14 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
     }
     let mut total = 0;
     let mut rights = Vec::new();
+    // With SO_PASSCRED, the writer's credentials, and only their bytes.
+    let passcred = matches!(&file.lock().kind, FileKind::Socket(s) if super::unix::stream_passcred(s));
+    let mut cred = None;
     for (i, (base, len)) in iovecs(p, m.iov, m.iovlen)?.into_iter().enumerate() {
         let flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
         let before = rights.len();
-        match recv_rights(p, &file, base, len, flags, &mut rights) {
+        let slot = if passcred { Some(&mut cred) } else { None };
+        match recv_rights(p, &file, base, len, flags, &mut rights, slot) {
             Ok(n) => {
                 total += n;
                 // One batch of descriptors per call, as on Linux.
@@ -564,12 +585,13 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
         }
     }
     let peer = super::unix::names(&file, true).ok().flatten();
-    let anc = super::unix::Ancillary { rights, cred: None };
+    let anc = super::unix::Ancillary { rights, cred };
     super::unix::finish_recvmsg(p, msg, m.name, peer.as_ref(), anc, flags, false)?;
     Ok(total)
 }
 
-/// `recv`, taking descriptors that came with the bytes.
+/// `recv`, taking descriptors that came with the bytes (and, with `cred`,
+/// who wrote them).
 fn recv_rights(
     p: &mut Process,
     file: &FileRef,
@@ -577,12 +599,13 @@ fn recv_rights(
     len: u64,
     flags: u64,
     rights: &mut Vec<crate::unix::Rights>,
+    cred: Option<&mut Option<crate::unix::Cred>>,
 ) -> SysResult {
     let f = file.lock();
     let nonblock = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Socket(s) = &f.kind else { return Err(ENOTSOCK) };
     match &s.rx {
-        Some(rx) => super::unix::recv_stream(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0, rights),
+        Some(rx) => super::unix::recv_stream(p, rx, buf, len, nonblock, flags & MSG_PEEK != 0, rights, cred),
         None => Ok(0),
     }
 }
@@ -659,7 +682,11 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
         SO_SNDBUF | SO_RCVBUF => ipc::PIPE_CAPACITY as u32,
         SO_DOMAIN if netlink => AF_NETLINK as u32,
         SO_DOMAIN => AF_UNIX as u32,
-        SO_PASSCRED => super::unix::sock_of(&file).is_some_and(|s| s.lock().passcred) as u32,
+        SO_PASSCRED => u32::from(match &file.lock().kind {
+            FileKind::Unix(s) => s.lock().passcred,
+            FileKind::Socket(end) => super::unix::stream_passcred(end),
+            _ => false,
+        }),
         _ => return Err(ENOPROTOOPT),
     };
     if read_u32(&mut p.aspace, len)? < 4 {
@@ -724,19 +751,23 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
             return Err(EINVAL);
         }
         let on = read_u32(&mut p.aspace, val)? != 0;
-        // A message socket's messages carry their senders' credentials
-        // from now on; a stream's don't (yet).
-        match super::unix::sock_of(&file) {
-            Some(s) => s.lock().passcred = on,
-            None if on => {
-                let _ = p.unimplemented(
-                    nr::setsockopt,
-                    "setsockopt",
-                    "SO_PASSCRED on a stream, or a socket not yet connected",
-                    EINVAL,
-                );
+        // Messages, or a stream's bytes, come with their senders'
+        // credentials from now on. A socket not yet bound or connected
+        // becomes one that keeps the setting until it is.
+        let mut f = file.lock();
+        match &mut f.kind {
+            FileKind::Unix(s) => s.lock().passcred = on,
+            FileKind::Socket(end) => {
+                if let Some(info) = end.unix.as_mut() {
+                    info.passcred = on;
+                }
             }
-            None => {}
+            &mut FileKind::UnixUnbound(ty) => {
+                let sock = crate::unix::Sock::new(ty, crate::unix::State::Idle, super::unix::cred(p));
+                sock.lock().passcred = on;
+                f.kind = FileKind::Unix(sock);
+            }
+            _ => {}
         }
     }
     Ok(0)

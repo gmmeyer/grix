@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -1089,6 +1091,82 @@ static int passcred(void) {
     return 0;
 }
 
+// SO_PASSCRED on a stream: each read is one writer's bytes, with their
+// credentials, as Linux never glues different writers' together then;
+// without it, reads go across. Set before connecting, or on a listener
+// (which its accepted sockets inherit), it stays.
+static int streamcred(void) {
+    int sv[2], st;
+    struct ucred uc;
+    char data[17];
+    for (int pass = 0; pass < 2; pass++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        int on = 1, v = -1;
+        socklen_t len = sizeof v;
+        if (pass) CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+        CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == pass);
+        CHECK(write(sv[1], "aa", 2) == 2);
+        pid_t child = fork();
+        if (child == 0) _exit(write(sv[1], "bbb", 3) == 3 ? 0 : 1);
+        CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        CHECK(write(sv[1], "c", 1) == 1 && write(sv[1], "d", 1) == 1);
+        if (!pass) {
+            CHECK(recv_cred(sv[0], &uc, data) == 0 && strcmp(data, "aabbbcd") == 0);
+        } else {
+            CHECK(recv_cred(sv[0], &uc, data) == 1 && strcmp(data, "aa") == 0 && uc.pid == getpid());
+            CHECK(uc.uid == getuid() && uc.gid == getgid());
+            // Peeking doesn't go further, and two buffers don't either.
+            CHECK(recv(sv[0], data, 16, MSG_PEEK) == 3);
+            char a[2], b[8];
+            struct iovec iov[2] = {{a, 2}, {b, 8}};
+            char control[CMSG_SPACE(sizeof uc)];
+            struct msghdr m = {.msg_iov = iov, .msg_iovlen = 2, .msg_control = control, .msg_controllen = sizeof control};
+            CHECK(recvmsg(sv[0], &m, 0) == 3 && !memcmp(a, "bb", 2) && b[0] == 'b');
+            memcpy(&uc, CMSG_DATA(CMSG_FIRSTHDR(&m)), sizeof uc);
+            CHECK(uc.pid == child);
+            // Same writer twice: one read. read() stops at writers too.
+            CHECK(write(sv[1], "e", 1) == 1);
+            CHECK(read(sv[0], data, 16) == 3 && !memcmp(data, "cde", 3));
+        }
+        close(sv[0]);
+        close(sv[1]);
+    }
+    // Before connecting, and inherited from a listener.
+    int l = socket(AF_UNIX, SOCK_STREAM, 0), c = socket(AF_UNIX, SOCK_STREAM, 0), on = 1, v = 0;
+    socklen_t len = sizeof v;
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    memcpy(sa.sun_path, "\0streamcred", 11);
+    socklen_t salen = offsetof(struct sockaddr_un, sun_path) + 11;
+    CHECK(bind(l, (void *)&sa, salen) == 0 && listen(l, 1) == 0);
+    CHECK(setsockopt(l, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(setsockopt(c, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+    CHECK(connect(c, (void *)&sa, salen) == 0);
+    int a = accept(l, NULL, NULL);
+    CHECK(a >= 0);
+    CHECK(getsockopt(a, SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    v = 0;
+    CHECK(getsockopt(c, SOL_SOCKET, SO_PASSCRED, &v, &len) == 0 && v == 1);
+    // A sender may say who it is (within its own ids), on a stream too.
+    struct ucred mine = {getpid(), getuid(), getgid()};
+    char control[CMSG_SPACE(sizeof mine)] = {0};
+    struct iovec iov = {"me", 2};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_CREDENTIALS;
+    cm->cmsg_len = CMSG_LEN(sizeof mine);
+    memcpy(CMSG_DATA(cm), &mine, sizeof mine);
+    CHECK(sendmsg(c, &m, 0) == 2);
+    CHECK(recv_cred(a, &uc, data) == 1 && uc.pid == getpid() && strcmp(data, "me") == 0);
+    mine.pid = 1;
+    memcpy(CMSG_DATA(cm), &mine, sizeof mine);
+    CHECK(getpid() == 1 || (sendmsg(c, &m, 0) == -1 && errno == EPERM));
+    close(a);
+    close(c);
+    close(l);
+    return 0;
+}
+
 // capset: nothing has a capability, so dropping them all is allowed
 // (Chromium's zygote does before it forks); raising one is denied.
 struct cap_header { unsigned version; int pid; };
@@ -1139,6 +1217,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "prctls") == 0) r = prctls();
         if (strcmp(argv[i], "tasks") == 0) r = tasks();
         if (strcmp(argv[i], "passcred") == 0) r = passcred();
+        if (strcmp(argv[i], "streamcred") == 0) r = streamcred();
         if (strcmp(argv[i], "capdrop") == 0) r = capdrop();
         // The arguments after it are only there to be laid out.
         if (strcmp(argv[i], "argvlayout") == 0) {

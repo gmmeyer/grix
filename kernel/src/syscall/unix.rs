@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
 
-use super::file::{base_of, pipe_read_rights, pipe_write, would_block};
+use super::file::{base_of, would_block};
 use super::{AT_FDCWD, require, table::nr};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, FileRef, O_RDWR, new_file};
@@ -88,9 +88,10 @@ pub fn pair(p: &mut Process, ty: u64) -> Result<(FileKind, FileKind), Errno> {
     let me = cred(p);
     match ty {
         SOCK_STREAM => {
-            let (mut a, mut b) = crate::ipc::socketpair();
+            let (mut a, mut b) = unix::stream_pair();
             for end in [&mut a, &mut b] {
-                end.unix = Some(alloc::boxed::Box::new(StreamInfo { local: None, peer: None, peer_cred: me }));
+                let info = StreamInfo { local: None, peer: None, peer_cred: me, passcred: false };
+                end.unix = Some(alloc::boxed::Box::new(info));
             }
             Ok((FileKind::Socket(a), FileKind::Socket(b)))
         }
@@ -197,7 +198,11 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
     let blocked = |p: &mut Process| if nonblock { Err(EAGAIN) } else { would_block(p, false) };
     match ty {
         SOCK_STREAM => match unix::connect_stream(&target, me, cred(p)) {
-            Ok((end, _)) => {
+            Ok((mut end, _)) => {
+                // SO_PASSCRED set before it connected.
+                if let (Some(s), Some(info)) = (&mine, end.unix.as_mut()) {
+                    info.passcred = s.lock().passcred;
+                }
                 file.lock().kind = FileKind::Socket(end);
                 Ok(0)
             }
@@ -206,6 +211,9 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
         },
         SOCK_SEQPACKET => match unix::connect_packet(&target, me, cred(p)) {
             Ok(sock) => {
+                if let Some(s) = &mine {
+                    sock.lock().passcred = s.lock().passcred;
+                }
                 file.lock().kind = FileKind::Unix(sock);
                 Ok(0)
             }
@@ -383,7 +391,7 @@ pub fn read_control(p: &mut Process, control: u64, len: u64) -> Result<Control, 
 
 /// The credentials a message carries unless its sender says otherwise:
 /// its process and real ids, as Linux's scm_send.
-fn sender(p: &Process) -> Cred {
+pub(super) fn sender(p: &Process) -> Cred {
     Cred { pid: p.pid, uid: p.ids.ruid, gid: p.ids.rgid }
 }
 
@@ -571,7 +579,8 @@ pub fn recv_msg(
 }
 
 /// Send on a connected stream, with descriptors attached to its first
-/// byte.
+/// byte, and as `cred` (SCM_CREDENTIALS) or the sender.
+#[allow(clippy::too_many_arguments)]
 pub fn send_stream(
     p: &mut Process,
     tx: &PipeEnd,
@@ -580,12 +589,13 @@ pub fn send_stream(
     nonblock: bool,
     sigpipe: bool,
     rights: Option<Rights>,
+    cred: Option<Cred>,
 ) -> SysResult {
     if rights.as_ref().is_some_and(|r| r.holds_pipe(&tx.pipe)) {
         return Err(Errno(109)); // ETOOMANYREFS: it would hold itself open
     }
     let at = tx.pipe.lock().written;
-    let n = pipe_write(p, tx, super::file::Src::User(buf), len, nonblock, sigpipe)?;
+    let n = super::file::pipe_write_as(p, tx, super::file::Src::User(buf), len, nonblock, sigpipe, cred)?;
     if let Some(r) = rights
         && n > 0
     {
@@ -594,6 +604,10 @@ pub fn send_stream(
     Ok(n)
 }
 
+/// Receive from a connected stream: descriptors that came with the bytes
+/// into `rights`, and, with `cred` (SO_PASSCRED), only one writer's bytes,
+/// whose credentials it gets (if it has some already, only theirs).
+#[allow(clippy::too_many_arguments)]
 pub fn recv_stream(
     p: &mut Process,
     rx: &PipeEnd,
@@ -602,8 +616,14 @@ pub fn recv_stream(
     nonblock: bool,
     peek: bool,
     rights: &mut Vec<Rights>,
+    cred: Option<&mut Option<Cred>>,
 ) -> SysResult {
-    pipe_read_rights(p, rx, buf, len, nonblock, peek, rights)
+    super::file::pipe_read_full(p, rx, buf, len, nonblock, peek, rights, cred)
+}
+
+/// Does this connected stream want its writers' credentials?
+pub fn stream_passcred(end: &crate::ipc::SocketEnd) -> bool {
+    end.unix.as_ref().is_some_and(|u| u.passcred)
 }
 
 /// What comes with received data: descriptors, and the sender's

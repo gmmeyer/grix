@@ -43,7 +43,17 @@ pub struct Pipe {
     /// Descriptors passed with SCM_RIGHTS on a stream socket, at the
     /// position of the first byte they came with.
     pub rights: VecDeque<(u64, crate::unix::Rights)>,
+    /// An AF_UNIX stream's: who wrote the bytes from each position on (a
+    /// run per writer, as Linux keeps credentials per skb), at most
+    /// `MAX_CRED_RUNS`, charged to `kmem`.
+    pub creds: Option<VecDeque<(u64, crate::unix::Cred)>>,
+    creds_charge: crate::kmem::Charge,
 }
+
+/// Runs of different writers' bytes one stream holds: a writer whose run
+/// would be one too many waits, as on Linux, where each write is an skb
+/// charged to the socket's buffer.
+pub const MAX_CRED_RUNS: usize = 256;
 
 impl Pipe {
     pub fn space(&self) -> usize {
@@ -73,17 +83,62 @@ impl Pipe {
         n
     }
 
-    /// Give the buffer's memory back once it has been read empty.
+    /// Give the buffer's memory back once it has been read empty, and
+    /// forget whose bytes were read.
     pub fn drained(&mut self) {
         if self.buf.is_empty() && self.buf.capacity() > 0 {
             self.buf = VecDeque::new();
             let _ = self.charge.resize(0);
         }
+        self.prune_writers();
     }
 
     pub fn touch(&mut self) {
         self.version += 1;
         changed();
+    }
+
+    /// Bytes from `self.written` on come from `cred`: false if that's a
+    /// new run there's no room for.
+    pub fn note_writer(&mut self, cred: crate::unix::Cred) -> bool {
+        let at = self.written;
+        let Some(runs) = &mut self.creds else { return true };
+        if runs.back().is_some_and(|&(_, c)| c == cred) {
+            return true;
+        }
+        if runs.len() >= MAX_CRED_RUNS {
+            return false;
+        }
+        let bytes = ((runs.len() + 1) * core::mem::size_of::<(u64, crate::unix::Cred)>()) as u64;
+        if self.creds_charge.bytes() < bytes && self.creds_charge.resize(bytes.next_power_of_two()).is_err() {
+            return false;
+        }
+        runs.push_back((at, cred));
+        true
+    }
+
+    /// Who wrote the byte at `self.read`, and where the next writer's
+    /// bytes start (None: nothing recorded).
+    pub fn writer(&self) -> Option<(crate::unix::Cred, Option<u64>)> {
+        let runs = self.creds.as_ref()?;
+        let i = runs.iter().rposition(|&(pos, _)| pos <= self.read)?;
+        Some((runs[i].1, runs.get(i + 1).map(|&(pos, _)| pos)))
+    }
+
+    /// Forget the runs read past.
+    fn prune_writers(&mut self) {
+        let (read, empty) = (self.read, self.buf.is_empty());
+        let Some(runs) = &mut self.creds else { return };
+        if empty {
+            runs.clear();
+        }
+        while runs.get(1).is_some_and(|&(pos, _)| pos <= read) {
+            runs.pop_front();
+        }
+        if runs.is_empty() {
+            *runs = VecDeque::new();
+            let _ = self.creds_charge.resize(0);
+        }
     }
 }
 
@@ -103,6 +158,8 @@ fn new_pipe(readers: usize, writers: usize) -> Arc<Mutex<Pipe>> {
         written: 0,
         read: 0,
         rights: VecDeque::new(),
+        creds: None,
+        creds_charge: crate::kmem::Charge::default(),
     }))
 }
 

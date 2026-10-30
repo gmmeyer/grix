@@ -739,6 +739,10 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         FileKind::Pty(end) => super::tty::read(p, end, buf, count, nonblock),
         FileKind::Unix(s) => super::unix::recv_msg(p, s, &[(buf, count)], 0, nonblock).map(|r| r.n),
         FileKind::Socket(s) => match &s.rx {
+            // With SO_PASSCRED, one writer's bytes at a time.
+            Some(rx) if super::unix::stream_passcred(s) => {
+                pipe_read_full(p, rx, buf, count, nonblock, false, &mut Vec::new(), Some(&mut None))
+            }
             Some(rx) => pipe_read(p, rx, buf, count, nonblock, false),
             None => Ok(0), // shut down for reading
         },
@@ -1036,6 +1040,25 @@ pub(super) fn pipe_read_rights(
     peek: bool,
     rights: &mut Vec<crate::unix::Rights>,
 ) -> SysResult {
+    pipe_read_full(p, end, buf, count, nonblock, peek, rights, None)
+}
+
+/// The same, and with `cred` (an AF_UNIX stream's reader with
+/// SO_PASSCRED) only one writer's bytes, as Linux's
+/// unix_stream_read_generic never glues different writers' together:
+/// their credentials go into `cred`, or, if it has some already (an
+/// earlier part of the same recvmsg), only bytes from them are read.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pipe_read_full(
+    p: &mut Process,
+    end: &PipeEnd,
+    buf: u64,
+    count: u64,
+    nonblock: bool,
+    peek: bool,
+    rights: &mut Vec<crate::unix::Rights>,
+    cred: Option<&mut Option<crate::unix::Cred>>,
+) -> SysResult {
     let mut pipe = end.pipe.lock();
     if pipe.buf.is_empty() {
         if pipe.writers == 0 {
@@ -1046,6 +1069,17 @@ pub(super) fn pipe_read_rights(
     }
     let mut n = (count as usize).min(pipe.buf.len());
     let at = pipe.read;
+    if let Some(cred) = cred
+        && let Some((writer, next)) = pipe.writer()
+    {
+        match cred {
+            Some(c) if *c != writer => return Ok(0),
+            _ => *cred = Some(writer),
+        }
+        if let Some(next) = next {
+            n = n.min(next.saturating_sub(at).max(1) as usize);
+        }
+    }
     // Descriptors that came with the first byte read arrive with it.
     let mut take_rights = false;
     if let Some(&(pos, _)) = pipe.rights.front() {
@@ -1111,6 +1145,20 @@ pub(super) fn pipe_write(
     nonblock: bool,
     sigpipe: bool,
 ) -> SysResult {
+    pipe_write_as(p, end, src, count, nonblock, sigpipe, None)
+}
+
+/// The same, as `cred` (SCM_CREDENTIALS) rather than the writer (an
+/// AF_UNIX stream keeps who wrote what).
+pub(super) fn pipe_write_as(
+    p: &mut Process,
+    end: &PipeEnd,
+    src: Src,
+    count: u64,
+    nonblock: bool,
+    sigpipe: bool,
+    cred: Option<crate::unix::Cred>,
+) -> SysResult {
     if count == 0 {
         return Ok(0);
     }
@@ -1124,7 +1172,8 @@ pub(super) fn pipe_write(
     }
     // Writes of up to PIPE_BUF bytes are atomic: wait for room for all of it.
     let need = if count as usize <= PIPE_BUF { count as usize } else { 1 };
-    if pipe.reserve(need) < need {
+    let writer = cred.unwrap_or_else(|| super::unix::sender(p));
+    if pipe.reserve(need) < need || !pipe.note_writer(writer) {
         drop(pipe);
         return would_block(p, nonblock);
     }

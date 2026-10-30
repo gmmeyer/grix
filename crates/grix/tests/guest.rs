@@ -2250,6 +2250,12 @@ fn credentials_with_messages() {
 }
 
 #[test]
+fn credentials_with_streams() {
+    // SO_PASSCRED on a stream: reads stop where the writer changes.
+    popular(with("popular").allow(Capability::Process), &["streamcred"]);
+}
+
+#[test]
 fn dropping_capabilities() {
     // Dropping all of them succeeds (none are held); raising one is
     // denied, and reported.
