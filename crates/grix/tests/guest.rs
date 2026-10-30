@@ -2717,6 +2717,14 @@ fn dropping_capabilities() {
 }
 
 #[test]
+fn timerfds_nobody_reads_leave_the_kernel_free() {
+    let b = with("hardening2").timeout(Duration::from_secs(20)).allow(Capability::Process);
+    let out = run(b, &["/bin/hardening2", "timerstorm"]);
+    assert_eq!(out.stdout_str(), "timerstorm ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+}
+
+#[test]
 fn job_control() {
     // Stopping and continuing other processes (and themselves), with every
     // thread; the parent hears of it through wait and SIGCHLD.

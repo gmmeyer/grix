@@ -253,13 +253,13 @@ impl Server {
         let mut good = HashSet::new();
         let mut bad = HashSet::new();
         for &start in nodes.keys() {
-            let (mut path, mut at) = (Vec::new(), start);
+            let (mut path, mut seen, mut at) = (Vec::new(), HashSet::new(), start);
             let ok = loop {
                 if (1..=roots).contains(&at) || good.contains(&at) {
                     break true;
                 }
                 // Gone, known not to lead anywhere, or seen on this walk.
-                if bad.contains(&at) || path.len() > nodes.len() {
+                if bad.contains(&at) || !seen.insert(at) {
                     break false;
                 }
                 let Some(n) = nodes.get(&at) else { break false };
@@ -557,6 +557,18 @@ impl Server {
                 }
                 let (cf, ct) = (cname(from)?, cname(to)?);
                 let (df, dt) = (self.dir(from_dir)?, self.dir(to_dir)?);
+                // What the host keeps for the guest stays bounded, as for a
+                // new id: the name an id takes, and the one it leaves.
+                let known = |dir, name: &str| self.by_name.contains_key(&(dir, name.to_string()));
+                let changes = match (known(from_dir, from), known(to_dir, to)) {
+                    (true, true) if exchange => None,
+                    (true, _) => Some((to, from)),
+                    (false, true) if exchange => Some((from, to)),
+                    _ => None,
+                };
+                if changes.is_some_and(|(new, old)| self.id_bytes + new.len() > MAX_ID_BYTES + old.len()) {
+                    return Err(ENOMEM);
+                }
                 if exchange {
                     rename(df.as_raw_fd(), &cf, dt.as_raw_fd(), &ct, false, true).map_err(err)?;
                     // Each id now names what the other did.
@@ -985,6 +997,44 @@ mod tests {
         s.forget(1, &long(0));
         assert!(s.id(1, &long(n)).is_ok());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A rename can't take what's kept past the bound either.
+    #[test]
+    fn renames_stay_within_ids_bytes() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-renamed-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("s"), "").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        s.id(1, "s").unwrap();
+        s.id_bytes = MAX_ID_BYTES;
+        let long = "l".repeat(255);
+        let r = Request::Rename { from_dir: 1, from: "s", to_dir: 1, to: &long, noreplace: false, exchange: false };
+        let reply = req(&mut s, r);
+        assert!(matches!(Reply::decode(&reply), Ok((_, Reply::Err(ENOMEM)))));
+        assert!(root.join("s").exists() && s.id_bytes == MAX_ID_BYTES);
+        s.id_bytes = 1;
+        let r = Request::Rename { from_dir: 1, from: "s", to_dir: 1, to: &long, noreplace: false, exchange: false };
+        req(&mut s, r);
+        assert!(root.join(&long).exists() && s.id_bytes == 255);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Cycles in a saved state (a file may come from anyone) cost a walk
+    /// each, not the whole table each.
+    #[test]
+    fn cycles_in_saved_nodes_are_seen_at_once() {
+        let mut nodes = HashMap::new();
+        for i in 0..40_000u64 {
+            let at = 10 + i * 2;
+            nodes.insert(at, Node { parent: at + 1, name: "a".into() });
+            nodes.insert(at + 1, Node { parent: at, name: "b".into() });
+        }
+        let started = std::time::Instant::now();
+        assert!(Server::reachable(1, &nodes).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     /// An id that takes a longer name by RENAME_EXCHANGE counts it: a short

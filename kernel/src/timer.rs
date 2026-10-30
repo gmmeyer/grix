@@ -158,13 +158,18 @@ pub struct TimerFd {
 
 impl TimerFd {
     /// Catch up with the clock. Expiries are counted lazily (read, poll,
-    /// gettime) as well as by `fire`; whoever counts one wakes the waiters.
+    /// gettime) as well as by `fire`; whoever makes it readable wakes the
+    /// waiters. More expiries of a readable one aren't news, as the poll
+    /// that counts them comes from waking up: `sched::poll`, which looks
+    /// until nothing has changed, would never end on a short period.
     pub fn update(&mut self, now: u64) -> u64 {
         let n = self.timing.expire(now);
         if n > 0 {
+            if self.expirations == 0 {
+                ipc::changed();
+            }
             self.expirations = self.expirations.saturating_add(n);
             self.version += 1;
-            ipc::changed();
         }
         n
     }
@@ -190,13 +195,15 @@ pub struct Timers {
 /// the closed ones, and open files are bounded (`fd::max_open_files`).
 static TIMER_FDS: Mutex<Vec<Weak<Mutex<TimerFd>>>> = Mutex::new(Vec::new());
 
-pub fn add_timerfd(fd: &Arc<Mutex<TimerFd>>) {
+pub fn add_timerfd(fd: &Arc<Mutex<TimerFd>>) -> Result<(), Errno> {
     let mut fds = TIMER_FDS.lock();
     // Once it's full, not each time: there may be tens of thousands.
     if fds.len() == fds.capacity() {
         fds.retain(|w| w.strong_count() > 0);
+        fds.try_reserve(1).map_err(|_| ENOMEM)?;
     }
     fds.push(Arc::downgrade(fd));
+    Ok(())
 }
 
 /// The earliest deadline of a timerfd that can wake someone up: not one
@@ -357,7 +364,16 @@ pub fn fire(p: &mut Process) -> bool {
         .posix
         .iter()
         .filter(|(_, t)| !t.pending && t.timing.next.is_some())
-        .filter_map(|(&id, t)| Some((id, t.cpu.map_or(Some(now), |c| c.now(p))?)))
+        .filter_map(|(&id, t)| {
+            // The process's clock is a sum over its threads: once, for
+            // any number of timers on it.
+            let at = match t.cpu {
+                None => now,
+                Some(CpuClock::Process) => cpu_now,
+                Some(thread) => thread.now(p)?,
+            };
+            Some((id, at))
+        })
         .collect();
     let due: Vec<(u32, u64)> = clocks
         .into_iter()

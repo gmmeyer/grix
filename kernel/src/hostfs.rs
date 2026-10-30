@@ -138,7 +138,12 @@ pub fn read(id: u64, off: u64, out: &mut [u8]) -> Result<usize, Errno> {
         }
         let want = (out.len() - done).clamp(IO_MAX / 4, IO_MAX);
         let data = call(&Request::Read { id, off: pos, len: want as u32 }, |r| match r {
-            Reply::Data(d) if d.len() <= want => Ok(d.to_vec()),
+            Reply::Data(d) if d.len() <= want => {
+                let mut data = Vec::new();
+                data.try_reserve_exact(d.len()).map_err(|_| ENOMEM)?;
+                data.extend_from_slice(d);
+                Ok(data)
+            }
             _ => unexpected(),
         })?;
         let n = (out.len() - done).min(data.len());

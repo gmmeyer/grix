@@ -280,6 +280,13 @@ impl<'a> ToHost<'a> {
     }
 }
 
+/// Is this encoded `ToGuest` a datagram? Those may be lost, and nothing
+/// but the sender's pace bounds them, where a connection's data has its
+/// window, paid for when the connection was made.
+pub fn is_datagram(msg: &[u8]) -> bool {
+    matches!(msg.first(), Some(9 | 10))
+}
+
 impl<'a> ToGuest<'a> {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -389,6 +396,16 @@ impl<'a> ToGuest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_datagrams_are_datagrams() {
+        let (peer, data) = (Addr::V4([1, 2, 3, 4]), &b"d"[..]);
+        assert!(is_datagram(&ToGuest::UdpRecv { id: 1, addr: peer, port: 2, data }.encode()));
+        assert!(is_datagram(&ToGuest::UdpIncoming { port: 2, peer, peer_port: 3, data }.encode()));
+        assert!(!is_datagram(&ToGuest::Data { id: 1, data }.encode()));
+        assert!(!is_datagram(&ToGuest::Incoming { id: 1, port: 2, peer, peer_port: 3 }.encode()));
+        assert!(!is_datagram(&[]));
+    }
 
     #[test]
     fn roundtrip_and_reject_garbage() {

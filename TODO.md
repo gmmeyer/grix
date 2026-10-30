@@ -709,11 +709,15 @@ Left, none of it a way out of the sandbox:
       lost wake-ups above, which need another thread to keep running. It
       has a 1 ns periodic timerfd armed, 64 fatal timers and a child
       spinning; look there, and in grix-vmm's wait for the virtual timer.
+      (0.0.57's timerfd livelock needs O_ASYNC, which that run hadn't.)
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.
-- [ ] `timer.rs` and the kernel's `hostfs.rs` have had only a light
-      security read.
+- [~] `timer.rs` and `hostfs.rs` on both sides have had a security read
+      (0.0.57). Left: a writable mount's `read_entries` holds a listing as
+      big as the directory (the host's inodes bound it, nothing else), and
+      `Create` makes the file when ids have run out; `watch.rs`'s `os::wait`
+      and kqueue side weren't read.
 
 ## Performance and scale
 

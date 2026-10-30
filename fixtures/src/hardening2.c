@@ -1020,10 +1020,32 @@ static void busybox_refused(void) {
 
 static void t_interpperm(void) {
     CHECK(getuid() == 0);
-    const char *ld[] = {"/lib/ld-musl-aarch64.so.1", "/lib/ld-musl-x86_64.so.1"};
+#ifdef __aarch64__
+    const char *ld = "/lib/ld-musl-aarch64.so.1";
+#else
+    const char *ld = "/lib/ld-musl-x86_64.so.1";
+#endif
     as_user(busybox_runs);
-    CHECK(chmod(ld[0], 0700) == 0 || chmod(ld[1], 0700) == 0);
+    CHECK(chmod(ld, 0700) == 0);
     as_user(busybox_refused);
+}
+
+// Expired timerfds that nobody reads, with their state watched for O_ASYNC:
+// looking at one mustn't count as news, or the kernel looks for ever.
+static void t_timerstorm(void) {
+    struct itimerspec fast = {.it_interval = {0, 1}, .it_value = {0, 1}};
+    for (int i = 0; i < 8; i++) {
+        int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+        CHECK(fd >= 0 && timerfd_settime(fd, 0, &fast, 0) == 0);
+        CHECK(fcntl(fd, F_SETOWN, getpid()) == 0 && fcntl(fd, F_SETFL, O_ASYNC) == 0);
+    }
+    pid_t c = fork();
+    CHECK(c >= 0);
+    if (c == 0) _exit(3);
+    int status;
+    CHECK(waitpid(c, &status, 0) == c && WIFEXITED(status) && WEXITSTATUS(status) == 3);
+    struct timespec t = {0, 20000000};
+    CHECK(nanosleep(&t, 0) == 0);
 }
 
 // ---- /proc/self/fd/N/name
@@ -1288,6 +1310,7 @@ int main(int argc, char **argv) {
         {"mode3", t_mode3}, {"opath", t_opath}, {"race", t_race}, {"heap", t_heap}, {"timers", t_timers},
         {"epoll", t_epoll}, {"argv", t_argv}, {"tabs", t_tabs}, {"ptsperm", t_ptsperm}, {"sigioperm", t_sigioperm},
         {"execperm", t_execperm}, {"groupperm", t_groupperm}, {"interpperm", t_interpperm},
+        {"timerstorm", t_timerstorm},
         {"fasync", t_fasync}, {"timerfd", t_timerfd}, {"fexec", t_fexec}, {"fdpath", t_fdpath},
         {"altstack", t_altstack}, {"rules", t_rules},
     };

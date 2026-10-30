@@ -579,6 +579,11 @@ impl Assembler {
         if self.buf.len() + chunk.len() > MAX_MESSAGE || more > 1 {
             self.bad = true;
         }
+        // What's held here reaches MAX_MESSAGE, and the guest's heap may
+        // have no such hole.
+        if !self.bad && self.buf.try_reserve(chunk.len()).is_err() {
+            self.bad = true;
+        }
         if !self.bad {
             self.buf.extend_from_slice(chunk);
         }

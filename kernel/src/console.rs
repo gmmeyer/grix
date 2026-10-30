@@ -241,10 +241,17 @@ const MAX_NOTICES: usize = 1024;
 #[derive(Default)]
 struct Taken {
     link: Vec<Vec<u8>>,
+    /// What datagrams in `link` hold: past `MAX_HELD_DATAGRAMS` more are
+    /// lost, as a slow answer from the host keeps `dispatch` from them.
+    datagrams: usize,
     notices: Vec<Vec<u8>>,
     /// Notices dropped for want of room.
     lost: bool,
 }
+
+const MAX_HELD_DATAGRAMS: usize = 1 << 20;
+/// A datagram's `Vec` and its share of the list.
+const DATAGRAM_OVERHEAD: usize = 64;
 
 impl Taken {
     fn is_empty(&self) -> bool {
@@ -264,6 +271,12 @@ fn drain(c: &mut Console) -> Taken {
     dev.receive(|bytes| {
         for &b in bytes {
             match decoder.push(b) {
+                Some((Input::Link, msg)) if grix_abi::link::is_datagram(msg) => {
+                    if taken.datagrams < MAX_HELD_DATAGRAMS {
+                        taken.datagrams += msg.len() + DATAGRAM_OVERHEAD;
+                        taken.link.push(msg.to_vec());
+                    }
+                }
                 Some((Input::Link, msg)) => taken.link.push(msg.to_vec()),
                 Some((Input::FsEvent, msg)) if taken.notices.len() < MAX_NOTICES => taken.notices.push(msg.to_vec()),
                 Some((Input::FsEvent, _)) => taken.lost = true,
