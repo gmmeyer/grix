@@ -431,13 +431,7 @@ impl Listener {
         if Listener::conflicts(addr, port, v6only) {
             return Err(Errno(98)); // EADDRINUSE
         }
-        let l = Arc::new(Mutex::new(Listener {
-            port,
-            addr,
-            v6only,
-            queue: VecDeque::new(),
-            version: 0,
-        }));
+        let l = Arc::new(Mutex::new(Listener { port, addr, v6only, queue: VecDeque::new(), version: 0 }));
         let mut listeners = LISTENERS.lock();
         let on = listeners.entry(port).or_default();
         on.retain(|w| w.strong_count() > 0);

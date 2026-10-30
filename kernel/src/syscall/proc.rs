@@ -221,7 +221,8 @@ fn read_strings(
         if s == 0 {
             return Ok(out);
         }
-        let arg = read_cstr(&mut p.aspace, s, process::MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
+        let arg =
+            read_cstr(&mut p.aspace, s, process::MAX_ARGS).map_err(|e| if e == ENAMETOOLONG { E2BIG } else { e })?;
         *total += arg.len() + 1 + 8;
         if *total > process::MAX_ARGS {
             return Err(E2BIG);
