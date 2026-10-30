@@ -108,6 +108,45 @@ fn parent_in(p: &mut Process, base: Ino, path: &str) -> Result<(Ino, String), Er
     r
 }
 
+/// Is what call `n` (one `fs_write` gates) would change on a read-only
+/// live mount? Then it's EROFS, as a read-only filesystem answers, and
+/// no denial: `fs_write` wouldn't change it. Only the place named counts
+/// (the node, or the directory a name would go in), looked up quietly;
+/// anything else, or a path that doesn't resolve, is for the gate.
+pub(super) fn read_only_target(p: &mut Process, n: u32, a: [u64; 6]) -> bool {
+    let at = AT_FDCWD as i64 as u64;
+    // (dirfd, path) pairs to look at; a path of 0 means the descriptor.
+    let places: [(u64, u64); 2] = match n {
+        nr::unlinkat | nr::mknodat | nr::fchmodat | nr::fchownat | nr::fchmodat2 | nr::utimensat => {
+            [(a[0], a[1]), (a[0], a[1])]
+        }
+        nr::renameat | nr::renameat2 => [(a[0], a[1]), (a[2], a[3])],
+        nr::linkat => [(a[2], a[3]), (a[2], a[3])],
+        nr::symlinkat => [(a[1], a[2]), (a[1], a[2])],
+        nr::truncate | nr::setxattr | nr::lsetxattr | nr::removexattr | nr::lremovexattr => [(at, a[0]), (at, a[0])],
+        nr::fchmod | nr::fchown | nr::fsetxattr | nr::fremovexattr => [(a[0], 0), (a[0], 0)],
+        #[cfg(target_arch = "x86_64")]
+        nr::rmdir | nr::unlink | nr::chmod | nr::chown | nr::lchown | nr::mknod => [(at, a[0]), (at, a[0])],
+        #[cfg(target_arch = "x86_64")]
+        nr::rename => [(at, a[0]), (at, a[1])],
+        #[cfg(target_arch = "x86_64")]
+        nr::link | nr::symlink => [(at, a[1]), (at, a[1])],
+        _ => return false,
+    };
+    places.iter().any(|&(dirfd, pathp)| {
+        if pathp == 0 {
+            return fd_node(p, dirfd).is_ok_and(|ino| fs::lock().read_only(ino));
+        }
+        let Ok(path) = read_cstr(&mut p.aspace, pathp, PATH_MAX) else { return false };
+        let Ok(base) = base_of(p, dirfd, &path) else { return false };
+        let mut fs = fs::lock();
+        match fs.lookup_parent(base, &path) {
+            Ok((dir, name)) => fs.read_only(dir) || fs.child_of(dir, &name).is_some_and(|ino| fs.read_only(ino)),
+            Err(_) => false,
+        }
+    })
+}
+
 /// A file's node for *at(fd, "", AT_EMPTY_PATH) and f* calls.
 pub(super) fn fd_node(p: &Process, fd: u64) -> Result<Ino, Errno> {
     if fd as i32 == AT_FDCWD {
@@ -216,6 +255,15 @@ fn need_write(p: &mut Process, n: u32, path: &str) -> Result<(), Errno> {
     require(p, n, Capability::FsWrite, path)
 }
 
+/// `need_write` for a change in directory `dir`, which on a read-only
+/// live mount is EROFS whatever the policy says (`read_only_target`).
+fn need_write_in(p: &mut Process, n: u32, dir: Option<Ino>, path: &str) -> Result<(), Errno> {
+    if dir.is_some_and(|d| fs::lock().read_only(d)) {
+        return Err(EROFS);
+    }
+    need_write(p, n, path)
+}
+
 pub fn openat(p: &mut Process, dirfd: u64, pathp: u64, flags: u64, mode: u64) -> SysResult {
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     open(p, nr::openat, dirfd, &path, flags as u32, mode as u32, 0)
@@ -316,7 +364,8 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         if acc == O_RDONLY {
             return Err(EINVAL);
         }
-        need_write(p, n, path)?;
+        let dir = fs::lock().lookup_in(base, path, true, &scope).ok();
+        need_write_in(p, n, dir, path)?;
         let (ino, content) = {
             let mut fs = fs::lock();
             let dir = fs.lookup_in(base, path, true, &scope)?;
@@ -356,7 +405,8 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             if flags & O_DIRECTORY != 0 {
                 return Err(EINVAL);
             }
-            need_write(p, n, path)?;
+            let dir = fs::lock().lookup_parent_in(base, path, &scope).ok().map(|(d, _)| d);
+            need_write_in(p, n, dir, path)?;
             match create_file(p, base, path, perm, 0, &scope) {
                 Ok(ino) => (ino, true),
                 // Made meanwhile, on a live mount's host: open that one.
@@ -1684,7 +1734,7 @@ pub fn mkdirat(p: &mut Process, dirfd: u64, pathp: u64, mode: u64) -> SysResult 
     if matches!(name.as_str(), "" | "." | "..") || fs::lock().child_of(dir, &name).is_some() {
         return Err(EEXIST);
     }
-    need_write(p, nr::mkdirat, &path)?;
+    need_write_in(p, nr::mkdirat, Some(dir), &path)?;
     let perm = mode as u32 & 0o1777 & !p.umask();
     fs::lock().create(dir, &name, Kind::Dir(alloc::collections::BTreeMap::new()), perm, p.uid, p.gid).map(|_| 0)
 }

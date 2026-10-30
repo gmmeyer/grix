@@ -1422,6 +1422,50 @@ fn live_mount_works_on_the_host_directory() {
 }
 
 #[test]
+fn read_only_mounts_without_fs_write() {
+    // A read-only mount is EROFS for every change, as Linux's read-only
+    // filesystems are, with fs_write or without: no "needs fs_write"
+    // denial, which granting it wouldn't answer. Elsewhere it's still one.
+    let host = temp_dir("ro-mount");
+    std::fs::write(host.join("a.txt"), "a\n").unwrap();
+    std::fs::create_dir(host.join("sub")).unwrap();
+    let b = Sandbox::builder()
+        .import(fixture("alpine/bin/busybox.static"), "/bin/busybox")
+        .unwrap()
+        .mount_read_only(&host, "/work")
+        .unwrap()
+        .allow(Capability::Process);
+    let changes = [
+        "rm /work/a.txt",
+        "rmdir /work/sub",
+        "mkdir /work/new",
+        "touch /work/new",
+        "touch /work/a.txt",
+        "mv /work/a.txt /work/b.txt",
+        "chmod 600 /work/a.txt",
+        "chown 0 /work/a.txt",
+        "ln -s x /work/link",
+        "ln /work/a.txt /work/hard",
+        "truncate -s 0 /work/a.txt",
+    ];
+    let script: String =
+        changes.iter().map(|c| format!("/bin/busybox {c} 2>&1 | /bin/busybox grep -c 'Read-only' ; ")).collect();
+    let out =
+        run(b, &["/bin/busybox", "sh", "-c", &format!("{script} echo > /work/x.txt; /bin/busybox mkdir /elsewhere")]);
+    assert_eq!(out.stdout_str(), "1\n".repeat(changes.len()), "{}", out.stderr_str());
+    assert!(out.stderr_str().contains("/work/x.txt: Read-only file system"), "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(1));
+    assert_eq!(
+        out.events,
+        [GuestEvent::Denied { syscall: "mkdirat".into(), capability: "fs_write".into(), detail: "/elsewhere".into() }]
+    );
+    assert_eq!(std::fs::read_to_string(host.join("a.txt")).unwrap(), "a\n");
+    let names: Vec<_> = std::fs::read_dir(&host).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    std::fs::remove_dir_all(&host).unwrap();
+}
+
+#[test]
 fn inotify_sees_changes_made_on_the_host() {
     use std::os::unix::fs::PermissionsExt;
     let host = temp_dir("watch");

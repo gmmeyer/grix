@@ -82,7 +82,7 @@ pub fn handle(tf: &mut TrapFrame) {
     // were (Linux's syscall_rollback): no result to set.
     let mut trapped = false;
     let result = match u32::try_from(n) {
-        Ok(n) => match gate(p, n) {
+        Ok(n) => match gate(p, n, a) {
             Err(e) => Err(e),
             Ok(()) => match crate::seccomp::verdict(p, n, a, tf.pc()) {
                 Verdict::Allow => dispatch(p, tf, n, a),
@@ -161,11 +161,13 @@ pub(crate) fn require(p: &mut Process, n: u32, cap: Capability, detail: &str) ->
 /// The policy's gate for call `n`. It comes before any seccomp filter:
 /// what the policy refuses is denied (and reported) whatever the
 /// program's filters say.
-fn gate(p: &mut Process, n: u32) -> Result<(), Errno> {
+fn gate(p: &mut Process, n: u32, a: [u64; 6]) -> Result<(), Errno> {
     let (name, gate) = table::info(n);
     match gate {
         Gate::Core => Ok(()),
         Gate::Cap(cap) if p.policy.allows(cap) => Ok(()),
+        // A read-only live mount is read-only whatever the policy says.
+        Gate::Cap(Capability::FsWrite) if file::read_only_target(p, n, a) => Err(EROFS),
         Gate::Cap(cap) => p.deny(n, name, cap.name(), "").map(|_| ()),
         Gate::Privileged => p.deny(n, name, "privileged", "").map(|_| ()),
     }
