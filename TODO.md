@@ -588,11 +588,20 @@ up without CAP_SYS_RESOURCE would do.
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
 - [~] `mincore`; accept the remaining `madvise` advice values.
       `mincore` works.
-- [ ] Free empty page-table pages on munmap.
+- [x] Free empty page-table pages on munmap. `PageTable::prune`, after
+      `arch::flush_tables` (TLBI VAE1IS on arm64, every level; INVLPG or a
+      CR3 load on x86_64). A page touched in each of 2000 2 MiB regions
+      left 8 MB of tables behind; now MemFree comes all the way back
+      (`many_mappings`). MAP_FIXED over a mapping keeps them.
 - [x] Bound kernel memory a program can tie up. Pipe buffers, netlink
       replies, /proc contents, queued RT signals, mappings and inotify
       watches all hit an errno before the heap runs out (kmem.rs).
-- [ ] `find_free` (mmap without a hint) is O(n) in the number of mappings.
+- [x] `find_free` (mmap without a hint) is O(n) in the number of mappings.
+      It starts at `AddressSpace::free_hint` unless a stretch above it
+      might fit (`free_hole`: Linux 2.6's free_area_cache and
+      cached_hole_size); removing a mapping above the hint raises it.
+      With 20000 mappings the last thousand mmaps took 41 ms (the first
+      thousand 0.9 ms); now 0.27 ms both (`manymaps` fixture).
 
 ## Binary compatibility
 

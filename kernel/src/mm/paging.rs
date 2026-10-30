@@ -1,6 +1,8 @@
 //! 4-level, 4 KiB-granule page tables for user address spaces (the entries'
 //! format is `arch::pte`'s).
 
+use alloc::vec::Vec;
+
 use super::{PAGE_SIZE, frame, p2v};
 use crate::arch;
 
@@ -109,6 +111,18 @@ impl PageTable {
         }
     }
 
+    /// Take out the tables under the root that cover part of `[start,
+    /// end)` and map nothing now, and return them ((table, an address it
+    /// covered)): the caller frees them once no TLB or walk cache can
+    /// lead to them (`arch::flush_tables`).
+    pub fn prune(&mut self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut gone = Vec::new();
+        if start < end {
+            prune(self.root, 0, 0, start, end, &mut gone);
+        }
+        gone
+    }
+
     /// Call `f(va, pte)` for every valid leaf entry in `[start, end)`,
     /// skipping unpopulated subtrees.
     pub fn for_each_mapped(&mut self, start: u64, end: u64, mut f: impl FnMut(u64, *mut u64)) {
@@ -135,6 +149,27 @@ impl Drop for PageTable {
             frame::free(table);
         }
         free_level(self.root, 0);
+    }
+}
+
+/// `PageTable::prune` below `table` (at `level`, covering from `base`).
+fn prune(table: u64, level: u32, base: u64, start: u64, end: u64, gone: &mut Vec<(u64, u64)>) {
+    let shift = 39 - 9 * level;
+    let span = 1u64 << shift;
+    let lo = (start.max(base) - base) >> shift;
+    let hi = ((end - 1).min(base + 512 * span - 1) - base) >> shift;
+    for idx in lo..=hi {
+        let e = entry(table, idx);
+        let v = unsafe { *e };
+        if v & VALID == 0 || level == 3 {
+            continue;
+        }
+        let (next, va) = (v & ADDR_MASK, base + idx * span);
+        prune(next, level + 1, va, start, end, gone);
+        if (0..512).all(|i| unsafe { *entry(next, i) } & VALID == 0) {
+            unsafe { *e = 0 };
+            gone.push((next, va));
+        }
     }
 }
 

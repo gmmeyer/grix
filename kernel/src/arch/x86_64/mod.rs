@@ -746,6 +746,17 @@ fn flush_ipi() {
 
 /// With the kernel lock, before any user memory: the flushes asked of
 /// this CPU that it missed while it couldn't take their IPI.
+/// The tables that covered `vas` (one address each) are out of `root`:
+/// no TLB or paging-structure cache may lead to them before they're
+/// freed. An INVLPG of an address drops the paging-structure caches'
+/// entries for it too, and a CR3 load all of them, so `flush_tlb` over
+/// the addresses does.
+pub fn flush_tables(root: u64, vas: &[u64]) {
+    if let (Some(&lo), Some(&hi)) = (vas.iter().min(), vas.iter().max()) {
+        flush_tlb(root, lo, hi + 4096);
+    }
+}
+
 pub fn tlb_sync() {
     let me = cpu_number() % MAX_CPUS;
     let want = WANTED[me].load(Ordering::SeqCst);

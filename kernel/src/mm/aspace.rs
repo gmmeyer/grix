@@ -258,6 +258,14 @@ pub struct AddressSpace {
     /// top-down from `mmap_top`, a gap below it.
     stack_size: u64,
     mmap_top: u64,
+    /// Where `find_free` starts looking, so mmap without a hint doesn't
+    /// pass every mapping each time (Linux 2.6's free_area_cache and
+    /// cached_hole_size): no free stretch between `free_hint` and
+    /// `mmap_top` is longer than `free_hole`, so a longer one is below
+    /// `free_hint` or nowhere. Removing a mapping that reaches above
+    /// `free_hint` raises it past the space freed (`carve`).
+    free_hint: u64,
+    free_hole: u64,
 }
 
 impl Drop for AddressSpace {
@@ -282,6 +290,8 @@ impl AddressSpace {
             brk: 0,
             stack_size: 0,
             mmap_top: 0,
+            free_hint: 0,
+            free_hole: 0,
         };
         a.set_stack(STACK_SIZE);
         Some(a)
@@ -291,6 +301,8 @@ impl AddressSpace {
     pub fn set_stack(&mut self, size: u64) {
         self.stack_size = size;
         self.mmap_top = STACK_TOP - size - STACK_GAP;
+        // Look from the top again.
+        (self.free_hint, self.free_hole) = (self.mmap_top, 0);
     }
 
     /// The stack's lowest address.
@@ -492,21 +504,34 @@ impl AddressSpace {
         start < end && end <= USER_TOP && self.vmas.range(..end).next_back().is_none_or(|(_, v)| v.end <= start)
     }
 
-    /// Highest free `len`-byte range below `mmap_top`.
-    pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut end = self.mmap_top;
-        for (_, v) in self.vmas.range(..self.mmap_top).rev() {
-            if v.end <= end && end - v.end >= len {
-                return Some(end - len);
+    /// Highest free `len`-byte range below `mmap_top`: from `free_hint`
+    /// unless a stretch above it might be long enough.
+    pub fn find_free(&mut self, len: u64) -> Option<u64> {
+        let (mut end, mut hole) =
+            if len > self.free_hole { (self.free_hint, self.free_hole) } else { (self.mmap_top, 0) };
+        let mut found = None;
+        for (_, v) in self.vmas.range(..end).rev() {
+            if v.end <= end {
+                if end - v.end >= len {
+                    found = Some(end - len);
+                    break;
+                }
+                hole = hole.max(end - v.end);
             }
             end = end.min(v.start);
         }
-        (end >= MMAP_BOTTOM + len).then(|| end - len)
+        let at = found.or_else(|| (end >= MMAP_BOTTOM + len).then(|| end - len))?;
+        // The next look starts above what it's given (a caller may not map
+        // it after all), and every stretch it passed was shorter than `len`.
+        (self.free_hint, self.free_hole) = (at + len, hole);
+        Some(at)
     }
 
     /// Insert a mapping, replacing anything already in its range (MAP_FIXED semantics).
     pub fn map(&mut self, vma: Vma) {
-        self.unmap(vma.start, vma.end);
+        // (Its tables stay: it's about to use them.)
+        self.carve(vma.start, vma.end);
+        self.discard(vma.start, vma.end);
         self.vmas.insert(vma.start, vma);
         self.recount();
     }
@@ -514,6 +539,12 @@ impl AddressSpace {
     /// Remove `[start, end)` from the VMA set without touching pages.
     /// Returns the removed pieces in ascending order.
     fn carve(&mut self, start: u64, end: u64) -> Vec<Vma> {
+        // Space freed above `free_hint`: past it, to where the next mapping
+        // up begins (`find_free`).
+        if end > self.free_hint {
+            let next = self.vmas.range(end..).next().map_or(self.mmap_top, |(&s, _)| s);
+            self.free_hint = self.free_hint.max(next.min(self.mmap_top));
+        }
         let keys: Vec<u64> = self.vmas.range(..end).rev().take_while(|(_, v)| v.end > start).map(|(k, _)| *k).collect();
         let mut removed = Vec::with_capacity(keys.len());
         for k in keys.into_iter().rev() {
@@ -529,10 +560,19 @@ impl AddressSpace {
         removed
     }
 
-    /// munmap: drop mappings and free their pages.
+    /// munmap: drop mappings and free their pages, and the page tables
+    /// that map nothing now.
     pub fn unmap(&mut self, start: u64, end: u64) {
         self.carve(start, end);
         self.discard(start, end);
+        let gone = self.pt.prune(start, end);
+        if !gone.is_empty() {
+            let vas: Vec<u64> = gone.iter().map(|&(_, va)| va).collect();
+            arch::flush_tables(self.pt.root, &vas);
+            for (table, _) in gone {
+                frame::free(table);
+            }
+        }
         self.recount();
     }
 

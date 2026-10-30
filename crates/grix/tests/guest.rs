@@ -2172,6 +2172,29 @@ fn id_registers_from_user_mode() {
 }
 
 #[test]
+fn many_mappings() {
+    // 20000 mappings: mmap without a hint finds the highest hole that fits
+    // without passing each of them (`AddressSpace::free_hint`), and munmap
+    // gives back the page tables it emptied.
+    let out = run(with("manymaps").memory_mb(512), &["/bin/manymaps"]);
+    assert_eq!(out.stdout_str(), "mappings ok\npage tables ok\n", "{}\n{}", out.stderr_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // The last thousand cost about what the first did (they took 40 times
+    // as long passing every mapping).
+    let us: Vec<u64> = out
+        .stderr_str()
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    let [_, first, _, last] = us[..] else { panic!("{}", out.stderr_str()) };
+    assert!(last < first * 5 + 2000, "{}", out.stderr_str());
+}
+
+#[test]
 fn futex_waitv_waits_on_several_words() {
     // futex_waitv: the index of the word that woke it, requeues, absolute
     // deadlines on either clock, EINTR from a handler, and EINVAL for

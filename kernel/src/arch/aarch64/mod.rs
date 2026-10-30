@@ -695,6 +695,24 @@ pub fn flush_tlb(_root: u64, start: u64, end: u64) {
     unsafe { asm!("dsb ish", "isb") };
 }
 
+/// The tables that covered `vas` (one address each) are out of `root`:
+/// no TLB or walk cache may lead to them before they're freed. TLBI
+/// VAE1IS drops every level's entries for an address, where `flush_tlb`'s
+/// VALE1IS drops only the last.
+pub fn flush_tables(_root: u64, vas: &[u64]) {
+    crate::smp::note(crate::smp::Stat::Flush, 1);
+    if vas.len() as u64 > FLUSH_PAGES {
+        unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb") };
+        return;
+    }
+    // SAFETY: TLB maintenance; the tables' entries were cleared first.
+    unsafe { asm!("dsb ishst") };
+    for &va in vas {
+        unsafe { asm!("tlbi vae1is, {}", in(reg) (va >> 12) & ((1 << 44) - 1)) };
+    }
+    unsafe { asm!("dsb ish", "isb") };
+}
+
 /// Flushes another CPU asked for and this one missed: none (`flush_tlb`
 /// broadcasts).
 pub fn tlb_sync() {}
