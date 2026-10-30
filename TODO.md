@@ -369,7 +369,12 @@ Left, none of it a way out of the sandbox:
       grix images (`from = "image:FILE"`), and a cache of applied bases and
       of build steps (`--no-cache`).
 - [x] A Docker image of grix itself (`Dockerfile`): static `grix` and
-      `grix-vmm`, FROM scratch, run with `--device /dev/kvm`.
+      `grix-vmm`, FROM scratch, run with `--device /dev/kvm`. Its
+      `kvm-optional` target adds QEMU, and emulates without KVM.
+- [x] Kubernetes without KubeVirt (`examples/kubernetes`): pods get
+      `/dev/kvm` from a device plugin (generic-device-plugin, unprivileged):
+      `devic.es/kvm` only on nodes with KVM, or `devic.es/kvm-optional` on
+      every node, with `/dev/kvm` where there is one (for `kvm-optional`).
 
 ## Processes and exec
 

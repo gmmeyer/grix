@@ -95,7 +95,8 @@ kernel in its own VMM, `grix-vmm` (Hypervisor.framework or KVM, no QEMU
 needed): an arm64 guest on an arm64 host, an x86_64 guest on an x86
 host. A run that boots, runs a program and exits takes
 about 0.1 s. Elsewhere it uses QEMU, with its emulator if the host can't
-virtualize arm64. `GRIX_ACCEL=tcg|hvf|kvm` chooses QEMU with that
+virtualize the guest (and `grix run` says so when that's for want of
+`/dev/kvm`). `GRIX_ACCEL=tcg|hvf|kvm` chooses QEMU with that
 accelerator, and `GRIX_VMM=PATH|qemu` picks the VMM. A Node script that
 boots, starts a worker thread and exits takes about 0.9s with HVF, 9s
 emulated.
@@ -513,7 +514,7 @@ guest makes up is `other`), so no program can make the series grow.
 ### In a container
 
 `grix run` can be a container's command, as for a server in Kubernetes
-(the container needs `/dev/kvm`; see the `Dockerfile`):
+(the `Dockerfile` makes grix's image):
 
 ```sh
 grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threads --image app.grix
@@ -530,6 +531,48 @@ grix run --timeout 0 --metrics 0.0.0.0:9090 -p 0.0.0.0:8080:8000 -a net -a threa
   failed).
 - The container's memory limit needs room for the guest's (`--mem`, 512
   MiB by default) and grix's own.
+- The image (FROM scratch: grix, grix-vmm and the kernels) runs the
+  machine on KVM, so the container needs `/dev/kvm` (`docker run --device
+  /dev/kvm`).
+- Where there may be no KVM, the `Dockerfile`'s `kvm-optional` target
+  (`docker build --target kvm-optional -t grix:kvm-optional .`) adds
+  QEMU: grix uses KVM when the container has `/dev/kvm`, and emulates the
+  machine when it doesn't, saying so (`grix: no KVM ...`; `GRIX_ACCEL=tcg`
+  chooses emulation, without the notice). Emulated, it boots as quickly,
+  but programs run 20–40× slower than natively (a Python loop 20×,
+  Node's startup 30×), and QEMU doesn't count its emulator as a security
+  boundary, so the container is the boundary to rely on.
+
+### In Kubernetes
+
+There's no need for KubeVirt: grix's VM runs inside an ordinary pod,
+and the pod only needs `/dev/kvm`, which a device plugin provides.
+`examples/kubernetes` has one, and a Deployment whose pods ask for it:
+
+```sh
+kubectl apply -f examples/kubernetes/kvm-device-plugin.yaml   # once per cluster
+kubectl apply -f examples/kubernetes/grix.yaml                # with your image in it
+```
+
+- `kvm-device-plugin.yaml` runs squat/generic-device-plugin on every node,
+  unprivileged. A pod chooses with its image and limits:
+
+  | image | limit | runs on | gets |
+  |---|---|---|---|
+  | `grix` | `devic.es/kvm: 1` (`grix.yaml`'s) | only nodes with KVM (Pending where there are none) | `/dev/kvm` |
+  | `grix:kvm-optional` | `devic.es/kvm-optional: 1` | any node | `/dev/kvm` if the node has it, and grix emulates if not |
+  | `grix:kvm-optional` | none (and `GRIX_ACCEL=tcg`) | any node, with no device plugin | emulation |
+
+  Either way the pod gets no other device of the node's, so it needn't be
+  privileged: `grix.yaml`'s has no capabilities and a read-only root
+  (`GRIX_CACHE` on an `emptyDir`). A privileged pod with a `hostPath` of
+  `/dev/kvm` works too, but then the pod has the whole node.
+- Nodes with KVM are bare-metal machines, or VMs with nested
+  virtualization, which most clouds offer only on some machine types. In
+  a cluster with both kinds, nothing makes a `kvm-optional` pod prefer
+  the nodes with KVM.
+- grix listens on a published port before the program does, so make the
+  readiness probe ask the program (`httpGet`), not just open the port.
 
 ## Images
 
@@ -768,9 +811,12 @@ disk, and only the imported files in its memory. The guest kernel's policy
 checks are what make the sandbox *least privilege* and *observable*, but they
 aren't the only wall.
 
-Where it runs (arm64 macOS and Linux), the VMM is grix's own: small, and
-confined itself, so a guest that escaped the hypervisor into it would
-still have no files or network. Elsewhere it's QEMU, which is large.
+Where it runs (arm64 macOS 15+, and Linux with KVM), the VMM is grix's own:
+small, and confined itself, so a guest that escaped the hypervisor into it
+would still have no files or network. Elsewhere it's QEMU, which is large.
+Without hardware virtualization there's no hypervisor either: QEMU's
+emulator (TCG) isn't a security boundary by QEMU's own account, so the
+walls are grix's kernel and whatever holds QEMU, such as a container.
 Either way, don't treat grix as hardened against a determined attacker yet:
 it hasn't had an outside security review.
 
@@ -857,7 +903,7 @@ kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat and 
   src/syscall/     Linux syscall table (+ capability gates) and implementations
 fixtures/          C (src/, built with zig) and Go (go/) test programs; build/ also gets Alpine runtimes
 tools/alpine.py    Alpine package resolver for building importable root filesystems
-examples/          example manifests
+examples/          example manifests, and Kubernetes manifests (kubernetes/)
 ```
 
 See [AGENTS.md](AGENTS.md) for contributor and agent guidelines.

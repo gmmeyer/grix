@@ -1,0 +1,97 @@
+# /dev/kvm for pods that ask for it, without KubeVirt: a device plugin
+# (squat/generic-device-plugin) on every node, offering two resources:
+#
+#   devic.es/kvm            only on nodes with /dev/kvm
+#   devic.es/kvm-optional   on every node, with /dev/kvm where there is one,
+#                           for grix:kvm-optional, which emulates the machine
+#                           where there isn't
+#
+# A pod with one of them in its limits (`devic.es/kvm: 1`) gets /dev/kvm and
+# nothing else of the node's: it needn't be privileged.
+#
+#   kubectl apply -f kvm-device-plugin.yaml
+#   kubectl get nodes -o custom-columns=NODE:.metadata.name,KVM:.status.allocatable.devic\\.es/kvm
+#
+# The plugin itself only lists the node's /dev, unprivileged; it registers
+# with the kubelet through its device-plugins directory.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kvm-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kvm-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvm-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kvm-device-plugin
+    spec:
+      automountServiceAccountToken: false
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+        effect: NoExecute
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: kvm-device-plugin
+        image: ghcr.io/squat/generic-device-plugin:0.2.0
+        # Any number of pods on a node can share /dev/kvm: count is how many.
+        args:
+        - --domain=devic.es
+        - --device
+        - |
+          name: kvm
+          groups:
+            - count: 1000
+              paths:
+                - path: /dev/kvm
+        # The plugin offers a device only where one of its paths is there:
+        # /dev/null (every container has it anyway) always is.
+        - --device
+        - |
+          name: kvm-optional
+          groups:
+            - count: 1000
+              paths:
+                - path: /dev/null
+                - path: /dev/kvm
+                  optional: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 10Mi
+          limits:
+            cpu: 50m
+            memory: 20Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        # Not in /dev, which is the node's, read-only.
+        terminationMessagePath: /termination-log
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        # It reports the node's paths to the kubelet, so they're at the same
+        # place here.
+        - name: dev
+          mountPath: /dev
+          readOnly: true
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+      - name: dev
+        hostPath:
+          path: /dev

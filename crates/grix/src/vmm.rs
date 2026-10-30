@@ -418,15 +418,27 @@ pub(crate) fn run(
     }
     let vmm = cfg.vmm.as_ref().unwrap_or(&cfg.qemu);
     let child = cmd.spawn().with_context(|| {
-        if cfg.vmm.is_none() {
-            // QEMU is the fallback; say what would have made it unnecessary.
-            format!(
-                "starting {} (grix runs its own VMM instead on arm64 macOS 15+, and on arm64 Linux with \
-                 /dev/kvm: in a container, pass --device /dev/kvm)",
+        if cfg.vmm.is_some() {
+            return format!("starting {}", vmm.display());
+        }
+        // QEMU is the fallback; say what would have made it unnecessary.
+        match crate::sandbox::kvm_error(cfg.arch) {
+            Some(e) => {
+                // Missing or not allowed is what a container without it sees.
+                let hint = match e.kind() {
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied => {
+                        "; in a container, pass --device /dev/kvm (in Kubernetes, ask a KVM device plugin \
+                         for it), or use grix's kvm-optional image, which emulates without: see the README"
+                    }
+                    _ => "",
+                };
+                format!("starting {} (grix runs its own VMM instead on KVM, but /dev/kvm: {e}{hint})", vmm.display())
+            }
+            None => format!(
+                "starting {} (grix runs its own VMM instead for the host's own architecture, on arm64 \
+                 macOS 15+ and on Linux with KVM)",
                 vmm.display()
-            )
-        } else {
-            format!("starting {}", vmm.display())
+            ),
         }
     })?;
     let mut child = ChildGuard::new(child);
