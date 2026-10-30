@@ -947,7 +947,7 @@ pub fn start(img: Image<'static>) -> ! {
     let argv = img.argv.iter().map(|s| String::from(*s)).collect();
     let envp: Vec<String> = img.envp.iter().map(|s| String::from(*s)).collect();
     let exe = search_path(cwd, img.exe, &envp);
-    let program = match load_program(&p, cwd, &exe, argv, envp) {
+    let program = match load_program(&p, Start::Path(cwd), &exe, argv, envp) {
         Ok(program) => program,
         Err(e) => fail(if e.errno == ENOENT { 127 } else { 126 }, &e.reason),
     };
@@ -967,6 +967,10 @@ pub fn start(img: Image<'static>) -> ! {
     crate::smp::unlock();
     arch::enter_user(entry, sp)
 }
+
+/// The heap an argument takes beyond its bytes: its `String` (Vecs leave
+/// room to grow) and the smallest allocation.
+pub const ARG_OVERHEAD: u64 = 2 * core::mem::size_of::<String>() as u64 + 16;
 
 /// Why a program couldn't be loaded: the errno execve returns, and the
 /// explanation reported for the first program.
@@ -994,12 +998,20 @@ pub struct Program {
     auxv: Vec<u64>,
 }
 
-/// Find `path` (relative to directory `base`), follow `#!` lines, and load
-/// the ELF and its interpreter into a new address space with the initial
-/// stack built. `p` is untouched, so a failure leaves it running.
+/// What execve starts from.
+pub enum Start {
+    /// A path, from this directory.
+    Path(Ino),
+    /// A file open at a descriptor (fexecve): `path` is only its name.
+    File { ino: Ino, content: fs::Content, cwd: Ino, reachable: bool },
+}
+
+/// Find what `start` and `path` name, follow `#!` lines, and load the ELF
+/// and its interpreter into a new address space with the initial stack
+/// built. `p` is untouched, so a failure leaves it running.
 pub fn load_program(
     p: &Process,
-    base: Ino,
+    start: Start,
     path: &str,
     argv: Vec<String>,
     envp: Vec<String>,
@@ -1007,10 +1019,13 @@ pub fn load_program(
     let landlock = crate::landlock::domain(p);
     let (exe, ino, src, argv) = {
         let mut fs = fs::lock();
-        resolve_interpreters(&mut fs, landlock.as_deref(), base, path, argv)?
+        resolve_interpreters(&mut fs, landlock.as_deref(), (p.uid, p.gid), start, path, argv)?
     };
-    let bytes = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
-    let args_charge = crate::kmem::Charge::new(bytes)
+    let bytes: u64 = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
+    // What they hold on the heap (`Process::argv`, the name): an empty
+    // string costs more than its byte, and execve takes 100,000 of them.
+    let held = bytes + (argv.len() + envp.len()) as u64 * ARG_OVERHEAD + exe.len() as u64;
+    let args_charge = crate::kmem::Charge::new(held)
         .map_err(|e| exec_error(e, "no kernel memory left for argv and environment".into()))?;
     let mut aspace = AddressSpace::new().ok_or_else(|| exec_error(ENOMEM, "out of memory".into()))?;
     // The stack is as big as RLIMIT_STACK lets it grow on Linux, with room
@@ -1152,22 +1167,34 @@ fn may_execute(
 fn resolve_interpreters(
     fs: &mut fs::Fs,
     landlock: Option<&crate::landlock::Domain>,
-    cwd: Ino,
+    (uid, gid): (u32, u32),
+    start: Start,
     path: &str,
     mut argv: Vec<String>,
 ) -> Result<(String, Ino, elf::Source, Vec<String>), ExecError> {
     let mut path = String::from(path);
+    let (cwd, mut opened, mut reachable) = match start {
+        Start::Path(base) => (base, None, true),
+        Start::File { ino, content, cwd, reachable } => (cwd, Some((ino, content)), reachable),
+    };
     for _ in 0..5 {
         let what = if argv.first().is_some_and(|a| *a == path) || argv.is_empty() { "program" } else { "interpreter" };
-        let ino = fs
-            .lookup(cwd, &path, true)
-            .map_err(|e| exec_error(e, alloc::format!("{what} {path} not found (was it imported?)")))?;
-        let node = fs.node(ino);
-        let src = match &node.kind {
-            Kind::File(c) if node.perm & 0o111 != 0 => elf::Source::of(c),
-            Kind::File(_) => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable"))),
-            _ => return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file"))),
+        let (ino, content) = match opened.take() {
+            Some((ino, content)) => (ino, Some(content)),
+            None => {
+                let ino = fs
+                    .lookup(cwd, &path, true)
+                    .map_err(|e| exec_error(e, alloc::format!("{what} {path} not found (was it imported?)")))?;
+                (ino, fs.content(ino).filter(|_| matches!(fs.node(ino).kind, Kind::File(_))))
+            }
         };
+        let Some(content) = content else {
+            return Err(exec_error(EACCES, alloc::format!("{what} {path} is not a regular file")));
+        };
+        if !fs.permits(ino, uid, gid, fs::MAY_EXEC) {
+            return Err(exec_error(EACCES, alloc::format!("{what} {path} is not executable")));
+        }
+        let src = elf::Source::of(&content);
         may_execute(fs, landlock, ino, cwd, &path)?;
         // Linux reads at most this much of the #! line.
         let mut buf = [0u8; 256];
@@ -1192,6 +1219,13 @@ fn resolve_interpreters(
             continue;
         }
         let Some(rest) = head.strip_prefix(b"#!") else { return Ok((fs.path_of(ino), ino, src, argv)) };
+        if !reachable {
+            return Err(exec_error(
+                ENOENT,
+                alloc::format!("{path}: a close-on-exec script can't be read by its #! line"),
+            ));
+        }
+        reachable = true;
         let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
         let line = core::str::from_utf8(&line[..line.len().min(254)])
             .map_err(|_| exec_error(ENOEXEC, alloc::format!("{path}: invalid #! line")))?

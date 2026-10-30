@@ -457,7 +457,10 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         }
         let file = new_file(FileKind::Node(ino), O_RDONLY);
         let mut f = file.lock();
-        (f.path_only, f.pin) = (true, Some(fs::lock().pin(ino)));
+        // Its contents too: execveat can run it once it's unlinked.
+        let fs = fs::lock();
+        (f.path_only, f.pin, f.content) = (true, Some(fs.pin(ino)), fs.content(ino));
+        drop(fs);
         drop(f);
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }

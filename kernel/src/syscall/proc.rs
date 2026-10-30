@@ -206,7 +206,12 @@ pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
 const MAX_ARGS: usize = 1 << 20;
 
 /// Read a NULL-terminated array of strings (argv, envp).
-fn read_strings(p: &mut Process, mut ptr: u64, total: &mut usize) -> Result<Vec<String>, Errno> {
+fn read_strings(
+    p: &mut Process,
+    mut ptr: u64,
+    total: &mut usize,
+    held: &mut crate::kmem::Charge,
+) -> Result<Vec<String>, Errno> {
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
@@ -221,8 +226,30 @@ fn read_strings(p: &mut Process, mut ptr: u64, total: &mut usize) -> Result<Vec<
         if *total > MAX_ARGS {
             return Err(E2BIG);
         }
+        // Megabytes of small strings, before `load_program` charges them.
+        held.resize(held.bytes() + arg.len() as u64 + process::ARG_OVERHEAD)?;
+        out.try_reserve(1).map_err(|_| ENOMEM)?;
         out.push(arg);
         ptr += 8;
+    }
+}
+
+/// The file open at `fd`, O_PATH or not, for execveat: EACCES for what
+/// isn't a regular file, as do_open_execat.
+fn open_program(p: &Process, fd: u64) -> Result<process::Start, Errno> {
+    if fd as i32 == crate::syscall::AT_FDCWD {
+        return Err(EACCES);
+    }
+    let file = p.fds.get_raw(fd)?;
+    let f = file.lock();
+    match (&f.kind, &f.content) {
+        (FileKind::Node(ino), Some(content)) => {
+            // A script's interpreter couldn't get at the file (Linux's
+            // BINPRM_FLAGS_PATH_INACCESSIBLE).
+            let reachable = !p.fds.cloexec(fd)?;
+            Ok(process::Start::File { ino: *ino, content: content.clone(), cwd: p.cwd(), reachable })
+        }
+        _ => Err(EACCES),
     }
 }
 
@@ -244,26 +271,31 @@ pub fn execve(
     }
     let path = read_cstr(&mut p.aspace, pathp, PATH_MAX)?;
     let mut total = 0;
-    let argv = read_strings(p, argv, &mut total)?;
-    let envp = read_strings(p, envp, &mut total)?;
-    let (base, path) = if path.is_empty() {
+    let mut held = crate::kmem::Charge::default();
+    let argv = read_strings(p, argv, &mut total, &mut held)?;
+    let envp = read_strings(p, envp, &mut total, &mut held)?;
+    let program = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
         }
-        // fexecve: the file open at dirfd.
-        let ino = super::file::fd_node(p, dirfd)?;
-        (crate::fs::ROOT, crate::fs::lock().path_of(ino))
+        // fexecve: the file open at dirfd, whatever its name leads to now.
+        // Scripts get to their own text by /dev/fd/N (Linux's name for it).
+        let start = open_program(p, dirfd)?;
+        process::load_program(p, start, &alloc::format!("/dev/fd/{}", dirfd as i32), argv, envp).map_err(|e| e.errno)?
     } else {
-        (super::file::base_of(p, dirfd, &path)?, path)
-    };
-    let program = match process::load_program(p, base, &path, argv, envp) {
-        Ok(program) => program,
-        Err(e) => {
+        let base = super::file::base_of(p, dirfd, &path)?;
+        // O_NOFOLLOW's ELOOP, as do_open_execat.
+        let link =
+            |fs: &mut crate::fs::Fs| fs.lookup(base, &path, false).is_ok_and(|ino| fs.link_target(ino) != Err(EINVAL));
+        if flags & AT_SYMLINK_NOFOLLOW != 0 && link(&mut crate::fs::lock()) {
+            return Err(ELOOP);
+        }
+        process::load_program(p, process::Start::Path(base), &path, argv, envp).map_err(|e| {
             if e.errno == ENOENT {
                 p.missing_path(base, &path);
             }
-            return Err(e.errno);
-        }
+            e.errno
+        })?
     };
     // Other CPUs running threads of this process, in the address space
     // about to go, leave it first (see `smp`); the call then runs again.
