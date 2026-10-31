@@ -582,6 +582,34 @@ fn get(port: u16, path: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Node's fs.watch hears what Node does to the sandbox's own files, and
+/// a real inotify client too.
+#[test]
+fn watching_the_sandboxs_own_files() {
+    let js = r#"
+const fs = require('fs');
+fs.mkdirSync('/tmp/w');
+const seen = new Set();
+const w = fs.watch('/tmp/w', (event, name) => {
+  seen.add(`${event} ${name}`);
+  if (seen.has('rename a.txt') && seen.has('change a.txt') && seen.has('rename b.txt')) {
+    w.close();
+    clearTimeout(give_up);
+    console.log([...seen].sort().join(', '));
+  }
+});
+const give_up = setTimeout(() => { console.log('heard only', [...seen]); process.exit(3); }, 30000);
+fs.writeFileSync('/tmp/w/a.txt', 'x');
+fs.appendFileSync('/tmp/w/a.txt', 'y');
+fs.renameSync('/tmp/w/a.txt', '/tmp/w/b.txt');
+"#;
+    let b = sandbox("node").allow(Capability::FsWrite);
+    let out = run(b, &["/usr/bin/node", "-e", js]);
+    assert_eq!(out.stdout_str(), "change a.txt, rename a.txt, rename b.txt\n", "{}", out.stderr_str());
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert_no_surprises(&out);
+}
+
 #[test]
 fn stdin_for_python_and_node() {
     let py = sandbox("python").env("PYTHONDONTWRITEBYTECODE", "1").build().unwrap();

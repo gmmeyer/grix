@@ -1071,6 +1071,10 @@ pub fn load_program(
         let mut fs = fs::lock();
         resolve_interpreters(&mut fs, landlock.as_deref(), p.who(), start, path, argv)?
     };
+    // As it's opened and read to be run, for inotify.
+    fs::opened(ino);
+    fs::accessed(ino);
+    fs::closed(ino, false, None);
     let bytes: u64 = argv.iter().chain(&envp).map(|s| s.len() as u64 + 1).sum();
     // What they hold on the heap (`Process::argv`, the name): an empty
     // string costs more than its byte, and execve takes 100,000 of them.

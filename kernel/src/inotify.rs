@@ -2,10 +2,11 @@
 //!
 //! Events come from the host, for live mounts' nodes (`grix_abi::hostfs`'s
 //! `Watch` and `Notice`): the first watch on a node asks the host to watch
-//! it, and the last one going tells it to stop. The guest's own changes
-//! to its other files make no events (yet), though changes it makes in a
-//! live mount do, since the host sees them. A lazy import never changes
-//! for the guest, so watching it asks nothing of the host.
+//! it, and the last one going tells it to stop. Changes the guest makes in
+//! a live mount come that way too, since the host sees them. Everything
+//! else is the guest's own, a lazy import's nodes included: `Fs` says what
+//! happens to them (`notify`), as Linux's fsnotify calls do. Nothing looks
+//! any further than `watched` until something's watched.
 //!
 //! Every event is charged to the kernel heap, and an instance queues at
 //! most `MAX_QUEUED` (Linux's max_queued_events): past that, one
@@ -15,7 +16,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use grix_abi::hostfs::{Notice, mask::*};
 use spin::Mutex;
 
@@ -104,6 +105,12 @@ pub struct Inotify(pub Arc<Mutex<State>>);
 
 /// Instances watching each node the host watches for us, once per watch.
 static REMOTE: Mutex<BTreeMap<u64, Vec<Weak<Mutex<State>>>>> = Mutex::new(BTreeMap::new());
+/// And each node whose changes are the guest's own to say.
+static LOCAL: Mutex<BTreeMap<Ino, Vec<Weak<Mutex<State>>>>> = Mutex::new(BTreeMap::new());
+/// Is anything in `LOCAL`? Every file operation asks.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+/// A rename's cookie, which pairs its two events (never 0).
+static COOKIE: AtomicU32 = AtomicU32::new(1);
 
 impl Inotify {
     pub fn new() -> Inotify {
@@ -161,6 +168,9 @@ impl Inotify {
                 })?;
             }
             REMOTE.lock().entry(id).or_default().push(Arc::downgrade(&self.0));
+        } else {
+            LOCAL.lock().entry(ino).or_default().push(Arc::downgrade(&self.0));
+            WATCHING.store(true, Ordering::Relaxed);
         }
         WATCHES.fetch_add(1, Ordering::Relaxed);
         st.next_wd = wd;
@@ -255,25 +265,25 @@ impl State {
         }
     }
 
-    /// A change the host saw in node `id`, for this instance's watches of
-    /// it. Returns the watches that ended (for `gone`).
-    fn deliver(&mut self, id: u64, n: &Notice) -> Vec<Watch> {
-        let wds: Vec<i32> = self.watches.iter().filter(|(_, w)| w.remote == Some(id)).map(|(&wd, _)| wd).collect();
+    /// A change, for this instance's `watched` watches: `mask` of `name`.
+    /// Returns the watches that ended (for `gone`).
+    fn deliver(&mut self, watched: impl Fn(&Watch) -> bool, mask: u32, cookie: u32, name: &str) -> Vec<Watch> {
+        let wds: Vec<i32> = self.watches.iter().filter(|(_, w)| watched(w)).map(|(&wd, _)| wd).collect();
         let mut ended = Vec::new();
         for wd in wds {
             let w = &self.watches[&wd];
-            // The host's own end of the watch: so it ends here too.
-            if n.mask & IN_IGNORED != 0 {
+            // The watch's end: the host's, or the node's.
+            if mask & IN_IGNORED != 0 {
                 self.push(Event { wd, mask: IN_IGNORED, cookie: 0, name: String::new() });
                 ended.extend(self.watches.remove(&wd));
                 continue;
             }
-            let wanted = n.mask & w.mask & IN_ALL_EVENTS != 0 || n.mask & IN_UNMOUNT != 0;
+            let wanted = mask & w.mask & IN_ALL_EVENTS != 0 || mask & IN_UNMOUNT != 0;
             if !wanted {
                 continue;
             }
             let oneshot = w.mask & IN_ONESHOT != 0;
-            self.push(Event { wd, mask: n.mask, cookie: n.cookie, name: n.name.to_string() });
+            self.push(Event { wd, mask, cookie, name: name.to_string() });
             if oneshot {
                 self.push(Event { wd, mask: IN_IGNORED, cookie: 0, name: String::new() });
                 ended.extend(self.watches.remove(&wd));
@@ -287,9 +297,10 @@ impl Drop for State {
     fn drop(&mut self) {
         for (_, w) in core::mem::take(&mut self.watches) {
             WATCHES.fetch_sub(1, Ordering::Relaxed);
-            if let Some(id) = w.remote {
-                // This instance's own entries are dead already.
-                unregister(id, |e| e.strong_count() == 0);
+            // This instance's own entries are dead already.
+            match w.remote {
+                Some(id) => unregister(id, |e| e.strong_count() == 0),
+                None => unregister_local(w.ino, |e| e.strong_count() == 0),
             }
         }
     }
@@ -310,13 +321,62 @@ fn unregister(id: u64, is: impl Fn(&Weak<Mutex<State>>) -> bool) {
     }
 }
 
+/// One of `ino`'s entries matching `is` goes.
+fn unregister_local(ino: Ino, is: impl Fn(&Weak<Mutex<State>>) -> bool) {
+    let mut local = LOCAL.lock();
+    let Some(list) = local.get_mut(&ino) else { return };
+    if let Some(i) = list.iter().position(is) {
+        list.remove(i);
+    }
+    if list.is_empty() {
+        local.remove(&ino);
+    }
+    WATCHING.store(!local.is_empty(), Ordering::Relaxed);
+}
+
 /// Watch `w` of instance `st` ended.
 fn gone(st: &Arc<Mutex<State>>, w: Watch) {
     WATCHES.fetch_sub(1, Ordering::Relaxed);
-    if let Some(id) = w.remote {
-        let me = Arc::downgrade(st);
-        unregister(id, |e| e.ptr_eq(&me));
+    let me = Arc::downgrade(st);
+    match w.remote {
+        Some(id) => unregister(id, |e| e.ptr_eq(&me)),
+        None => unregister_local(w.ino, |e| e.ptr_eq(&me)),
     }
+}
+
+/// Is anything watching what the guest changes itself?
+pub fn watched() -> bool {
+    WATCHING.load(Ordering::Relaxed)
+}
+
+/// A cookie for one rename's events.
+pub fn cookie() -> u32 {
+    COOKIE.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+/// `mask` happened to node `ino`, or to `name` in it (a file in a directory,
+/// `unlinked` if it has no name left, which IN_EXCL_UNLINK doesn't hear of).
+pub fn notify(ino: Ino, mask: u32, cookie: u32, name: &str, unlinked: bool) {
+    let instances: Vec<Arc<Mutex<State>>> =
+        LOCAL.lock().get(&ino).map_or_else(Vec::new, |l| l.iter().filter_map(Weak::upgrade).collect());
+    for s in &instances {
+        let heard = |w: &Watch| w.ino == ino && w.remote.is_none() && !(unlinked && w.mask & IN_EXCL_UNLINK != 0);
+        let ended = s.lock().deliver(heard, mask, cookie, name);
+        for w in ended {
+            gone(s, w);
+        }
+    }
+}
+
+/// How many watches keep node `ino`'s slot: it's held by nothing else.
+pub fn watches_of(ino: Ino) -> usize {
+    LOCAL.lock().get(&ino).map_or(0, Vec::len)
+}
+
+/// Node `ino` is gone at last: its watches end, whatever they asked for.
+pub fn deleted(ino: Ino) {
+    notify(ino, IN_DELETE_SELF, 0, "", false);
+    notify(ino, IN_IGNORED, 0, "", false);
 }
 
 /// Every instance watching anything through the host, once each.
@@ -361,7 +421,7 @@ pub fn from_host(msgs: &[Vec<u8>], lost: bool) {
             seen.push(s);
             let mut st = s.lock();
             let inos: Vec<Ino> = st.watches.values().filter(|w| w.remote == Some(n.id)).map(|w| w.ino).collect();
-            let ended = st.deliver(n.id, &n);
+            let ended = st.deliver(|w| w.remote == Some(n.id), n.mask, n.cookie, n.name);
             drop(st);
             for ino in inos {
                 crate::fs::host_changed(Some((ino, n.name)));
@@ -387,9 +447,8 @@ pub fn rewatch() {
         }
         let instances: Vec<Arc<Mutex<State>>> =
             REMOTE.lock().get(&id).map_or_else(Vec::new, |l| l.iter().filter_map(Weak::upgrade).collect());
-        let ignored = Notice { id, mask: IN_IGNORED, cookie: 0, name: "" };
         for s in &instances {
-            let ended = s.lock().deliver(id, &ignored);
+            let ended = s.lock().deliver(|w| w.remote == Some(id), IN_IGNORED, 0, "");
             for w in ended {
                 gone(s, w);
             }

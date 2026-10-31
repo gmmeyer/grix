@@ -209,6 +209,12 @@ impl Drop for OpenFile {
         if self.locked {
             crate::locks::release_all(crate::locks::Owner::File(self.id()));
         }
+        if let FileKind::Node(ino) = self.kind
+            && !self.path_only
+        {
+            let write = self.writable();
+            crate::fs::closed(ino, write, self.pin.take());
+        }
     }
 }
 

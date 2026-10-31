@@ -706,7 +706,9 @@ fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cl
     let mut f = file.lock();
     (f.content, f.pin, f.pinned, f.landlock_denied) = (content, Some(pin), pinned, denied);
     drop(f);
-    p.fds.alloc(FdEntry { file, cloexec }, 0)
+    let fd = p.fds.alloc(FdEntry { file, cloexec }, 0)?;
+    fs::opened(ino);
+    Ok(fd)
 }
 
 /// Create the regular file `path` (which doesn't exist). A dangling symlink
@@ -924,11 +926,14 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         }
         // Terminal nodes open as FileKind::Pty.
         FileKind::Dev(Dev::Ptmx | Dev::Pts(_) | Dev::Tty, _) => Err(ENXIO),
-        FileKind::Node(_) => match &f.content {
+        &FileKind::Node(ino) => match &f.content {
             Some(c) => {
                 let n = read_content(p, c, at.unwrap_or(f.offset), buf, count)?;
                 if at.is_none() {
                     f.offset += n;
+                }
+                if n > 0 {
+                    fs::accessed(ino);
                 }
                 Ok(n)
             }
@@ -1782,6 +1787,7 @@ pub fn getdents64(p: &mut Process, fd: u64, buf: u64, count: u64) -> SysResult {
     copy_out(&mut p.aspace, buf, &out)?;
     f.offset = pos;
     f.dir_pos = cursor;
+    fs::accessed(dir);
     Ok(out.len() as u64)
 }
 
@@ -2273,7 +2279,7 @@ const SENDFILE_CHUNK: u64 = 64 * 1024;
 /// pipe or FIFO, or a stream socket. Other destinations get EINVAL, which
 /// makes callers (Python's shutil, busybox) fall back to read and write.
 pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64) -> SysResult {
-    let (in_file, src, _) = fd_content(p, in_fd, false)?;
+    let (in_file, src, in_ino) = fd_content(p, in_fd, false)?;
     let start = match offset_arg(p, offp)? {
         Some(o) => o,
         None => in_file.lock().offset,
@@ -2350,6 +2356,9 @@ pub fn sendfile(p: &mut Process, out_fd: u64, in_fd: u64, offp: u64, count: u64)
     if blocked {
         return would_block(p, nonblock);
     }
+    if n > 0 {
+        fs::accessed(in_ino);
+    }
     if offp != 0 {
         write_u64(&mut p.aspace, offp, start + n)?;
     } else {
@@ -2370,7 +2379,7 @@ pub fn copy_file_range(
     if flags != 0 {
         return Err(EINVAL);
     }
-    let (in_file, src, _) = fd_content(p, in_fd, false)?;
+    let (in_file, src, in_ino) = fd_content(p, in_fd, false)?;
     let (out_file, dst, dino) = fd_content(p, out_fd, true)?;
     if out_file.lock().flags & O_APPEND != 0 {
         return Err(EBADF);
@@ -2383,6 +2392,9 @@ pub fn copy_file_range(
     }
     note_shared(p, nr::copy_file_range, &dst);
     let n = copy_contents(&src, soff, &dst, dino, doff, len)?;
+    if n > 0 {
+        fs::accessed(in_ino);
+    }
     if offin != 0 {
         write_u64(&mut p.aspace, offin, soff + n)?;
     } else {

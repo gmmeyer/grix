@@ -18,6 +18,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use grix_abi::hostfs::mask::{
+    IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF,
+    IN_MOVED_FROM, IN_MOVED_TO, IN_OPEN,
+};
 use grix_abi::hostfs::{Attr, FileType};
 use grix_abi::image::{Entry, EntryKind, LiveMount};
 use grix_abi::stats::{Limit, Resource};
@@ -26,6 +30,7 @@ use spin::{Mutex, MutexGuard};
 use crate::console::klog;
 use crate::errno::*;
 use crate::hostfs;
+use crate::inotify;
 use crate::mm::pageindex::PageIndex;
 use crate::mm::{PAGE_SIZE, frame, p2v};
 use crate::procfs::{self, ProcFile};
@@ -834,6 +839,8 @@ pub struct Node {
     /// A lazy import's node copied into the sandbox: the inode number it
     /// had as the host's (so it doesn't change).
     pub host_ino: u64,
+    /// A memfd: in no directory, whatever `parent` and `name` say.
+    pub anonymous: bool,
     /// Realtime nanoseconds.
     pub atime: u64,
     pub mtime: u64,
@@ -864,6 +871,7 @@ impl Node {
             remote: None,
             generated: false,
             host_ino: 0,
+            anonymous: false,
             atime: time,
             mtime: time,
             ctime: time,
@@ -1030,10 +1038,35 @@ enum Later {
     Task(u32, u32, bool),
     /// /dev/pts/N goes (its master closed).
     PtsHide(u32),
+    /// The last of an open file description of this node, for writing or
+    /// not, and what held it.
+    Closed(Ino, bool, Option<Arc<()>>),
 }
 
 static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
 static LATER_ANY: AtomicBool = AtomicBool::new(false);
+
+/// `ino` was read, for inotify.
+pub fn accessed(ino: Ino) {
+    if inotify::watched() {
+        lock().notify(ino, IN_ACCESS);
+    }
+}
+
+/// `ino` was opened, for inotify.
+pub fn opened(ino: Ino) {
+    if inotify::watched() {
+        lock().notify(ino, IN_OPEN);
+    }
+}
+
+/// An open file description of `ino` ended (`pin` was its hold on it). Out
+/// of whatever's dropping it, which may have the filesystem.
+pub fn closed(ino: Ino, write: bool, pin: Option<Arc<()>>) {
+    if inotify::watched() {
+        later(Later::Closed(ino, write, pin));
+    }
+}
 
 /// Do `what` to the filesystem now if it's free, or once it is.
 fn later(what: Later) {
@@ -1580,6 +1613,11 @@ impl Fs {
                 Later::Task(pid, tid, true) => self.task_show(pid, tid),
                 Later::Task(pid, tid, false) => self.task_hide(pid, tid),
                 Later::PtsHide(index) => self.pts_hide(index),
+                Later::Closed(ino, write, pin) => {
+                    self.notify(ino, if write { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE });
+                    drop(pin);
+                    self.notify_deleted(ino);
+                }
             }
         }
     }
@@ -2170,11 +2208,60 @@ impl Fs {
         let now = crate::time::realtime_ns();
         let n = &mut self.nodes[ino];
         (n.mtime, n.ctime) = (now, now);
+        self.notify(ino, IN_MODIFY);
     }
 
     /// A node's metadata changed (chmod, chown, utimensat).
     pub fn changed(&mut self, ino: Ino) {
         self.nodes[ino].ctime = crate::time::realtime_ns();
+        self.notify(ino, IN_ATTRIB);
+    }
+
+    /// Does the host say what happens to `ino`? (`inotify`.)
+    fn host_reports(&self, ino: Ino) -> bool {
+        self.nodes[ino].remote.as_ref().is_some_and(|r| !self.lazy[r.mount])
+    }
+
+    /// `mask` happened to `ino`, for watches of it and, by name, of its
+    /// directory: Linux's fsnotify_parent. (An O_TMPFILE file has no name,
+    /// and a memfd's are only for show.)
+    fn notify(&self, ino: Ino, mask: u32) {
+        if !inotify::watched() || self.host_reports(ino) {
+            return;
+        }
+        let n = &self.nodes[ino];
+        let mask = mask | if matches!(n.kind, Kind::Dir(_)) { IN_ISDIR } else { 0 };
+        if !n.name.is_empty() && n.parent != ino && !n.anonymous {
+            inotify::notify(n.parent, mask, 0, &n.name, n.nlink == 0);
+        }
+        inotify::notify(ino, mask, 0, "", false);
+    }
+
+    /// `mask` happened to `ino` itself, for watches of it alone.
+    fn notify_self(&self, ino: Ino, mask: u32) {
+        if inotify::watched() && !self.host_reports(ino) {
+            inotify::notify(ino, mask, 0, "", false);
+        }
+    }
+
+    /// `mask` happened to `name` in directory `dir`, `ino` now or until now.
+    fn notify_entry(&self, dir: Ino, mask: u32, cookie: u32, name: &str, ino: Ino) {
+        if inotify::watched() && !self.host_reports(dir) {
+            let isdir = if matches!(self.nodes[ino].kind, Kind::Dir(_)) { IN_ISDIR } else { 0 };
+            inotify::notify(dir, mask | isdir, cookie, name, false);
+        }
+    }
+
+    /// `ino` has no names left, and if nothing has it open it's gone.
+    fn notify_deleted(&self, ino: Ino) {
+        let n = &self.nodes[ino];
+        if inotify::watched()
+            && !self.host_reports(ino)
+            && n.nlink == 0
+            && Arc::strong_count(&n.pin) == 1 + inotify::watches_of(ino)
+        {
+            inotify::deleted(ino);
+        }
     }
 
     pub fn child_of(&mut self, dir: Ino, name: &str) -> Option<Ino> {
@@ -2285,6 +2372,7 @@ impl Fs {
         let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
         children.insert(name.into(), ino);
         self.touch_dir(dir);
+        self.notify_entry(dir, IN_CREATE, 0, name, ino);
         Ok(ino)
     }
 
@@ -2320,7 +2408,7 @@ impl Fs {
         // /proc/self/fd shows it as Linux does.
         let label = alloc::format!("memfd:{name} (deleted)");
         let mut node = Node::new(kind, 0o777, (who.uid, who.gid), ROOT, &label, crate::time::realtime_ns());
-        (node.nlink, node.changed) = (0, true);
+        (node.nlink, node.changed, node.anonymous) = (0, true, true);
         self.reclaim();
         charge(node.cost() + label.len() as u64)?;
         let ino = self.alloc_node(node);
@@ -2392,6 +2480,11 @@ impl Fs {
         release(entry_cost(name));
         self.touch_dir(dir);
         self.drop_name(ino);
+        if !self.is_dir(ino) {
+            self.notify_self(ino, IN_ATTRIB);
+        }
+        self.notify_deleted(ino);
+        self.notify_entry(dir, IN_DELETE, 0, name, ino);
         Ok(())
     }
 
@@ -2448,6 +2541,8 @@ impl Fs {
         n.nlink += 1;
         n.ctime = now;
         self.touch_dir(dir);
+        self.notify_self(ino, IN_ATTRIB);
+        self.notify_entry(dir, IN_CREATE, 0, name, ino);
         Ok(())
     }
 
@@ -2728,6 +2823,25 @@ impl Fs {
         self.nodes[src].ctime = now;
         self.touch_dir(odir);
         self.touch_dir(ndir);
+        // Linux's fsnotify_move, for each that moved.
+        let cookie = inotify::cookie();
+        self.notify_entry(odir, IN_MOVED_FROM, cookie, oname, src);
+        self.notify_entry(ndir, IN_MOVED_TO, cookie, nname, src);
+        if exchange {
+            let (dst, cookie) = (dst.expect("exchanged"), inotify::cookie());
+            self.notify_self(src, IN_MOVE_SELF);
+            self.notify_entry(ndir, IN_MOVED_FROM, cookie, nname, dst);
+            self.notify_entry(odir, IN_MOVED_TO, cookie, oname, dst);
+            self.notify_self(dst, IN_MOVE_SELF);
+            return Ok(());
+        }
+        if let Some(dst) = dst {
+            self.notify_self(dst, IN_ATTRIB);
+        }
+        self.notify_self(src, IN_MOVE_SELF);
+        if let Some(dst) = dst {
+            self.notify_deleted(dst);
+        }
         Ok(())
     }
 }

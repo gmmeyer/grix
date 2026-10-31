@@ -1554,6 +1554,23 @@ fn files_the_host_replaces_while_they_are_open() {
     assert!(std::fs::read(host.join("w")).unwrap().iter().all(|&b| b == b'B'));
 }
 
+/// inotify for a program's own files. What the fixture prints is what
+/// Linux prints for the same steps (run it natively in an empty directory
+/// on a file system with user xattrs): this is that output.
+#[test]
+fn inotify_of_the_programs_own_changes() {
+    let b = with("fsevents").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/fsevents", "/tmp"]);
+    let want = include_str!("fsevents.expected");
+    let got = out.stdout_str();
+    for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+        assert_eq!(g, w, "line {}\n{got}", i + 1);
+    }
+    assert_eq!(got.lines().count(), want.lines().count(), "{got}");
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// O_TMPFILE in a live mount: the file is the sandbox's until linkat names
 /// it, when the host gets it, and what has it open follows. The fixture
 /// passes on Linux too, built with -DON_LINUX, apart from what's marked.

@@ -299,8 +299,18 @@ unwatched, the guest told by an overflow), and a round of changes
 outbox (`Outbox::send_notice`: stats requests and datagrams still fit),
 so its own kernel's queue holds the rest. A restored snapshot's host watches nothing:
 `inotify::rewatch` asks again for every node and queues an overflow,
-as what changed meanwhile was missed. The guest's changes elsewhere make
-no events yet.
+as what changed meanwhile was missed. Everything else makes its events in
+the kernel, from `Fs::notify` and its neighbours, as Linux's fsnotify
+calls: a watch's in `inotify::LOCAL`, and nothing looks further than
+`inotify::watched`, one atomic, until something's watched. `Fs::modified`
+and `changed` make IN_MODIFY and IN_ATTRIB, so whatever changes a file
+goes through them, and anything new that makes, removes or moves a node
+says so; `fs::accessed` and `opened` are for what reads or opens one, and
+`OpenFile`'s drop is its close, put off with `fs::later` as the filesystem
+may be held. A node's gone (IN_DELETE_SELF) when it has no names and
+nothing but watches holds its pin. Order and all are Linux's:
+`crates/grix/tests/fsevents.expected` is what `fixtures/src/fsevents.c`
+printed there, so a change to these gets checked there first.
 
 Processes (`process.rs`, `procs.rs`, `syscall/proc.rs`): the running
 process is in this CPU's slot of `PROCESS` (`process::running()`); every

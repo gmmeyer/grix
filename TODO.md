@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.65)
+## What's left (after 0.0.66)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -33,8 +33,7 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. inotify for the guest's own changes elsewhere, a node left unwatched
-   on macOS, `TZ` from the host, stack growth and guard pages, holes in
+4. A node left unwatched on macOS, `TZ` from the host, stack growth and guard pages, holes in
    shared memory (`MADV_REMOVE`, `FALLOC_FL_PUNCH_HOLE`), newer syscalls
    as programs ask for them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
@@ -572,10 +571,16 @@ Left, none of it a way out of the sandbox:
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): kept on the sandbox's nodes
       (round 3, 25).
-- [~] `inotify`. Node `fs.watch`, webpack, watchdog.
+- [x] `inotify`. Node `fs.watch`, webpack, watchdog.
       Events for live mounts' changes, the host's and the program's (which
-      arrive just after the call that made them, not before it returns).
-      The sandbox's own files (imports, written files) make none yet.
+      arrive just after the call that made them, not before it returns),
+      and for the sandbox's own files, as Linux's fsnotify makes them:
+      `fsevents.c` prints each step's events, and `fsevents.expected` is
+      what it printed on Linux. Left: a file with several names is reported
+      by its first, whichever it was opened by; an unnamed O_TMPFILE file
+      makes none (Linux's name for it is its inode number); a working
+      directory removed from under a process isn't IN_DELETE_SELF until
+      something else lets go of it.
 - [x] `flock` and `fcntl` record locks with real semantics (sqlite): see
       round 2, item 11.
 - [x] Real file timestamps from the host (make, build caches). Everything
