@@ -2071,6 +2071,7 @@ pub fn ftruncate(p: &mut Process, fd: u64, len: u64) -> SysResult {
 
 pub fn fallocate(p: &mut Process, fd: u64, mode: u64, off: u64, len: u64) -> SysResult {
     const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    const FALLOC_FL_PUNCH_HOLE: u64 = 2;
     let (off, len) = (off as i64, len as i64);
     if off < 0 || len <= 0 {
         return Err(EINVAL);
@@ -2087,8 +2088,26 @@ pub fn fallocate(p: &mut Process, fd: u64, mode: u64, off: u64, len: u64) -> Sys
             Ok(0)
         }
         FALLOC_FL_KEEP_SIZE => Ok(0),
+        // (A hole keeps the size or it isn't asked for at all.)
+        m if m == FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE => punch_hole(p, nr::fallocate, &c, ino, off as u64, end),
         _ => Err(EOPNOTSUPP),
     }
+}
+
+/// `[off, end)` of file `c` becomes a hole, in what's mapped of it too.
+pub(super) fn punch_hole(p: &mut Process, n: u32, c: &Content, ino: Ino, off: u64, end: u64) -> SysResult {
+    c.lock().may_write(0)?;
+    note_shared(p, n, c);
+    let (first, last) = c.lock().punch(off, end)?;
+    if c.lock().mapped_live() {
+        let (from, to) = (first * crate::mm::PAGE_SIZE, last.saturating_mul(crate::mm::PAGE_SIZE));
+        p.aspace.zap_file_range(c, from, to);
+        for q in crate::procs::PROCS.lock().others.values_mut() {
+            q.aspace.access().zap_file_range(c, from, to);
+        }
+    }
+    fs::lock().modified(ino);
+    Ok(0)
 }
 
 /// chmod: only the owner (or root) may change the mode.

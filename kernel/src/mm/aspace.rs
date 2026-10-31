@@ -152,6 +152,12 @@ impl SharedPages {
         }
         Ok(pa)
     }
+
+    /// MADV_REMOVE: the pages in `[first, last)` are gone (whatever maps
+    /// them has been told, `AddressSpace::zap_pages`), zeros when next used.
+    pub fn punch(&self, first: u64, last: u64) {
+        self.0.lock().remove_range(first, last, &mut frame::free);
+    }
 }
 
 impl Drop for SharedPages {
@@ -313,6 +319,13 @@ fn discard_in(pt: &mut PageTable, start: u64, end: u64) {
         gather.add(va, pa);
     });
     gather.finish();
+}
+
+/// Where `v`, which maps what starts at `offset`, has `[from, to)` of it.
+/// (Empty if it doesn't.)
+fn mapped_part(v: &Vma, offset: u64, from: u64, to: u64) -> (u64, u64) {
+    let at = |o: u64| v.start.saturating_add(o.saturating_sub(offset)).min(v.end);
+    (at(from), at(to))
 }
 
 /// `tables` (and an address each covered) are out of `root`'s page tables.
@@ -754,12 +767,30 @@ impl AddressSpace {
     /// `data` shrank to `len`: its pages past the end go from this address
     /// space's shared mappings of it (they fault with SIGBUS from now on).
     pub fn zap_file(&mut self, data: &Content, len: u64) {
-        let keep = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        self.zap_file_range(data, len.div_ceil(PAGE_SIZE) * PAGE_SIZE, u64::MAX);
+    }
+
+    /// What's mapped of `[from, to)` of file `data` goes: a hole was made.
+    pub fn zap_file_range(&mut self, data: &Content, from: u64, to: u64) {
         for v in self.vmas.values() {
             if let Backing::SharedFile { data: d, offset, .. } = &v.backing
                 && Arc::ptr_eq(d, data)
             {
-                discard_in(&mut self.pt, v.start + keep.saturating_sub(*offset), v.end);
+                let (start, end) = mapped_part(v, *offset, from, to);
+                discard_in(&mut self.pt, start, end);
+            }
+        }
+    }
+
+    /// The same for pages `[first, last)` of shared memory.
+    pub fn zap_pages(&mut self, pages: &Arc<SharedPages>, first: u64, last: u64) {
+        for v in self.vmas.values() {
+            if let Backing::Shared { pages: p, index, .. } = &v.backing
+                && Arc::ptr_eq(p, pages)
+            {
+                let range = (first.saturating_mul(PAGE_SIZE), last.saturating_mul(PAGE_SIZE));
+                let (start, end) = mapped_part(v, index.saturating_mul(PAGE_SIZE), range.0, range.1);
+                discard_in(&mut self.pt, start, end);
             }
         }
     }

@@ -624,6 +624,58 @@ impl FileData {
         self.count_nodes(nodes);
     }
 
+    /// What the file takes up, in 512-byte blocks (`st_blocks`): its pages,
+    /// as tmpfs counts them, so `du` and sparse copies see its holes. The
+    /// host doesn't say of a live mount's.
+    pub fn blocks(&self) -> u64 {
+        if self.remote.is_some() {
+            return self.len.div_ceil(512);
+        }
+        let imported = (self.base.len() as u64).div_ceil(PAGE_SIZE);
+        self.pages.len().max(imported) * (PAGE_SIZE / 512)
+    }
+
+    /// FALLOC_FL_PUNCH_HOLE: `[off, end)` of the file reads as zeros, and
+    /// the length stays. Whole pages are given back, but for imported
+    /// bytes, which would show through. Returns the pages that went, for
+    /// `zap_file_range`. A host's file has its own idea of holes.
+    pub fn punch(&mut self, off: u64, end: u64) -> Result<(u64, u64), Errno> {
+        if self.remote.is_some() {
+            if !self.cow {
+                return Err(EOPNOTSUPP);
+            }
+            self.make_local(u64::MAX)?;
+        }
+        let end = end.min(self.len);
+        if off >= end {
+            return Ok((0, 0));
+        }
+        let first = off.div_ceil(PAGE_SIZE);
+        let last = if end == self.len { end.div_ceil(PAGE_SIZE) } else { end / PAGE_SIZE };
+        self.zero(off, end.min(first * PAGE_SIZE))?;
+        if last >= first {
+            self.zero(last * PAGE_SIZE, end)?;
+        }
+        let imported = (self.base.len() as u64).div_ceil(PAGE_SIZE);
+        for idx in first..last.min(imported) {
+            self.page_mut(idx)?.fill(0);
+        }
+        let nodes = self.pages.nodes();
+        self.pages.remove_range(first.max(imported), last, &mut free_page);
+        self.count_nodes(nodes);
+        self.copied.remove_range(first, last, &mut |_| {});
+        Ok((first, last))
+    }
+
+    /// Zeros in `[from, to)`, within one page, if there's anything there.
+    fn zero(&mut self, from: u64, to: u64) -> Result<(), Errno> {
+        if from < to && (self.pages.get(from / PAGE_SIZE).is_some() || from < self.base.len() as u64) {
+            let at = (from % PAGE_SIZE) as usize;
+            self.page_mut(from / PAGE_SIZE)?[at..at + (to - from) as usize].fill(0);
+        }
+        Ok(())
+    }
+
     /// The index had `before` nodes: they're file data too, so a sparse
     /// file's can't take more than the limit allows.
     fn count_nodes(&self, before: u64) {
@@ -2108,7 +2160,11 @@ impl Fs {
             uid: n.uid,
             gid: n.gid,
             size,
-            blocks: size.div_ceil(512),
+            blocks: match &n.kind {
+                Kind::File(c) => c.lock().blocks(),
+                Kind::Unlinked { data, .. } => data.upgrade().map_or(0, |c| c.lock().blocks()),
+                _ => size.div_ceil(512),
+            },
             rdev,
             atime: n.atime,
             mtime: n.mtime,
