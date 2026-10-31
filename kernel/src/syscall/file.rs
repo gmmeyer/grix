@@ -475,6 +475,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         let fs = fs::lock();
         (f.path_only, f.pin, f.content) = (true, Some(fs.pin(ino)), fs.content(ino));
         drop(fs);
+        f.pinned = f.content.as_ref().and_then(|c| c.lock().pin(false));
         drop(f);
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
@@ -700,8 +701,9 @@ fn reopened(file: &crate::fd::FileRef, flags: u32) -> Option<(Ino, Option<Conten
 fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool, denied: u16) -> SysResult {
     let file = new_file(FileKind::Node(ino), flags & !(O_CLOEXEC | O_CREAT | O_EXCL | O_TRUNC | O_TMPFILE));
     let pin = fs::lock().pin(ino);
+    let pinned = content.as_ref().and_then(|c| c.lock().pin(flags & O_ACCMODE != O_RDONLY));
     let mut f = file.lock();
-    (f.content, f.pin, f.landlock_denied) = (content, Some(pin), denied);
+    (f.content, f.pin, f.pinned, f.landlock_denied) = (content, Some(pin), pinned, denied);
     drop(f);
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }

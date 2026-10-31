@@ -1512,6 +1512,48 @@ fn read_only_mounts_without_fs_write() {
     std::fs::remove_dir_all(&host).unwrap();
 }
 
+/// What a program has open or mapped in a live mount, itself included,
+/// stays what it opened whatever the host does to the name, as on Linux,
+/// and a new open gets what's there now.
+#[test]
+fn files_the_host_replaces_while_they_are_open() {
+    const SIZE: usize = 1 << 20;
+    let host = temp_dir("replaced");
+    for name in ["f", "m", "w", "gone"] {
+        std::fs::write(host.join(name), vec![b'A'; SIZE]).unwrap();
+    }
+    for i in 0..40 {
+        std::fs::write(host.join(format!("other{i}")), "x").unwrap();
+    }
+    std::fs::copy(fixture("hostreplace"), host.join("prog")).unwrap();
+    let sb = Sandbox::builder().timeout(Duration::from_secs(90)).mount(&host, "/work").unwrap().build().unwrap();
+    let guest = std::thread::spawn(move || sb.run(&["/work/prog"]).unwrap());
+    let started = std::time::Instant::now();
+    while !host.join("ready").exists() {
+        assert!(started.elapsed() < Duration::from_secs(60) && !guest.is_finished(), "the program never got there");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // As an editor saves, and a compiler writes its output: a new file
+    // renamed over the old one.
+    let replace = |name: &str, bytes: Vec<u8>| {
+        let new = host.join(format!("{name}.new"));
+        std::fs::write(&new, bytes).unwrap();
+        std::fs::rename(&new, host.join(name)).unwrap();
+    };
+    replace("f", vec![b'B'; SIZE + 4096]);
+    replace("m", vec![b'B'; SIZE]);
+    replace("w", vec![b'B'; SIZE]);
+    replace("prog", vec![0; 4096]);
+    std::fs::remove_file(host.join("gone")).unwrap();
+    std::fs::write(host.join("go"), "").unwrap();
+    let out = guest.join().unwrap();
+    assert_eq!(out.stdout_str(), "float 3.00\nhostreplace ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Its write went to the file it had.
+    assert!(std::fs::read(host.join("w")).unwrap().iter().all(|&b| b == b'B'));
+}
+
 #[test]
 fn links_and_exchanges_in_a_live_mount() {
     // Hard links and RENAME_EXCHANGE are made on the host, within the

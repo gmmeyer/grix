@@ -252,7 +252,14 @@ time and getdents pages through the host, which holds at most `MAX_LISTED`
 entries of it (`read_entries`, going on from where the guest is), with a
 page empty only at the end, as that's what it means to `list_remote`. What
 makes a node asks for its id first (`id_room`): the guest is told a failed
-`Create` changed nothing. Each request waits for the
+`Create` changed nothing. An id means a name, until the guest has the file
+open or mapped: then `fs::Pinned` (one a file, `Arc`s in `OpenFile` and
+`Backing::Data`) has the host hold on to the file itself (`Request::Pin`,
+gone with the last `Arc`), and if `check_pinned` finds another file at that
+name, the name gets a new id, a new node to the guest, and the old id goes
+on meaning what the program has. Past `at::take_fd`'s share of descriptors
+an id just goes on meaning its name. Lazy imports aren't pinned (they
+have `unchanged`). Each request waits for the
 host's answer in `console::host_request`. The host walks every path down
 from the mount's root fd with `openat`/`O_NOFOLLOW`, so nothing the guest
 says can lead outside the mount. Lazy imports (`LiveMount::lazy`) are
@@ -280,8 +287,8 @@ IN_Q_OVERFLOW), which queues them on the matching watches (each event
 charged, `MAX_QUEUED` per instance) and marks what changed for fetching
 again (`fs::host_changed`, applied when the filesystem is next free).
 The host bounds what it keeps (`hostfs::MAX_WATCHES`; on macOS entries
-and descriptors: a share of RLIMIT_NOFILE, `watch::fd_budget`, for every
-watcher in the process, past which files are polled and a node goes
+and descriptors: a share of RLIMIT_NOFILE, `at::take_fd`, for everything
+held for guests in the process, past which files are polled and a node goes
 unwatched, the guest told by an overflow), and a round of changes
 (`watch::MAX_BATCH`, then an overflow, kept to as it's made), and sends as the guest takes them, within a quarter of the
 outbox (`Outbox::send_notice`: stats requests and datagrams still fit),

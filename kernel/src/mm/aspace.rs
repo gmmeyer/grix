@@ -71,7 +71,14 @@ pub enum Backing {
     /// Private copy of a file written in the sandbox: each page is copied
     /// from byte `offset + o` of the file when it faults in. File bytes at
     /// or past `end` read as zero (an ELF segment's .bss).
-    Data { data: Content, offset: u64, end: u64, ino: Ino, shared: Option<Arc<()>> },
+    Data {
+        data: Content,
+        offset: u64,
+        end: u64,
+        ino: Ino,
+        shared: Option<Arc<()>>,
+        pinned: Option<Arc<crate::fs::Pinned>>,
+    },
     /// Each page starts with the signal-return trampoline (`arch::sigframe::TRAMPOLINE`).
     Sigpage,
     /// MAP_SHARED anonymous memory: page `index + o / PAGE_SIZE` of
@@ -181,12 +188,13 @@ impl Vma {
         let skip = s - self.start;
         let backing = match self.backing {
             Backing::Anon => Backing::Anon,
-            Backing::Data { ref data, offset, end, ino, ref shared } => Backing::Data {
+            Backing::Data { ref data, offset, end, ino, ref shared, ref pinned } => Backing::Data {
                 data: data.clone(),
                 offset: offset.saturating_add(skip),
                 end,
                 ino,
                 shared: shared.clone(),
+                pinned: pinned.clone(),
             },
             Backing::Sigpage => Backing::Sigpage,
             Backing::KernelPage(pa) => Backing::KernelPage(pa),

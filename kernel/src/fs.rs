@@ -190,6 +190,11 @@ pub struct FileData {
     /// read from the host until the first write or truncate brings them in
     /// (`make_local`).
     cow: bool,
+    /// A lazy import's: it's checked against what the guest first saw of
+    /// it instead, so it's never pinned.
+    lazy: bool,
+    /// What's holding it open on the host, while anything is.
+    pinned: Weak<Pinned>,
 }
 
 pub const F_SEAL_SEAL: u32 = 1;
@@ -199,6 +204,22 @@ pub const F_SEAL_WRITE: u32 = 8;
 pub const F_SEAL_FUTURE_WRITE: u32 = 16;
 
 pub type Content = Arc<Mutex<FileData>>;
+
+/// A live mount's file the program has open or mapped: while this lasts
+/// the host holds it open too, so it stays that file whatever happens to
+/// its name there (`hostfs::Request::Pin`). What's new at that name gets
+/// an id of its own, and so a node of its own (`list_remote`).
+#[derive(Debug)]
+pub struct Pinned {
+    id: u64,
+    write: AtomicBool,
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        hostfs::unpin(self.id);
+    }
+}
 
 impl core::fmt::Debug for FileData {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -221,11 +242,13 @@ impl FileData {
             remote: None,
             unlinked: false,
             cow: false,
+            lazy: false,
+            pinned: Weak::new(),
         }))
     }
 
     /// A live mount's file `id`, `size` bytes long.
-    pub fn remote(id: u64, size: u64) -> Content {
+    pub fn remote(id: u64, size: u64, lazy: bool) -> Content {
         Arc::new(Mutex::new(FileData {
             base: &[],
             pages: PageIndex::new(),
@@ -239,7 +262,31 @@ impl FileData {
             remote: Some(id),
             unlinked: false,
             cow: false,
+            lazy,
+            pinned: Weak::new(),
         }))
+    }
+
+    /// The program is opening or mapping this: for a live mount's file,
+    /// what keeps it this file on the host for as long as that lasts.
+    pub fn pin(&mut self, write: bool) -> Option<Arc<Pinned>> {
+        let id = self.remote_id().filter(|_| !self.lazy)?;
+        let pinned = self.pinned.upgrade();
+        if pinned.as_ref().is_some_and(|p| p.write.load(Ordering::Relaxed) || !write) {
+            return pinned;
+        }
+        hostfs::pin(id, write);
+        let pinned = pinned.unwrap_or_else(|| Arc::new(Pinned { id, write: AtomicBool::new(false) }));
+        pinned.write.fetch_or(write, Ordering::Relaxed);
+        self.pinned = Arc::downgrade(&pinned);
+        Some(pinned)
+    }
+
+    /// A restored snapshot's host holds nothing: ask again.
+    fn repin(&self) {
+        if let Some(p) = self.pinned.upgrade() {
+            hostfs::pin(p.id, p.write.load(Ordering::Relaxed));
+        }
     }
 
     /// The host's id for a live mount's file (not a copied-up one's: that
@@ -2590,6 +2637,15 @@ impl Fs {
         hostfs::forget_kept();
     }
 
+    /// Restored from a snapshot: what the program has open, the host is
+    /// to hold on to again. (Whatever has that name now: it can't be told
+    /// from what was there.)
+    pub fn repin(&self) {
+        for c in self.remote_files.values().filter_map(Weak::upgrade) {
+            c.lock().repin();
+        }
+    }
+
     /// What the host said changed (`host_changed`) is fetched again when
     /// next used: a watched directory's entries, and the entry named.
     fn apply_host_changes(&mut self) {
@@ -2757,7 +2813,7 @@ impl Fs {
                         c
                     }
                     None => {
-                        let c = FileData::remote(e.id, e.attr.size);
+                        let c = FileData::remote(e.id, e.attr.size, self.lazy[mount]);
                         self.remote_files.insert(e.id, Arc::downgrade(&c));
                         c
                     }

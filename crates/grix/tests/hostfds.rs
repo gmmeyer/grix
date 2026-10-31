@@ -67,6 +67,12 @@ fn watches_leave_the_host_its_descriptors() {
     let told = if cfg!(target_os = "macos") { "overflow" } else { "all" };
     assert!(said.starts_with(&format!("watched 301, {told}\n")), "{said}");
     assert!(out.events.is_empty(), "{:?}", out.events);
+    // Files held open are held open on the host too, while its share lasts:
+    // 900 of them are more than it may have at all.
+    let out = sb.run(&["/bin/hardening2", "holdmany", "/work", &port.to_string()]).unwrap();
+    assert_eq!(out.stdout_str(), "holdmany ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
     // And the watcher's descriptors went with the sandbox.
     drop(sb);
     std::thread::sleep(Duration::from_millis(500));

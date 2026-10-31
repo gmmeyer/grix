@@ -60,7 +60,10 @@ impl Source {
     fn backing(&self, offset: u64, filesz: u64, ino: Ino) -> Backing {
         match self {
             Source::Image(data) => Backing::File { data, offset, filesz, ino, shared: None },
-            Source::Written(c) => Backing::Data { data: c.clone(), offset, end: offset + filesz, ino, shared: None },
+            Source::Written(c) => {
+                let pinned = c.lock().pin(false);
+                Backing::Data { data: c.clone(), offset, end: offset + filesz, ino, shared: None, pinned }
+            }
         }
     }
 }

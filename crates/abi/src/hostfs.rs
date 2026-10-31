@@ -212,6 +212,17 @@ pub enum Request<'a> {
         dir: u64,
         name: &'a str,
     },
+    /// The guest has `id`, a file, open or mapped (`write`: for writing
+    /// too): hold on to the file it is now, until `Unpin`, whatever happens
+    /// to its name. No answer: if it can't, `id` goes on meaning its name.
+    Pin {
+        id: u64,
+        write: bool,
+    },
+    /// The guest has let go of `id`. No answer.
+    Unpin {
+        id: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,6 +372,15 @@ impl<'a> Request<'a> {
                 w.u8(13);
                 w.u64(id);
             }
+            Request::Pin { id, write } => {
+                w.u8(16);
+                w.u64(id);
+                w.u8(write as u8);
+            }
+            Request::Unpin { id } => {
+                w.u8(17);
+                w.u64(id);
+            }
             Request::Unwatch { id } => {
                 w.u8(14);
                 w.u64(id);
@@ -418,6 +438,8 @@ impl<'a> Request<'a> {
             13 => Request::Watch { id: r.u64()? },
             14 => Request::Unwatch { id: r.u64()? },
             15 => Request::Link { id: r.u64()?, dir: r.u64()?, name: get_str(&mut r)? },
+            16 => Request::Pin { id: r.u64()?, write: r.u8()? != 0 },
+            17 => Request::Unpin { id: r.u64()? },
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -621,6 +643,9 @@ mod tests {
             Request::Forget { id: 9 },
             Request::Watch { id: 9 },
             Request::Unwatch { id: 9 },
+            Request::Pin { id: 9, write: true },
+            Request::Pin { id: 9, write: false },
+            Request::Unpin { id: 9 },
         ];
         for r in reqs {
             assert_eq!(Request::decode(&r.encode(7)), Ok((7, r)));

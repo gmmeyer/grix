@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// For directories only passed through on the way down: no read permission
 /// needed, as for a path lookup.
@@ -17,6 +18,36 @@ const SEARCH: libc::c_int = libc::O_PATH;
 const SEARCH: libc::c_int = libc::O_SEARCH;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const SEARCH: libc::c_int = libc::O_RDONLY;
+
+/// Descriptors held for guests in this process (sandboxes are many).
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// The share of the process's descriptors (RLIMIT_NOFILE's soft limit, 256
+/// from a macOS shell) that guests can make it hold: the rest are for live
+/// mounts' other files, the proxy's connections, the VMM's pipes.
+fn fd_budget(soft_limit: u64) -> usize {
+    (soft_limit / 4).clamp(16, 64 * 1024) as usize
+}
+
+fn soft_limit() -> u64 {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit fills in the struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 { lim.rlim_cur } else { 256 }
+}
+
+/// One more held for a guest, if the budget has room.
+pub(crate) fn take_fd() -> bool {
+    // (Two sandboxes at once may go one over: it's a share, not a limit.)
+    let room = HELD.load(Ordering::Relaxed) < fd_budget(soft_limit());
+    if room {
+        HELD.fetch_add(1, Ordering::Relaxed);
+    }
+    room
+}
+
+pub(crate) fn give_fd() {
+    HELD.fetch_sub(1, Ordering::Relaxed);
+}
 
 pub(crate) fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
@@ -240,6 +271,14 @@ pub(crate) fn rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptors_are_a_share_of_the_limit() {
+        // A macOS shell's default, and the most one host process holds.
+        assert_eq!(fd_budget(256), 64);
+        assert_eq!(fd_budget(64), 16);
+        assert_eq!(fd_budget(u64::MAX), 64 * 1024);
+    }
     use std::fs;
     use std::path::PathBuf;
 
