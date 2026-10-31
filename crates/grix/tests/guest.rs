@@ -657,19 +657,30 @@ fn madvise_does_what_it_says() {
     assert_eq!(out.stdout_str(), "madvise ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
-    // No holes in shared memory: what can't happen says so.
     let out = run(sandbox(), &["/bin/madvise", "remove"]);
     assert_eq!(out.stdout_str(), "madvise remove ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
-    assert!(
-        matches!(&out.events[..], [GuestEvent::Unimplemented { detail, .. }] if detail.contains("MADV_REMOVE")),
-        "{:?}",
-        out.events
-    );
+    assert!(out.events.is_empty(), "{:?}", out.events);
     // Cutting mappings up is bounded as making them is.
     let out = run(sandbox(), &["/bin/madvise", "cut", "400000"]);
     assert_eq!(out.stdout_str(), "madvise cut ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
+}
+
+/// Holes in files and shared memory, by fallocate and by MADV_REMOVE. The
+/// fixture passes on Linux as it is, on tmpfs.
+#[test]
+fn holes_in_files_and_shared_memory() {
+    let b = with("holes")
+        .allow(Capability::Process)
+        .allow(Capability::FsWrite)
+        .file("/data/imported", vec![b'I'; 3 * 4096], 0o644)
+        .unwrap();
+    // What's punched is given back: 16 times this is more than there is.
+    let out = run(b, &["/bin/holes", "/data/imported", "64"]);
+    assert_eq!(out.stdout_str(), "holes ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
 #[test]

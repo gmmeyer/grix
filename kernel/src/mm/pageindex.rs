@@ -174,18 +174,24 @@ impl PageIndex {
 
     /// Take out every page from `keep` on, passing each frame to `each`.
     pub fn remove_from(&mut self, keep: u64, each: &mut dyn FnMut(u64)) {
+        self.remove_range(keep, u64::MAX, each);
+    }
+
+    /// Take out the pages in `[from, to)`, passing each frame to `each`. It
+    /// costs what's there, however far apart the two are.
+    pub fn remove_range(&mut self, from: u64, to: u64, each: &mut dyn FnMut(u64)) {
         if self.root == 0 {
             return;
         }
-        if self.remove_in(self.root, self.levels - 1, 0, keep, each) {
+        if self.remove_in(self.root, self.levels - 1, 0, from, to, each) {
             self.free_node(self.root);
             (self.root, self.levels) = (0, 0);
         }
     }
 
-    /// Take out the pages from `keep` on under `pa` (a node at `level`,
+    /// Take out the pages in `[from, to)` under `pa` (a node at `level`,
     /// covering pages from `first`). True if it's empty now.
-    fn remove_in(&mut self, pa: u64, level: u32, first: u64, keep: u64, each: &mut dyn FnMut(u64)) -> bool {
+    fn remove_in(&mut self, pa: u64, level: u32, first: u64, from: u64, to: u64, each: &mut dyn FnMut(u64)) -> bool {
         let per = 1u64 << (BITS * level);
         let mut empty = true;
         for i in 0..FANOUT {
@@ -194,17 +200,13 @@ impl PageIndex {
                 continue;
             }
             let start = first + i * per;
-            if level == 0 {
-                if start >= keep {
-                    each(child);
-                    set(pa, i, 0);
-                    self.len -= 1;
-                } else {
-                    empty = false;
-                }
-            } else if start.saturating_add(per) <= keep {
+            if start.saturating_add(per) <= from || start >= to {
                 empty = false;
-            } else if self.remove_in(child, level - 1, start, keep, each) {
+            } else if level == 0 {
+                each(child);
+                set(pa, i, 0);
+                self.len -= 1;
+            } else if self.remove_in(child, level - 1, start, from, to, each) {
                 self.free_node(child);
                 set(pa, i, 0);
             } else {

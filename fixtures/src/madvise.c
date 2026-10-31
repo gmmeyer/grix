@@ -345,13 +345,7 @@ static void removing(void) {
     char *ro = mapped(rfd, 1, PROT_READ, MAP_SHARED);
     FAILS(madvise(ro, PAGE, MADV_REMOVE), EACCES);
     char *rw = mapped(fd, 1, PROT_READ, MAP_SHARED);
-#ifdef ON_LINUX
     CHECK(madvise(rw, PAGE, MADV_REMOVE) == 0 && rw[0] == 0);
-#else
-    // No holes in shared memory yet: reported, and nothing lost.
-    FAILS(madvise(rw, PAGE, MADV_REMOVE), EOPNOTSUPP);
-    CHECK(rw[0] == 'f');
-#endif
 }
 
 static void cutting(int n) {
