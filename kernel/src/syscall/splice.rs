@@ -290,6 +290,9 @@ pub fn splice(p: &mut Process, fd_in: u64, off_in: u64, fd_out: u64, off_out: u6
     let n = write_out(p, &mut o, oout, &data, nonblock)?;
     consume(&i, &src, n as usize);
     if let Source::File(at) = src {
+        if let (FileKind::Node(ino), true) = (&i.kind, n > 0) {
+            crate::fs::accessed(*ino);
+        }
         match oin {
             Some(_) => write_u64(&mut p.aspace, off_in, at + n)?,
             None => i.offset = at + n,

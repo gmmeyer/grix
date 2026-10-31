@@ -1,0 +1,237 @@
+create
+  dir CREATE [f]
+  dir OPEN [f]
+write
+  dir MODIFY [f]
+pwrite
+  dir MODIFY [f]
+writev
+  dir MODIFY [f]
+close after writing
+  dir CLOSE_WRITE [f]
+open and close for writing
+  dir OPEN [f]
+  dir CLOSE_WRITE [f]
+open a watched file
+  dir OPEN [f]
+  file OPEN
+read
+  dir ACCESS [f]
+  file ACCESS
+read at the end
+pread
+  dir ACCESS [f]
+  file ACCESS
+close after reading
+  dir CLOSE_NOWRITE [f]
+  file CLOSE_NOWRITE
+chmod
+  dir ATTRIB [f]
+  file ATTRIB
+chown
+  dir ATTRIB [f]
+  file ATTRIB
+utimes
+  dir ATTRIB [f]
+  file ATTRIB
+setxattr
+  dir ATTRIB [f]
+  file ATTRIB
+removexattr
+  dir ATTRIB [f]
+  file ATTRIB
+truncate
+  dir MODIFY [f]
+  file MODIFY
+ftruncate
+  dir OPEN [f]
+  file OPEN
+  dir MODIFY [f]
+  file MODIFY
+  dir CLOSE_WRITE [f]
+  file CLOSE_WRITE
+open with O_TRUNC
+  dir MODIFY [f]
+  file MODIFY
+  dir OPEN [f]
+  file OPEN
+  dir CLOSE_WRITE [f]
+  file CLOSE_WRITE
+an empty write
+  dir OPEN [f]
+  file OPEN
+O_PATH
+  dir MODIFY [f]
+  file MODIFY
+  dir CLOSE_WRITE [f]
+  file CLOSE_WRITE
+stat and access
+mmap
+  dir OPEN [f]
+  file OPEN
+written through a mapping
+  dir CLOSE_WRITE [f]
+  file CLOSE_WRITE
+for copying
+  dir OPEN [f]
+  file OPEN
+  dir CREATE [copy]
+  dir OPEN [copy]
+sendfile
+  dir 1 [f]
+  dir 2 [copy]
+  file 1 []
+copied
+  dir CLOSE_NOWRITE [f]
+  file CLOSE_NOWRITE
+  dir CLOSE_WRITE [copy]
+opendir
+  dir OPEN ISDIR
+readdir
+  dir ACCESS ISDIR
+closedir
+  dir CLOSE_NOWRITE ISDIR
+mkdir
+  dir CREATE ISDIR [d]
+symlink
+  dir CREATE [l]
+link
+  file ATTRIB
+  dir CREATE [h]
+unlink one of two names
+  file ATTRIB
+  dir DELETE [h]
+unlink a symlink
+  dir DELETE [l]
+mkfifo
+  dir CREATE [p]
+unlink and rmdir
+  dir DELETE [p]
+  dir DELETE ISDIR [d]
+rename in a directory
+  dir MOVED_FROM [f] cookie1
+  dir MOVED_TO [g] cookie1
+  file MOVE_SELF
+rename to another directory
+  dir MOVED_FROM [g] cookie2
+  sub MOVED_TO [g] cookie2
+  file MOVE_SELF
+rename back
+  sub MOVED_FROM [g] cookie3
+  dir MOVED_TO [f] cookie3
+  file MOVE_SELF
+a file to replace
+  dir CREATE [t]
+  dir OPEN [t]
+  dir MODIFY [t]
+  dir CLOSE_WRITE [t]
+rename over a watched file
+  dir MOVED_FROM [f] cookie4
+  dir MOVED_TO [t] cookie4
+  target ATTRIB
+  file MOVE_SELF
+  target DELETE_SELF
+  target IGNORED
+rename back again
+  dir MOVED_FROM [t] cookie5
+  dir MOVED_TO [f] cookie5
+  file MOVE_SELF
+a directory to move
+  dir CREATE ISDIR [m]
+rename a directory
+  dir MOVED_FROM ISDIR [m] cookie6
+  sub MOVED_TO ISDIR [m] cookie6
+  moved MOVE_SELF
+rmdir a watched directory
+  moved DELETE_SELF
+  moved IGNORED
+  sub DELETE ISDIR [m]
+unlink a watched file
+  file ATTRIB
+  file DELETE_SELF
+  file IGNORED
+  dir DELETE [f]
+a file to unlink while open
+  dir CREATE [open]
+  dir OPEN [open]
+  dir MODIFY [open]
+  dir CLOSE_WRITE [open]
+opened
+  dir OPEN [open]
+  open OPEN
+unlinked
+  open ATTRIB
+  dir DELETE [open]
+written after unlinking
+  dir MODIFY [open]
+  open MODIFY
+closed after unlinking
+  dir CLOSE_WRITE [open]
+  open CLOSE_WRITE
+  open DELETE_SELF
+  open IGNORED
+a file to watch once
+  dir CREATE [one]
+  dir OPEN [one]
+  dir MODIFY [one]
+  dir CLOSE_WRITE [one]
+IN_ONESHOT
+  dir OPEN [one]
+  dir ACCESS [one]
+  oneshot ACCESS
+  oneshot IGNORED
+  dir ACCESS [one]
+  dir CLOSE_NOWRITE [one]
+a file to watch for one thing
+  dir CREATE [narrow]
+  dir OPEN [narrow]
+  dir MODIFY [narrow]
+  dir CLOSE_WRITE [narrow]
+IN_MODIFY only
+  dir OPEN [narrow]
+  dir ACCESS [narrow]
+  dir MODIFY [narrow]
+  narrow MODIFY
+  dir CLOSE_WRITE [narrow]
+changed to IN_CLOSE
+  dir OPEN [narrow]
+  dir MODIFY [narrow]
+  dir CLOSE_WRITE [narrow]
+  narrow CLOSE_WRITE
+IN_MASK_ADD
+  dir ATTRIB [narrow]
+  narrow ATTRIB
+inotify_rm_watch
+  narrow IGNORED
+unwatched
+  dir DELETE [narrow]
+  dir DELETE [one]
+  dir DELETE [copy]
+a program to run
+  dir 100 [prog]
+  dir 2 [prog]
+  dir 20 [prog]
+  dir 8 [prog]
+exec
+  dir 1 [prog]
+  dir 10 [prog]
+  dir 20 [prog]
+no more of it
+  dir DELETE [prog]
+IN_EXCL_UNLINK
+  dir CREATE [ex]
+  dir OPEN [ex]
+  dir MODIFY [ex]
+  dir CLOSE_WRITE [ex]
+unlinked while open
+  dir OPEN [ex]
+  dir DELETE [ex]
+what it does then
+rmdir a watched directory in a watched one
+  sub DELETE_SELF
+  sub IGNORED
+  dir DELETE ISDIR [sub]
+rmdir the last
+  dir DELETE_SELF
+  dir IGNORED
+fsevents ok
