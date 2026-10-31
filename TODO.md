@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.60)
+## What's left (after 0.0.62)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -23,40 +23,33 @@ change):
 
 Robustness, first:
 
-1. The forwarded-port test in `runtimes.rs` still counts anything that
-   connects: tools on a developer's machine probe new ports, as the C
-   fixtures now allow for.
-2. A writable live mount's listing has no cap on the host, `Create`
-   makes the file when ids have run out, and `watch.rs`'s `os::wait` and
-   kqueue side have had no security read.
-3. `rv048 extremes`: one hang at 0.0.48, none in 32,000 runs since.
+1. `rv048 extremes`: one hang at 0.0.48, none in 32,000 runs since.
    Only worth more with a new idea, or if it comes back.
-4. Tests that have never failed: `hostfds` (macOS only) and `ptsperm`,
-   `sigioperm` and `execperm` haven't been run on an unfixed kernel.
+2. `hostfds` has never failed: what it guards is kqueue's descriptors,
+   so it takes an unfixed build on macOS.
 
 Linux behaviour:
 
-5. An image's files keep their owners, then directories' search
+3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-6. Live mounts: hard links within a mount, RENAME_EXCHANGE, O_TMPFILE,
-   and a file the host replaces while it's open.
-7. inotify for the guest's own changes elsewhere, a node left unwatched
+4. Live mounts: O_TMPFILE, and a file the host replaces while it's open.
+5. inotify for the guest's own changes elsewhere, a node left unwatched
    on macOS, `TZ` from the host, `madvise`'s last advice values, stack
    growth and guard pages, newer syscalls as programs ask for them.
-8. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
-9. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
+6. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
+7. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
 
 Bigger:
 
-10. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
-    shared between processes.
-11. Finer locking: phase 2, a reader/writer lock with per-process
-    check-out.
-12. Faster live-mount round trips, multi-architecture images, and the
+8. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+   shared between processes.
+9. Finer locking: phase 2, a reader/writer lock with per-process
+   check-out.
+10. Faster live-mount round trips, multi-architecture images, and the
     rest of `/proc/grix/smp`'s counters.
-13. An outside security review (round 2, item 20).
+11. An outside security review (round 2, item 20).
 
 By design, not left: eBPF and Linux capabilities (DATADOG.md: the agent
 runs and its intake accepts data, system-probe's eBPF features don't),
@@ -767,17 +760,32 @@ Left, none of it a way out of the sandbox:
       (0.0.57's timerfd livelock needs O_ASYNC, which that run hadn't. A
       kick landing just before `wfi` doesn't lose it, with 200 µs added
       there; and 22,551 runs of 0.0.57 at 2 CPUs didn't hang.)
-- [ ] `crates/grix/tests/runtimes.rs`'s forwarded-port test counts
-      whoever connects first (the C fixtures take only their own client:
-      tools on a developer's machine probe new ports).
+- [x] `crates/grix/tests/runtimes.rs`'s forwarded-port test counts only
+      its own request, and probes the port itself: a request for
+      something else, and a connection that says nothing, which used to
+      keep the server up until the run timed out. Each of the host's
+      connections there has its own thread, for the same reason.
+- [x] The permission tests, run on kernels without their checks:
+      `ptsperm` and `sigioperm` fail there. `execperm` didn't: the program
+      it runs if it's let exits 0, so the child looked like a success, and
+      Landlock's refused exec had the same hole (`after-exec`). Both now
+      run something that ends as no success, and both fail there too.
 - [ ] RFC 1918 addresses stay reachable with `net` and no allow-list,
       unlike `fc00::/7`: a default-deny there would break programs that
       reach a LAN, so it's documented rather than changed.
-- [~] `timer.rs` and `hostfs.rs` on both sides have had a security read
-      (0.0.57). Left: a writable mount's `read_entries` holds a listing as
-      big as the directory (the host's inodes bound it, nothing else), and
-      `Create` makes the file when ids have run out; `watch.rs`'s `os::wait`
-      and kqueue side weren't read.
+- [x] `timer.rs`, `hostfs.rs` on both sides (0.0.57) and `watch.rs` (0.0.62)
+      have had a security read. A listing is held a window at a time
+      (`MAX_LISTED`, read on from where the guest is, so a directory of
+      any size still works; a lazy import's as far as there's room to
+      keep it), `Create` and `Link` ask for an id before they change
+      anything, and kqueue's side no longer reads every name into memory
+      before it looks at its limit (`each_name`) or searches a list for
+      each of another (`pair`, up to 256 KiB of entries each, with
+      `Watcher::add` waiting: past a round, an overflow). Nothing else
+      in `os::wait` or kqueue's side: its limits hold, and it panics
+      on nothing a guest can do. `os::take` on Linux reads on while
+      what it reads gives no changes, which takes names no guest can
+      make.
 
 ## Performance and scale
 

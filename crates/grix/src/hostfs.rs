@@ -10,7 +10,7 @@
 //! (`watch.rs`), through descriptors opened the same way; lazy imports
 //! never change for the guest, so they aren't.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};
 use grix_abi::wire::{self, Input};
 
-use crate::at::{check, openat, read_dir, readlink_at, rename, stat_at, stat_fd};
+use crate::at::{check, each_name, openat, readlink_at, rename, stat_at, stat_fd};
 
 /// A directory mounted live.
 #[derive(Clone, Debug)]
@@ -58,6 +58,17 @@ const STATE_VERSION: u32 = 1;
 /// and link targets' bytes.
 const MAX_FROZEN: usize = 4_000_000;
 const MAX_FROZEN_BYTES: usize = 64 << 20;
+/// Entries of a directory held while the guest pages through them, and
+/// their names' and link targets' bytes; a bigger one is read on from
+/// where the guest is, once those run out.
+#[cfg(not(test))]
+const MAX_LISTED: usize = 64 * 1024;
+#[cfg(not(test))]
+const MAX_LISTED_BYTES: usize = 64 << 20;
+#[cfg(test)]
+const MAX_LISTED: usize = 64;
+#[cfg(test)]
+const MAX_LISTED_BYTES: usize = 8192;
 /// Files kept open between requests.
 const OPEN_FILES: usize = 32;
 /// Files the guest removed while it may still have them open.
@@ -141,29 +152,71 @@ fn attr_of(st: &libc::stat) -> Option<Attr> {
     })
 }
 
-/// A directory's entries the guest can see, sorted: (name, attributes,
-/// link target).
-fn read_entries(d: RawFd) -> Result<Vec<(String, Attr, String)>, u16> {
-    let mut entries = Vec::new();
-    for name in read_dir(d).map_err(err)? {
-        // Names the guest can't hold, and things it can't see, are left out.
-        let Ok(s) = name.to_str() else { continue };
-        if s.len() > 255 {
-            continue;
+/// A directory entry the guest can see: (name, attributes, link target).
+type Entry = (String, Attr, String);
+
+/// The first names in directory `d` past `after`, at most `max` of them
+/// and `max_bytes` of their bytes; and whether that's all of them.
+fn names_past(d: RawFd, after: &str, max: usize, max_bytes: usize) -> Result<(BTreeSet<String>, bool), u16> {
+    let (mut names, mut bytes, mut whole) = (BTreeSet::new(), 0, true);
+    each_name(d, |name| {
+        // Names the guest can't hold are left out.
+        let Ok(s) = name.to_str() else { return true };
+        if s.len() > 255 || s <= after {
+            return true;
         }
-        let Ok(st) = stat_at(d, &name) else { continue };
-        let Some(attr) = attr_of(&st) else { continue };
-        let target = match attr.ty {
-            FileType::Symlink => match readlink_at(d, &name).map(String::from_utf8) {
-                Ok(Ok(t)) if !t.is_empty() => t,
-                _ => continue,
-            },
-            _ => String::new(),
-        };
-        entries.push((s.to_string(), attr, target));
+        bytes += s.len();
+        names.insert(s.to_string());
+        while names.len() > max || bytes > max_bytes {
+            whole = false;
+            bytes -= names.pop_last().map_or(0, |last| last.len());
+        }
+        true
+    })
+    .map_err(err)?;
+    Ok((names, whole))
+}
+
+/// The first of directory `d`'s entries past `after` that the guest can
+/// see, sorted, at most `max` and `max_bytes` of names and targets; and
+/// whether that's the last of them.
+/// What's in a directory is the guest's to fill on a writable mount, so
+/// the host never holds all of it. Empty only at the end, which is what
+/// an empty page means to the guest.
+fn read_entries(d: RawFd, after: &str, max: usize, max_bytes: usize) -> Result<(Vec<Entry>, bool), u16> {
+    let mut after = after.to_string();
+    loop {
+        let (names, whole) = names_past(d, &after, max, max_bytes)?;
+        let (mut entries, mut bytes) = (Vec::new(), 0);
+        for name in &names {
+            let Ok(c) = CString::new(name.as_str()) else { continue };
+            let Ok((attr, target)) = look_up(d, &c) else { continue };
+            bytes += name.len() + target.len();
+            if bytes > max_bytes && !entries.is_empty() {
+                return Ok((entries, false));
+            }
+            entries.push((name.clone(), attr, target));
+        }
+        match names.last() {
+            Some(last) if entries.is_empty() && !whole => after = last.clone(),
+            _ => return Ok((entries, whole)),
+        }
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(entries)
+}
+
+/// `name` in directory `d` as it is now, if the guest can see it: its
+/// attributes and link target.
+fn look_up(d: RawFd, name: &CStr) -> Result<(Attr, String), u16> {
+    let st = stat_at(d, name).map_err(err)?;
+    // What the guest can't see isn't there.
+    let attr = attr_of(&st).ok_or(2u16)?;
+    let target = match attr.ty {
+        FileType::Symlink => {
+            readlink_at(d, name).ok().and_then(|t| String::from_utf8(t).ok()).filter(|t| !t.is_empty()).ok_or(2u16)?
+        }
+        _ => String::new(),
+    };
+    Ok((attr, target))
 }
 
 struct Node {
@@ -175,7 +228,10 @@ struct Node {
 /// through them.
 struct Listing {
     dir: u64,
-    entries: Vec<(String, Attr, String)>,
+    entries: Vec<Entry>,
+    /// They go on to the directory's end: if not, more are read once
+    /// they've run out.
+    whole: bool,
 }
 
 pub(crate) struct Server {
@@ -187,7 +243,7 @@ pub(crate) struct Server {
     /// `MAX_FROZEN` in all, beyond which directories are read as they are).
     lazy: Vec<bool>,
     attrs: HashMap<u64, Attr>,
-    frozen: HashMap<u64, Vec<(String, Attr, String)>>,
+    frozen: HashMap<u64, Vec<Entry>>,
     frozen_entries: usize,
     frozen_bytes: usize,
     nodes: HashMap<u64, Node>,
@@ -513,6 +569,7 @@ impl Server {
                 self.writable(dir)?;
                 let c = cname(name)?;
                 let d = self.dir(dir)?;
+                self.id_room(dir, name)?;
                 // No setuid or setgid from the sandbox; the host's umask applies.
                 let mode = mode & 0o1777;
                 match ty {
@@ -609,6 +666,7 @@ impl Server {
                 let (pd, pname) = self.parent(id)?.ok_or(EPERM)?;
                 let c = cname(name)?;
                 let d = self.dir(dir)?;
+                self.id_room(dir, name)?;
                 // SAFETY: linkat on descriptors we hold and checked names;
                 // without AT_SYMLINK_FOLLOW it links a link, not its target.
                 check(unsafe { libc::linkat(pd.as_raw_fd(), pname.as_ptr(), d.as_raw_fd(), c.as_ptr(), 0) })
@@ -653,8 +711,8 @@ impl Server {
             }
             // A lazy import's: from its directory as first listed.
             Request::Lookup { dir, name } if self.is_lazy(dir) => {
-                cname(name)?;
-                let find = |entries: &[(String, Attr, String)]| {
+                let c = cname(name)?;
+                let find = |entries: &[Entry]| {
                     let i = entries.binary_search_by(|e| e.0.as_str().cmp(name)).map_err(|_| 2u16)?;
                     Ok::<_, u16>((entries[i].1, entries[i].2.clone()))
                 };
@@ -662,7 +720,12 @@ impl Server {
                     Some(entries) => find(entries)?,
                     None => {
                         let d = self.dir(dir)?;
-                        find(&self.entries(dir, d.as_raw_fd())?)?
+                        match self.entries(dir, d.as_raw_fd(), "")? {
+                            (entries, true) => find(&entries)?,
+                            // Not all of it: as it is, as one too big to
+                            // keep is read.
+                            _ => look_up(d.as_raw_fd(), &c)?,
+                        }
                     }
                 };
                 let id = self.id(dir, name)?;
@@ -672,17 +735,7 @@ impl Server {
             Request::Lookup { dir, name } => {
                 let c = cname(name)?;
                 let d = self.dir(dir)?;
-                let st = stat_at(d.as_raw_fd(), &c).map_err(err)?;
-                // What the guest can't see isn't there.
-                let attr = attr_of(&st).ok_or(2u16)?;
-                let target = match attr.ty {
-                    FileType::Symlink => readlink_at(d.as_raw_fd(), &c)
-                        .ok()
-                        .and_then(|t| String::from_utf8(t).ok())
-                        .filter(|t| !t.is_empty())
-                        .ok_or(2u16)?,
-                    _ => String::new(),
-                };
+                let (attr, target) = look_up(d.as_raw_fd(), &c)?;
                 let id = self.id(dir, name)?;
                 ok(Reply::Found { id, attr, target: &target })
             }
@@ -868,23 +921,38 @@ impl Server {
         if (first.size, first.mtime_ns) == (now.size, now.mtime_ns) { Ok(()) } else { Err(EIO) }
     }
 
-    /// The entries of directory `dir`, sorted: as first listed, for a lazy
-    /// import's (while there's room to keep them).
-    fn entries(&mut self, dir: u64, d: RawFd) -> Result<Vec<(String, Attr, String)>, u16> {
+    /// The entries of directory `dir` past `after`, sorted, and whether
+    /// they go on to its end: as first listed, for a lazy import's (while
+    /// there's room to keep them).
+    fn entries(&mut self, dir: u64, d: RawFd, after: &str) -> Result<(Vec<Entry>, bool), u16> {
         if let Some(e) = self.frozen.get(&dir) {
-            return Ok(e.clone());
+            return Ok((e.clone(), true));
         }
-        let entries = read_entries(d)?;
+        // A lazy import's are looked at for what can be kept of them.
+        let lazy = self.is_lazy(dir);
+        let (room, room_bytes) =
+            (MAX_FROZEN.saturating_sub(self.frozen_entries), MAX_FROZEN_BYTES.saturating_sub(self.frozen_bytes));
+        let (max, max_bytes) = if lazy {
+            (room.max(MAX_LISTED), room_bytes.max(MAX_LISTED_BYTES))
+        } else {
+            (MAX_LISTED, MAX_LISTED_BYTES)
+        };
+        let (entries, whole) = read_entries(d, after, max, max_bytes)?;
         let bytes: usize = entries.iter().map(|(name, _, target)| name.len() + target.len()).sum();
-        if self.is_lazy(dir)
-            && self.frozen_entries + entries.len() <= MAX_FROZEN
-            && self.frozen_bytes + bytes <= MAX_FROZEN_BYTES
-        {
+        if lazy && whole && after.is_empty() && entries.len() <= room && bytes <= room_bytes {
             self.frozen_entries += entries.len();
             self.frozen_bytes += bytes;
             self.frozen.insert(dir, entries.clone());
         }
-        Ok(entries)
+        Ok((entries, whole))
+    }
+
+    /// Is there room for an id for `name` in `dir`? Asked before a change
+    /// on the host too: an error after it wouldn't undo it, and the guest
+    /// would have been told it never happened.
+    fn id_room(&self, dir: u64, name: &str) -> Result<(), u16> {
+        let full = self.nodes.len() >= MAX_IDS || self.id_bytes + name.len() > MAX_ID_BYTES;
+        if full && !self.by_name.contains_key(&(dir, name.to_string())) { Err(ENOMEM) } else { Ok(()) }
     }
 
     /// The id of `name` in `dir`, given out now if it has none.
@@ -892,9 +960,7 @@ impl Server {
         if let Some(&id) = self.by_name.get(&(dir, name.to_string())) {
             return Ok(id);
         }
-        if self.nodes.len() >= MAX_IDS || self.id_bytes + name.len() > MAX_ID_BYTES {
-            return Err(ENOMEM);
-        }
+        self.id_room(dir, name)?;
         let id = self.next_id;
         self.next_id += 1;
         self.id_bytes += name.len();
@@ -918,12 +984,19 @@ impl Server {
         let d = self.dir(dir)?;
         let dir_attr = stat_fd(d.as_raw_fd()).map_err(err).and_then(|st| attr_of(&st).ok_or(EIO))?;
         let dir_attr = self.saw(dir, &dir_attr);
-        // A new listing starts at "": read the directory then.
-        if after.is_empty() || self.listing.as_ref().is_none_or(|l| l.dir != dir) {
-            let entries = self.entries(dir, d.as_raw_fd())?;
-            self.listing = Some(Listing { dir, entries });
-        }
-        let listing = self.listing.take().unwrap();
+        // A new listing starts at "": read the directory then, and on from
+        // `after` when what was read has run out.
+        let held = self.listing.take().filter(|l| {
+            let left = l.whole || l.entries.last().is_some_and(|e| e.0.as_str() > after);
+            !after.is_empty() && l.dir == dir && left
+        });
+        let listing = match held {
+            Some(l) => l,
+            None => {
+                let (entries, whole) = self.entries(dir, d.as_raw_fd(), after)?;
+                Listing { dir, entries, whole }
+            }
+        };
         let start = listing.entries.partition_point(|e| e.0.as_str() <= after);
         let mut size = 0;
         let mut end = start;
@@ -948,7 +1021,7 @@ impl Server {
             .zip(attrs)
             .map(|(((name, _, target), id), attr)| ListEntry { name, id, attr, target })
             .collect();
-        let more = end < listing.entries.len();
+        let more = end < listing.entries.len() || !listing.whole;
         let bytes = Reply::Listed { dir: dir_attr, entries, more }.encode(0);
         if more {
             self.listing = Some(listing);
@@ -996,6 +1069,139 @@ mod tests {
         assert_eq!(s.id(1, &long(n)), Err(ENOMEM));
         s.forget(1, &long(0));
         assert!(s.id(1, &long(n)).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Out of ids, nothing happens on the host: the guest is told it
+    /// didn't, and an id is what it would need to take it back.
+    #[test]
+    fn nothing_is_made_without_an_id() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-no-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("old"), "").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        let old = s.id(1, "old").unwrap();
+        s.id_bytes = MAX_ID_BYTES;
+        for (name, ty, target) in [("f", FileType::File, ""), ("d", FileType::Dir, ""), ("l", FileType::Symlink, "old")]
+        {
+            let r = req(&mut s, Request::Create { dir: 1, name, ty, mode: 0o644, target });
+            assert!(matches!(Reply::decode(&r), Ok((_, Reply::Err(ENOMEM)))), "{name}");
+            assert!(std::fs::symlink_metadata(root.join(name)).is_err(), "{name} was made");
+        }
+        let r = req(&mut s, Request::Link { id: old, dir: 1, name: "hard" });
+        assert!(matches!(Reply::decode(&r), Ok((_, Reply::Err(ENOMEM)))));
+        assert!(!root.join("hard").exists());
+        // A name that has one needs none: it's free again once it's gone
+        // on the host, whoever removed it.
+        std::fs::remove_file(root.join("old")).unwrap();
+        let r = req(&mut s, Request::Create { dir: 1, name: "old", ty: FileType::File, mode: 0o644, target: "" });
+        assert!(matches!(Reply::decode(&r), Ok((_, Reply::Created { id, .. })) if id == old));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// All of a directory's names, as the guest pages through them: what
+    /// `list_remote` does. Every page but the last has something in it, or
+    /// the guest would take it for the end.
+    fn page_through(s: &mut Server, dir: u64) -> Vec<String> {
+        let (mut names, mut after) = (Vec::new(), String::new());
+        loop {
+            let r = req(s, Request::List { dir, after: &after });
+            let Ok((_, Reply::Listed { entries, more, .. })) = Reply::decode(&r) else { panic!() };
+            names.extend(entries.iter().map(|e| e.name.to_string()));
+            if !more {
+                return names;
+            }
+            after = entries.last().expect("a page with something in it").name.to_string();
+            let held = s.listing.as_ref().map_or(0, |l| l.entries.len());
+            assert!(held <= MAX_LISTED, "{held} held");
+        }
+    }
+
+    /// A directory the guest filled can't make the host hold it all, and
+    /// doesn't stop working for being big: the kernel's budget runs out
+    /// first, and then its names are looked up, and listed, by the page.
+    #[test]
+    fn listings_are_bounded() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-listed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["fits", "many", "long", "unseen"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let fits = sorted((0..MAX_LISTED).map(|i| i.to_string()).collect());
+        let many = sorted((0..MAX_LISTED * 5 / 2).map(|i| i.to_string()).collect());
+        for name in &fits {
+            std::fs::write(root.join("fits").join(name), "").unwrap();
+        }
+        for name in &many {
+            std::fs::write(root.join("many").join(name), "").unwrap();
+        }
+        // Few entries, but long link targets.
+        let long = sorted((0..MAX_LISTED_BYTES / 2000 * 3).map(|i| i.to_string()).collect());
+        for name in &long {
+            std::os::unix::fs::symlink("t".repeat(4000), root.join("long").join(name)).unwrap();
+        }
+        // More than can be held that the guest can't see, before what it can.
+        for i in 0..MAX_LISTED * 2 {
+            let c = CString::new(root.join(format!("unseen/a{i:04}")).to_str().unwrap()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        }
+        std::fs::write(root.join("unseen/z"), "").unwrap();
+        let host = root.canonicalize().unwrap();
+        for lazy in [false, true] {
+            let m = LiveMount { host: host.clone(), guest: "/m".into(), writable: !lazy, lazy };
+            let mut s = Server::new(&[m]).unwrap();
+            if lazy {
+                // Nothing left to keep them with.
+                (s.frozen_entries, s.frozen_bytes) = (MAX_FROZEN, MAX_FROZEN_BYTES);
+            }
+            let dir = |s: &mut Server, name| match Reply::decode(&req(s, Request::Lookup { dir: 1, name })) {
+                Ok((_, Reply::Found { id, .. })) => id,
+                other => panic!("{other:?}"),
+            };
+            let (d, want) = (dir(&mut s, "fits"), &fits);
+            assert_eq!(&page_through(&mut s, d), want);
+            assert!(s.listing.is_none());
+            let (d, want) = (dir(&mut s, "many"), &many);
+            assert_eq!(&page_through(&mut s, d), want);
+            // Past what any one read holds, and not there.
+            let r = req(&mut s, Request::Lookup { dir: d, name: many.last().unwrap() });
+            assert!(matches!(Reply::decode(&r), Ok((_, Reply::Found { .. }))));
+            let r = req(&mut s, Request::Lookup { dir: d, name: "nothing" });
+            assert!(matches!(Reply::decode(&r), Ok((_, Reply::Err(2)))));
+            let (d, want) = (dir(&mut s, "long"), &long);
+            assert_eq!(&page_through(&mut s, d), want);
+            let d = dir(&mut s, "unseen");
+            assert_eq!(page_through(&mut s, d), ["z"]);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A lazy import's directory bigger than a listing's window is still
+    /// kept as first seen, while there's room.
+    #[test]
+    fn big_lazy_directories_are_still_kept() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-big-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..MAX_LISTED * 2 {
+            std::fs::write(root.join(format!("f{i}")), "").unwrap();
+        }
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: false, lazy: true };
+        let mut s = Server::new(&[m]).unwrap();
+        assert_eq!(page_through(&mut s, 1).len(), MAX_LISTED * 2);
+        assert_eq!(s.frozen.get(&1).map(Vec::len), Some(MAX_LISTED * 2));
+        // As first listed, whatever's there now.
+        std::fs::remove_file(root.join("f0")).unwrap();
+        std::fs::write(root.join("new"), "").unwrap();
+        let names = page_through(&mut s, 1);
+        assert!(names.contains(&"f0".to_string()) && !names.contains(&"new".to_string()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
