@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.64)
+## What's left (after 0.0.65)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -33,24 +33,23 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. Live mounts: O_TMPFILE.
-5. inotify for the guest's own changes elsewhere, a node left unwatched
+4. inotify for the guest's own changes elsewhere, a node left unwatched
    on macOS, `TZ` from the host, stack growth and guard pages, holes in
    shared memory (`MADV_REMOVE`, `FALLOC_FL_PUNCH_HOLE`), newer syscalls
    as programs ask for them.
-6. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
-7. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
+5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
+6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
 
 Bigger:
 
-8. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+7. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-9. Finer locking: phase 2, a reader/writer lock with per-process
+8. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-10. Faster live-mount round trips, multi-architecture images, and the
-    rest of `/proc/grix/smp`'s counters.
-11. An outside security review (round 2, item 20).
+9. Faster live-mount round trips, multi-architecture images, and the
+   rest of `/proc/grix/smp`'s counters.
+10. An outside security review (round 2, item 20).
 
 By design, not left: eBPF and Linux capabilities (DATADOG.md: the agent
 runs and its intake accepts data, system-probe's eBPF features don't),
@@ -556,17 +555,18 @@ Left, none of it a way out of the sandbox:
       (`file::read_only_target`), as `open` and `mkdir` do
       (`need_write_in`): EROFS, no denial (`read_only_mounts_without_fs_write`).
 - [x] Live mounts: inotify for host-side changes (the host watches what the guest watches: inotify on Linux, kqueue on macOS).
-- [~] Live mounts: hard links within a mount (EPERM today); RENAME_EXCHANGE (EINVAL); O_TMPFILE (EOPNOTSUPP).
-      Hard links and RENAME_EXCHANGE are done: `hostfs::Request::Link`
-      (`linkat` without AT_SYMLINK_FOLLOW, both ends walked to as always)
-      and `Rename`'s `exchange` (RENAME_EXCHANGE, macOS's RENAME_SWAP),
-      `links_and_exchanges_in_a_live_mount`. A link's new name is a node
-      of its own (the host keeps an id per name), so the guest shows the
-      two names different inode numbers and an nlink of 1. Left:
-      O_TMPFILE, which would need the unnamed local file made the host's
-      when `linkat` names it (Create, then its bytes written over, and
-      its open descriptors and mappings moved to the host's file), or a
-      host-side O_TMPFILE (Linux only; macOS has none).
+- [x] Live mounts: hard links within a mount, RENAME_EXCHANGE, O_TMPFILE.
+      `hostfs::Request::Link` (`linkat` without AT_SYMLINK_FOLLOW, both ends
+      walked to as always) and `Rename`'s `exchange` (RENAME_EXCHANGE,
+      macOS's RENAME_SWAP), `links_and_exchanges_in_a_live_mount`. A link's
+      new name is a node of its own (the host keeps an id per name), so
+      the guest shows the two names different inode numbers and an nlink
+      of 1. O_TMPFILE: the file is the sandbox's until linkat names it
+      (`Fs::publish`), as a host's O_TMPFILE is Linux's alone: the host
+      makes it and takes its bytes, and what has it open follows, with
+      `unnamed_files_in_a_live_mount`. Left: its inode number changes
+      then, and what has it open isn't pinned; naming one that's mapped
+      shared is reported, as a mapping of its pages can't follow it.
 - [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).

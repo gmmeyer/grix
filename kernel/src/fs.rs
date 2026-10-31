@@ -532,6 +532,42 @@ impl FileData {
         Ok((done, start))
     }
 
+    /// Do any of this file's own pages show in a mapping? (`map_live`.)
+    pub fn has_live_maps(&self) -> bool {
+        self.live_maps.iter().any(|w| w.strong_count() > 0)
+    }
+
+    /// This file becomes the host's file `id`, new and empty: its bytes go
+    /// there, and it's a live mount's file from now on, whoever has it
+    /// open. On failure it stays as it was. A chunk of zeros stays a hole.
+    pub fn publish(&mut self, id: u64) -> Result<(), Errno> {
+        let chunk = grix_abi::hostfs::IO_MAX;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk).map_err(|_| ENOMEM)?;
+        buf.resize(chunk, 0);
+        let mut off = 0;
+        while off < self.len {
+            let want = ((self.len - off) as usize).min(chunk);
+            let n = self.read_at(off, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            let mut done = 0;
+            while done < n && buf[..n].iter().any(|&b| b != 0) {
+                match hostfs::write(id, off + done as u64, false, &buf[done..n])? {
+                    (0, _) => return Err(EIO),
+                    (wrote, _) => done += wrote,
+                }
+            }
+            off += n as u64;
+        }
+        hostfs::set_len(id, self.len)?;
+        self.free_pages(0);
+        self.base = &[];
+        self.remote = Some(id);
+        Ok(())
+    }
+
     /// A lazy import's file becomes the sandbox's: its bytes read in from
     /// the host (the first `keep` of them). On failure it stays as it was.
     pub fn make_local(&mut self, keep: u64) -> Result<(), Errno> {
@@ -754,6 +790,10 @@ pub enum Kind {
     Unlinked {
         data: Weak<Mutex<FileData>>,
         linkable: bool,
+        /// O_TMPFILE in a live directory: its pin, as `Node::parent` says
+        /// which mount this may be named in, and a listing's directories
+        /// are otherwise forgotten (`Fs::evict`).
+        home: Option<Arc<()>>,
     },
     Dir(BTreeMap<String, Ino>),
     Symlink(String),
@@ -2195,7 +2235,8 @@ impl Fs {
             }
             // Dropping the node drops its contents (unlinked files have none
             // left by now) and its name.
-            *self.nodes[ino] = Node::new(Kind::Unlinked { data: Weak::new(), linkable: false }, 0, (0, 0), ROOT, "", 0);
+            let empty = Kind::Unlinked { data: Weak::new(), linkable: false, home: None };
+            *self.nodes[ino] = Node::new(empty, 0, (0, 0), ROOT, "", 0);
             self.nodes[ino].nlink = 0;
             self.free.push(ino);
         }
@@ -2248,15 +2289,18 @@ impl Fs {
     }
 
     /// An unnamed file in `dir` (O_TMPFILE). It goes away when its last
-    /// descriptor closes, unless linkat gives it a name.
-    pub fn create_unnamed(&mut self, dir: Ino, perm: u32, who: Who) -> Result<(Ino, Content), Errno> {
-        // As on Linux for a filesystem that can't do O_TMPFILE.
-        if self.nodes[dir].remote.is_some() {
-            return Err(EOPNOTSUPP);
+    /// descriptor closes, unless linkat gives it a name (never, if it
+    /// isn't `linkable`: O_EXCL). In a live directory it's the sandbox's
+    /// until then (`publish`): a host's O_TMPFILE is Linux's alone, and not
+    /// every file system's there.
+    pub fn create_unnamed(&mut self, dir: Ino, perm: u32, linkable: bool, who: Who) -> Result<(Ino, Content), Errno> {
+        if self.read_only(dir) {
+            return Err(EROFS);
         }
         self.may_change(dir, None, who)?;
         let content = FileData::new(&[]);
-        let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: true };
+        let home = self.nodes[dir].remote.is_some().then(|| self.pin(dir));
+        let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable, home };
         let mut node = Node::new(kind, perm, (who.uid, who.gid), dir, "", crate::time::realtime_ns());
         (node.nlink, node.changed) = (0, true);
         self.reclaim();
@@ -2272,7 +2316,7 @@ impl Fs {
     pub fn create_memfd(&mut self, name: &str, seals: u32, who: Who) -> Result<(Ino, Content), Errno> {
         let content = FileData::new(&[]);
         content.lock().seals = Some(seals);
-        let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: false };
+        let kind = Kind::Unlinked { data: Arc::downgrade(&content), linkable: false, home: None };
         // /proc/self/fd shows it as Linux does.
         let label = alloc::format!("memfd:{name} (deleted)");
         let mut node = Node::new(kind, 0o777, (who.uid, who.gid), ROOT, &label, crate::time::realtime_ns());
@@ -2298,7 +2342,7 @@ impl Fs {
         }
         if let Kind::File(c) = &n.kind {
             // Open descriptors keep the contents alive; nothing else does.
-            n.kind = Kind::Unlinked { data: Arc::downgrade(c), linkable: false };
+            n.kind = Kind::Unlinked { data: Arc::downgrade(c), linkable: false, home: None };
         }
         self.orphans.push(ino);
     }
@@ -2366,9 +2410,11 @@ impl Fs {
         }
         // Within one live mount the host makes the link; nothing links
         // across a mount.
+        let home = self.unnamed_in(ino);
         match (self.nodes[ino].remote.as_ref(), self.nodes[dir].remote.as_ref()) {
-            (None, None) => {}
+            (None, None) if home.is_none() => {}
             (Some(a), Some(b)) if a.mount == b.mount => return self.link_remote(ino, dir, name, who),
+            (None, Some(b)) if home == Some(b.mount) => return self.publish(ino, dir, name, who),
             _ => return Err(EXDEV),
         }
         if self.nodes[dir].nlink == 0 {
@@ -2384,7 +2430,7 @@ impl Fs {
         let revive = match &self.nodes[ino].kind {
             // An O_TMPFILE file getting its first name. Other unlinked files
             // stay gone, as on Linux.
-            Kind::Unlinked { data, linkable: true } => Some(data.upgrade().ok_or(ENOENT)?),
+            Kind::Unlinked { data, linkable: true, .. } => Some(data.upgrade().ok_or(ENOENT)?),
             Kind::Unlinked { .. } => return Err(ENOENT),
             _ if self.nodes[ino].nlink == 0 => return Err(ENOENT),
             _ => None,
@@ -2401,6 +2447,82 @@ impl Fs {
         let n = &mut self.nodes[ino];
         n.nlink += 1;
         n.ctime = now;
+        self.touch_dir(dir);
+        Ok(())
+    }
+
+    /// The live mount an O_TMPFILE file was made in, while it's unnamed.
+    fn unnamed_in(&self, ino: Ino) -> Option<usize> {
+        let n = &self.nodes[ino];
+        let Kind::Unlinked { home: Some(_), .. } = n.kind else { return None };
+        self.nodes[n.parent].remote.as_ref().filter(|r| !self.lazy[r.mount]).map(|r| r.mount)
+    }
+
+    /// `linkat` is to name `ino`, an O_TMPFILE file that a shared mapping
+    /// has the pages of, in a live directory: those can't follow it to the
+    /// host (`publish`).
+    pub fn publish_refused(&self, ino: Ino, dir: Ino) -> bool {
+        let home = self.unnamed_in(ino);
+        let there = home.is_some() && home == self.nodes[dir].remote.as_ref().map(|r| r.mount);
+        let linkable = matches!(self.nodes[ino].kind, Kind::Unlinked { linkable: true, .. });
+        there && linkable && self.content(ino).is_some_and(|c| c.lock().has_live_maps())
+    }
+
+    /// `link` of an O_TMPFILE file made in this mount: the host makes the
+    /// file and takes its bytes, and from then on it's a live mount's file
+    /// like any, for the descriptors it already has too. Nothing's left
+    /// behind if that fails. (Its inode number changes with it.)
+    fn publish(&mut self, ino: Ino, dir: Ino, name: &str, who: Who) -> Result<(), Errno> {
+        // O_EXCL: never to have a name.
+        if matches!(self.nodes[ino].kind, Kind::Unlinked { linkable: false, .. }) {
+            return Err(ENOENT);
+        }
+        let r = self.nodes[dir].remote.as_deref().unwrap();
+        let (did, mount, writable) = (r.id, r.mount, r.writable);
+        if !writable {
+            return Err(EROFS);
+        }
+        if self.nodes[dir].nlink == 0 {
+            return Err(ENOENT);
+        }
+        if name.is_empty() || name == "." || name == ".." || self.find_child(dir, name)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.may_change(dir, None, who)?;
+        let c = self.content(ino).ok_or(ENOENT)?;
+        charge(entry_cost(name) + REMOTE_COST)?;
+        let uncharge = || release(entry_cost(name) + REMOTE_COST);
+        let (id, attr) = match hostfs::create(did, name, FileType::File, self.nodes[ino].perm, "") {
+            Ok(made) => made,
+            Err(e) => {
+                uncharge();
+                // Made on the host since the last listing, perhaps.
+                if e == EEXIST
+                    && let Some(r) = self.nodes[dir].remote.as_deref_mut()
+                {
+                    r.listed_at = 0;
+                }
+                return Err(e);
+            }
+        };
+        let len = c.lock().len();
+        if let Err(e) = c.lock().publish(id) {
+            uncharge();
+            let _ = hostfs::remove(did, name, false);
+            return Err(e);
+        }
+        self.orphans.retain(|&o| o != ino);
+        self.remote_files.insert(id, Arc::downgrade(&c));
+        let owner = (self.nodes[dir].uid, self.nodes[dir].gid);
+        let n = &mut self.nodes[ino];
+        (n.kind, n.parent, n.name, n.nlink, n.changed) = (Kind::File(c), dir, name.into(), 1, false);
+        (n.uid, n.gid) = owner;
+        n.remote = Some(Remote::new(id, mount, writable, 0));
+        // Its size as it is now, whatever the host says of the rest.
+        let attr = hostfs::stat(id).unwrap_or(attr);
+        self.apply_attr(ino, &Attr { size: len, ..attr });
+        let Kind::Dir(children) = &mut self.nodes[dir].kind else { unreachable!() };
+        children.insert(name.into(), ino);
         self.touch_dir(dir);
         Ok(())
     }
@@ -3001,7 +3123,9 @@ impl Fs {
     /// them can't be (EXDEV)? A lazy import's nodes are the sandbox's by
     /// then.
     pub fn crosses_mount(&self, a: Ino, b: Ino) -> bool {
-        let mount = |ino: Ino| self.nodes[ino].remote.as_ref().filter(|r| !self.lazy[r.mount]).map(|r| r.mount);
+        // (An O_TMPFILE file is in the mount it was made in.)
+        let live = |ino: Ino| self.nodes[ino].remote.as_ref().filter(|r| !self.lazy[r.mount]).map(|r| r.mount);
+        let mount = |ino: Ino| live(ino).or(self.unnamed_in(ino));
         mount(a) != mount(b)
     }
 
