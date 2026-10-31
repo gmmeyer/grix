@@ -949,7 +949,8 @@ static void t_execperm(void) {
     CHECK(c >= 0);
     if (c == 0) {
         CHECK(setgid(1000) == 0 && setuid(1000) == 0);
-        char *argv[] = {"mine", "ran", "", 0}, *envp[] = {0};
+        // "refused": if it runs after all, this child doesn't end as a success.
+        char *argv[] = {"mine", "refused", 0}, *envp[] = {0};
         FAILS(execve("/app/mine", argv, envp), EACCES);
         _exit(0);
     }
@@ -1302,6 +1303,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(c, "script")) return !(argc > 2 && !strncmp(argv[2], "/dev/fd/", 8));
+    if (!strcmp(c, "refused")) {
+        printf("FAILED: ran what it may not\n");
+        return 9;
+    }
     if (!strcmp(c, "wrongfile")) {
         printf("FAILED: ran what's at the old name\n");
         return 9;
