@@ -178,12 +178,7 @@ pub fn load(aspace: &mut AddressSpace, src: &Source, ino: Ino, base: Option<u64>
         }
         let start = page_down(vstart);
         let skew = vstart - start;
-        aspace.map(Vma {
-            start,
-            end: vend,
-            prot: Prot::from_elf(p.flags),
-            backing: src.backing(p.offset - skew, p.filesz + skew, ino),
-        });
+        aspace.map(Vma::new(start, vend, Prot::from_elf(p.flags), src.backing(p.offset - skew, p.filesz + skew, ino)));
         end = end.max(vend);
     }
 

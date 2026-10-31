@@ -480,15 +480,20 @@ fn http_server(body: &'static str) -> u16 {
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut c in l.incoming().flatten() {
-            let mut req = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => req.extend_from_slice(&buf[..n]),
+            // A thread each: tools on a developer's machine probe new ports,
+            // and some connect and say nothing.
+            std::thread::spawn(move || {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
                 }
-            }
-            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ =
+                    write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            });
         }
     });
     port
@@ -527,10 +532,15 @@ asyncio.run(main())
         r#"
 const http = require('http');
 const srv = http.createServer((req, res) => {{
+  if (req.url != '/page') return res.end('not the test');
   http.get('http://{host}/', up => {{
     let body = '';
     up.on('data', d => body += d);
-    up.on('end', () => {{ res.end(`node saw: ${{body}} for ${{req.url}}`); srv.close(); }});
+    up.on('end', () => {{
+      res.on('finish', () => srv.closeAllConnections());
+      res.end(`node saw: ${{body}} for ${{req.url}}`);
+      srv.close();
+    }});
   }});
 }});
 srv.listen(8000);
@@ -546,13 +556,15 @@ srv.listen(8000);
         .unwrap();
     let guest = std::thread::spawn(move || sb.run(&["/usr/bin/node", "-e", &js]).unwrap());
     let started = std::time::Instant::now();
-    let reply = loop {
+    // Tools on a developer's machine probe new ports. Only the test's own
+    // request ends the server: not one for something else, and not one
+    // that connects and says nothing, which the server doesn't wait for.
+    while get(forwarded, "/probe").is_none() {
         assert!(started.elapsed() < Duration::from_secs(60), "node never answered");
-        if let Some(r) = get(forwarded, "/page") {
-            break r;
-        }
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+    let _silent = std::net::TcpStream::connect(("127.0.0.1", forwarded)).unwrap();
+    let reply = get(forwarded, "/page").expect("an answer");
     assert!(reply.ends_with("node saw: hello from the host for /page"), "{reply}");
     let out = guest.join().unwrap();
     assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr_str());

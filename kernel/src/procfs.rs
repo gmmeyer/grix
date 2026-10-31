@@ -546,8 +546,16 @@ fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
         block.clear();
         map_line(&a, &fs, v, &mut block);
         usage_lines(&mut block, v.end - v.start, &u);
-        let flags =
-            [(v.prot.read, "rd"), (v.prot.write, "wr"), (v.prot.exec, "ex"), (true, "mr"), (true, "mw"), (true, "me")];
+        let flags = [
+            (v.prot.read, "rd"),
+            (v.prot.write, "wr"),
+            (v.prot.exec, "ex"),
+            (true, "mr"),
+            (true, "mw"),
+            (true, "me"),
+            (v.dontfork, "dc"),
+            (v.wipeonfork, "wf"),
+        ];
         let _ = write!(block, "VmFlags:");
         for (_, f) in flags.iter().filter(|(on, _)| *on) {
             let _ = write!(block, " {f}");

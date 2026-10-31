@@ -159,11 +159,20 @@ pub struct Vma {
     pub end: u64,
     pub prot: Prot,
     pub backing: Backing,
+    /// MADV_DONTFORK: a child doesn't get this mapping (VM_DONTCOPY).
+    pub dontfork: bool,
+    /// MADV_WIPEONFORK: a child gets it empty (VM_WIPEONFORK), and so do
+    /// its children.
+    pub wipeonfork: bool,
 }
 
 impl Vma {
+    pub fn new(start: u64, end: u64, prot: Prot, backing: Backing) -> Self {
+        Vma { start, end, prot, backing, dontfork: false, wipeonfork: false }
+    }
+
     pub fn anon(start: u64, end: u64, prot: Prot) -> Self {
-        Vma { start, end, prot, backing: Backing::Anon }
+        Vma::new(start, end, prot, Backing::Anon)
     }
 
     /// The sub-range `[s, e)` of this VMA, with file offsets adjusted.
@@ -199,7 +208,7 @@ impl Vma {
                 shared: shared.clone(),
             },
         };
-        Vma { start: s, end: e, prot: self.prot, backing }
+        Vma { start: s, end: e, prot: self.prot, backing, dontfork: self.dontfork, wipeonfork: self.wipeonfork }
     }
 
     /// A MAP_SHARED file mapping that only holds a copy of the file (a
@@ -415,13 +424,18 @@ impl AddressSpace {
     /// A copy for a forked child: the same mappings, sharing every page.
     /// Writable pages become read-only in both, and the first write to one
     /// copies it (`fault`'s copy-on-write).
-    pub fn fork(&mut self) -> Result<AddressSpace, Errno> {
+    pub fn fork(&mut self, vfork: bool) -> Result<AddressSpace, Errno> {
         if !Self::total_room(self.vmas.len()) {
             crate::stats::hit(Limit::Mappings);
             return Err(ENOMEM);
         }
         let mut child = AddressSpace::new().ok_or(ENOMEM)?;
         child.vmas = self.vmas.clone();
+        // Linux's dup_mmap. A vfork doesn't go through it: the child is in
+        // the caller's memory there, so here it's as if it were.
+        if !vfork {
+            child.vmas.retain(|_, v| !v.dontfork);
+        }
         child.recount();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
@@ -431,6 +445,9 @@ impl AddressSpace {
         // parent's threads may still write through their old ones.
         let mut downgraded = Span::new();
         for v in self.vmas.values() {
+            if !vfork && (v.dontfork || v.wipeonfork) {
+                continue;
+            }
             let cow = v.prot.write && !v.shared_pages();
             self.pt.for_each_mapped(v.start, v.end, |va, pte| unsafe {
                 if out_of_memory {
@@ -671,6 +688,21 @@ impl AddressSpace {
     /// faults in fresh zero (or file) contents. MADV_DONTNEED semantics.
     pub fn discard(&mut self, start: u64, end: u64) {
         discard_in(&mut self.pt, start, end);
+    }
+
+    /// The lowest mapping with anything in `[start, end)`.
+    pub fn first_in(&self, start: u64, end: u64) -> Option<&Vma> {
+        self.find(start).or_else(|| self.vmas.range(start..end).next().map(|(_, v)| v))
+    }
+
+    /// `set` on what's in `[start, end)` of the mappings there, which are
+    /// cut at its edges: see `room_for`.
+    pub fn set_flags(&mut self, start: u64, end: u64, set: impl Fn(&mut Vma)) {
+        for mut piece in self.carve(start, end) {
+            set(&mut piece);
+            self.vmas.insert(piece.start, piece);
+        }
+        self.recount();
     }
 
     /// Does `[start, end)` overlap a MAP_SHARED file mapping that only

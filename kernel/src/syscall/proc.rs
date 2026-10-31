@@ -63,7 +63,7 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & CLONE_PARENT_SETTID != 0 {
         write_u32(&mut p.aspace, args.parent_tid, pid)?;
     }
-    let aspace = p.aspace.fork()?;
+    let aspace = p.aspace.fork(flags & CLONE_VFORK != 0)?;
     let share =
         Share { files: flags & CLONE_FILES != 0, fs: flags & CLONE_FS != 0, sighand: flags & CLONE_SIGHAND != 0 };
     let mut c = p.fork(pid, aspace, share)?;

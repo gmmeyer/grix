@@ -278,8 +278,8 @@ mod os {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use super::{Change, ENOSPC, guest_name};
-    use crate::at::{Kind, check, ctime_ns, identity, kind, mode, mtime_ns, openat, read_dir, stat_at, stat_fd};
+    use super::{Change, ENOSPC, MAX_BATCH, guest_name};
+    use crate::at::{Kind, check, ctime_ns, each_name, identity, kind, mode, mtime_ns, openat, stat_at, stat_fd};
     use grix_abi::hostfs::mask::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -390,18 +390,20 @@ mod os {
         lost: bool,
     }
 
-    /// A directory's entries the guest can see, by name; at most `room`.
+    /// A directory's entries the guest can see, by name; None past `room`,
+    /// with no more of them held than that.
     fn scan(dir: RawFd, room: usize) -> io::Result<Option<BTreeMap<String, Seen>>> {
         let mut out = BTreeMap::new();
-        for name in read_dir(dir)? {
-            let Some(s) = guest_name(name.to_bytes()) else { continue };
-            let Some(seen) = stat_at(dir, &name).ok().as_ref().and_then(seen) else { continue };
+        let all = each_name(dir, |name| {
+            let Some(s) = guest_name(name.to_bytes()) else { return true };
+            let Some(seen) = stat_at(dir, name).ok().as_ref().and_then(seen) else { return true };
             if out.len() >= room {
-                return Ok(None);
+                return false;
             }
             out.insert(s.to_string(), seen);
-        }
-        Ok(Some(out))
+            true
+        })?;
+        Ok(all.then_some(out))
     }
 
     impl State {
@@ -597,6 +599,13 @@ mod os {
         /// (Linux's MOVED_FROM and MOVED_TO with one cookie), or else
         /// deletions and creations.
         fn pair(&mut self, gone: Vec<(u64, String, Seen)>, mut new: Vec<(u64, String, Seen)>, out: &mut Vec<Change>) {
+            // More than a round carries (`bounded` would throw them away)
+            // is an overflow, and not a search of one list for each of the
+            // other, up to `MAX_ENTRIES` of each, with `Watcher::add` waiting.
+            if gone.len() > MAX_BATCH || new.len() > MAX_BATCH {
+                out.push(Change::new(0, IN_Q_OVERFLOW, ""));
+                return;
+            }
             let isdir = |s: &Seen| if s.dir { IN_ISDIR } else { 0 };
             let mut moved_to = BTreeSet::new();
             let mut deleted = Vec::new();
@@ -692,6 +701,20 @@ mod os {
         }
     }
 
+    #[cfg(test)]
+    impl State {
+        /// `n` files, each renamed.
+        pub(super) fn pair_for_test(&mut self, n: usize, out: &mut Vec<Change>) {
+            let file = |i: usize, name: String| {
+                let seen = Seen { file: (1, i as u64), dir: false, size: 0, mtime: 0, ctime: 0, mode: 0o644 };
+                (1, name, seen)
+            };
+            let gone = (0..n).map(|i| file(i, format!("a{i}"))).collect();
+            let new = (0..n).map(|i| file(i, format!("b{i}"))).collect();
+            self.pair(gone, new, out);
+        }
+    }
+
     pub fn wait(state: &Mutex<State>, tick: Duration) -> Vec<Change> {
         let kq = state.lock().unwrap().kq.as_raw_fd();
         // SAFETY: zeroed kevents are valid for the kernel to fill.
@@ -751,6 +774,20 @@ mod tests {
         let round = bounded(out);
         assert_eq!(round.len(), MAX_BATCH);
         assert_eq!(round.last().unwrap().mask, IN_Q_OVERFLOW);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_round_too_big_to_carry_is_an_overflow() {
+        let mut st = os::State::new().unwrap();
+        let mut out = Vec::new();
+        st.pair_for_test(MAX_BATCH + 1, &mut out);
+        assert_eq!(out, [Change::new(0, IN_Q_OVERFLOW, "")]);
+        // Renames are found among as many as a round carries.
+        out.clear();
+        st.pair_for_test(MAX_BATCH, &mut out);
+        assert_eq!(out.len(), MAX_BATCH * 2);
+        assert!(out.iter().all(|c| c.mask & (IN_MOVED_FROM | IN_MOVED_TO) != 0), "{out:?}");
     }
 
     #[cfg(target_os = "macos")]

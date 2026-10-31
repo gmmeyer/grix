@@ -139,8 +139,10 @@ pub(crate) fn readlink_at(dir: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The names in directory `dir` (not `.` or `..`).
-pub(crate) fn read_dir(dir: RawFd) -> io::Result<Vec<CString>> {
+/// Calls `f` with each name in directory `dir` (not `.` or `..`) until it
+/// returns false; false if it did. For a directory anyone can fill, which
+/// may hold more names than anyone should keep.
+pub(crate) fn each_name(dir: RawFd, mut f: impl FnMut(&CStr) -> bool) -> io::Result<bool> {
     // fdopendir takes the descriptor over, so give it a copy.
     // SAFETY: dup of a descriptor we hold; fdopendir owns the copy, and
     // closedir closes it.
@@ -153,19 +155,28 @@ pub(crate) fn read_dir(dir: RawFd) -> io::Result<Vec<CString>> {
     }
     // From the start, whatever the shared offset was.
     unsafe { libc::rewinddir(d) };
-    let mut names = Vec::new();
-    loop {
+    let all = loop {
         // SAFETY: readdir's entry is valid until the next call on `d`.
         let e = unsafe { libc::readdir(d) };
         if e.is_null() {
-            break;
+            break true;
         }
         let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
+        if name.to_bytes() != b"." && name.to_bytes() != b".." && !f(name) {
+            break false;
         }
-    }
+    };
     unsafe { libc::closedir(d) };
+    Ok(all)
+}
+
+/// The names in directory `dir` (not `.` or `..`).
+pub(crate) fn read_dir(dir: RawFd) -> io::Result<Vec<CString>> {
+    let mut names = Vec::new();
+    each_name(dir, |name| {
+        names.push(name.to_owned());
+        true
+    })?;
     Ok(names)
 }
 

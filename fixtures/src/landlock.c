@@ -339,7 +339,7 @@ static void basic(void) {
     close(fd);
     FAILS(open("/srv/ll", O_TMPFILE | O_RDWR, 0600), EACCES);
     // execve needs EXECUTE (and READ_FILE) on the program: /bin has none.
-    char *argv[] = {"/bin/landlock", "after-exec", NULL};
+    char *argv[] = {"/bin/landlock", "refused", NULL};
     FAILS(execv("/bin/landlock", argv), EACCES);
 }
 
@@ -852,6 +852,11 @@ static int wrap(char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "after-exec")) after_exec();
+    // What a refused execve would have run: it ends as no success.
+    if (argc > 1 && !strcmp(argv[1], "refused")) {
+        printf("FAILED: ran what it may not\n");
+        return 9;
+    }
     if (argc > 1 && !strcmp(argv[1], "wrap")) return wrap(argv + 2);
     if (argc > 1 && !strcmp(argv[1], "policy")) {
         in_child("policy", policy);

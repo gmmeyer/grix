@@ -248,7 +248,11 @@ files' `FileData` reads and writes go to the host. A directory's entries
 are fetched on first use and kept for `hostfs::FRESH_NS` (`Fs::ensure`).
 Under memory pressure `Fs::evict` forgets idle directories' entries. A
 directory too big to hold is `Remote::large`: names are looked up one at a
-time and getdents pages through the host. Each request waits for the
+time and getdents pages through the host, which holds at most `MAX_LISTED`
+entries of it (`read_entries`, going on from where the guest is), with a
+page empty only at the end, as that's what it means to `list_remote`. What
+makes a node asks for its id first (`id_room`): the guest is told a failed
+`Create` changed nothing. Each request waits for the
 host's answer in `console::host_request`. The host walks every path down
 from the mount's root fd with `openat`/`O_NOFOLLOW`, so nothing the guest
 says can lead outside the mount. Lazy imports (`LiveMount::lazy`) are
@@ -294,7 +298,9 @@ picks threads round-robin across processes, swapping bodies between the two
 and the address space in TTBR0. fork copies the address space
 copy-on-write (per-frame refcounts in `mm/frame.rs`; `AddressSpace::fork`
 and `unshare`; the kernel's own writes unshare in `ensure`). vfork is a
-copy too, with the parent waiting (`WaitOn::Vfork`) for exec or exit.
+copy too, with the parent waiting (`WaitOn::Vfork`) for exec or exit,
+and ignores `Vma::dontfork` and `wipeonfork` (madvise's), as Linux's child
+is in the caller's memory.
 Every way a process ends goes through `Process::terminate`: for init (pid
 1, the program) that ends the sandbox; any other process is marked, and
 `procs::finalize` (run from `schedule`, which `return_to_user` calls for an
@@ -909,7 +915,10 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
 3. Add a C fixture in `fixtures/src/` or a Go one in `fixtures/go/<name>/`
    (built automatically by `fixtures/build.sh`) or use busybox, plus an end-to-end test in
    `crates/grix/tests/guest.rs` that checks the program's output, its
-   exit status, **and** `events`.
+   exit status, **and** `events`. A check that something is refused must
+   fail if it's allowed: an `execve` that should be refused runs something
+   that ends as no success, and it's worth seeing fail once, on a kernel
+   without the check.
 4. Run `make test`, plus `GRIX_ACCEL=hvf cargo test -p grix --test guest` on Apple Silicon.
 
 To find what a real program is missing, run it with `--json` and read the
