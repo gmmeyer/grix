@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.62)
+## What's left (after 0.0.63)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -35,8 +35,9 @@ Linux behaviour:
    groups. Nothing surveyed needs them yet: wait for a program that does.
 4. Live mounts: O_TMPFILE, and a file the host replaces while it's open.
 5. inotify for the guest's own changes elsewhere, a node left unwatched
-   on macOS, `TZ` from the host, `madvise`'s last advice values, stack
-   growth and guard pages, newer syscalls as programs ask for them.
+   on macOS, `TZ` from the host, stack growth and guard pages, holes in
+   shared memory (`MADV_REMOVE`, `FALLOC_FL_PUNCH_HOLE`), newer syscalls
+   as programs ask for them.
 6. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
 7. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
@@ -688,8 +689,14 @@ Left, none of it a way out of the sandbox:
       exec sizes the stack from `RLIMIT_STACK` (up to 4 GiB), and mmap stays 128 MiB below it
       (a hint, 1 MiB). `MAP_GROWSDOWN` mappings don't grow.
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
-- [~] `mincore`; accept the remaining `madvise` advice values.
-      `mincore` works.
+- [x] `mincore`, and `madvise` as Linux 6.1's, every advice (the `madvise`
+      fixture passes on Linux too, built with `-DON_LINUX`): invalid advice
+      refused where it all used to succeed, holes in a range ENOMEM,
+      `MADV_FREE` only for what's nobody else's (it took a file mapping's
+      private copies), `MADV_DONTFORK` and `MADV_WIPEONFORK` per mapping,
+      `MADV_POPULATE_*`, and `dc` and `wf` in smaps. Left: `MADV_REMOVE` on
+      a mapping the descriptor could write (reported: shared memory has no
+      holes yet).
 - [x] Free empty page-table pages on munmap. `PageTable::prune`, after
       `arch::flush_tables` (TLBI VAE1IS on arm64, every level; INVLPG or a
       CR3 load on x86_64). A page touched in each of 2000 2 MiB regions

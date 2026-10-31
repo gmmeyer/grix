@@ -1126,15 +1126,11 @@ pub fn load_program(
     aspace.brk_start = loaded.end;
     aspace.brk = loaded.end;
     aspace.map(Vma::anon(aspace.stack_bottom(), STACK_TOP, Prot::RW));
-    aspace.map(Vma { start: SIGPAGE, end: SIGPAGE + PAGE_SIZE, prot: Prot::RX, backing: Backing::Sigpage });
+    aspace.map(Vma::new(SIGPAGE, SIGPAGE + PAGE_SIZE, Prot::RX, Backing::Sigpage));
     let (vvar, vdso) = crate::vdso::frames();
-    aspace.map(Vma {
-        start: VVAR,
-        end: VVAR + PAGE_SIZE,
-        prot: Prot { read: true, write: false, exec: false },
-        backing: Backing::KernelPage(vvar),
-    });
-    aspace.map(Vma { start: VDSO, end: VDSO + PAGE_SIZE, prot: Prot::RX, backing: Backing::KernelPage(vdso) });
+    let read_only = Prot { read: true, write: false, exec: false };
+    aspace.map(Vma::new(VVAR, VVAR + PAGE_SIZE, read_only, Backing::KernelPage(vvar)));
+    aspace.map(Vma::new(VDSO, VDSO + PAGE_SIZE, Prot::RX, Backing::KernelPage(vdso)));
 
     let auxv = [
         (33, VDSO),                       // AT_SYSINFO_EHDR

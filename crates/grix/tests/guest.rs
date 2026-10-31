@@ -648,6 +648,30 @@ fn shared_mappings_of_mounted_files_are_reported() {
     assert_eq!(unimplemented, ["mmap", "mprotect", "write"], "{:?}", out.events);
 }
 
+/// madvise, as Linux 6.1's: the fixture passes there too, built with
+/// -DON_LINUX, apart from what's marked.
+#[test]
+fn madvise_does_what_it_says() {
+    let sandbox = || with("madvise").allow(Capability::Process);
+    let out = run(sandbox(), &["/bin/madvise"]);
+    assert_eq!(out.stdout_str(), "madvise ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // No holes in shared memory: what can't happen says so.
+    let out = run(sandbox(), &["/bin/madvise", "remove"]);
+    assert_eq!(out.stdout_str(), "madvise remove ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { detail, .. }] if detail.contains("MADV_REMOVE")),
+        "{:?}",
+        out.events
+    );
+    // Cutting mappings up is bounded as making them is.
+    let out = run(sandbox(), &["/bin/madvise", "cut", "400000"]);
+    assert_eq!(out.stdout_str(), "madvise cut ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+}
+
 #[test]
 fn memory_management() {
     let out = run(with("mem"), &["/bin/mem"]);

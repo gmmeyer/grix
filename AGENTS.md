@@ -298,7 +298,9 @@ picks threads round-robin across processes, swapping bodies between the two
 and the address space in TTBR0. fork copies the address space
 copy-on-write (per-frame refcounts in `mm/frame.rs`; `AddressSpace::fork`
 and `unshare`; the kernel's own writes unshare in `ensure`). vfork is a
-copy too, with the parent waiting (`WaitOn::Vfork`) for exec or exit.
+copy too, with the parent waiting (`WaitOn::Vfork`) for exec or exit,
+and ignores `Vma::dontfork` and `wipeonfork` (madvise's), as Linux's child
+is in the caller's memory.
 Every way a process ends goes through `Process::terminate`: for init (pid
 1, the program) that ends the sandbox; any other process is marked, and
 `procs::finalize` (run from `schedule`, which `return_to_user` calls for an

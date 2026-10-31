@@ -150,7 +150,7 @@ pub(super) fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Pro
         a.find_free(len).ok_or(ENOMEM)?
     };
     a.room_for(start, start + len, false, 1)?;
-    a.map(Vma { start, end: start + len, prot, backing });
+    a.map(Vma::new(start, start + len, prot, backing));
     Ok(start)
 }
 
@@ -216,18 +216,81 @@ pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64,
     p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
 }
 
+/// madvise, as Linux 6.1's, which is what uname says: mm/madvise.c. What
+/// only advises is taken and does nothing, as it may on Linux too; what a
+/// program can see the effect of, happens. A range with holes in it is
+/// ENOMEM, after the rest has been done, and an error stops at the mapping
+/// it's about, after those before it.
 pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {
-    const MADV_DONTNEED: u64 = 4;
-    const MADV_FREE: u64 = 8;
-    if !aligned(addr) {
+    const MADV_DONTNEED: u32 = 4;
+    const MADV_FREE: u32 = 8;
+    const MADV_REMOVE: u32 = 9;
+    const MADV_DONTFORK: u32 = 10;
+    const MADV_DOFORK: u32 = 11;
+    const MADV_WIPEONFORK: u32 = 18;
+    const MADV_KEEPONFORK: u32 = 19;
+    const MADV_POPULATE_READ: u32 = 22;
+    const MADV_POPULATE_WRITE: u32 = 23;
+    const MADV_DONTNEED_LOCKED: u32 = 24;
+    const MADV_COLLAPSE: u32 = 25;
+    // An `int` there. Nothing's 5 to 7; 100 and 101 take CONFIG_MEMORY_FAILURE,
+    // which this isn't, and MADV_GUARD_* came with 6.13.
+    let advice = advice as u32;
+    if !matches!(advice, 0..=4 | 8..=25) || !aligned(addr) {
         return Err(EINVAL);
     }
-    let len = page_up(len).ok_or(EINVAL)?;
-    let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(EINVAL)?;
-    if matches!(advice, MADV_DONTNEED | MADV_FREE) {
-        p.aspace.discard(addr, end);
+    let end = page_up(len).and_then(|len| addr.checked_add(len)).ok_or(EINVAL)?;
+    let (mut at, mut hole) = (addr, false);
+    while at < end {
+        let Some(v) = p.aspace.first_in(at, end) else {
+            hole = true;
+            break;
+        };
+        hole |= v.start > at;
+        let (start, stop) = (v.start.max(at), v.end.min(end));
+        let anon = matches!(v.backing, Backing::Anon);
+        let (read, write) = (v.prot.read, v.prot.write);
+        // VM_MAYWRITE: what the descriptor could do, not what the mapping
+        // does now.
+        let shared_file = match v.backing {
+            Backing::Shared { may_write, .. } | Backing::SharedFile { may_write, .. } => Some(may_write),
+            _ => None,
+        };
+        let file = shared_file.is_some() || matches!(v.backing, Backing::Data { .. } | Backing::File { .. });
+        match advice {
+            MADV_DONTNEED | MADV_DONTNEED_LOCKED => p.aspace.discard(start, stop),
+            // Only what nothing else holds: a file's pages aren't the
+            // mapping's to lose, and its private copies aren't to go.
+            MADV_FREE if !anon => return Err(EINVAL),
+            MADV_FREE => p.aspace.discard(start, stop),
+            MADV_REMOVE if !file => return Err(EINVAL),
+            MADV_REMOVE if shared_file != Some(true) => return Err(EACCES),
+            MADV_REMOVE => {
+                return p.unimplemented(nr::madvise, "madvise", "MADV_REMOVE: no holes in shared memory", EOPNOTSUPP);
+            }
+            MADV_WIPEONFORK if !anon => return Err(EINVAL),
+            MADV_DONTFORK | MADV_DOFORK | MADV_WIPEONFORK | MADV_KEEPONFORK => {
+                // A mapping that can't be cut: EAGAIN, as Linux says for
+                // what's only short for now.
+                p.aspace.room_for(start, stop, true, 0).map_err(|_| EAGAIN)?;
+                p.aspace.set_flags(start, stop, |v| match advice {
+                    MADV_DONTFORK | MADV_DOFORK => v.dontfork = advice == MADV_DONTFORK,
+                    _ => v.wipeonfork = advice == MADV_WIPEONFORK,
+                });
+            }
+            // EINVAL rather than EFAULT for permissions: faultin_vma_page_range.
+            MADV_POPULATE_READ if !read => return Err(EINVAL),
+            MADV_POPULATE_WRITE if !write => return Err(EINVAL),
+            MADV_POPULATE_READ | MADV_POPULATE_WRITE => {
+                p.aspace.ensure(start, stop - start, advice == MADV_POPULATE_WRITE)?;
+            }
+            // Nothing here is a huge page, or could be.
+            MADV_COLLAPSE => return Err(EINVAL),
+            _ => {}
+        }
+        at = stop;
     }
-    Ok(0)
+    if hole { Err(ENOMEM) } else { Ok(0) }
 }
 
 // NUMA memory policies (mm/mempolicy.c). The machine has one node, 0, so
