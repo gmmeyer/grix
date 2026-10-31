@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.66)
+## What's left (after 0.0.67)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -33,9 +33,8 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. A node left unwatched on macOS, `TZ` from the host, stack growth and guard pages, holes in
-   shared memory (`MADV_REMOVE`, `FALLOC_FL_PUNCH_HOLE`), newer syscalls
-   as programs ask for them.
+4. A node left unwatched on macOS, `TZ` from the host, stack growth and
+   guard pages, newer syscalls as programs ask for them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
@@ -706,9 +705,15 @@ Left, none of it a way out of the sandbox:
       refused where it all used to succeed, holes in a range ENOMEM,
       `MADV_FREE` only for what's nobody else's (it took a file mapping's
       private copies), `MADV_DONTFORK` and `MADV_WIPEONFORK` per mapping,
-      `MADV_POPULATE_*`, and `dc` and `wf` in smaps. Left: `MADV_REMOVE` on
-      a mapping the descriptor could write (reported: shared memory has no
-      holes yet).
+      `MADV_POPULATE_*`, `MADV_REMOVE`, and `dc` and `wf` in smaps.
+- [x] Holes: `FALLOC_FL_PUNCH_HOLE` and `MADV_REMOVE` (`file::punch_hole`,
+      `FileData::punch`, `SharedPages::punch`), as tmpfs does them, the
+      `holes` fixture passing on Linux as it is. They cost what's there,
+      not the size of the hole (`PageIndex::remove_range`), and what's
+      punched is given back, but for imported bytes, which would show
+      through, so those stay as zeroed pages. `st_blocks` is what a file
+      holds now, not its length, so `du` and sparse copies see holes.
+      A live mount's file has EOPNOTSUPP, as the host's may have no holes.
 - [x] Free empty page-table pages on munmap. `PageTable::prune`, after
       `arch::flush_tables` (TLBI VAE1IS on arm64, every level; INVLPG or a
       CR3 load on x86_64). A page touched in each of 2000 2 MiB regions

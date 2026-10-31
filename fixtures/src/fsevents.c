@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +183,9 @@ int main(int argc, char **argv) {
     fd = open("w/f", O_WRONLY | O_TRUNC);
     CHECK(fd >= 0 && close(fd) == 0);
     events("open with O_TRUNC");
+    fd = open("w/f", O_RDWR);
+    CHECK(fd >= 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 1) == 0 && close(fd) == 0);
+    events("a hole");
     // Nothing to read or write: no event.
     fd = open("w/f", O_RDWR);
     CHECK(fd >= 0 && write(fd, "", 0) == 0);

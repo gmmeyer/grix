@@ -620,7 +620,10 @@ read-only, so a write faults and gets the frame), so it's never
 copy-on-write, and a file
 that shrinks takes its pages out of every process's mappings
 (`file::zap_shared`): page tables are kernel memory, so another
-process's can be changed without its address space active. A live
+process's can be changed without its address space active. A hole
+(`file::punch_hole`, FALLOC_FL_PUNCH_HOLE and MADV_REMOVE; shared memory's
+`SharedPages::punch`) does the same for a range, whose size costs nothing
+(`PageIndex::remove_range`). A live
 mount's files still map as copies. `locks.rs` has flock, POSIX and OFD
 locks; anything that closes a descriptor must call `file::closing`
 first (POSIX locks go with any close of the file), and `OpenFile::drop`

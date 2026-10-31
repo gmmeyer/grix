@@ -220,6 +220,13 @@ pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64,
     p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
 }
 
+/// What a shared mapping shows: a file (from its offset), or shared memory
+/// (from a page). MADV_REMOVE makes a hole there.
+enum Held {
+    File(crate::fs::Content, crate::fs::Ino, u64),
+    Memory(alloc::sync::Arc<crate::mm::aspace::SharedPages>, u64),
+}
+
 /// madvise, as Linux 6.1's, which is what uname says: mm/madvise.c. What
 /// only advises is taken and does nothing, as it may on Linux too; what a
 /// program can see the effect of, happens. A range with holes in it is
@@ -261,6 +268,12 @@ pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {
             _ => None,
         };
         let file = shared_file.is_some() || matches!(v.backing, Backing::Data { .. } | Backing::File { .. });
+        let v_start = v.start;
+        let held = match &v.backing {
+            Backing::SharedFile { data, offset, ino, .. } => Some(Held::File(data.clone(), *ino, *offset)),
+            Backing::Shared { pages, index, .. } => Some(Held::Memory(pages.clone(), *index)),
+            _ => None,
+        };
         match advice {
             MADV_DONTNEED | MADV_DONTNEED_LOCKED => p.aspace.discard(start, stop),
             // Only what nothing else holds: a file's pages aren't the
@@ -270,7 +283,21 @@ pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {
             MADV_REMOVE if !file => return Err(EINVAL),
             MADV_REMOVE if shared_file != Some(true) => return Err(EACCES),
             MADV_REMOVE => {
-                return p.unimplemented(nr::madvise, "madvise", "MADV_REMOVE: no holes in shared memory", EOPNOTSUPP);
+                let (pages, off) = (start - v_start, stop - start);
+                match held.expect("shared") {
+                    Held::File(data, ino, offset) => {
+                        super::file::punch_hole(p, nr::madvise, &data, ino, offset + pages, offset + pages + off)?;
+                    }
+                    Held::Memory(shared, index) => {
+                        let first = index + pages / PAGE_SIZE;
+                        let last = first + off / PAGE_SIZE;
+                        p.aspace.zap_pages(&shared, first, last);
+                        for q in crate::procs::PROCS.lock().others.values_mut() {
+                            q.aspace.access().zap_pages(&shared, first, last);
+                        }
+                        shared.punch(first, last);
+                    }
+                }
             }
             MADV_WIPEONFORK if !anon => return Err(EINVAL),
             MADV_DONTFORK | MADV_DOFORK | MADV_WIPEONFORK | MADV_KEEPONFORK => {

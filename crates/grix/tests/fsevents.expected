@@ -57,6 +57,13 @@ open with O_TRUNC
   file OPEN
   dir CLOSE_WRITE [f]
   file CLOSE_WRITE
+a hole
+  dir OPEN [f]
+  file OPEN
+  dir MODIFY [f]
+  file MODIFY
+  dir CLOSE_WRITE [f]
+  file CLOSE_WRITE
 an empty write
   dir OPEN [f]
   file OPEN
