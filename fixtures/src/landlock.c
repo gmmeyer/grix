@@ -698,6 +698,18 @@ static void mounts(void) {
         snprintf(p, sizeof p, "%s/shut/new", roots[i]);
         CHECK(can_open(p, O_WRONLY | O_CREAT) == -EACCES);
         CHECK(can_open(roots[i], O_RDONLY | O_DIRECTORY) == -EACCES);
+        // An O_TMPFILE file's first name needs MAKE_REG like any file's,
+        // wherever the file's bytes are until then.
+        snprintf(p, sizeof p, "%s/open", roots[i]);
+        int tmp = open(p, O_TMPFILE | O_RDWR, 0600);
+        CHECK(tmp >= 0 && write(tmp, "t", 1) == 1);
+        char self[32], to[64];
+        snprintf(self, sizeof self, "/proc/self/fd/%d", tmp);
+        snprintf(to, sizeof to, "%s/shut/named", roots[i]);
+        FAILS(linkat(AT_FDCWD, self, AT_FDCWD, to, AT_SYMLINK_FOLLOW), EACCES);
+        snprintf(to, sizeof to, "%s/open/named", roots[i]);
+        CHECK(linkat(AT_FDCWD, self, AT_FDCWD, to, AT_SYMLINK_FOLLOW) == 0);
+        CHECK(unlink(to) == 0 && close(tmp) == 0);
     }
 }
 

@@ -259,7 +259,12 @@ gone with the last `Arc`), and if `check_pinned` finds another file at that
 name, the name gets a new id, a new node to the guest, and the old id goes
 on meaning what the program has. Past `at::take_fd`'s share of descriptors
 an id just goes on meaning its name. Lazy imports aren't pinned (they
-have `unchanged`). Each request waits for the
+have `unchanged`). An O_TMPFILE file there is the sandbox's, holding its
+directory (`Kind::Unlinked`'s `home`), and counts as in that mount
+(`unnamed_in`, `crosses_mount`, for Landlock's check of its first name)
+until linkat names it (`Fs::publish`): the host makes the file and takes
+its bytes, and the same node and `FileData` are a live mount's file from
+then on, for the descriptors it has too. Each request waits for the
 host's answer in `console::host_request`. The host walks every path down
 from the mount's root fd with `openat`/`O_NOFOLLOW`, so nothing the guest
 says can lead outside the mount. Lazy imports (`LiveMount::lazy`) are

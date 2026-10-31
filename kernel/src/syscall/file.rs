@@ -396,7 +396,8 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             if !fs.is_dir(dir) {
                 return Err(ENOTDIR);
             }
-            let (ino, content) = fs.create_unnamed(dir, perm, p.who())?;
+            // O_EXCL: never to get a name.
+            let (ino, content) = fs.create_unnamed(dir, perm, flags & O_EXCL == 0, p.who())?;
             // Opened as a file in `dir`.
             let denied = match &landlock {
                 Some(d) => landlock::open_access(d, &fs, ino, dir, acc)?,
@@ -1966,6 +1967,10 @@ pub fn linkat(p: &mut Process, odirfd: u64, opathp: u64, ndirfd: u64, npathp: u6
         // The directory its path went through, as a dentry's parent.
         let odir = fs.found_in(src, obase, &opath, &fs::Scope::NONE);
         d.check_refer(&fs, src, odir, dir, None, false, false)?;
+    }
+    if fs.publish_refused(src, dir) {
+        drop(fs);
+        return p.unimplemented(nr::linkat, "linkat", "an O_TMPFILE file mapped shared, to a live mount", EOPNOTSUPP);
     }
     fs.link(src, dir, &name, p.who()).map(|_| 0)
 }

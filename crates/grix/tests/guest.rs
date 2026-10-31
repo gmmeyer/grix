@@ -1554,6 +1554,40 @@ fn files_the_host_replaces_while_they_are_open() {
     assert!(std::fs::read(host.join("w")).unwrap().iter().all(|&b| b == b'B'));
 }
 
+/// O_TMPFILE in a live mount: the file is the sandbox's until linkat names
+/// it, when the host gets it, and what has it open follows. The fixture
+/// passes on Linux too, built with -DON_LINUX, apart from what's marked.
+#[test]
+fn unnamed_files_in_a_live_mount() {
+    let host = temp_dir("tmpfile");
+    let b = || with("hosttmpfile").mount(&host, "/work").unwrap().allow(Capability::FsWrite);
+    let out = run(b(), &["/bin/hosttmpfile", "/work", "/tmp"]);
+    assert_eq!(out.stdout_str(), "hosttmpfile ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Nothing of it stays on the host, named or not.
+    assert_eq!(std::fs::read_dir(&host).unwrap().count(), 0);
+    // A shared mapping is the file's own pages: said, and refused.
+    let out = run(b(), &["/bin/hosttmpfile", "/work", "/tmp", "shared"]);
+    assert_eq!(out.stdout_str(), "hosttmpfile shared ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { syscall, .. }] if syscall == "linkat"),
+        "{:?}",
+        out.events
+    );
+    // Without fs_write too: a live mount is its own permission.
+    let b = with("hosttmpfile").mount(&host, "/work").unwrap();
+    let out = run(b, &["/bin/hosttmpfile", "/work", "/tmp", "plain"]);
+    assert_eq!(out.stdout_str(), "plain ok\n", "{}", out.kernel_log);
+    // What's read-only stays so.
+    let b = with("hosttmpfile").mount_read_only(&host, "/work").unwrap();
+    let out = run(b, &["/bin/hosttmpfile", "/work", "/tmp", "readonly"]);
+    assert_eq!(out.stdout_str(), "hosttmpfile readonly ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 #[test]
 fn links_and_exchanges_in_a_live_mount() {
     // Hard links and RENAME_EXCHANGE are made on the host, within the
