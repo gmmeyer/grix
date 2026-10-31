@@ -17,6 +17,9 @@ use crate::fs::{Content, Ino, Stale};
 /// User addresses are below 2^48.
 pub const USER_TOP: u64 = crate::arch::USER_TOP;
 pub const STACK_TOP: u64 = USER_TOP - 0x2_0000;
+/// Nothing is mapped below this (`/proc/sys/vm/mmap_min_addr`): a NULL
+/// pointer, in the kernel too, always faults.
+pub const MMAP_MIN_ADDR: u64 = 0x1_0000;
 /// RLIMIT_STACK's default, as on Linux.
 pub const STACK_SIZE: u64 = 8 << 20;
 /// The biggest stack exec makes (for an unlimited RLIMIT_STACK too). It's
@@ -177,11 +180,14 @@ pub struct Vma {
     /// MADV_WIPEONFORK: a child gets it empty (VM_WIPEONFORK), and so do
     /// its children.
     pub wipeonfork: bool,
+    /// VM_GROWSDOWN (the stack, MAP_GROWSDOWN): a fault below it extends it
+    /// (`AddressSpace::grow_down`).
+    pub grows_down: bool,
 }
 
 impl Vma {
     pub fn new(start: u64, end: u64, prot: Prot, backing: Backing) -> Self {
-        Vma { start, end, prot, backing, dontfork: false, wipeonfork: false }
+        Vma { start, end, prot, backing, dontfork: false, wipeonfork: false, grows_down: false }
     }
 
     pub fn anon(start: u64, end: u64, prot: Prot) -> Self {
@@ -222,7 +228,8 @@ impl Vma {
                 shared: shared.clone(),
             },
         };
-        Vma { start: s, end: e, prot: self.prot, backing, dontfork: self.dontfork, wipeonfork: self.wipeonfork }
+        let (dontfork, wipeonfork, grows_down) = (self.dontfork, self.wipeonfork, self.grows_down);
+        Vma { start: s, end: e, prot: self.prot, backing, dontfork, wipeonfork, grows_down }
     }
 
     /// A MAP_SHARED file mapping that only holds a copy of the file (a
@@ -321,6 +328,12 @@ fn discard_in(pt: &mut PageTable, start: u64, end: u64) {
     gather.finish();
 }
 
+/// Where a mapping's start is, to one looking for room: what grows down
+/// keeps a gap below it.
+fn guarded_start(v: &Vma) -> u64 {
+    if v.grows_down { v.start.saturating_sub(STACK_GUARD) } else { v.start }
+}
+
 /// Where `v`, which maps what starts at `offset`, has `[from, to)` of it.
 /// (Empty if it doesn't.)
 fn mapped_part(v: &Vma, offset: u64, from: u64, to: u64) -> (u64, u64) {
@@ -360,7 +373,9 @@ pub struct AddressSpace {
     charge: crate::kmem::Charge,
     pub brk_start: u64,
     pub brk: u64,
-    /// The stack is [STACK_TOP - stack_size, STACK_TOP); mmap allocates
+    /// RLIMIT_STACK now: how far a mapping may grow down.
+    pub stack_limit: u64,
+    /// The stack may reach [STACK_TOP - stack_size, STACK_TOP); mmap allocates
     /// top-down from `mmap_top`, a gap below it.
     stack_size: u64,
     mmap_top: u64,
@@ -396,6 +411,7 @@ impl AddressSpace {
             charge: Default::default(),
             brk_start: 0,
             brk: 0,
+            stack_limit: STACK_SIZE,
             stack_size: 0,
             mmap_top: 0,
             free_hint: 0,
@@ -405,7 +421,8 @@ impl AddressSpace {
         Some(a)
     }
 
-    /// Where the stack goes (exec maps it), and so where mmap starts.
+    /// Where the stack may go (exec maps its start), and so where mmap
+    /// starts.
     pub fn set_stack(&mut self, size: u64) {
         self.stack_size = size;
         self.mmap_top = STACK_TOP - size - STACK_GAP;
@@ -413,7 +430,7 @@ impl AddressSpace {
         (self.free_hint, self.free_hole) = (self.mmap_top, 0);
     }
 
-    /// The stack's lowest address.
+    /// The lowest address the stack was left room for.
     pub fn stack_bottom(&self) -> u64 {
         STACK_TOP - self.stack_size
     }
@@ -461,6 +478,7 @@ impl AddressSpace {
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.set_stack(self.stack_size);
+        child.stack_limit = self.stack_limit;
         let mut out_of_memory = false;
         // Entries made read-only: until the flush, other CPUs running the
         // parent's threads may still write through their old ones.
@@ -626,6 +644,33 @@ impl AddressSpace {
         self.vmas.range(..=va).next_back().map(|(_, v)| v).filter(|v| va < v.end)
     }
 
+    /// Is there nothing that grows down just above `end`? (Linux's
+    /// vm_start_gap: only an address asked for exactly goes there.)
+    pub fn clear_of_growing(&self, end: u64) -> bool {
+        self.vmas.range(end..).next().is_none_or(|(_, v)| end <= guarded_start(v))
+    }
+
+    /// `va` is in no mapping. If the next one up grows down, it does now,
+    /// as far as RLIMIT_STACK lets it from its top, and a gap from what's
+    /// below, unless that's a mapping nothing can use: Linux's
+    /// expand_downwards. Only the address space changes, not how much of it
+    /// there is, so what counts mappings doesn't care.
+    fn grow_down(&mut self, va: u64) -> bool {
+        let page = page_down(va);
+        let Some((&start, v)) = self.vmas.range(va..).next() else { return false };
+        if !v.grows_down || v.end - page > self.stack_limit || page < MMAP_MIN_ADDR {
+            return false;
+        }
+        let below = self.vmas.range(..va).next_back().map(|(_, b)| b);
+        if below.is_some_and(|b| !b.grows_down && !b.prot.is_none() && page - b.end < STACK_GUARD) {
+            return false;
+        }
+        let mut v = self.vmas.remove(&start).expect("just found");
+        v.start = page;
+        self.vmas.insert(page, v);
+        true
+    }
+
     pub fn is_free(&self, start: u64, end: u64) -> bool {
         start < end && end <= USER_TOP && self.vmas.range(..end).next_back().is_none_or(|(_, v)| v.end <= start)
     }
@@ -644,7 +689,7 @@ impl AddressSpace {
                 }
                 hole = hole.max(end - v.end);
             }
-            end = end.min(v.start);
+            end = end.min(guarded_start(v));
         }
         let at = found.or_else(|| (end >= MMAP_BOTTOM + len).then(|| end - len))?;
         // The next look starts above what it's given (a caller may not map
@@ -939,6 +984,9 @@ impl AddressSpace {
 
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), FaultError> {
         let page = page_down(va);
+        if self.find(va).is_none() && !self.grow_down(va) {
+            return Err(FaultError::Segv);
+        }
         let vma = self.find(va).ok_or(FaultError::Segv)?.clone();
         if !vma.allows(access) {
             return Err(FaultError::Segv);
@@ -1094,6 +1142,11 @@ impl AddressSpace {
         let access = if write { Access::Write } else { Access::Read };
         let mut page = page_down(addr);
         while page < end {
+            // The kernel's own access is a fault too, on Linux: a call can
+            // be what makes a stack grow.
+            if self.find(page).is_none() && !self.grow_down(page) {
+                return Err(EFAULT);
+            }
             if !self.find(page).ok_or(EFAULT)?.allows(access) {
                 return Err(EFAULT);
             }

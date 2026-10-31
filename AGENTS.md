@@ -335,7 +335,9 @@ makes its `exe`, `cwd` and `root` fail with ENOENT, and leaves its
 leader alone in `task`, paid for by what its last thread held); a pidfd (`FileKind::PidFd`) is just the pid,
 which is never reused. `execve` loads the new program into a fresh
 address space first (`process::load_program`), so a failure leaves the
-caller running. What clone can share between processes is a handle to
+caller running. The stack it makes is small, and it and `MAP_GROWSDOWN`
+mappings grow on a fault (`AddressSpace::grow_down`, from `fault` and
+`ensure`), by `RLIMIT_STACK` as it is then (`AddressSpace::stack_limit`). What clone can share between processes is a handle to
 one value: the descriptor table (`fd::FdTable`, CLONE_FILES), the
 working directory and umask (`Process::fs`, a `process::Shared<FsInfo>`,
 CLONE_FS) and the signal actions (`Process::sigactions`, CLONE_SIGHAND,

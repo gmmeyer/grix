@@ -553,6 +553,7 @@ fn smaps(p: &Process, s: &mut String, rollup: bool) -> Result<(), Errno> {
             (true, "mr"),
             (true, "mw"),
             (true, "me"),
+            (v.grows_down, "gd"),
             (v.dontfork, "dc"),
             (v.wipeonfork, "wf"),
         ];

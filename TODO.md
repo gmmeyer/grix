@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.67)
+## What's left (after 0.0.68)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -33,8 +33,8 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. A node left unwatched on macOS, `TZ` from the host, stack growth and
-   guard pages, newer syscalls as programs ask for them.
+4. A node left unwatched on macOS, `TZ` from the host, newer syscalls as
+   programs ask for them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
@@ -696,9 +696,16 @@ Left, none of it a way out of the sandbox:
 
 - [x] Copy-on-write and shared-page refcounting (needed by fork).
 - [x] `MAP_SHARED` anonymous memory (and `/dev/zero`) shared across fork.
-- [~] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
-      exec sizes the stack from `RLIMIT_STACK` (up to 4 GiB), and mmap stays 128 MiB below it
-      (a hint, 1 MiB). `MAP_GROWSDOWN` mappings don't grow.
+- [x] Linux-like stack growth and guard pages (`MAP_GROWSDOWN`, `RLIMIT_STACK`).
+      The stack starts at what the arguments need and 128 KiB, and it and
+      `MAP_GROWSDOWN` mappings grow on a fault, a kernel access's too
+      (`AddressSpace::grow_down`, Linux's expand_downwards), as far as
+      `RLIMIT_STACK` says at the time and a 1 MiB gap from what's below
+      allows, so a program can raise its own limit (gcc's cc1 does). exec
+      leaves room for what the limit says then, up to 4 GiB, and mmap stays
+      128 MiB below that (a hint, 1 MiB). `PROT_GROWSDOWN`, and `gd` in
+      smaps. The `stackgrow` fixture passes on Linux as it is. Left:
+      `MAP_GROWSDOWN` of a file (reported).
 - [x] `membarrier` commands (`PRIVATE_EXPEDITED` for .NET and JITs): trivial on one CPU.
 - [x] `mincore`, and `madvise` as Linux 6.1's, every advice (the `madvise`
       fixture passes on Linux too, built with `-DON_LINUX`): invalid advice

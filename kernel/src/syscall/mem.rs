@@ -3,7 +3,7 @@
 
 use crate::errno::*;
 use crate::fd::FileKind;
-use crate::mm::aspace::{Backing, USER_TOP, Vma};
+use crate::mm::aspace::{Backing, MMAP_MIN_ADDR, USER_TOP, Vma};
 use crate::mm::paging::Prot;
 use crate::mm::{PAGE_SIZE, page_up};
 use crate::process::Process;
@@ -13,10 +13,8 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 pub(super) const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_GROWSDOWN: u64 = 0x100;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
-/// Nothing is mapped below this (`/proc/sys/vm/mmap_min_addr`): a NULL
-/// pointer, in the kernel too, always faults.
-pub const MMAP_MIN_ADDR: u64 = 0x1_0000;
 
 fn aligned(a: u64) -> bool {
     a.is_multiple_of(PAGE_SIZE)
@@ -57,6 +55,15 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
         0x3 => true, // MAP_SHARED_VALIDATE
         _ => return Err(EINVAL),
     };
+    if flags & MAP_GROWSDOWN != 0 {
+        if shared && flags & MAP_ANONYMOUS != 0 {
+            return Err(EINVAL);
+        }
+        // Growing would need the offset to move below where it started.
+        if flags & MAP_ANONYMOUS == 0 {
+            return p.unimplemented(nr::mmap, "mmap", "MAP_GROWSDOWN of a file", EINVAL);
+        }
+    }
     let prot = Prot::from_linux(prot);
     let shared_anon = || Backing::Shared { pages: Default::default(), index: 0, may_write: true, sysv: None };
     let backing = if flags & MAP_ANONYMOUS != 0 {
@@ -147,14 +154,16 @@ pub(super) fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Pro
         addr
     } else if addr >= MMAP_MIN_ADDR
         && aligned(addr)
-        && addr.checked_add(len).is_some_and(|e| a.is_free(addr, e) && a.clear_of_stack(e))
+        && addr.checked_add(len).is_some_and(|e| a.is_free(addr, e) && a.clear_of_stack(e) && a.clear_of_growing(e))
     {
         addr
     } else {
         a.find_free(len).ok_or(ENOMEM)?
     };
     a.room_for(start, start + len, false, 1)?;
-    a.map(Vma::new(start, start + len, prot, backing));
+    let mut vma = Vma::new(start, start + len, prot, backing);
+    vma.grows_down = flags & MAP_GROWSDOWN != 0;
+    a.map(vma);
     Ok(start)
 }
 
@@ -170,7 +179,12 @@ pub fn munmap(p: &mut Process, addr: u64, len: u64) -> SysResult {
 }
 
 pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
-    if !aligned(addr) {
+    const PROT_SEM: u64 = 8;
+    const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    const PROT_GROWSUP: u64 = 0x0200_0000;
+    let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+    let prot = prot & !grows;
+    if grows == PROT_GROWSDOWN | PROT_GROWSUP || !aligned(addr) {
         return Err(EINVAL);
     }
     let len = page_up(len).ok_or(ENOMEM)?;
@@ -178,6 +192,22 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
         return Ok(0);
     }
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(ENOMEM)?;
+    if prot & !(7 | PROT_SEM) != 0 {
+        return Err(EINVAL);
+    }
+    // Down to where the mapping starts, wherever that's got to by now.
+    let addr = if grows == PROT_GROWSDOWN {
+        let v = p.aspace.first_in(addr, end).ok_or(ENOMEM)?;
+        if !v.grows_down {
+            return Err(EINVAL);
+        }
+        v.start
+    } else if grows != 0 {
+        // Nothing here grows up.
+        return Err(EINVAL);
+    } else {
+        addr
+    };
     let prot = Prot::from_linux(prot);
     p.aspace.room_for(addr, end, true, 0)?;
     if prot.write && p.aspace.has_read_only_shared_file(addr, end) {
