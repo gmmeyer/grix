@@ -130,15 +130,16 @@ pub fn start_ap(cpu: u32, vector: u8) {
     }
 }
 
-/// Debug builds only: the GSI (and 1) of a device whose interrupt the next
-/// wait is to take first, for what comes next to land on top of
-/// (`STACK_OVERFLOW_TEST`).
+/// Debug builds only: the GSI (and 1) of a device whose interrupt this
+/// CPU's next wait is to take first, for what comes next to land on top of
+/// (`STACK_OVERFLOW_TEST`). Each CPU's own: taken by another, one still
+/// coming up, say, it would be noted there and that CPU would sleep on.
 #[cfg(debug_assertions)]
-static BENEATH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BENEATH: [core::sync::atomic::AtomicU32; MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
 
 #[cfg(debug_assertions)]
 pub fn device_beneath_next_wake(gsi: u32) {
-    BENEATH.store(gsi + 1, Ordering::Relaxed);
+    BENEATH[me()].store(gsi + 1, Ordering::Relaxed);
 }
 
 /// Take it, as if it had come just as this CPU woke: what wakes it, a
@@ -146,7 +147,7 @@ pub fn device_beneath_next_wake(gsi: u32) {
 /// happens in the instant before the idle loop's `cli`.
 #[cfg(debug_assertions)]
 pub fn take_device_beneath() {
-    let gsi = BENEATH.swap(0, Ordering::Relaxed);
+    let gsi = BENEATH[me()].swap(0, Ordering::Relaxed);
     if gsi != 0 {
         send_ipi(lapic_id(), DEVICE_VECTOR + gsi - 1);
         // SAFETY: interrupts on for one instruction.
