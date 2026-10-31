@@ -181,6 +181,8 @@ pub struct OpenFile {
     pub path_only: bool,
     /// A regular file's contents, held so they outlive an unlink.
     pub content: Option<Content>,
+    /// A live mount's file: the host's holding on to it for this.
+    pub pinned: Option<Arc<crate::fs::Pinned>>,
     /// Keeps the node's slot from being reused while this is open (`fs::Fs::pin`).
     pub pin: Option<Arc<()>>,
     /// getdents: the last directory entry returned.
@@ -393,6 +395,7 @@ pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
         flags,
         path_only: false,
         content: None,
+        pinned: None,
         pin: None,
         dir_pos: None,
         held: None,

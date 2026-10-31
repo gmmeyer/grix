@@ -1283,9 +1283,32 @@ static void t_watchmany(const char *dir, int port) {
     printf("watched %d, %s\n", watched, lost ? "overflow" : "all");
 }
 
+// Hundreds of a live mount's files open at once, past what the host holds
+// open for a guest: they all still read, and it has descriptors left.
+static void t_holdmany(const char *dir, int port) {
+    static int fds[900];
+    char p[512], b[16];
+    for (int i = 0; i < 900; i++) {
+        snprintf(p, sizeof p, "%s/big/f%d", dir, i);
+        fds[i] = open(p, O_RDONLY);
+        CHECK(fds[i] >= 0 && read(fds[i], b, sizeof b) == 1 && b[0] == 'x');
+    }
+    for (int i = 0; i < 900; i++) CHECK(pread(fds[i], b, 1, 0) == 1 && b[0] == 'x');
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(0x0a000202)};
+    CHECK(connect(s, (void *)&a, sizeof a) == 0);
+    CHECK(write(s, "ping", 4) == 4 && read(s, b, 4) == 4 && memcmp(b, "ping", 4) == 0);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     const char *c = argc > 1 ? argv[1] : "";
+    if (!strcmp(c, "holdmany")) {
+        CHECK(argc > 3);
+        t_holdmany(argv[2], atoi(argv[3]));
+        printf("holdmany ok\n");
+        return 0;
+    }
     if (!strcmp(c, "watchmany")) {
         CHECK(argc > 3);
         t_watchmany(argv[2], atoi(argv[3]));

@@ -54,7 +54,10 @@ pub fn take_if_wanted() {
             // Counted from here: what the restored run runs into, re-watching
             // too, is its own.
             crate::stats::restored();
-            crate::fs::lock().forget_live();
+            let mut fs = crate::fs::lock();
+            fs.forget_live();
+            fs.repin();
+            drop(fs);
             crate::inotify::rewatch();
             crate::inet::forget_forward_peers();
             klog!("restored from a snapshot taken {} ms ago\n", x5 / 1_000_000);

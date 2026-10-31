@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.63)
+## What's left (after 0.0.64)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -25,15 +25,15 @@ Robustness, first:
 
 1. `rv048 extremes`: one hang at 0.0.48, none in 32,000 runs since.
    Only worth more with a new idea, or if it comes back.
-2. `hostfds` has never failed: what it guards is kqueue's descriptors,
-   so it takes an unfixed build on macOS.
+2. `hostfds` fails without the budget for files held open, on Linux too;
+   what it guards of kqueue's descriptors takes an unfixed build on macOS.
 
 Linux behaviour:
 
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. Live mounts: O_TMPFILE, and a file the host replaces while it's open.
+4. Live mounts: O_TMPFILE.
 5. inotify for the guest's own changes elsewhere, a node left unwatched
    on macOS, `TZ` from the host, stack growth and guard pages, holes in
    shared memory (`MADV_REMOVE`, `FALLOC_FL_PUNCH_HOLE`), newer syscalls
@@ -371,7 +371,7 @@ Left, none of it a way out of the sandbox:
       another process's are ENOENT past their own name. Few tools go
       there, and it means another process's table under the filesystem's
       lock (`FdTable::walking`).
-- [ ] A node with no descriptor left for it (macOS, `watch::fd_budget`)
+- [ ] A node with no descriptor left for it (macOS, `at::take_fd`)
       stays unwatched until the guest watches it again.
 
 ## Agent integrations
@@ -543,7 +543,14 @@ Left, none of it a way out of the sandbox:
       MCP or Python.
 - [x] Read-write host directory mounts, gated by policy.
       Live: `mount` / `mount_read_only` / `--mount HOST:GUEST[:rw|ro]` (`hostfs`: the host serves listings, bytes and changes, confined with `openat`/`O_NOFOLLOW`; any size; host changes show within a second). Or applied when the program ends: `mount_on_exit` / `:on-exit`.
-- [ ] Live mounts: a file the host replaces while the program has it open can show the new contents once the host's descriptor for it ages out (it reopens by name). Pin descriptors for files the guest has open (Open/Close requests).
+- [x] Live mounts: a file the host replaces while the program has it open stays what it opened, as on Linux, and a new open gets what's there now.
+      `hostfs::Request::Pin` and `Unpin` (`fs::Pinned`, one a file, held by
+      whatever has it open or mapped, the running program's own file too):
+      the host holds the file open, and when it sees its name is another
+      file gives the name a new id (`check_pinned`), which is a new node
+      to the guest. Past the share of descriptors the host keeps for
+      guests (`at::take_fd`) an id goes on meaning its name, as it did.
+      `files_the_host_replaces_while_they_are_open`.
 - [x] Live mounts: changes on a read-only mount without `fs_write` report "needs fs_write" (the syscall gate runs first) instead of EROFS.
       The gate looks at what an `fs_write` call would change first
       (`file::read_only_target`), as `open` and `mkdir` do

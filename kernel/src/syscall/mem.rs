@@ -111,7 +111,11 @@ pub fn mmap(p: &mut Process, addr: u64, len: u64, prot: u64, flags: u64, fd: u64
                         ino,
                         shared,
                     },
-                    None => Backing::Data { data: c.clone(), offset: off, end: u64::MAX, ino, shared },
+                    None => {
+                        // Its pages come as they're used, after a close too.
+                        let pinned = data.pin(false);
+                        Backing::Data { data: c.clone(), offset: off, end: u64::MAX, ino, shared, pinned }
+                    }
                 }
             }
             // /dev/zero, which Linux maps as shared anonymous memory when shared.

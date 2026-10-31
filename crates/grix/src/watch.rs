@@ -13,8 +13,8 @@
 //!
 //! What the host keeps is bounded: `hostfs::MAX_WATCHES` nodes, and on
 //! macOS `MAX_ENTRIES` directory entries and descriptors: `MAX_CHILD_FDS`
-//! of a watcher's, and a share of RLIMIT_NOFILE (`fd_budget`) of every
-//! watcher's in the process, since it needs descriptors for much else.
+//! of a watcher's, and a share of RLIMIT_NOFILE (`at::fd_budget`) of what
+//! the process holds for guests, since it needs descriptors for much else.
 //! Past that budget files are polled, and a node isn't watched at all:
 //! the guest is told it may have lost changes (`IN_Q_OVERFLOW`).
 //! The notices of one round of changes are bounded too (`MAX_BATCH`):
@@ -279,44 +279,16 @@ mod os {
     use std::time::{Duration, Instant};
 
     use super::{Change, ENOSPC, MAX_BATCH, guest_name};
-    use crate::at::{Kind, check, ctime_ns, each_name, identity, kind, mode, mtime_ns, openat, stat_at, stat_fd};
+    use crate::at::{
+        Kind, check, ctime_ns, each_name, give_fd, identity, kind, mode, mtime_ns, openat, stat_at, stat_fd, take_fd,
+    };
     use grix_abi::hostfs::mask::*;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Directory entries kept, across every watched directory.
     pub const MAX_ENTRIES: usize = 256 * 1024;
     /// Descriptors held for watched directories' files.
     pub const MAX_CHILD_FDS: usize = 1024;
-    /// Every watcher's descriptors in this process (sandboxes are many).
-    static HELD: AtomicUsize = AtomicUsize::new(0);
-
-    /// The share of the process's descriptors (RLIMIT_NOFILE's soft limit,
-    /// 256 from a macOS shell) that watches may hold: the rest are for live
-    /// mounts' files, the proxy's connections, the VMM's pipes.
-    pub fn fd_budget(soft_limit: u64) -> usize {
-        (soft_limit / 4).clamp(16, 64 * 1024) as usize
-    }
-
-    fn soft_limit() -> u64 {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: getrlimit fills in the struct.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 { lim.rlim_cur } else { 256 }
-    }
-
-    /// One more for a watch, if the budget has room.
-    fn take_fd() -> bool {
-        // (Two sandboxes at once may go one over: it's a share, not a limit.)
-        let room = HELD.load(Ordering::Relaxed) < fd_budget(soft_limit());
-        if room {
-            HELD.fetch_add(1, Ordering::Relaxed);
-        }
-        room
-    }
-
-    fn give_fd() {
-        HELD.fetch_sub(1, Ordering::Relaxed);
-    }
     /// How often directories with files not watched on their own are
     /// compared again.
     const POLL: Duration = Duration::from_secs(1);
@@ -788,15 +760,6 @@ mod tests {
         st.pair_for_test(MAX_BATCH, &mut out);
         assert_eq!(out.len(), MAX_BATCH * 2);
         assert!(out.iter().all(|c| c.mask & (IN_MOVED_FROM | IN_MOVED_TO) != 0), "{out:?}");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn descriptors_are_a_share_of_the_limit() {
-        // A macOS shell's default, and the most one host process holds.
-        assert_eq!(os::fd_budget(256), 64);
-        assert_eq!(os::fd_budget(64), 16);
-        assert_eq!(os::fd_budget(u64::MAX), 64 * 1024);
     }
 
     #[test]

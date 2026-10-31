@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};
 use grix_abi::wire::{self, Input};
 
-use crate::at::{check, each_name, openat, readlink_at, rename, stat_at, stat_fd};
+use crate::at::{check, each_name, give_fd, identity, openat, readlink_at, rename, stat_at, stat_fd, take_fd};
 
 /// A directory mounted live.
 #[derive(Clone, Debug)]
@@ -224,6 +224,20 @@ struct Node {
     name: String,
 }
 
+/// A file the guest has open or mapped, held open as the file it was.
+struct Pin {
+    fd: OwnedFd,
+    writable: bool,
+    /// Which file that is (`at::identity`).
+    file: (u64, u64),
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        give_fd();
+    }
+}
+
 /// One listed directory's entries, sorted, kept while the guest pages
 /// through them.
 struct Listing {
@@ -257,6 +271,9 @@ pub(crate) struct Server {
     /// writable, descriptor) so it can go on using them as on Linux, until
     /// it says it's done with them (`Forget`) or room is needed.
     kept: VecDeque<(u64, bool, OwnedFd)>,
+    /// What the guest has open or mapped, by id, while the budget for
+    /// them lasts (`at::take_fd`); past it, an id goes on meaning its name.
+    pinned: HashMap<u64, Pin>,
     listing: Option<Listing>,
     assembler: Assembler,
     /// Where notices of watched nodes' changes go (frames for the guest),
@@ -290,6 +307,7 @@ impl Server {
             by_name: HashMap::new(),
             files: Vec::new(),
             kept: VecDeque::new(),
+            pinned: HashMap::new(),
             listing: None,
             assembler: Assembler::default(),
             notices: None,
@@ -470,6 +488,14 @@ impl Server {
                 if let Some(w) = &self.watcher {
                     w.remove(id);
                 }
+                return Vec::new();
+            }
+            Ok((_, Request::Pin { id, write })) => {
+                self.pin(id, write);
+                return Vec::new();
+            }
+            Ok((_, Request::Unpin { id })) => {
+                self.pinned.remove(&id);
                 return Vec::new();
             }
             Ok((seq, req)) => match self.serve(req) {
@@ -735,6 +761,7 @@ impl Server {
             Request::Lookup { dir, name } => {
                 let c = cname(name)?;
                 let d = self.dir(dir)?;
+                self.check_pinned(dir, name, d.as_raw_fd());
                 let (attr, target) = look_up(d.as_raw_fd(), &c)?;
                 let id = self.id(dir, name)?;
                 ok(Reply::Found { id, attr, target: &target })
@@ -749,7 +776,56 @@ impl Server {
                 self.watcher()?.add(id, fd)?;
                 ok(Reply::Done)
             }
-            Request::Forget { .. } | Request::Unwatch { .. } => unreachable!("handled without an answer"),
+            Request::Forget { .. } | Request::Unwatch { .. } | Request::Pin { .. } | Request::Unpin { .. } => {
+                unreachable!("handled without an answer")
+            }
+        }
+    }
+
+    /// The guest has file `id` open or mapped: hold on to the file it is
+    /// now. Opening it for writing is only asked for if the guest will,
+    /// as a file open for writing can't be run on the host.
+    fn pin(&mut self, id: u64, write: bool) {
+        let held = self.pinned.get(&id);
+        if self.is_lazy(id) || held.is_some_and(|p| p.writable || !write) {
+            return;
+        }
+        let Ok(Some((d, name))) = self.parent(id) else { return };
+        let write = write && self.writable(id).is_ok();
+        let open = |access| openat(d.as_raw_fd(), &name, access | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0).ok();
+        // What it can't write the host says so of when it's written to.
+        let (fd, writable) = match write.then(|| open(libc::O_RDWR)).flatten() {
+            Some(fd) => (fd, true),
+            None => match open(libc::O_RDONLY) {
+                Some(fd) => (fd, false),
+                None => return,
+            },
+        };
+        let Ok(st) = stat_fd(fd.as_raw_fd()) else { return };
+        if attr_of(&st).map(|a| a.ty) != Some(FileType::File) {
+            return;
+        }
+        let file = identity(&st);
+        match self.pinned.get_mut(&id) {
+            // To write to too, if it's still that file.
+            Some(p) if p.file == file => (p.fd, p.writable) = (fd, writable),
+            Some(_) => {}
+            None if take_fd() => {
+                self.pinned.insert(id, Pin { fd, writable, file });
+            }
+            None => {}
+        }
+    }
+
+    /// The guest is finding out what `name` in `dir` is now. If its id is
+    /// pinned to a file that isn't what's there, the host replaced it: the
+    /// id stays with the file the guest has open, and the name gets a new
+    /// one, which to the guest is a new file (`list_remote`).
+    fn check_pinned(&mut self, dir: u64, name: &str, d: RawFd) {
+        let Some(pin) = self.by_name.get(&(dir, name.to_string())).and_then(|id| self.pinned.get(id)) else { return };
+        let Ok(c) = cname(name) else { return };
+        if stat_at(d, &c).is_ok_and(|st| identity(&st) != pin.file) {
+            self.forget(dir, name);
         }
     }
 
@@ -786,6 +862,10 @@ impl Server {
     fn writable(&self, id: u64) -> Result<(), u16> {
         if let Some(k) = self.kept.iter().find(|k| k.0 == id) {
             return if k.1 { Ok(()) } else { Err(EROFS) };
+        }
+        // (Its name may be another file's by now.)
+        if self.pinned.get(&id).is_some_and(|p| p.writable) {
+            return Ok(());
         }
         if self.roots[self.mount_of(id)?].1 { Ok(()) } else { Err(EROFS) }
     }
@@ -831,8 +911,9 @@ impl Server {
     }
 
     fn stat(&self, id: u64) -> Result<Attr, u16> {
-        if let Some(k) = self.kept.iter().find(|k| k.0 == id) {
-            return stat_fd(k.2.as_raw_fd()).map_err(err).and_then(|st| attr_of(&st).ok_or(ESTALE));
+        let held = self.kept.iter().find(|k| k.0 == id).map(|k| &k.2).or(self.pinned.get(&id).map(|p| &p.fd));
+        if let Some(fd) = held {
+            return stat_fd(fd.as_raw_fd()).map_err(err).and_then(|st| attr_of(&st).ok_or(ESTALE));
         }
         let st = match self.parent(id)? {
             Some((d, name)) => stat_at(d.as_raw_fd(), &name),
@@ -863,6 +944,9 @@ impl Server {
     fn file(&mut self, id: u64, write: bool) -> Result<RawFd, u16> {
         if let Some(k) = self.kept.iter().find(|k| k.0 == id) {
             return if write && !k.1 { Err(EROFS) } else { Ok(k.2.as_raw_fd()) };
+        }
+        if let Some(p) = self.pinned.get(&id).filter(|p| p.writable || !write) {
+            return Ok(p.fd.as_raw_fd());
         }
         if let Some(i) = self.files.iter().position(|&(f, w, _)| f == id && (w || !write)) {
             let entry = self.files.remove(i);
@@ -993,6 +1077,11 @@ impl Server {
         let listing = match held {
             Some(l) => l,
             None => {
+                let held = self.pinned.keys().filter_map(|id| self.nodes.get(id)).filter(|n| n.parent == dir);
+                let names: Vec<String> = held.map(|n| n.name.clone()).collect();
+                for name in names {
+                    self.check_pinned(dir, &name, d.as_raw_fd());
+                }
                 let (entries, whole) = self.entries(dir, d.as_raw_fd(), after)?;
                 Listing { dir, entries, whole }
             }
@@ -1051,6 +1140,15 @@ mod tests {
         out.expect("a reply")
     }
 
+    /// What the guest says expecting no answer.
+    fn tell(s: &mut Server, r: Request) {
+        for (more, chunk) in hostfs::frames(&r.encode(7)) {
+            let mut payload = vec![more];
+            payload.extend_from_slice(chunk);
+            assert!(s.handle(&payload).is_empty(), "an answer to {r:?}");
+        }
+    }
+
     /// Long names run out of room before the count does: what the host
     /// keeps for the guest is bounded in bytes.
     #[test]
@@ -1098,6 +1196,107 @@ mod tests {
         std::fs::remove_file(root.join("old")).unwrap();
         let r = req(&mut s, Request::Create { dir: 1, name: "old", ty: FileType::File, mode: 0o644, target: "" });
         assert!(matches!(Reply::decode(&r), Ok((_, Reply::Created { id, .. })) if id == old));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A pinned file is the file it was. What's at its name now has an
+    /// id of its own, and writes go where the guest's descriptor points.
+    #[test]
+    fn a_pinned_file_stays_what_it_was() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), "old").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        let id = |s: &mut Server, name| match Reply::decode(&req(s, Request::Lookup { dir: 1, name })) {
+            Ok((_, Reply::Found { id, .. })) => id,
+            other => panic!("{other:?}"),
+        };
+        let read = |s: &mut Server, id| match Reply::decode(&req(s, Request::Read { id, off: 0, len: 16 })) {
+            Ok((_, Reply::Data(d))) => String::from_utf8_lossy(d).to_string(),
+            other => panic!("{other:?}"),
+        };
+        let old = id(&mut s, "f");
+        tell(&mut s, Request::Pin { id: old, write: true });
+        std::fs::write(root.join("new"), "newer").unwrap();
+        std::fs::rename(root.join("new"), root.join("f")).unwrap();
+        // Until the guest looks, the id is what it was.
+        assert_eq!(read(&mut s, old), "old");
+        // It looks: a new file, while the old one's still there.
+        let new = id(&mut s, "f");
+        assert_ne!(new, old);
+        assert_eq!((read(&mut s, old), read(&mut s, new)), ("old".to_string(), "newer".to_string()));
+        let r = req(&mut s, Request::Stat { id: old });
+        assert!(matches!(Reply::decode(&r), Ok((_, Reply::Attr(a))) if a.size == 3));
+        let r = req(&mut s, Request::Write { id: old, off: 0, append: false, data: b"OLD" });
+        assert!(matches!(Reply::decode(&r), Ok((_, Reply::Written { n: 3, .. }))));
+        assert_eq!(read(&mut s, old), "OLD");
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"newer");
+        // Nothing changed, nothing new.
+        tell(&mut s, Request::Pin { id: new, write: false });
+        assert_eq!(id(&mut s, "f"), new);
+        // Listing finds out too.
+        std::fs::write(root.join("new"), "newest").unwrap();
+        std::fs::rename(root.join("new"), root.join("f")).unwrap();
+        let r = req(&mut s, Request::List { dir: 1, after: "" });
+        let Ok((_, Reply::Listed { entries, .. })) = Reply::decode(&r) else { panic!() };
+        assert!(entries.iter().any(|e| e.name == "f" && e.id != new && e.id != old), "{entries:?}");
+        assert_eq!(read(&mut s, new), "newer");
+        // Let go of: it's gone, and an id means its name again.
+        tell(&mut s, Request::Unpin { id: old });
+        let r = req(&mut s, Request::Read { id: old, off: 0, len: 16 });
+        assert!(matches!(Reply::decode(&r), Ok((_, Reply::Err(ESTALE)))));
+        // Removed on the host, it's still there for who has it.
+        assert_eq!(read(&mut s, new), "newer");
+        std::fs::remove_file(root.join("f")).unwrap();
+        assert_eq!(read(&mut s, new), "newer");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A read-only pin is asked to write once the guest does; a file that
+    /// won't can't take the mount's name for it.
+    #[test]
+    fn pins_take_only_what_the_guest_opened_for() {
+        let root = std::env::temp_dir().join(format!("grix-hostfs-pin-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), "x").unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        let id = s.id(1, "f").unwrap();
+        s.pin(id, false);
+        assert!(!s.pinned[&id].writable);
+        s.pin(id, true);
+        assert!(s.pinned[&id].writable);
+        // Not another file by way of its name.
+        let file = s.pinned[&id].file;
+        std::fs::write(root.join("new"), "y").unwrap();
+        std::fs::rename(root.join("new"), root.join("f")).unwrap();
+        s.pinned.get_mut(&id).unwrap().writable = false;
+        s.pin(id, true);
+        assert!(!s.pinned[&id].writable && s.pinned[&id].file == file);
+        // A read-only mount, and a lazy import.
+        for lazy in [false, true] {
+            let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: false, lazy };
+            let mut s = Server::new(&[m]).unwrap();
+            let id = s.id(1, "f").unwrap();
+            s.pin(id, true);
+            assert_eq!(s.pinned.get(&id).map(|p| p.writable), (!lazy).then_some(false));
+        }
+        // What isn't a file, and an id that's nothing.
+        std::os::unix::fs::symlink("f", root.join("l")).unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        let m = LiveMount { host: root.canonicalize().unwrap(), guest: "/m".into(), writable: true, lazy: false };
+        let mut s = Server::new(&[m]).unwrap();
+        for name in ["l", "d"] {
+            let id = s.id(1, name).unwrap();
+            s.pin(id, false);
+            assert!(s.pinned.is_empty(), "{name}");
+        }
+        s.pin(999, true);
+        s.pin(1, true);
+        assert!(s.pinned.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

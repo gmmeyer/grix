@@ -94,6 +94,19 @@ pub fn release(id: u64) {
     console::host_send(&Request::Forget { id }.encode(seq));
 }
 
+/// The host is to hold on to file `id` as it is now: the program has it
+/// open or mapped.
+pub fn pin(id: u64, write: bool) {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    console::host_send(&Request::Pin { id, write }.encode(seq));
+}
+
+/// It can let go of `id`.
+pub fn unpin(id: u64) {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    console::host_send(&Request::Unpin { id }.encode(seq));
+}
+
 /// Just `name` in directory `dir`.
 pub fn lookup(dir: u64, name: &str) -> Result<Entry, Errno> {
     call(&Request::Lookup { dir, name }, |r| match r {
