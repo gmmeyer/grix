@@ -33,8 +33,8 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. A node left unwatched on macOS, `TZ` from the host, stack growth and guard pages, holes in
-   newer syscalls as programs ask for them.
+4. A node left unwatched on macOS, `TZ` from the host, stack growth and
+   guard pages, newer syscalls as programs ask for them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
