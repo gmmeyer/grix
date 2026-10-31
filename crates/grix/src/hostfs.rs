@@ -1141,10 +1141,10 @@ mod tests {
         for name in &many {
             std::fs::write(root.join("many").join(name), "").unwrap();
         }
-        // Few entries, but long link targets.
-        let long = sorted((0..MAX_LISTED_BYTES / 2000 * 3).map(|i| i.to_string()).collect());
+        // Few entries, but long link targets (macOS takes 1023 bytes at most).
+        let long = sorted((0..MAX_LISTED_BYTES / 500 * 3).map(|i| i.to_string()).collect());
         for name in &long {
-            std::os::unix::fs::symlink("t".repeat(4000), root.join("long").join(name)).unwrap();
+            std::os::unix::fs::symlink("t".repeat(500), root.join("long").join(name)).unwrap();
         }
         // More than can be held that the guest can't see, before what it can.
         for i in 0..MAX_LISTED * 2 {
