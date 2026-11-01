@@ -137,7 +137,10 @@ class Common:
         port = probe.getsockname()[1]
         probe.close()
         udp = FIXTURES / ("amd64/udp" if X86_64 else "udp")
-        sb = grix.Sandbox(imports={udp: "/bin/udp"}, capabilities=["net"], publish=[f"{port}:5300/udp"], timeout=60)
+        # A datagram isn't asked about on the `vm` stack, and the fixture's to
+        # expect that (see `may_drop` in guest.rs).
+        env = {"DROPPED": "1"} if os.environ.get("GRIX_NETWORK") == "vm" else {}
+        sb = grix.Sandbox(imports={udp: "/bin/udp"}, env=env, capabilities=["net"], publish=[f"{port}:5300/udp"], timeout=60)
         result = {}
         guest = threading.Thread(target=lambda: result.update(out=sb.run(["/bin/udp", "serve", "5300"])))
         guest.start()

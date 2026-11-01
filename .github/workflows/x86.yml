@@ -98,7 +98,9 @@ jobs:
           GRIX_VMM=qemu GRIX_ARCH=x86_64 python3 -m unittest discover -s python/tests
       # Alone, so its machine has the runner's cores to itself.
       - name: End-to-end tests on the vm network stack, in grix-vmm (KVM)
-        run: GRIX_NETWORK=vm GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes --test mcp
+        run: |
+          GRIX_NETWORK=vm GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes --test mcp
+          GRIX_NETWORK=vm GRIX_ARCH=x86_64 python3 -m unittest discover -s python/tests
       - name: Threads in parallel on 4 CPUs, in grix-vmm (KVM)
         run: GRIX_STRICT_SPEEDUP=1 GRIX_ARCH=x86_64 cargo test -p grix --test guest -- --exact threads_run_in_parallel_on_more_cpus
       - name: End-to-end tests on the x86_64 kernel with 4 CPUs, in grix-vmm (KVM)
