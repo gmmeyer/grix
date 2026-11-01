@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.68)
+## What's left (after 0.0.69)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -33,8 +33,8 @@ Linux behaviour:
 3. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups. Nothing surveyed needs them yet: wait for a program that does.
-4. A node left unwatched on macOS, `TZ` from the host, newer syscalls as
-   programs ask for them.
+4. A node left unwatched on macOS, newer syscalls as programs ask for
+   them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
@@ -631,8 +631,15 @@ Left, none of it a way out of the sandbox:
       manifests, MCP's `run` and Python: each unless it's set, `HOME` from
       /etc/passwd (`a_default_environment_on_request`). Images get
       Docker's `HOME` and `HOSTNAME` anyway (round 4).
-- [~] `/etc/localtime`/`TZ` from the host. Everything is UTC today.
-      A UTC `/etc/localtime` is generated unless one is imported (`-i /etc/localtime`). There's no option yet to pass in the host's zone.
+- [x] `/etc/localtime`/`TZ` from the host, on request: everything's UTC
+      otherwise, as a zone says something of where the host is.
+      `SandboxBuilder::host_timezone`, `--host-timezone`, `host_timezone`
+      in manifests and Python, and over MCP if the server allows it
+      (`grix mcp --host-timezone`). The zone's file goes in
+      `/usr/share/zoneinfo`, and `/etc/localtime` is a link to it, as ICU
+      goes by where that leads (a copy of the file is `undefined` to
+      Node's Intl, for a zone it can't guess from an abbreviation). A
+      `TZ` that's a rule stays `TZ`. `timezone.rs`.
 - [~] With `net`: `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, a CA
       bundle in `/etc/ssl/certs`.
       `/etc/hosts` and `/etc/resolv.conf` are generated unless imported. Alpine's

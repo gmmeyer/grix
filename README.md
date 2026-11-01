@@ -62,6 +62,11 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 ./target/release/grix run --hostname worker-1 --default-env -a process \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox sh -c 'hostname; env'
 
+# The host's time zone (a sandbox is in UTC otherwise, as a zone says something
+# of where the host is), from TZ or /etc/localtime. Node's Intl and Python see it.
+./target/release/grix run --host-timezone -a process \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox date
+
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox cp /etc/passwd /out/
@@ -359,6 +364,7 @@ grix mcp --root ~/projects/demo          # host paths only under the roots (defa
 grix mcp -a fs_write -a process          # capabilities agents may grant (default: fs_write, threads, process)
 grix mcp -a net --allow-host pypi.org    # net only if allowed, and only where the rules say
 grix mcp --writable                      # rw/on_exit mounts and build_image (default: agents only read the host)
+grix mcp --host-timezone                 # runs may ask for the host's time zone (default: UTC)
 grix mcp --registry-credentials          # build_image may pull with your registry logins (default: anonymously)
 grix mcp --max-parallel 4                # tool calls at once (default 2; more wait their turn)
 grix mcp --max-timeout 120 --max-mem 1024

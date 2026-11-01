@@ -54,6 +54,8 @@ pub struct McpConfig {
     /// `build_image` may pull images with the user's registry logins. Off
     /// by default: what an agent builds is anonymous.
     pub registry_credentials: bool,
+    /// A run may ask for the host's time zone (`--host-timezone`).
+    pub host_timezone: bool,
     /// How many tool calls run at once (each boots a VM, with up to
     /// `max_memory_mb`); more wait their turn.
     pub max_parallel: usize,
@@ -77,6 +79,7 @@ impl McpConfig {
             max_cpus: 4,
             writable: false,
             registry_credentials: false,
+            host_timezone: false,
             max_parallel: 2,
             metrics: None,
         })
@@ -498,6 +501,8 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                     "cwd": {"type": "string"},
                     "hostname": {"type": "string", "description": "The sandbox's host name (default grix)."},
+                    "host_timezone": {"type": "boolean",
+                                      "description": "Run in the host's time zone, not UTC, if the server allows it."},
                     "default_env": {"type": "boolean",
                                     "description": "Give the program HOME, PATH, LANG and TMPDIR, unless env sets them."},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
@@ -697,6 +702,12 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
     }
     if args["default_env"].as_bool() == Some(true) {
         b = b.default_env();
+    }
+    if args["host_timezone"].as_bool() == Some(true) {
+        if !config.host_timezone {
+            bail!("this server doesn't give runs the host's time zone (grix mcp --host-timezone)");
+        }
+        b = b.host_timezone();
     }
     for name in strings(&args["capabilities"]) {
         let cap = Capability::from_name(&name).with_context(|| format!("unknown capability {name:?}"))?;

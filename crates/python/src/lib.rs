@@ -36,6 +36,7 @@ struct Config {
     cwd: Option<String>,
     hostname: Option<String>,
     default_env: bool,
+    host_timezone: bool,
     capabilities: Vec<String>,
     memory_mb: Option<u64>,
     cpus: Option<u32>,
@@ -79,6 +80,9 @@ impl Config {
         }
         if self.default_env {
             b = b.default_env();
+        }
+        if self.host_timezone {
+            b = b.host_timezone();
         }
         for name in &self.capabilities {
             b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);
