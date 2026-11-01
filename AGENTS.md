@@ -25,8 +25,9 @@ make check       # clippy for host and kernel
   and `crates/grix/tests/runtimes.rs` (Python, Node); `hostfds.rs` is alone
   in a process, as it lowers the process's descriptor limit. They need
   `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
-  built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
-  are never skipped.
+  built kernel, `fixtures/build/`, and ICMP from the host (root, or on
+  Linux `net.ipv4.ping_group_range` with your group). Missing pieces fail
+  loudly; they are never skipped.
 - Which VMM: grix's own (`crates/vmm`) for the host's own architecture's
   guests, on arm64 macOS 15+ and on arm64 and x86_64 Linux with KVM, when
   it's built; QEMU otherwise. `GRIX_ACCEL=hvf|kvm|tcg` (or
@@ -227,6 +228,15 @@ Restoring a snapshot forgets them. The guest is 10.0.2.15, the host's own loopba
 (`host.grix.internal`, only with an explicit rule), and the nameserver is
 10.0.2.3 (synthetic `/etc/resolv.conf` and `/etc/hosts` in `fs.rs`). Host
 denials come back as `Denied` events with capability `allow_host`.
+ICMP echo (`net_raw`, on top of `net`) is a `Udp` with `Icmp` set and
+`link::ICMP_PORT`, so it's asked for and allowed per destination the same
+way, by a rule without a port. The guest answers for its own addresses
+(`icmp_send`); anything else goes through the host, which checks the
+capability itself and sends only echo requests (`net::IcmpSocket`: a ping
+socket, or a raw one where the host won't give one, its kernel writing the
+IP header either way). Any other raw socket stays unimplemented: it's what
+keeps a program from forging packets. An image can only ask for it, as for
+`net`, and a restored snapshot hasn't got it.
 Interface listings (`netlink.rs`: netlink, the `SIOCGIF*` ioctls,
 `SIOCETHTOOL`, `/proc/net/dev`, `route`, `if_inet6` and `ipv6_route`;
 `procfs::ETH0_FILES` for `/sys/class/net/eth0`) show `lo`, and with

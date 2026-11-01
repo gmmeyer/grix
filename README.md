@@ -66,6 +66,11 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # of where the host is), from TZ or /etc/localtime. Node's Intl and Python see it.
 ./target/release/grix run --host-timezone -a process \
     -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox date
+# ping: ICMP echo takes net_raw on top of net, and goes through the host, which
+# checks it as it does a connection (a rule without a port). The host has to be
+# able to send it: root, or net.ipv4.ping_group_range including your group.
+./target/release/grix run -a net -a net_raw --allow-host 1.1.1.1 \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox ping -c 3 1.1.1.1
 
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
@@ -681,7 +686,7 @@ grix run --image alpine-x86_64.grix -a process -- uname -m    # x86_64
 - An image runs only with a grix of the same ABI version as its kernel
   (the kernel carries a marker that grix checks). Running it grants the
   capabilities it lists that stay in the sandbox (`threads`, `process`,
-  `fs_write`). `net` it can only ask for: grant it with `-a net` /
+  `fs_write`). `net` and `net_raw` it can only ask for: grant them with `-a net` /
   `allow(Capability::Net)`. Its kernel runs inside the VM like any other:
   `net`, the network policy, mounts and exports are checked by the host,
   whatever the guest kernel does.
@@ -692,7 +697,7 @@ The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
 
 ```toml
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
-capabilities = []        # fs_write, threads, process, net
+capabilities = []        # fs_write, threads, process, net, net_raw
 on_deny = "errno"        # "errno" (EPERM) or "kill" (SIGSYS, like seccomp)
 # allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
 memory_mb = 256

@@ -527,6 +527,72 @@ pub const VERDICT_PATIENCE_NS: u64 = 1_000_000_000;
 /// itself) goes to the host's resolver; a datagram to the guest's own
 /// addresses straight to the socket bound there; any other through the
 /// host, to destinations its policy allowed (asked once per destination).
+/// What makes a socket an ICMP one (`socket(.., SOCK_DGRAM or SOCK_RAW,
+/// IPPROTO_ICMP)`): it's a `Udp` otherwise, as it's asked for and allowed
+/// per destination the same way, only with `link::ICMP_PORT`.
+#[derive(Clone, Copy, Debug)]
+pub struct Icmp {
+    /// SOCK_RAW: IPv4's replies are read with their IP header, as Linux's.
+    pub raw: bool,
+    pub v6: bool,
+    /// The identifier of the last request: the host's socket uses its
+    /// own, and a program looks for what it sent.
+    pub ident: u16,
+}
+
+impl Icmp {
+    /// What the program reads of echo reply `msg`, from `from` to `to`.
+    fn as_read(&self, from: Addr, to: Addr, msg: &[u8]) -> Option<Vec<u8>> {
+        if msg.len() < 8 {
+            return None;
+        }
+        let mut m = msg.to_vec();
+        m[4..6].copy_from_slice(&self.ident.to_be_bytes());
+        m[2..4].fill(0);
+        let sum = match (from, to) {
+            // IPv6's covers the addresses, as UDP's does.
+            (Addr::V6(a), Addr::V6(b)) => {
+                let mut head = alloc::vec::Vec::with_capacity(40);
+                head.extend_from_slice(&a);
+                head.extend_from_slice(&b);
+                head.extend_from_slice(&(m.len() as u32).to_be_bytes());
+                head.extend_from_slice(&[0, 0, 0, 58]);
+                checksum(&[&head, &m])
+            }
+            _ => checksum(&[&m]),
+        };
+        m[2..4].copy_from_slice(&sum.to_be_bytes());
+        let (Addr::V4(src), Addr::V4(dst), true) = (from, to, self.raw && !self.v6) else { return Some(m) };
+        let mut ip = alloc::vec![0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((20 + m.len()) as u16).to_be_bytes());
+        ip[6] = 0x40; // don't fragment
+        ip[8] = 64; // the TTL: the host's reply says, and isn't asked
+        ip[9] = 1;
+        ip[12..16].copy_from_slice(&src);
+        ip[16..20].copy_from_slice(&dst);
+        let sum = checksum(&[&ip]);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        ip.extend_from_slice(&m);
+        Some(ip)
+    }
+}
+
+/// The internet checksum of `parts` together, each an even length but the
+/// last.
+fn checksum(parts: &[&[u8]]) -> u16 {
+    let mut sum = 0u32;
+    for part in parts {
+        for word in part.chunks(2) {
+            sum += u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]) as u32;
+        }
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 pub struct Udp {
     pub id: u32,
     /// Datagrams in, and who sent them.
@@ -556,6 +622,8 @@ pub struct Udp {
     pub local: Option<SockAddr>,
     /// connect()ed: datagrams only from there.
     pub peer: Option<SockAddr>,
+    /// An ICMP socket, not a UDP one.
+    pub icmp: Option<Icmp>,
     pub version: u64,
 }
 
@@ -589,6 +657,7 @@ impl Udp {
             busy: false,
             local: None,
             peer,
+            icmp: None,
             version: 0,
         }));
         let mut all = UDPS.lock();
@@ -637,6 +706,14 @@ impl Udp {
         self.bytes += cost;
         self.rx.push_back((from, data.to_vec()));
         self.touch();
+    }
+
+    /// An echo reply from `from` to the guest's address `to`, for an ICMP
+    /// socket.
+    pub fn push_icmp(&mut self, from: SockAddr, to: Addr, msg: &[u8]) {
+        if let Some(m) = self.icmp.and_then(|i| i.as_read(from.addr, to, msg)) {
+            self.push(from, &m);
+        }
     }
 
     /// The next datagram (or a look at it).
@@ -886,7 +963,20 @@ pub fn from_host(payload: &[u8]) {
         }
         ToGuest::UdpRecv { id, addr, port, data } => {
             if let Some(u) = udp(id) {
-                u.lock().push(SockAddr { addr, port }, data);
+                let mut u = u.lock();
+                let from = SockAddr { addr, port };
+                match u.icmp {
+                    None => u.push(from, data),
+                    Some(_) if port == link::ICMP_PORT => {
+                        let own = if matches!(addr, Addr::V6(_)) {
+                            Addr::V6(link::GUEST_V6)
+                        } else {
+                            Addr::V4(link::GUEST_V4)
+                        };
+                        u.push_icmp(from, own, data);
+                    }
+                    Some(_) => {}
+                }
             }
         }
         ToGuest::UdpIncoming { port, peer, peer_port, data } => {
@@ -990,6 +1080,8 @@ pub struct Inet {
     pub v6only: bool,
     /// UDP: bind named an address, so connect doesn't choose one.
     pub addr_bound: bool,
+    /// An ICMP socket, which is a UDP one otherwise.
+    pub icmp: Option<Icmp>,
 }
 
 impl Inet {
@@ -1005,6 +1097,7 @@ impl Inet {
             sndtimeo: None,
             v6only: false,
             addr_bound: false,
+            icmp: None,
         }
     }
 

@@ -206,7 +206,7 @@ struct RunArgs {
     /// Repeatable.
     #[arg(short = 'p', long = "publish", value_name = "[ADDR:]HOSTPORT:GUESTPORT[/udp]")]
     publish: Vec<String>,
-    /// Grant a capability (fs_write, threads, process, net). Repeatable.
+    /// Grant a capability (fs_write, threads, process, net, net_raw). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
     /// Set an environment variable KEY=VALUE, or KEY to pass on the

@@ -667,6 +667,73 @@ fn madvise_does_what_it_says() {
     assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
+/// ICMP echo with net_raw, by ping socket and raw socket: the guest answers
+/// for itself, and the host's proxy makes a real echo of anything else, if
+/// the policy allows the address. The fixture passes on Linux too, built
+/// with -DON_LINUX, apart from what's marked.
+#[test]
+fn ping_with_net_raw() {
+    let raw = || with("pingsock").allow(Capability::Net).allow(Capability::NetRaw);
+    // Not without it: net alone is sockets, and it's said which is missing.
+    let out = run(with("pingsock").allow(Capability::Net), &["/bin/pingsock", "denied"]);
+    assert_eq!(out.stdout_str(), "pingsock denied ok\n", "{}", out.kernel_log);
+    assert_eq!(out.missing_capabilities(), ["net_raw"]);
+    let out = run(raw(), &["/bin/pingsock", "local"]);
+    assert_eq!(out.stdout_str(), "pingsock local ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // Raw IP of any other kind isn't here, and says so.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Unimplemented { detail, .. }] if detail == "raw IP sockets"),
+        "{:?}",
+        out.events
+    );
+    // A real reply, from the host's own stack: as for a connection, the
+    // host itself takes a rule of its own.
+    let b = raw().allow_host("host.grix.internal").unwrap();
+    let out = run(b, &["/bin/pingsock", "host", "10.0.2.2"]);
+    // (A host that won't give ICMP sockets says so in the events.)
+    assert_eq!(out.stdout_str(), "pingsock host ok\n", "{}{:?}", out.kernel_log, out.events);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // A rule for a port says nothing of ICMP, and an address nobody named
+    // isn't reached.
+    let b = raw().allow_host("host.grix.internal:80").unwrap();
+    let out = run(b, &["/bin/pingsock", "refused", "10.0.2.2"]);
+    assert_eq!(out.stdout_str(), "pingsock refused ok\n", "{}", out.kernel_log);
+    let b = raw().allow_host("example.com").unwrap();
+    let out = run(b, &["/bin/pingsock", "refused", "192.0.2.1"]);
+    assert_eq!(out.stdout_str(), "pingsock refused ok\n", "{}", out.kernel_log);
+    assert!(out.events.iter().any(|e| matches!(e, GuestEvent::Denied { .. })), "{:?}", out.events);
+}
+
+/// What reaches beyond the sandbox an image can only ask for: anyone can
+/// write an image, so it takes the caller to grant net_raw, as for net.
+#[test]
+fn an_image_cant_grant_itself_net_raw() {
+    use grix::build::{BuildOptions, BuildPolicy, Copy, Grixfile};
+    let dir = temp_dir("asks-net-raw");
+    let g = Grixfile {
+        command: Some(vec!["/bin/pingsock".into(), "denied".into()]),
+        capabilities: vec!["net".into(), "net_raw".into()],
+        copies: vec![Copy { host: fixture("pingsock"), guest: "/bin/pingsock".into(), outside_context: true }],
+        ..Default::default()
+    };
+    let opts = BuildOptions {
+        arch: None,
+        kernel: None,
+        on_output: &mut |_, _| {},
+        policy: BuildPolicy::default(),
+        control: None,
+    };
+    let image = g.build(&dir, opts).unwrap();
+    assert_eq!(image.config.capabilities, ["net", "net_raw"]);
+    // net granted by the caller; net_raw only asked for.
+    let out = Sandbox::builder().image(&image).unwrap().allow(Capability::Net).build().unwrap();
+    let out = out.run(&["/bin/pingsock", "denied"]).unwrap();
+    assert_eq!(out.stdout_str(), "pingsock denied ok\n", "{}", out.kernel_log);
+    assert_eq!(out.missing_capabilities(), ["net_raw"]);
+}
+
 /// The stack and MAP_GROWSDOWN mappings grow on a fault, as far as
 /// RLIMIT_STACK says at the time and a guard gap allows. The fixture passes
 /// on Linux as it is.

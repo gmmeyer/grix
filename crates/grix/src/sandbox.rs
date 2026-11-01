@@ -1023,7 +1023,8 @@ impl SandboxBuilder {
         }
         for name in &c.capabilities {
             let cap = Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?;
-            if cap != Capability::Net {
+            // What reaches beyond the sandbox, an image may only ask for.
+            if !matches!(cap, Capability::Net | Capability::NetRaw) {
                 self.policy.grant(cap);
             }
         }
@@ -1389,6 +1390,7 @@ impl Sandbox {
         let exports = Collector::new(&cfg.exports, &mount_dirs, cfg.max_export as u64);
         let mut net = cfg.net.clone();
         net.enabled = cfg.policy.allows(Capability::Net);
+        net.icmp = net.enabled && cfg.policy.allows(Capability::NetRaw);
         let vm = VmConfig {
             net,
             control: cfg.control.clone(),
@@ -1685,6 +1687,7 @@ pub(crate) fn run_snapshot(
     let s = &snap.settings;
     let file = std::fs::File::open(snap.path()).with_context(|| format!("opening {}", snap.path().display()))?;
     let mut net = NetPolicy {
+        icmp: false,
         enabled: s.net,
         allow: s
             .allow_hosts
