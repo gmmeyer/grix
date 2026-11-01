@@ -35,9 +35,6 @@ Linux behaviour:
    groups. Nothing surveyed needs them yet: wait for a program that does.
 4. A node left unwatched on macOS, newer syscalls as programs ask for
    them.
-5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
-4. A node left unwatched on macOS, `TZ` from the host, newer syscalls as
-   programs ask for them.
 5. Raw sockets other than ICMP echo (reported as unsupported).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
