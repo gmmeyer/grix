@@ -46,6 +46,7 @@ mod smp;
 mod snapshot;
 mod stats;
 mod syscall;
+mod sysv;
 mod time;
 mod timer;
 mod tty;

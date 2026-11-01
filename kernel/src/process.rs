@@ -156,6 +156,8 @@ pub struct Thread {
     /// signal handler runs before the call re-executes, the call may fail
     /// with EINTR instead (see `signal::return_to_user`).
     pub restarting: bool,
+    /// Its last System V IPC call was left waiting (`sysv::rerun`).
+    pub waited_on_ipc: bool,
     /// Rewound by a wakeup (a signal, an I/O change): the syscall re-runs
     /// once before any signal is delivered, so a call that can now complete
     /// does (and the handler runs after it), as Linux checks the wait's
@@ -218,6 +220,7 @@ impl Thread {
             robust_list: 0,
             restart_deadline: None,
             restarting: false,
+            waited_on_ipc: false,
             recheck: false,
             io_done: 0,
             cpu_ns: 0,
@@ -345,6 +348,8 @@ pub struct Process {
     /// as the scheduler is round-robin and there's no disk.
     pub nice: i8,
     pub ioprio: u16,
+    /// It has System V semaphore changes to undo when it ends.
+    pub sem_undo: bool,
     pub ids: Ids,
     /// Signal actions (`action`, `set_action`).
     pub sigactions: Shared<SigActions>,
@@ -531,6 +536,7 @@ impl Process {
             ids: Ids { ruid: uid, suid: uid, rgid: gid, sgid: gid, groups: alloc::vec![gid] },
             nice: 0,
             ioprio: IOPRIO_DEFAULT,
+            sem_undo: false,
             sigactions: Shared::new([SigAction::default(); 65]),
             shared_pending: SigQueue::default(),
             rlimits,

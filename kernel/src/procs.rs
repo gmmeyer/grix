@@ -153,6 +153,9 @@ impl Procs {
 /// address space stays: the running one may still be in TTBR0.
 pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut Procs) {
     let status = dead.exit_status.expect("finalizing a live process");
+    if dead.sem_undo {
+        crate::sysv::process_ended(dead.pid);
+    }
     let cpu_ns = dead.process_cpu_ns() + dead.children_cpu_ns;
     LIVE.fetch_sub(1, Ordering::Relaxed);
     threads_gone(dead.threads.len());

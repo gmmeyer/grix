@@ -45,3 +45,9 @@ pub fn epoll_event_get(b: &[u8; EPOLL_EVENT]) -> (u32, u64) {
 
 /// What pkey_alloc says without the hardware: arm64's has none to give.
 pub const NO_PROTECTION_KEYS: crate::errno::Errno = crate::errno::ENOSPC;
+
+/// `struct semid64_ds`: its size, and where its fields are.
+pub const SEMID_BYTES: usize = 104;
+pub const SEMID_OTIME: usize = 48;
+pub const SEMID_CTIME: usize = 56;
+pub const SEMID_NSEMS: usize = 64;

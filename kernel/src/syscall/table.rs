@@ -336,6 +336,14 @@ syscalls! {
     432 fsmount Privileged;
     433 fspick Privileged;
     442 mount_setattr Privileged;
+    186 msgget Core;
+    187 msgctl Core;
+    188 msgrcv Core;
+    189 msgsnd Core;
+    190 semget Core;
+    191 semctl Core;
+    192 semtimedop Core;
+    193 semop Core;
 }
 
 // Linux x86_64 (arch/x86/entry/syscalls/syscall_64.tbl): the same calls, and
@@ -690,4 +698,12 @@ syscalls! {
     432 fsmount Privileged;
     433 fspick Privileged;
     442 mount_setattr Privileged;
+    68 msgget Core;
+    71 msgctl Core;
+    70 msgrcv Core;
+    69 msgsnd Core;
+    64 semget Core;
+    66 semctl Core;
+    220 semtimedop Core;
+    65 semop Core;
 }
