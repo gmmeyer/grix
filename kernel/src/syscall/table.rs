@@ -344,6 +344,12 @@ syscalls! {
     191 semctl Core;
     192 semtimedop Core;
     193 semop Core;
+    180 mq_open Core;
+    181 mq_unlink Core;
+    182 mq_timedsend Core;
+    183 mq_timedreceive Core;
+    184 mq_notify Core;
+    185 mq_getsetattr Core;
 }
 
 // Linux x86_64 (arch/x86/entry/syscalls/syscall_64.tbl): the same calls, and
@@ -706,4 +712,10 @@ syscalls! {
     66 semctl Core;
     220 semtimedop Core;
     65 semop Core;
+    240 mq_open Core;
+    241 mq_unlink Core;
+    242 mq_timedsend Core;
+    243 mq_timedreceive Core;
+    244 mq_notify Core;
+    245 mq_getsetattr Core;
 }

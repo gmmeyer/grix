@@ -565,6 +565,7 @@ fn restartable(regs: &TrapFrame) -> bool {
         // recvmmsg with a timeout is EINTR, as the other timed waits.
         nr::recvmmsg => regs.arg(4) == 0,
         nr::wait4 | nr::waitid => true,
+        nr::mq_timedsend | nr::mq_timedreceive => true,
         // x86_64's older calls keep their own numbers (`syscall::x86`).
         #[cfg(target_arch = "x86_64")]
         nr::open | nr::creat => true,

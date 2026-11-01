@@ -760,6 +760,21 @@ only, from `FdTable::walking`), checked as any other. execveat of a
 descriptor runs the file (`process::Start::File`), and is checked as one. `landlock::may_inspect` keeps a
 domain out of processes outside it, as Linux's ptrace hook.
 
+System V IPC and POSIX queues (`syscall/shm.rs` for shared memory, `sysv.rs`
+for message queues and semaphores, `mqueue.rs`): objects of the sandbox's, that
+outlive who made them, so they're counted (`MAX_OBJECTS`, `MAX_QUEUES`) and
+what they hold charged. A call that waits does as I/O does
+(`Process::block_io_rerun`), so `semop` is all or nothing by not starting
+until all of it can go, and whoever removes one wakes its waiters, who tell
+EIDRM from EINVAL by `sysv::rerun` and the ids just gone. semop and msgrcv are
+EINTR whatever SA_RESTART says, and the mq_ calls restart (`signal::restartable`
+has that). SEM_UNDO's adjustments are in `sysv::UNDO`, applied at
+`procs::finalize`. A queue's descriptor is a `FileKind::Mqueue`.
+
+`syscall/extras.rs` has what's left of Linux's calls, small because there's
+less here for them to say. Nice values and I/O priorities are a process's to
+set and read back, and nothing goes by them.
+
 Linux AIO (`syscall/aio.rs`): a context is a ring in the program's
 memory, Linux's `struct aio_ring` at the context's id (libaio reads it;
 a shared mapping that io_destroy unmaps only if it's still the ring),

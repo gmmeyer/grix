@@ -5091,6 +5091,15 @@ fn system_v_queues_and_semaphores() {
     }
 }
 
+/// POSIX message queues. The fixture passes on Linux as it is.
+#[test]
+fn posix_message_queues() {
+    let out = run(with("mqueue").allow(Capability::Process), &["/bin/mqueue"]);
+    assert_eq!(out.stdout_str().lines().last(), Some("mqueue ok"), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// The user's groups in the sandbox's /etc/group are the program's, as
 /// Docker's are, and it can't be given what /etc/group doesn't say.
 #[test]

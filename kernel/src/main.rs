@@ -33,6 +33,7 @@ mod kmem;
 mod landlock;
 mod locks;
 mod mm;
+mod mqueue;
 mod netlink;
 mod netstack;
 mod process;

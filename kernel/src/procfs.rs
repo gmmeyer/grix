@@ -845,6 +845,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
             fs::lock().path_of(*ino)
         }
         FileKind::Pty(end) => fs::lock().path_of(end.ino),
+        FileKind::Mqueue(_) => String::from("/dev/mqueue/queue"),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
         FileKind::ProcMem(pid, _) => format!("/proc/{pid}/mem"),
         FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),

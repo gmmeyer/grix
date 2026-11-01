@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.72)
+## What's left (after 0.0.73)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce. The rule for what's
@@ -17,9 +17,9 @@ stricter than Linux: Linux's behaviour by default, and stricter on request
 
 Linux behaviour:
 
-1. System V semaphores and message queues, POSIX message queues, and
-   newer syscalls as programs ask for them (`statmount`, `listmount`,
-   fanotify and the new mount API are refused or reported for now).
+1. Newer syscalls as programs ask for them: `statmount` and `listmount` are
+   reported, fanotify and the new mount API refused for now, and
+   `mq_notify` with SIGEV_THREAD is reported.
 2. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
    (nothing a program sends leaves the gateway, so a raw socket there
    forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
