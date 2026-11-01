@@ -1442,6 +1442,7 @@ impl Sandbox {
             seed,
             policy: cfg.policy,
             uid: cfg.uid,
+            groups: crate::container::supplementary_groups(cfg.uid, &cfg.files),
             gid: cfg.gid,
             cwd: &cfg.cwd,
             stdin: stdin.is_some() || take.is_some() || cfg.tty.is_some(),

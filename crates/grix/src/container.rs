@@ -93,6 +93,30 @@ pub(crate) fn resolve_user(
     Ok((uid, gid))
 }
 
+/// The groups `files`' /etc/group has `uid` in by name, as Docker's
+/// `User` gets them (none without an /etc/passwd entry for a name).
+pub(crate) fn supplementary_groups(uid: u32, files: &BTreeMap<String, Node>) -> Vec<u32> {
+    let lines = |path: &str| match files.get(path) {
+        Some(Node::File { data, .. }) => String::from_utf8_lossy(data).into_owned(),
+        _ => String::new(),
+    };
+    let passwd = lines("/etc/passwd");
+    let name = passwd
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|e| e.len() > 2 && e[2].parse() == Ok(uid))
+        .map(|e| e[0].to_string());
+    let Some(name) = name else { return Vec::new() };
+    lines("/etc/group")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .filter(|e| e.len() > 3 && e[3].split(',').any(|member| member == name))
+        .filter_map(|e| e[2].parse().ok())
+        .collect()
+}
+
 /// `uid`'s home directory in `files`' /etc/passwd, as Docker sets HOME:
 /// `/` if it has no entry there.
 pub(crate) fn home_dir(uid: u32, files: &BTreeMap<String, Node>) -> String {

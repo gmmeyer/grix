@@ -5061,6 +5061,30 @@ fn directories_need_search_permission() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// The user's groups in the sandbox's /etc/group are the program's, as
+/// Docker's are, and it can't be given what /etc/group doesn't say.
+#[test]
+fn a_user_has_its_groups() {
+    let passwd = "root:x:0:0::/:/bin/sh\napp:x:1000:1000::/:/bin/sh\n";
+    let group = "app:x:1000:\nwheel:x:10:root,app\nvideo:x:27:app,other\nother:x:30:someone\n";
+    let sandbox = |user: &str| {
+        with("alpine/bin/busybox.static")
+            .file("/etc/passwd", passwd, 0o644)
+            .unwrap()
+            .file("/etc/group", group, 0o644)
+            .unwrap()
+            .user(user)
+    };
+    let name = "/bin/alpine/bin/busybox.static";
+    let out = run(sandbox("app"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "1000 10 27\n", "{}", out.kernel_log);
+    let out = run(sandbox("0:0"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "0 10\n", "{}", out.kernel_log);
+    // A number with no name in /etc/passwd is in no one's list.
+    let out = run(sandbox("4242:4242"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "4242\n", "{}", out.kernel_log);
+}
+
 /// O_PATH | O_NOFOLLOW opens a magic link as a link, and RESOLVE_* say of
 /// one what Linux's do. The fixture passes on Linux as it is.
 #[test]

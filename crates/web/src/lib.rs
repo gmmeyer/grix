@@ -65,6 +65,7 @@ impl Default for Spec {
             cwd: "/".into(),
             memory_mb: 256,
             uid: 1000,
+            groups: Vec::new(),
             gid: 1000,
             cpus: 1,
             stdin: false,

@@ -392,7 +392,14 @@ parent reaps the zombie, and a vfork caller isn't always the parent
 (`vfork_parent`). New namespaces are denied, by clone and by unshare. Credentials: `Process::uid`/`gid` are the effective ids
 (permission checks, new files, `Process::who` with the groups);
 `Process::ids` keeps the real and saved ones and supplementary groups,
-changed by Linux's rules (uid 0 may set anything). They only matter
+changed by Linux's rules (uid 0 may set anything). An image's files keep
+their owners (`Node::owner` on the host, None for what's imported, which is
+the sandbox's user; `Entry::owner`, the tar headers of an image's file and the
+tree cache, and `ExportMsg::Entry` back). A path's directories are searched
+by the walker's permission (`Fs::may_search`, Linux's may_lookup), and nothing
+that walks a path says who for, so a CPU's walker is set as a system call
+starts (`fs::set_walker`): root's until then, for the kernel's own at boot,
+and anything the kernel walks in a call is the caller's. They only matter
 inside the guest filesystem: root bypasses
 mode bits but not `Node::system`, and nothing honours setuid bits, so
 keep it that way rather than giving uid 0 anything else.

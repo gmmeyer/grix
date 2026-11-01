@@ -17,26 +17,23 @@ stricter than Linux: Linux's behaviour by default, and stricter on request
 
 Linux behaviour:
 
-1. An image's files keep their owners, then directories' search
-   permission, in that order; then an image's user's supplementary
-   groups.
-2. A node left unwatched on macOS, and newer syscalls as programs ask for
+1. A node left unwatched on macOS, and newer syscalls as programs ask for
    them.
-3. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
+2. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
    (nothing a program sends leaves the gateway, so a raw socket there
    forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
-4. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
+3. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
    process's table under the filesystem's lock.
 
 Bigger:
 
-5. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+4. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-6. Finer locking: phase 2, a reader/writer lock with per-process
+5. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-7. Faster live-mount round trips, multi-architecture images, and the
+6. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-8. A security review of everything since the last one, by a team of agents.
+7. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
    interest.
 
@@ -136,9 +133,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
    resolver), the image's user (Docker's `User`, root by default), Linux's
    real/effective/saved ids and setgroups, `O_PATH|O_DIRECTORY` on a file
    (ENOTDIR), and ENOENT/ECONNREFUSED for AF_UNIX connects to nothing.
-   Left: `capset` (setpriv), supplementary groups in permission checks,
-   `posix_openpt` (apt's log; item 10), a `--user` flag for `grix build`
-   and `grix run`.
+   Left: `capset` (setpriv), `posix_openpt` (apt's log; item 10).
 10. [x] **Interactive use**: TTY mode (`grix run -t`, `tty`), pseudo-terminals
     and termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
     host too). Left: packet mode (`TIOCPKT`), `VMIN`+`VTIME`'s interbyte
@@ -408,16 +403,13 @@ makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
 
 Left, none of it a way out of the sandbox:
 
-- [ ] An image's files don't keep their owners (a layer's or a build
-      step's `chown`): everything imported is the sandbox user's. Docker's
-      own entrypoints (PostgreSQL, MariaDB, MySQL) work anyway, as they
-      `chown` at run time; it takes the image format, `Entry`, the export
-      messages and the tree cache. Do this before the next item, which
-      would otherwise refuse services their own directories.
-- [ ] A path's directories aren't searched by anyone's permission: only
-      the last component is checked (`MAY_EXEC` on the way down isn't).
-- [ ] An image's user gets no supplementary groups from its `/etc/group`,
-      as Docker's does; `initgroups` in the program works.
+- [x] An image's files keep their owners (a layer's or a build step's
+      `chown`), by way of the image format, `Entry`, the export messages
+      and the tree cache.
+- [x] A path's directories are searched by the walker's permission
+      (`Fs::may_search`, Linux's may_lookup; `searchperm` passes there).
+- [x] An image's user gets its supplementary groups from `/etc/group`, as
+      Docker's does (`container::supplementary_groups`).
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
       another process's are ENOENT past their own name. Few tools go
       there, and it means another process's table under the filesystem's

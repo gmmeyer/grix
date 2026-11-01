@@ -77,6 +77,8 @@ pub struct Image<'a> {
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
+    /// Its supplementary groups, from the sandbox's `/etc/group`.
+    pub groups: Vec<u32>,
     pub cwd: &'a str,
     /// The host sends stdin over the console (see `wire::Input`). Without
     /// it, stdin reads return end-of-file at once.
@@ -188,6 +190,10 @@ impl<'a> Image<'a> {
         w.u8(self.policy.on_deny as u8);
         w.u32(self.uid);
         w.u32(self.gid);
+        w.u32(self.groups.len() as u32);
+        for g in &self.groups {
+            w.u32(*g);
+        }
         w.str(self.cwd);
         w.u8(self.stdin as u8);
         w.str(self.exe);
@@ -247,6 +253,8 @@ impl<'a> Image<'a> {
         let on_deny = DenyAction::from_u8(r.u8()?).ok_or(DecodeError)?;
         let uid = r.u32()?;
         let gid = r.u32()?;
+        let n = r.u32()? as usize;
+        let groups = (0..n).map(|_| r.u32()).collect::<Result<_, _>>()?;
         let cwd = r.str()?;
         let stdin = r.u8()? != 0;
         let exe = r.str()?;
@@ -313,6 +321,7 @@ impl<'a> Image<'a> {
             policy: Policy { caps, on_deny },
             uid,
             gid,
+            groups,
             cwd,
             stdin,
             exe,
@@ -355,6 +364,7 @@ mod tests {
             seed: [7; 32],
             policy: Policy { caps: 0b101, on_deny: DenyAction::Kill },
             uid: 1000,
+            groups: vec![10, 20],
             gid: 1000,
             cwd: "/",
             stdin: true,
@@ -412,6 +422,7 @@ mod tests {
             seed: [0; 32],
             policy: Policy::default(),
             uid: 0,
+            groups: vec![],
             gid: 0,
             cwd: "/",
             stdin: false,

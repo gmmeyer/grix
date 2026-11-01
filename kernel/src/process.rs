@@ -983,6 +983,8 @@ pub fn start(img: Image<'static>) -> ! {
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    // Whoever says so: nothing but this program's own files go by them.
+    p.ids.groups.extend(img.groups.iter().copied().filter(|&g| g != img.gid).take(MAX_GROUPS - 1));
     p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");
     // This CPU's process from the start (`mm::gate`).
     p.aspace.lock();
