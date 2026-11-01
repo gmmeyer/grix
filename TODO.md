@@ -15,33 +15,28 @@ out of the sandbox, and no hang anyone can reproduce. The rule for what's
 stricter than Linux: Linux's behaviour by default, and stricter on request
 (`--strict-network`, `--no-outside-links`).
 
-Robustness, first:
-
-1. `hostfds` fails without the budget for files held open, on Linux too;
-   what it guards of kqueue's descriptors takes an unfixed build on macOS.
-
 Linux behaviour:
 
-2. An image's files keep their owners, then directories' search
+1. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
    groups.
-3. A node left unwatched on macOS, and newer syscalls as programs ask for
+2. A node left unwatched on macOS, and newer syscalls as programs ask for
    them.
-4. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
+3. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
    (nothing a program sends leaves the gateway, so a raw socket there
    forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
-5. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
+4. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
    process's table under the filesystem's lock.
 
 Bigger:
 
-6. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+5. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-7. Finer locking: phase 2, a reader/writer lock with per-process
+6. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-8. Faster live-mount round trips, multi-architecture images, and the
+7. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-9. A security review of everything since the last one, here. An outside
+8. A security review of everything since the last one, here. An outside
    one (round 2, item 20) can't be done from here: it has to be someone
    else's.
 
@@ -102,6 +97,9 @@ Live mounts:
 - [ ] `O_TMPFILE` and `linkat` on a live mount (`hosttmpfile`).
 - [ ] inotify on a live mount by kqueue: renames paired by inode, directories
       compared, the overflow past `fd_budget` (`hostfds`, `watch`).
+- [ ] `hostfds` tells on what it guards: with `at::take_within` always true it
+      must fail on macOS as on Linux. It's the one part of it only macOS can
+      prove, as kqueue holds a descriptor per watched file.
 - [ ] Listings past `MAX_LISTED`, and names of the most bytes, on APFS.
 
 Snapshots:
