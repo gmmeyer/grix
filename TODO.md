@@ -36,9 +36,9 @@ Bigger:
    check-out.
 7. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-8. A security review of everything since the last one, here. An outside
-   one (round 2, item 20) can't be done from here: it has to be someone
-   else's.
+8. A security review of everything since the last one, by a team of agents.
+   Not an outside vendor's: this isn't worth paying for until it gets real
+   interest.
 
 Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
 in 32,000 runs since.
