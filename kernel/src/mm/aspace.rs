@@ -183,11 +183,13 @@ pub struct Vma {
     /// VM_GROWSDOWN (the stack, MAP_GROWSDOWN): a fault below it extends it
     /// (`AddressSpace::grow_down`).
     pub grows_down: bool,
+    /// VM_SEALED (mseal): it stays as it is, for as long as the process is.
+    pub sealed: bool,
 }
 
 impl Vma {
     pub fn new(start: u64, end: u64, prot: Prot, backing: Backing) -> Self {
-        Vma { start, end, prot, backing, dontfork: false, wipeonfork: false, grows_down: false }
+        Vma { start, end, prot, backing, dontfork: false, wipeonfork: false, grows_down: false, sealed: false }
     }
 
     pub fn anon(start: u64, end: u64, prot: Prot) -> Self {
@@ -228,8 +230,8 @@ impl Vma {
                 shared: shared.clone(),
             },
         };
-        let (dontfork, wipeonfork, grows_down) = (self.dontfork, self.wipeonfork, self.grows_down);
-        Vma { start: s, end: e, prot: self.prot, backing, dontfork, wipeonfork, grows_down }
+        let (dontfork, wipeonfork, grows_down, sealed) = (self.dontfork, self.wipeonfork, self.grows_down, self.sealed);
+        Vma { start: s, end: e, prot: self.prot, backing, dontfork, wipeonfork, grows_down, sealed }
     }
 
     /// A MAP_SHARED file mapping that only holds a copy of the file (a
@@ -759,6 +761,29 @@ impl AddressSpace {
     /// The lowest mapping with anything in `[start, end)`.
     pub fn first_in(&self, start: u64, end: u64) -> Option<&Vma> {
         self.find(start).or_else(|| self.vmas.range(start..end).next().map(|(_, v)| v))
+    }
+
+    /// Is any of `[start, end)` sealed? Linux's can_modify_mm: it's asked
+    /// before anything changes, so nothing has if the answer's yes.
+    pub fn sealed_in(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).any(|v| v.sealed)
+    }
+
+    /// Is any of `[start, end)` sealed, private and not writable?
+    pub fn sealed_read_only_anon_in(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).any(|v| v.sealed && !v.prot.write && matches!(v.backing, Backing::Anon))
+    }
+
+    /// Is every page of `[start, end)` in a mapping?
+    pub fn all_mapped(&self, start: u64, end: u64) -> bool {
+        let mut at = start;
+        while at < end {
+            match self.find(at) {
+                Some(v) => at = v.end,
+                None => return false,
+            }
+        }
+        true
     }
 
     /// `set` on what's in `[start, end)` of the mappings there, which are

@@ -10,12 +10,12 @@
 //! (`watch.rs`), through descriptors opened the same way; lazy imports
 //! never change for the guest, so they aren't.
 
-use std::time::{Duration, Instant};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};

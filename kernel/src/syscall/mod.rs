@@ -1,6 +1,7 @@
 //! Linux syscall ABI. Each syscall is checked against the policy before it runs.
 
 pub mod aio;
+mod extras;
 mod file;
 mod mem;
 mod misc;
@@ -295,6 +296,40 @@ fn dispatch(p: &mut Process, tf: &mut TrapFrame, n: u32, a: [u64; 6]) -> SysResu
         nr::signalfd4 => file::signalfd4(p, a[0], a[1], a[2], a[3]),
         nr::copy_file_range => file::copy_file_range(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::sync => Ok(0),
+        nr::syncfs => extras::syncfs(p, a[0]),
+        nr::sync_file_range => extras::sync_file_range(p, a[0], a[1], a[2], a[3]),
+        nr::readahead => extras::readahead(p, a[0]),
+        nr::getpriority => extras::getpriority(p, a[0], a[1]),
+        nr::setpriority => extras::setpriority(p, a[0], a[1], a[2]),
+        nr::sched_rr_get_interval => extras::sched_rr_get_interval(p, a[0], a[1]),
+        nr::sched_getattr => extras::sched_getattr(p, a[0], a[1], a[2], a[3]),
+        nr::sched_setattr => extras::sched_setattr(p, a[0], a[1], a[2]),
+        nr::ioprio_get => extras::ioprio_get(p, a[0], a[1]),
+        nr::ioprio_set => extras::ioprio_set(p, a[0], a[1], a[2]),
+        nr::adjtimex => extras::adjtimex(p, a[0]),
+        nr::clock_adjtime => extras::clock_adjtime(p, a[0], a[1]),
+        nr::restart_syscall => Err(EINTR),
+        nr::process_mrelease => extras::process_mrelease(p, a[0], a[1]),
+        nr::process_madvise => extras::process_madvise(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::pkey_alloc => extras::pkey_alloc(p, a[0], a[1]),
+        nr::pkey_free => Err(EINVAL),
+        nr::pkey_mprotect => extras::pkey_mprotect(p, a[0], a[1], a[2], a[3]),
+        nr::move_pages => extras::move_pages(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::migrate_pages => extras::migrate_pages(p, a[0]),
+        nr::set_mempolicy_home_node => extras::set_mempolicy_home_node(a[0], a[2], a[3]),
+        nr::remap_file_pages => extras::remap_file_pages(p, a[0], a[1], a[2], a[3]),
+        nr::cachestat => extras::cachestat(p, a[0], a[1], a[2], a[3]),
+        nr::mseal => extras::mseal(p, a[0], a[1], a[2]),
+        nr::futex_wake => extras::futex_wake(p, a[0], a[1], a[2], a[3]),
+        nr::futex_wait => extras::futex_wait(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::futex_requeue => extras::futex_requeue(p, a[0], a[1], a[2], a[3]),
+        nr::lsm_list_modules => extras::lsm_list_modules(p, a[0], a[1], a[2]),
+        nr::lsm_get_self_attr => Ok(0),
+        nr::lsm_set_self_attr => Err(EOPNOTSUPP),
+        // Off unless it's asked for at boot, as it's off on Linux.
+        nr::memfd_secret => Err(ENOSYS),
+        // Shadow stacks take hardware support nothing here turns on.
+        nr::map_shadow_stack => Err(EOPNOTSUPP),
         nr::fadvise64 => p.fds.get(a[0]).map(|_| 0),
         nr::flock => file::flock(p, a[0], a[1]),
         nr::io_setup => aio::io_setup(p, a[0], a[1]),

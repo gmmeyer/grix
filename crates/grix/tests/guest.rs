@@ -5061,6 +5061,23 @@ fn directories_need_search_permission() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// Calls programs meet less often, as Linux has them: the fixture passes
+/// there, but for those newer than the kernel it was checked on.
+#[test]
+fn calls_programs_meet_less_often() {
+    let b = with("linuxcalls").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/linuxcalls"]);
+    assert_eq!(out.stdout_str().lines().last(), Some("linuxcalls ok"), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // Setting the clock is refused, and said to be: nothing else is.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { syscall, detail, .. }]
+            if syscall == "adjtimex" && detail == "setting the clock"),
+        "{:?}",
+        out.events
+    );
+}
+
 /// The user's groups in the sandbox's /etc/group are the program's, as
 /// Docker's are, and it can't be given what /etc/group doesn't say.
 #[test]

@@ -172,6 +172,26 @@ impl PageIndex {
         there
     }
 
+    /// How many pages `[from, to)` holds. It costs what's there, however
+    /// far apart the two are.
+    pub fn count_range(&self, from: u64, to: u64) -> u64 {
+        if self.root == 0 { 0 } else { self.count_in(self.root, self.levels - 1, 0, from, to) }
+    }
+
+    fn count_in(&self, pa: u64, level: u32, first: u64, from: u64, to: u64) -> u64 {
+        let per = 1u64 << (BITS * level);
+        let mut n = 0;
+        for i in 0..FANOUT {
+            let child = get(pa, i);
+            let start = first + i * per;
+            if child == 0 || start.saturating_add(per) <= from || start >= to {
+                continue;
+            }
+            n += if level == 0 { 1 } else { self.count_in(child, level - 1, start, from, to) };
+        }
+        n
+    }
+
     /// Take out every page from `keep` on, passing each frame to `each`.
     pub fn remove_from(&mut self, keep: u64, each: &mut dyn FnMut(u64)) {
         self.remove_range(keep, u64::MAX, each);

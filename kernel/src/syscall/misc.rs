@@ -151,8 +151,6 @@ pub fn dispatch(p: &mut Process, n: u32, name: &str, a: [u64; 6]) -> SysResult {
             _ => Err(EINVAL),
         },
         nr::sched_getparam => write_u32(&mut p.aspace, a[1], 0).map(|_| 0),
-        nr::getpriority => Ok(20),
-        nr::setpriority => Ok(0),
         nr::getcpu => {
             // The CPU, and its NUMA node (there's one).
             for (ptr, v) in a[..2].iter().zip([crate::smp::me() as u32, 0]) {

@@ -43,3 +43,6 @@ pub fn epoll_event(events: u32, data: u64) -> [u8; EPOLL_EVENT] {
 pub fn epoll_event_get(b: &[u8; EPOLL_EVENT]) -> (u32, u64) {
     (u32::from_le_bytes(b[..4].try_into().unwrap()), u64::from_le_bytes(b[4..].try_into().unwrap()))
 }
+
+/// What pkey_alloc says without the hardware: x86's finds out setting up a key it had.
+pub const NO_PROTECTION_KEYS: crate::errno::Errno = crate::errno::EINVAL;

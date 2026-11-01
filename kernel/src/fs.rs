@@ -624,6 +624,14 @@ impl FileData {
         self.count_nodes(nodes);
     }
 
+    /// Pages `[from, to)` of the file that are in memory (cachestat). The
+    /// imported ones are, as they're part of the boot image, unless written.
+    pub fn pages_in(&self, from: u64, to: u64) -> u64 {
+        let imported = (self.base.len() as u64).div_ceil(PAGE_SIZE);
+        let base = to.min(imported).saturating_sub(from.min(imported));
+        self.pages.count_range(from, to).max(base)
+    }
+
     /// What the file takes up, in 512-byte blocks (`st_blocks`): its pages,
     /// as tmpfs counts them, so `du` and sparse copies see its holes. The
     /// host doesn't say of a live mount's.
@@ -830,9 +838,9 @@ struct Walker {
     groups: Mutex<Vec<u32>>,
 }
 
-static WALKERS: [Walker; grix_abi::machine::MAX_CPUS as usize] = [const {
-    Walker { uid: AtomicU32::new(0), gid: AtomicU32::new(0), groups: Mutex::new(Vec::new()) }
-}; grix_abi::machine::MAX_CPUS as usize];
+static WALKERS: [Walker; grix_abi::machine::MAX_CPUS as usize] =
+    [const { Walker { uid: AtomicU32::new(0), gid: AtomicU32::new(0), groups: Mutex::new(Vec::new()) } };
+        grix_abi::machine::MAX_CPUS as usize];
 
 /// Path walks on this CPU are `who`'s, from now on.
 pub fn set_walker(who: Who) {
@@ -1909,6 +1917,10 @@ impl Fs {
 
     pub fn node_mut(&mut self, ino: Ino) -> &mut Node {
         &mut self.nodes[ino]
+    }
+
+    pub fn is_regular(&self, ino: Ino) -> bool {
+        matches!(self.nodes[ino].kind, Kind::File(_) | Kind::Unlinked { .. })
     }
 
     pub fn is_dir(&self, ino: Ino) -> bool {

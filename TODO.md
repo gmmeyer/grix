@@ -17,8 +17,9 @@ stricter than Linux: Linux's behaviour by default, and stricter on request
 
 Linux behaviour:
 
-1. A node left unwatched on macOS, and newer syscalls as programs ask for
-   them.
+1. System V semaphores and message queues, POSIX message queues, and
+   newer syscalls as programs ask for them (`statmount`, `listmount`,
+   fanotify and the new mount API are refused or reported for now).
 2. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
    (nothing a program sends leaves the gateway, so a raw socket there
    forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.

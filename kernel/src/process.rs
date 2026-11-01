@@ -311,6 +311,9 @@ pub struct Ids {
 /// keeps its own, and fork copies them).
 pub const MAX_GROUPS: usize = 64;
 
+/// IOPRIO_CLASS_BE, level 4: Linux's for anyone who hasn't said.
+const IOPRIO_DEFAULT: u16 = 2 << 13 | 4;
+
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
@@ -338,6 +341,10 @@ pub struct Process {
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
+    /// The nice value and I/O priority: a process's to set and read back,
+    /// as the scheduler is round-robin and there's no disk.
+    pub nice: i8,
+    pub ioprio: u16,
     pub ids: Ids,
     /// Signal actions (`action`, `set_action`).
     pub sigactions: Shared<SigActions>,
@@ -522,6 +529,8 @@ impl Process {
             uid,
             gid,
             ids: Ids { ruid: uid, suid: uid, rgid: gid, sgid: gid, groups: alloc::vec![gid] },
+            nice: 0,
+            ioprio: IOPRIO_DEFAULT,
             sigactions: Shared::new([SigAction::default(); 65]),
             shared_pending: SigQueue::default(),
             rlimits,
@@ -564,6 +573,7 @@ impl Process {
         let mut c = Process::new(pid, self.policy, self.uid, self.gid, aspace);
         c.args_charge = args_charge;
         c.ppid = self.pid;
+        (c.nice, c.ioprio) = (self.nice, self.ioprio);
         c.pgid = self.pgid;
         c.sid = self.sid;
         c.ctty = self.ctty.clone();
