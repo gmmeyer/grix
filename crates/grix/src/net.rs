@@ -741,6 +741,16 @@ impl Outbox {
         self.q.lock().unwrap().frames.is_empty()
     }
 
+    /// The next frame if there is one, without waiting.
+    #[cfg(test)]
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        let mut q = self.q.lock().unwrap();
+        let f = q.frames.pop_front()?;
+        q.bytes -= f.len();
+        self.room.notify_all();
+        Some(f)
+    }
+
     /// The next frame to write; None once closed.
     pub fn next(&self) -> Option<Vec<u8>> {
         let mut q = self.q.lock().unwrap();

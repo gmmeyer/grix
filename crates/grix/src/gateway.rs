@@ -537,14 +537,18 @@ mod tests {
         (Gateway::start(proxy, messages, to_guest.clone()).unwrap(), to_guest)
     }
 
-    /// The next packet for the guest, within a few seconds.
+    /// The next packet for the guest, within a few seconds. (By looking, not
+    /// with a thread in `next`: one left there when this gives up would take
+    /// the next packet to nobody.)
     fn packet_for_guest(out: &Arc<Outbox>) -> Option<Vec<u8>> {
-        let (tx, rx) = mpsc::channel();
-        let o = out.clone();
-        thread::spawn(move || {
-            let _ = tx.send(o.next());
-        });
-        rx.recv_timeout(Duration::from_secs(5)).ok()?.map(|f| f[wire::FRAME_HEADER..].to_vec())
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if let Some(f) = out.take() {
+                return Some(f[wire::FRAME_HEADER..].to_vec());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        None
     }
 
     /// A SYN, as a guest's stack would send it.
