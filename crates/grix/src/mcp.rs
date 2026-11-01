@@ -506,6 +506,10 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                     "default_env": {"type": "boolean",
                                     "description": "Give the program HOME, PATH, LANG and TMPDIR, unless env sets them."},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
+                    "network": {"type": "string", "enum": ["none", "native", "vm"],
+                                "description": "The network stack, if the server allows net: native \
+                                                (sockets on the host's own stack, what net gives) or vm \
+                                                (TCP/IP in the sandbox). The same rules hold on both."},
                     "exports": {"type": "array", "items": {"type": "string"},
                                 "description": "Sandbox directories whose contents to return when the program ends."},
                     "timeout_secs": {"type": "number"},
@@ -715,6 +719,14 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
             bail!("this server doesn't allow the {name} capability");
         }
         b = b.allow(cap);
+    }
+    if let Some(name) = args["network"].as_str() {
+        let network = crate::Network::parse(name)?;
+        // A stack is `net`, which is the server's to give.
+        if network != crate::Network::None && !config.capabilities.contains(&Capability::Net) {
+            bail!("this server doesn't allow the net capability");
+        }
+        b = b.network(network);
     }
     for rule in &config.allow_hosts {
         b = b.allow_host(rule)?;

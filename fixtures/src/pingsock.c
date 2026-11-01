@@ -197,7 +197,13 @@ int main(int argc, char **argv) {
         size_t len = request(m, 0);
         struct sockaddr_storage st;
         socklen_t alen = address(&st, argv[2]);
-        FAILS(sendto(s, m, len, 0, (void *)&st, alen), EPERM);
+        // Asked first on the `native` stack; on the `vm` one (DROPPED) it
+        // leaves, and the gateway drops it, as a firewall would.
+        if (getenv("DROPPED")) {
+            CHECK(sendto(s, m, len, 0, (void *)&st, alen) == (ssize_t)len);
+        } else {
+            FAILS(sendto(s, m, len, 0, (void *)&st, alen), EPERM);
+        }
         printf("pingsock refused ok\n");
         return 0;
     }

@@ -1214,8 +1214,7 @@ pub(super) fn inet_write(
                     break;
                 }
                 src.read(p, done, &mut chunk[..n])?;
-                let msg = link::ToHost::Data { id, data: &chunk[..n] }.encode();
-                if !crate::console::try_write(grix_abi::wire::Channel::Link, &msg) {
+                if !inet::write_data(id, &chunk[..n]) {
                     break;
                 }
                 c.lock().sent(n);

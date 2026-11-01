@@ -247,15 +247,19 @@ struct Taken {
     notices: Vec<Vec<u8>>,
     /// Notices dropped for want of room.
     lost: bool,
+    /// IP packets, for the `vm` network stack. Past `MAX_HELD_PACKETS` more
+    /// are lost, as on any link: TCP sends them again.
+    packets: Vec<Vec<u8>>,
 }
 
 const MAX_HELD_DATAGRAMS: usize = 1 << 20;
+const MAX_HELD_PACKETS: usize = 128;
 /// A datagram's `Vec` and its share of the list.
 const DATAGRAM_OVERHEAD: usize = 64;
 
 impl Taken {
     fn is_empty(&self) -> bool {
-        self.link.is_empty() && self.notices.is_empty() && !self.lost
+        self.link.is_empty() && self.notices.is_empty() && !self.lost && self.packets.is_empty()
     }
 }
 
@@ -278,6 +282,7 @@ fn drain(c: &mut Console) -> Taken {
                     }
                 }
                 Some((Input::Link, msg)) => taken.link.push(msg.to_vec()),
+                Some((Input::Packet, p)) if taken.packets.len() < MAX_HELD_PACKETS => taken.packets.push(p.to_vec()),
                 Some((Input::FsEvent, msg)) if taken.notices.len() < MAX_NOTICES => taken.notices.push(msg.to_vec()),
                 Some((Input::FsEvent, _)) => taken.lost = true,
                 Some((Input::Signal, &[sig])) if (1..=64).contains(&sig) && signals.len() < MAX_HOST_SIGNALS => {
@@ -331,6 +336,19 @@ fn dispatch(taken: Taken) {
     if !taken.notices.is_empty() || taken.lost {
         crate::inotify::from_host(&taken.notices, taken.lost);
     }
+    for p in taken.packets {
+        crate::netstack::received(p);
+    }
+}
+
+/// Take in what the host sent, with interrupts masked: for the end of the
+/// program, when nothing else will.
+pub fn pump() {
+    let mut guard = CONSOLE.lock();
+    let Some(c) = guard.as_mut() else { return };
+    let taken = drain(c);
+    drop(guard);
+    dispatch(taken);
 }
 
 /// Send a live mount's request (`grix_abi::hostfs`) and wait for the

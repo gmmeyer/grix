@@ -64,6 +64,11 @@ pub const HOST_V6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 /// The length of the network's prefix.
 pub const NET_V6_PREFIX: u8 = 64;
 /// A name for `HOST_V4`.
+/// The largest IP packet on the `vm` network stack's link: a frame each, in
+/// one of the console's buffers, as nothing here is a real Ethernet. It
+/// carries `MAX_UDP` over IPv4.
+pub const MTU: usize = crate::wire::MAX_FRAME - crate::wire::FRAME_HEADER;
+
 pub const HOST_NAME: &str = "host.grix.internal";
 
 /// Ids of connections the host opens (to forwarded ports) have this bit
@@ -74,6 +79,11 @@ pub const HOST_ID: u32 = 1 << 31;
 pub enum Addr {
     V4([u8; 4]),
     V6([u8; 16]),
+}
+
+/// Is this `ToHost` message the guest's credit for stdin?
+pub fn is_stdin_credit(msg: &[u8]) -> bool {
+    matches!(ToHost::decode(msg), Ok(ToHost::StdinCredit { .. }))
 }
 
 impl Addr {
@@ -403,6 +413,14 @@ impl<'a> ToGuest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_stdin_credit_is_stdin_credit() {
+        assert!(is_stdin_credit(&ToHost::StdinCredit { bytes: 1 }.encode()));
+        assert!(!is_stdin_credit(&ToHost::Credit { id: 1, bytes: 1 }.encode()));
+        assert!(!is_stdin_credit(&ToHost::Connect { id: 1, addr: Addr::V4([1, 1, 1, 1]), port: 80 }.encode()));
+        assert!(!is_stdin_credit(&[]));
+    }
 
     #[test]
     fn only_datagrams_are_datagrams() {

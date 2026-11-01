@@ -37,6 +37,8 @@ pub enum Channel {
     /// The kernel's resources and counters: a `stats::Stats`, when the host
     /// asks (`Input::Stats`) and as the program ends, before its status.
     Stats = 9,
+    /// The `vm` network stack: an IP packet, a frame each.
+    Packet = 10,
 }
 
 impl Channel {
@@ -51,6 +53,7 @@ impl Channel {
             7 => Some(Self::Link),
             8 => Some(Self::Fs),
             9 => Some(Self::Stats),
+            10 => Some(Self::Packet),
             _ => None,
         }
     }
@@ -84,6 +87,8 @@ pub enum Input {
     /// Live mounts: a change the host saw in a watched node, a
     /// `hostfs::Notice` (one per frame, unasked for).
     FsEvent = 8,
+    /// The `vm` network stack: an IP packet, a frame each.
+    Packet = 9,
 }
 
 impl Input {
@@ -97,6 +102,7 @@ impl Input {
             6 => Some(Self::Resize),
             7 => Some(Self::Stats),
             8 => Some(Self::FsEvent),
+            9 => Some(Self::Packet),
             _ => None,
         }
     }
@@ -477,7 +483,7 @@ mod tests {
     #[test]
     fn input_kinds_have_their_own_codes() {
         use Input::*;
-        let all = [Stdin, StdinEof, Link, Fs, Signal, Resize, Stats, FsEvent];
+        let all = [Stdin, StdinEof, Link, Fs, Signal, Resize, Stats, FsEvent, Packet];
         for (i, k) in all.iter().enumerate() {
             assert_eq!(Input::from_u8(*k as u8), Some(*k));
             assert!(all[..i].iter().all(|o| *o as u8 != *k as u8), "{k:?}");
@@ -488,7 +494,7 @@ mod tests {
 
     #[test]
     fn decodes_input_frames() {
-        let mut stream = vec![0x42, FRAME_MAGIC, 9, 0, 0]; // garbage and a bad kind
+        let mut stream = vec![0x42, FRAME_MAGIC, 10, 0, 0]; // garbage and a bad kind
         stream.extend(input_header(Input::Stdin, 3));
         stream.extend(b"abc");
         stream.extend(input_header(Input::StdinEof, 0));

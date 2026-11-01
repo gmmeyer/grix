@@ -34,6 +34,7 @@ mod landlock;
 mod locks;
 mod mm;
 mod netlink;
+mod netstack;
 mod process;
 mod procfs;
 mod procs;

@@ -881,6 +881,9 @@ pub fn finish(kind: ExitKind, code: i32) -> ! {
     // What the terminal still has to show goes before the status, and so
     // do the final counts.
     crate::tty::flush_console();
+    // What the program wrote and ended on Linux would still go out: here
+    // the machine's about to stop, so it goes now.
+    crate::netstack::flush();
     console::report_stats();
     // What the kernel lock and TLB flushes cost (`grix run -v` shows it).
     if crate::smp::count() > 1 {
@@ -952,6 +955,9 @@ pub fn start(img: Image<'static>) -> ! {
     let entries: &'static [grix_abi::image::Entry<'static>] = img.entries.leak();
     crate::export::init(&img.exports, &img.mounts, entries, img.export_budget);
     crate::inet::init(img.forwards.clone(), img.udp_forwards.clone());
+    if img.vm_stack {
+        crate::netstack::init();
+    }
     crate::procfs::set_hostname(img.hostname);
     let fail = |code: i32, reason: &str| -> ! {
         console::event(&Event::ExecFailed { path: img.exe, reason });

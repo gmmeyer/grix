@@ -38,6 +38,8 @@ const MAX_LOOKUPS: u32 = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Frames waiting for the guest to read them.
 const OUTBOX_BYTES: usize = 4 << 20;
+/// How long what a program wrote gets to reach its peer once it's ended.
+pub(crate) const LAST_DATA: Duration = Duration::from_secs(5);
 /// Denials reported, and addresses remembered with the names they were for.
 const MAX_REPORTED: usize = 512;
 const MAX_NAMES: usize = 4096;
@@ -734,6 +736,21 @@ impl Outbox {
         false
     }
 
+    #[cfg(test)]
+    pub(crate) fn q_is_empty(&self) -> bool {
+        self.q.lock().unwrap().frames.is_empty()
+    }
+
+    /// The next frame if there is one, without waiting.
+    #[cfg(test)]
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        let mut q = self.q.lock().unwrap();
+        let f = q.frames.pop_front()?;
+        q.bytes -= f.len();
+        self.room.notify_all();
+        Some(f)
+    }
+
     /// The next frame to write; None once closed.
     pub fn next(&self) -> Option<Vec<u8>> {
         let mut q = self.q.lock().unwrap();
@@ -1275,6 +1292,19 @@ impl Proxy {
 
     /// The run is over: close everything, stop listening, and return what
     /// was denied.
+    /// The program ended. What it wrote is still to reach its peers, as
+    /// the kernel it ran on would have seen to on Linux: connections close
+    /// the way a guest's `Close` does, with what's held written out first,
+    /// for as long as `LAST_DATA` if a peer doesn't read.
+    pub fn finish(&self) {
+        for (_, c) in self.shared.conns.lock().unwrap().drain() {
+            if let Some(stream) = c.stream.lock().unwrap().as_ref() {
+                let _ = stream.set_write_timeout(Some(LAST_DATA));
+            }
+            c.close();
+        }
+    }
+
     pub fn stop(&self) -> Vec<GuestEvent> {
         let s = &self.shared;
         let credit = s.stdin_credit.lock().unwrap();
@@ -1594,7 +1624,7 @@ fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A live mount's notices wait while the outbox is a quarter full, so
@@ -1614,7 +1644,7 @@ mod tests {
         assert_eq!(out.next().unwrap(), [1; 16]);
     }
 
-    fn policy(rules: &[&str]) -> NetPolicy {
+    pub(crate) fn policy(rules: &[&str]) -> NetPolicy {
         NetPolicy {
             enabled: true,
             icmp: false,

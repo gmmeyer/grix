@@ -55,6 +55,15 @@ class Common:
         self.assertGreater(r.guest_stats["usage"]["memory"]["peak"], 0)
         self.assertGreater(r.host_usage["peak_memory_bytes"], 0)
 
+    def test_the_network_stacks(self):
+        # Interfaces are what any socket lists: `eth0` means there's a stack.
+        run = ["/bin/busybox", "cat", "/proc/net/dev"]
+        imports = {BUSYBOX: "/bin/busybox"}
+        self.assertNotIn("eth0", grix.Sandbox(imports=imports).run(run).stdout)
+        self.assertNotIn("eth0", grix.Sandbox(imports=imports, network="none").run(run).stdout)
+        for stack in ("native", "vm"):
+            self.assertIn("eth0", grix.Sandbox(imports=imports, network=stack).run(run).stdout)
+
     def test_the_hosts_time_zone(self):
         run = ["/bin/busybox", "date", "+%Z %z"]
         sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
@@ -128,7 +137,10 @@ class Common:
         port = probe.getsockname()[1]
         probe.close()
         udp = FIXTURES / ("amd64/udp" if X86_64 else "udp")
-        sb = grix.Sandbox(imports={udp: "/bin/udp"}, capabilities=["net"], publish=[f"{port}:5300/udp"], timeout=60)
+        # A datagram isn't asked about on the `vm` stack, and the fixture's to
+        # expect that (see `may_drop` in guest.rs).
+        env = {"DROPPED": "1"} if os.environ.get("GRIX_NETWORK") == "vm" else {}
+        sb = grix.Sandbox(imports={udp: "/bin/udp"}, env=env, capabilities=["net"], publish=[f"{port}:5300/udp"], timeout=60)
         result = {}
         guest = threading.Thread(target=lambda: result.update(out=sb.run(["/bin/udp", "serve", "5300"])))
         guest.start()

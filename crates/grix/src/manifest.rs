@@ -3,6 +3,7 @@
 //! ```toml
 //! command = ["/bin/hello", "world"]
 //! capabilities = []          # fs_write, threads, process, net, net_raw
+//! network = "vm"             # none, native (what `net` gives) or vm
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
 //! hostname = "worker-1"      # grix unless given
@@ -65,6 +66,8 @@ pub struct Manifest {
     pub default_env: bool,
     #[serde(default)]
     pub host_timezone: bool,
+    /// The network stack: none, native or vm.
+    pub network: Option<String>,
     pub memory_mb: Option<u64>,
     /// 0: no time limit.
     pub timeout_secs: Option<u64>,
@@ -193,6 +196,9 @@ impl Manifest {
         }
         if let Some(mb) = self.max_export_mb {
             b = b.max_export(mb << 20);
+        }
+        if let Some(network) = &self.network {
+            b = b.network(crate::Network::parse(network)?);
         }
         for rule in &self.allow_hosts {
             b = b.allow_host(rule)?;

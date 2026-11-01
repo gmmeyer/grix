@@ -321,8 +321,33 @@ static int server_pair(int lo_port, int port) {
     return 0;
 }
 
+// Forwarded ports: more than any one buffer on the way holds, and the end
+// of the program with nothing closed. On Linux it would all still arrive.
+static int parting(int port) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 8) == 0);
+    int c;
+    char first;
+    for (;;) {
+        c = accept(l, 0, 0);
+        CHECK(c >= 0);
+        if (read(c, &first, 1) == 1 && first == 'p') break;
+        close(c);
+    }
+    static unsigned char data[1 << 20];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = (unsigned char)(i * 7 + (i >> 11));
+    for (size_t sent = 0; sent < sizeof data;) {
+        ssize_t n = write(c, data + sent, sizeof data - sent);
+        CHECK(n > 0);
+        sent += n;
+    }
+    _exit(0);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "resolve") == 0) return resolve(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "parting") == 0) return parting(atoi(argv[2]));
     if (argc == 4 && strcmp(argv[1], "server-pair") == 0) return server_pair(atoi(argv[2]), atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "server") == 0) return server(atoi(argv[2]));
     if (argc != 4 || strcmp(argv[1], "client") != 0) return 2;

@@ -159,6 +159,10 @@ class Sandbox:
     #: Give the program HOME, PATH, LANG and TMPDIR, unless ``env`` sets them.
     default_env: bool = False
     host_timezone: bool = False
+    #: The network stack: ``"none"``, ``"native"`` (sockets on the host's own
+    #: stack, what the ``net`` capability gives) or ``"vm"`` (TCP/IP in the
+    #: sandbox). The last two grant ``net``, and the same rules hold on both.
+    network: Optional[str] = None
     capabilities: Sequence[str] = ()
     memory_mb: Optional[int] = None
     #: CPUs for the program's threads (1 by default).
@@ -196,6 +200,8 @@ class Sandbox:
             a += ["--host-timezone"]
         if self.default_env:
             a += ["--default-env"]
+        if self.network is not None:
+            a += ["--network", self.network]
         for c in self.capabilities:
             a += ["-a", c]
         if self.memory_mb:
@@ -234,6 +240,7 @@ class Sandbox:
             "hostname": self.hostname,
             "default_env": bool(self.default_env),
             "host_timezone": bool(self.host_timezone),
+            "network": self.network,
             "capabilities": list(self.capabilities),
             "memory_mb": num(self.memory_mb or None, int),
             "cpus": num(self.cpus or None, int),

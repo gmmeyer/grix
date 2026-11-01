@@ -73,11 +73,22 @@ static void echo(int port) {
     printf("udp echo ok\n");
 }
 
+// What the policy refuses: EPERM on the `native` stack, which asks first. On
+// the `vm` one (DROPPED) the datagram leaves and the gateway drops it, as a
+// firewall would.
+static void refused(int s, struct sockaddr_in *to) {
+    if (getenv("DROPPED")) {
+        CHECK(sendto(s, "no", 2, 0, (void *)to, sizeof *to) == 2);
+    } else {
+        CHECK(sendto(s, "no", 2, 0, (void *)to, sizeof *to) == -1 && errno == EPERM);
+    }
+}
+
 static void denied(int port) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in to = at("10.0.2.2", port);
-    CHECK(sendto(s, "no", 2, 0, (void *)&to, sizeof to) == -1 && errno == EPERM);
-    CHECK(sendto(s, "no", 2, 0, (void *)&to, sizeof to) == -1 && errno == EPERM);
+    refused(s, &to);
+    refused(s, &to);
     printf("udp denied ok\n");
 }
 
@@ -97,7 +108,7 @@ static void serve(int port) {
             // forward, and the policy doesn't allow the host itself.
             struct sockaddr_in stranger = from;
             stranger.sin_port = htons(ntohs(from.sin_port) ^ 1);
-            CHECK(sendto(s, "no", 2, 0, (void *)&stranger, sizeof stranger) == -1 && errno == EPERM);
+            refused(s, &stranger);
         }
         int m = snprintf(reply, sizeof reply, "echo %zd: %.*s", n, (int)n, buf);
         CHECK(sendto(s, reply, m, 0, (void *)&from, len) == m);

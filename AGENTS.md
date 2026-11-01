@@ -237,6 +237,33 @@ socket, or a raw one where the host won't give one, its kernel writing the
 IP header either way). Any other raw socket stays unimplemented: it's what
 keeps a program from forging packets. An image can only ask for it, as for
 `net`, and a restored snapshot hasn't got it.
+The `vm` stack (`--network vm`, `SandboxBuilder::network`, `Image::vm_stack`;
+`native` is all of the above, and `none` is no `net`): the same sockets, on
+TCP/IP in the guest. `crates/netstack` (`no_std`, smoltcp, Reno as Cubic
+needs floating point) is both ends: `Stack` turns connections into IP packets,
+which are a frame each on the console (`Channel::Packet`, `Input::Packet`,
+at most `link::MTU`), so there's no NIC, nothing new in a VMM and nothing that
+differs between hypervisors. `packet` does UDP and ICMP, which keep no state.
+In the kernel, `netstack.rs` takes what `inet` would tell the host and answers
+as the host would (`inet::deliver`): every way a socket says something to the
+host must go through it (`inet::send`, `write_data`, `Udp`'s), or it bypasses
+the stack without a word. It may be called with a socket's lock held, so
+anything that may send back waits for `service` (`Guest::later`), from
+`sched::poll`; TCP's timers are a deadline as a timerfd's are
+(`netstack::deadline`). The kernel doesn't outlive the program here, as
+Linux's does: `flush`, from `process::finish`, sees what it wrote acknowledged.
+On the host `gateway.rs` has a `Stack` that answers for every address
+(`any_address`), and turns what comes out of it into `ToHost` for the same
+`Proxy`, whose `ToGuest` it turns into packets. So the policy is the proxy's
+and nothing a guest sends is forwarded: a SYN waits until the proxy has
+connected (a refusal is a reset, or an ICMP error for `EPERM` and the like, so
+`connect` says what it says on `native`), the source must be the guest, and
+with a gateway `Channel::Link` carries stdin's credit and nothing else. A
+datagram isn't asked about first: refused, it's dropped and reported, where
+`native` says `EPERM`. Sockets' buffers are `netstack::BUFFER` each way, in a
+window of their own (`inet::send_window`). `eth0`'s description still says
+1500, while the link carries `link::MTU`. `GRIX_NETWORK=vm` runs any test that
+has `net` on this stack.
 Interface listings (`netlink.rs`: netlink, the `SIOCGIF*` ioctls,
 `SIOCETHTOOL`, `/proc/net/dev`, `route`, `if_inet6` and `ipv6_route`;
 `procfs::ETH0_FILES` for `/sys/class/net/eth0`) show `lo`, and with
@@ -814,11 +841,12 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    seccomp allowlist on every thread): keep new work in it to what's
    already open (stdin, stdout, the serial socket), and add a system call
    to the allowlist only when it can't reach anything new.
-   Networking is no exception: there's no NIC and no guest TCP/IP stack.
-   Sockets are `link` messages on the console, and the host's proxy
-   (`crates/grix/src/net.rs`) makes every connection after checking the
-   policy, so a compromised guest can't reach anything the policy doesn't
-   allow. The host never trusts the guest's flow control either: credit,
+   Networking is no exception: there's no NIC. Sockets are `link` messages
+   on the console, or with the `vm` stack IP packets on it, which end at a
+   gateway, and either way the host's proxy (`crates/grix/src/net.rs`)
+   makes every connection after checking the policy, so a compromised guest
+   can't reach anything the policy doesn't allow, and no packet of its own
+   leaves the host. The host never trusts the guest's flow control either: credit,
    threads, lookups and queued frames all have host-side caps. Nor its
    capability checks: the proxy itself refuses everything without `net`,
    since an image brings its own kernel.
@@ -872,7 +900,8 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
       `kmem` pays for at `OPEN_FILE_COST` each; the first 4096 work
       whether it can or not), processes (`MAX_PROCESSES`, zombies
       included), network connections (`inet::MAX_CONNS`, each charged
-      its window), connections waiting to be accepted
+      its window; on the `vm` stack `netstack::FLOWS` sockets, each charged
+      `BUFFER` twice, with their slots made once), connections waiting to be accepted
       (`inet::MAX_PENDING`, each charged `PENDING_COST`; listen's
       backlog bounds nothing, as a full one has clients wait on Linux),
       pseudo-terminals (`tty::MAX_PTYS`, each charged its buffers),

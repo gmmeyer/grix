@@ -206,9 +206,13 @@ fn poll(mut p: Option<&mut Process>, procs: &mut Procs, timer: bool) -> bool {
             return woke;
         }
         let (mut next, mut cpu_timed) = (NONE, false);
+        // (Before the waiters: what it does is what some of them wait for.)
+        crate::netstack::service();
         if timers {
             woke |= crate::timer::fire_timerfds();
-            next = crate::timer::timerfd_deadline().map_or(NONE, clamp);
+            next = crate::timer::timerfd_deadline()
+                .map_or(NONE, clamp)
+                .min(crate::netstack::deadline().map_or(NONE, clamp));
         }
         for q in procs.each(p.as_deref_mut()) {
             if timers {
@@ -433,7 +437,9 @@ fn earliest(p: Option<&mut Process>, procs: &mut Procs) -> Option<u64> {
     if known != 0 && !CPU_TIMED.load(Ordering::Relaxed) {
         return (known != NONE).then_some(known);
     }
-    let (mut next, mut cpu, mut cpu_timed) = (crate::timer::timerfd_deadline().map_or(NONE, clamp), NONE, false);
+    let first =
+        crate::timer::timerfd_deadline().map_or(NONE, clamp).min(crate::netstack::deadline().map_or(NONE, clamp));
+    let (mut next, mut cpu, mut cpu_timed) = (first, NONE, false);
     for q in procs.each(p) {
         next = next.min(deadline_of(q));
         cpu = cpu.min(crate::timer::cpu_deadline(q).map_or(NONE, clamp));
