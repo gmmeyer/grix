@@ -25,8 +25,9 @@ make check       # clippy for host and kernel
   and `crates/grix/tests/runtimes.rs` (Python, Node); `hostfds.rs` is alone
   in a process, as it lowers the process's descriptor limit. They need
   `grix-vmm` (`make vmm`) where it runs, QEMU (some tests run both), the
-  built kernel, and `fixtures/build/`. Missing pieces fail loudly; they
-  are never skipped.
+  built kernel, `fixtures/build/`, and ICMP from the host (root, or on
+  Linux `net.ipv4.ping_group_range` with your group). Missing pieces fail
+  loudly; they are never skipped.
 - Which VMM: grix's own (`crates/vmm`) for the host's own architecture's
   guests, on arm64 macOS 15+ and on arm64 and x86_64 Linux with KVM, when
   it's built; QEMU otherwise. `GRIX_ACCEL=hvf|kvm|tcg` (or

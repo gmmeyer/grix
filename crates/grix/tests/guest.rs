@@ -691,7 +691,8 @@ fn ping_with_net_raw() {
     // host itself takes a rule of its own.
     let b = raw().allow_host("host.grix.internal").unwrap();
     let out = run(b, &["/bin/pingsock", "host", "10.0.2.2"]);
-    assert_eq!(out.stdout_str(), "pingsock host ok\n", "{}", out.kernel_log);
+    // (A host that won't give ICMP sockets says so in the events.)
+    assert_eq!(out.stdout_str(), "pingsock host ok\n", "{}{:?}", out.kernel_log, out.events);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
     // A rule for a port says nothing of ICMP, and an address nobody named

@@ -2,7 +2,7 @@
 //!
 //! ```toml
 //! command = ["/bin/hello", "world"]
-//! capabilities = []          # fs_write, threads, process, net
+//! capabilities = []          # fs_write, threads, process, net, net_raw
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
 //! hostname = "worker-1"      # grix unless given

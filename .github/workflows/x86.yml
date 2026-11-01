@@ -31,6 +31,10 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
           grep -c -E 'vmx|svm' /proc/cpuinfo
+      # The proxy's real echoes go out on the host's ICMP sockets, which a
+      # user that isn't root gets only by this.
+      - name: ICMP
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       - name: Packages
         run: |
           sudo apt-get update -q

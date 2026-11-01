@@ -697,7 +697,7 @@ The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
 
 ```toml
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
-capabilities = []        # fs_write, threads, process, net
+capabilities = []        # fs_write, threads, process, net, net_raw
 on_deny = "errno"        # "errno" (EPERM) or "kill" (SIGSYS, like seccomp)
 # allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
 memory_mb = 256
