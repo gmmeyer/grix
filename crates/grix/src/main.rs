@@ -91,6 +91,9 @@ struct McpArgs {
     /// Docker's, Podman's). Without it, agents' pulls are anonymous.
     #[arg(long)]
     registry_credentials: bool,
+    /// Let runs ask for the host's time zone. Without it they're in UTC.
+    #[arg(long)]
+    host_timezone: bool,
     /// How many tool calls run at once (default 2); more wait their turn.
     #[arg(long, value_name = "N")]
     max_parallel: Option<usize>,
@@ -220,6 +223,10 @@ struct RunArgs {
     /// Give the program HOME, PATH, LANG and TMPDIR, unless they're set.
     #[arg(long)]
     default_env: bool,
+    /// Run in the host's time zone, not UTC (it says something of where
+    /// the host is).
+    #[arg(long)]
+    host_timezone: bool,
     /// Guest memory in MiB.
     #[arg(long)]
     mem: Option<u64>,
@@ -731,6 +738,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     if args.default_env {
         b = b.default_env();
     }
+    if args.host_timezone {
+        b = b.host_timezone();
+    }
     if let Some(mb) = args.mem {
         b = b.memory_mb(mb);
     }
@@ -1012,6 +1022,7 @@ fn mcp(args: McpArgs) -> Result<i32> {
     }
     config.allow_hosts = args.allow_hosts.clone();
     config.registry_credentials = args.registry_credentials;
+    config.host_timezone = args.host_timezone;
     if let Some(n) = args.max_parallel {
         config.max_parallel = n.max(1);
     }

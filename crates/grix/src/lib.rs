@@ -38,6 +38,7 @@ mod oci;
 pub mod results;
 mod sandbox;
 pub mod snapshot;
+mod timezone;
 mod treecache;
 mod vmm;
 mod watch;

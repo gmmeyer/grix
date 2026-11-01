@@ -514,6 +514,8 @@ pub struct SandboxBuilder {
     hostname: Option<String>,
     /// Fill in a default environment (`default_env`) at `build`.
     default_env: bool,
+    /// The host's time zone rather than UTC (`host_timezone`) at `build`.
+    host_timezone: bool,
     /// What runs when `run` gets no command (an image's).
     command: Vec<String>,
 }
@@ -552,6 +554,7 @@ impl Default for SandboxBuilder {
             tty: None,
             hostname: None,
             default_env: false,
+            host_timezone: false,
             command: Vec::new(),
         }
     }
@@ -613,6 +616,14 @@ impl SandboxBuilder {
         let key = key.into();
         self.env.retain(|(k, _)| *k != key);
         self.env.push((key, value.into()));
+        self
+    }
+
+    /// Run in the host's time zone (`TZ`, or else `/etc/localtime`), not
+    /// UTC. It's a choice as it says something of where the host is. An
+    /// image's own `/etc/localtime` gives way to it.
+    pub fn host_timezone(mut self) -> Self {
+        self.host_timezone = true;
         self
     }
 
@@ -1155,6 +1166,18 @@ impl SandboxBuilder {
                     self.env.push((key.into(), value.into()));
                 }
             }
+        }
+        if self.host_timezone {
+            self = match crate::timezone::host_zone()? {
+                crate::timezone::Zone::Named { name, data } => {
+                    let path = format!("/usr/share/zoneinfo/{name}");
+                    self.file(&path, data, 0o644)?.symlink("/etc/localtime", &path)?
+                }
+                crate::timezone::Zone::File(data) => self.file("/etc/localtime", data, 0o644)?,
+                // (A `TZ` of the program's own is its own.)
+                crate::timezone::Zone::Rule(_) if self.env.iter().any(|(k, _)| k == "TZ") => self,
+                crate::timezone::Zone::Rule(rule) => self.env("TZ", rule),
+            };
         }
         // `arch` after `image`: the image's programs and kernel are another's.
         if let Some(image) = self.image_arch.filter(|&a| a != self.arch) {

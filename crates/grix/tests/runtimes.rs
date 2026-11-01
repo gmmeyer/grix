@@ -582,6 +582,32 @@ fn get(port: u16, path: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Node's Intl names the zone, which it finds by where /etc/localtime
+/// leads, and Python's time goes by the file. Dubai has only a number for
+/// an abbreviation: ICU can guess a zone from `JST`, which hides a copy of
+/// the file that isn't a link. (By the CLI: `TZ` is the host's, and a test
+/// can't change it for only itself.)
+#[test]
+fn the_hosts_time_zone_in_python_and_node() {
+    use std::process::Command;
+    let in_dubai = |name: &str, argv: &[&str]| {
+        let root = format!("{}:/", runtime(name).display());
+        let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+            .args(["run", "--host-timezone", "--mem", "1024", "-a", "threads", "-i", &root, "--"])
+            .args(argv)
+            .env("TZ", "Asia/Dubai")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let js = "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone, new Date().getTimezoneOffset())";
+    assert_eq!(in_dubai("node", &["/usr/bin/node", "-e", js]), "Asia/Dubai -240\n");
+    let py = "import time; print(time.tzname[0], time.timezone)";
+    assert_eq!(in_dubai("python", &["/usr/bin/python3", "-c", py]), "+04 -14400\n");
+}
+
 /// Node's fs.watch hears what Node does to the sandbox's own files, and
 /// a real inotify client too.
 #[test]

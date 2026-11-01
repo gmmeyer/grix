@@ -55,6 +55,21 @@ class Common:
         self.assertGreater(r.guest_stats["usage"]["memory"]["peak"], 0)
         self.assertGreater(r.host_usage["peak_memory_bytes"], 0)
 
+    def test_the_hosts_time_zone(self):
+        run = ["/bin/busybox", "date", "+%Z %z"]
+        sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
+        self.assertEqual(sb.run(run).stdout, "UTC +0000\n")
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Tokyo"
+        try:
+            sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"}, host_timezone=True)
+            self.assertEqual(sb.run(run).stdout, "JST +0900\n")
+        finally:
+            if saved is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = saved
+
     def test_snapshots(self):
         # grix-vmm runs the host's own architecture's guests, unless QEMU is
         # asked for; QEMU can't, and says so.

@@ -4675,6 +4675,40 @@ fn the_cli_passes_variables_by_name() {
     assert!(!env.contains("GRIX_TEST_UNSET"), "{env}");
 }
 
+/// A sandbox is in UTC, as what zone a host is in says something of where
+/// it is, unless it's asked to be in the host's. `TZ` here is what the host
+/// says, and far from any machine these run on.
+#[test]
+fn the_hosts_time_zone_on_request() {
+    use std::process::Command;
+    let busybox = format!("{}:/bin/busybox", fixture("alpine/bin/busybox.static").display());
+    let date = |tz: &str, flag: Option<&str>| {
+        let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+            .args(["run", "-i", &busybox, "-a", "process"])
+            .args(flag)
+            .args(["--", "/bin/busybox", "sh", "-c"])
+            .arg("/bin/busybox date +'%Z %z'; /bin/busybox readlink /etc/localtime; echo TZ=$TZ")
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(date("Asia/Tokyo", None), "UTC +0000\nTZ=\n");
+    let flag = Some("--host-timezone");
+    assert_eq!(date("Asia/Tokyo", flag), "JST +0900\n/usr/share/zoneinfo/Asia/Tokyo\nTZ=\n");
+    // A rule needs no file, so it's just passed on.
+    assert_eq!(date("XYZ-3", flag), "XYZ +0300\nTZ=XYZ-3\n");
+    // What the host's can't be is an error, not a quiet UTC.
+    let out = Command::new(env!("CARGO_BIN_EXE_grix"))
+        .args(["run", "-i", &busybox, "--host-timezone", "--", "/bin/busybox", "true"])
+        .env("TZ", "Nowhere/Land")
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Nowhere/Land"));
+}
+
 /// `grix run` as a container's command: output as it comes, events as they
 /// happen, no time limit, metrics while it runs.
 #[test]

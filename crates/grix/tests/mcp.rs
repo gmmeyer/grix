@@ -240,6 +240,28 @@ fn a_writable_server_builds_images_and_writes_mounts() {
 /// With `net` and an allow-list, a build's registry pulls connect only
 /// where the list allows, as its steps do: not this machine under another
 /// name for it, and not anywhere the list doesn't name.
+/// An agent gets the host's time zone only if the server was told it may:
+/// what zone it's in says something of where the host is.
+#[test]
+fn the_time_zone_is_the_servers_to_give() {
+    let fixtures = fixtures();
+    let busybox = busybox(&fixtures);
+    let args = json!({"command": ["/bin/busybox", "true"], "host_timezone": true,
+                      "imports": [{"host": busybox, "guest": "/bin/busybox"}]});
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let mut plain = Server::start(&[], &[fixtures.as_path()]);
+    plain.call(initialize.clone());
+    let r = plain.tool("run", args.clone());
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r.to_string().contains("--host-timezone"), "{r}");
+    plain.end();
+    let mut allowing = Server::start(&["--host-timezone"], &[fixtures.as_path()]);
+    allowing.call(initialize);
+    let r = allowing.tool("run", args);
+    assert_eq!(r["isError"], false, "{r}");
+    allowing.end();
+}
+
 #[test]
 fn registry_pulls_keep_to_the_network_policy() {
     let dir = std::env::temp_dir().join(format!("grix-mcp-pull-{}", std::process::id()));
