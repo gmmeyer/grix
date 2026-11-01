@@ -8,53 +8,106 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.71)
+## What's left (after 0.0.72)
 
 Each is written up in its section below; this is the order. No known way
-out of the sandbox, and no hang anyone can reproduce.
-
-To decide (each is a choice already made and documented, to keep or
-change):
-
-- `fc00::/7` is refused by default, while RFC 1918 stays reachable.
-- Alibaba's and Azure's metadata addresses are refused.
-- `--no-outside-links` is stricter than it was.
-- `O_PATH|O_NOFOLLOW` with `RESOLVE_*` is ELOOP, stricter than Linux.
+out of the sandbox, and no hang anyone can reproduce. The rule for what's
+stricter than Linux: Linux's behaviour by default, and stricter on request
+(`--strict-network`, `--no-outside-links`).
 
 Robustness, first:
 
-1. `rv048 extremes`: one hang at 0.0.48, none in 32,000 runs since.
-   Only worth more with a new idea, or if it comes back.
-2. `hostfds` fails without the budget for files held open, on Linux too;
+1. `hostfds` fails without the budget for files held open, on Linux too;
    what it guards of kqueue's descriptors takes an unfixed build on macOS.
 
 Linux behaviour:
 
-3. An image's files keep their owners, then directories' search
+2. An image's files keep their owners, then directories' search
    permission, in that order; then an image's user's supplementary
-   groups. Nothing surveyed needs them yet: wait for a program that does.
-4. A node left unwatched on macOS, newer syscalls as programs ask for
+   groups.
+3. A node left unwatched on macOS, and newer syscalls as programs ask for
    them.
-5. Raw sockets other than ICMP echo (reported as unsupported). The `vm`
-   stack is where they'd go: nothing a program sends leaves the gateway,
-   so a raw socket there forges nothing. Also what it leaves undone:
-   `IP_TTL`, `TCP_INFO`, and `eth0` still saying 1500.
-6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
-   another process's table under the filesystem's lock.
+4. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
+   (nothing a program sends leaves the gateway, so a raw socket there
+   forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
+5. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
+   process's table under the filesystem's lock.
 
 Bigger:
 
-7. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+6. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-8. Finer locking: phase 2, a reader/writer lock with per-process
+7. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-9. Faster live-mount round trips, multi-architecture images, and the
+8. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-10. An outside security review (round 2, item 20).
+9. A security review of everything since the last one, here. An outside
+   one (round 2, item 20) can't be done from here: it has to be someone
+   else's.
+
+Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
+in 32,000 runs since.
 
 By design, not left: eBPF and Linux capabilities (DATADOG.md: the agent
 runs and its intake accepts data, system-probe's eBPF features don't),
 and io_uring.
+
+## macOS: what to test
+
+A macOS agent runs these when the list above is done: nothing here has run
+on macOS but the release's unit tests. Arm64, macOS 15 or later. Add to this
+with anything that goes in that behaves differently there. Tick what passes,
+and write up what doesn't with its output.
+
+Build and the whole suite:
+
+- [ ] `make kernel host vmm python fixtures`, and `grix-vmm` is signed (no
+      "denied" from Hypervisor.framework).
+- [ ] `make test`: every end-to-end test in grix-vmm on Hypervisor.framework.
+- [ ] `GRIX_ACCEL=hvf cargo test -p grix --test guest`: the same in QEMU.
+- [ ] `GRIX_NETWORK=vm cargo test -p grix --test guest --test runtimes --test mcp`
+      and `GRIX_NETWORK=vm python3 -m unittest discover -s python/tests`:
+      all of it on the `vm` stack.
+- [ ] `GRIX_CPUS=4 cargo test -p grix --test guest --test runtimes`.
+- [ ] `make test-kvm` (M3 or later): grix-vmm on KVM, in nested Linux.
+- [ ] `make check`: clippy has only been run for macOS through a
+      cross-compiler.
+
+Network:
+
+- [ ] `ping` of `host.grix.internal` and of a real address, `-a net_raw`, as
+      an ordinary user: macOS's ping sockets keep the IP header and don't
+      filter by identifier, and that path has never run. `ping_with_net_raw`
+      needs it. Then both on `--network vm`.
+- [ ] `--network vm`: `wget` of a real site; Python's urllib and Node's fetch;
+      a forwarded port (`-p`), TCP and UDP; a refused connect says EPERM.
+- [ ] What a program wrote and ended on reaches a slow reader, both stacks
+      (`what_a_program_wrote_outlives_it`: it sets SO_SNDBUF on a listener,
+      which macOS may hold to differently).
+- [ ] `--strict-network` refuses `fc00::/7`, 100.100.100.200 and
+      168.63.129.16, and a rule opens each.
+- [ ] Throughput of `vm` against `native` on Hypervisor.framework: it's only
+      been measured under emulation.
+
+Time zone:
+
+- [ ] `--host-timezone` with `TZ` unset, from macOS's `/etc/localtime` link
+      (it leads into `/var/db/timezone/zoneinfo`, not `/usr/share/zoneinfo`).
+- [ ] Node's `Intl` names the zone (`the_hosts_time_zone_in_python_and_node`).
+
+Live mounts:
+
+- [ ] A file replaced on the host while it's open stays what it opened
+      (`hostreplace`: `at::take_fd`'s share of descriptors).
+- [ ] `O_TMPFILE` and `linkat` on a live mount (`hosttmpfile`).
+- [ ] inotify on a live mount by kqueue: renames paired by inode, directories
+      compared, the overflow past `fd_budget` (`hostfds`, `watch`).
+- [ ] Listings past `MAX_LISTED`, and names of the most bytes, on APFS.
+
+Snapshots:
+
+- [ ] Take and restore on Hypervisor.framework, on `native` and on `vm`, with
+      more than one CPU.
 
 ## Next up
 

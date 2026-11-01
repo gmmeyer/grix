@@ -163,6 +163,9 @@ class Sandbox:
     #: stack, what the ``net`` capability gives) or ``"vm"`` (TCP/IP in the
     #: sandbox). The last two grant ``net``, and the same rules hold on both.
     network: Optional[str] = None
+    #: Stricter than Linux: refuse unique local addresses (``fc00::/7``, where
+    #: some clouds' metadata services are) and more metadata addresses.
+    strict_network: bool = False
     capabilities: Sequence[str] = ()
     memory_mb: Optional[int] = None
     #: CPUs for the program's threads (1 by default).
@@ -202,6 +205,8 @@ class Sandbox:
             a += ["--default-env"]
         if self.network is not None:
             a += ["--network", self.network]
+        if self.strict_network:
+            a += ["--strict-network"]
         for c in self.capabilities:
             a += ["-a", c]
         if self.memory_mb:
@@ -241,6 +246,7 @@ class Sandbox:
             "default_env": bool(self.default_env),
             "host_timezone": bool(self.host_timezone),
             "network": self.network,
+            "strict_network": bool(self.strict_network),
             "capabilities": list(self.capabilities),
             "memory_mb": num(self.memory_mb or None, int),
             "cpus": num(self.cpus or None, int),

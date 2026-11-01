@@ -68,6 +68,9 @@ pub(crate) struct Settings {
     /// Its sockets are its own TCP/IP, which needs the gateway.
     #[serde(default)]
     pub vm_stack: bool,
+    /// As `NetPolicy::strict`: the caller's to say, never the file's.
+    #[serde(default)]
+    pub strict_network: bool,
     /// Taken in TTY mode: the program's stdio is a terminal.
     #[serde(default)]
     pub tty: bool,
@@ -180,6 +183,7 @@ impl Snapshot {
         };
         let mut settings = settings;
         settings.net = false;
+        settings.strict_network = false;
         settings.allow_hosts = None;
         settings.forwards.clear();
         settings.udp_forwards.clear();
@@ -239,6 +243,14 @@ impl Snapshot {
         self.settings.net = self.asked.net;
         self.settings.allow_hosts = (!allow_hosts.is_empty()).then(|| allow_hosts.to_vec());
         Ok(self)
+    }
+
+    /// Runs from here refuse what [`SandboxBuilder::strict_network`] does.
+    ///
+    /// [`SandboxBuilder::strict_network`]: crate::SandboxBuilder::strict_network
+    pub fn strict_network(mut self) -> Self {
+        self.settings.strict_network = true;
+        self
     }
 
     /// Forward connections to `host` to `guest_port` in runs from here (see
@@ -465,6 +477,7 @@ mod tests {
             memory_mb: 512,
             cpus: 1,
             vm_stack: false,
+            strict_network: false,
             tty: false,
             live: vec![],
             fs_state: String::new(),

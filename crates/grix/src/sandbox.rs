@@ -909,6 +909,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Stricter than Linux: refuse unique local addresses (`fc00::/7`, which
+    /// holds some clouds' metadata services) and Alibaba's and Azure's
+    /// metadata addresses, unless a rule names them.
+    pub fn strict_network(mut self) -> Self {
+        self.net.strict = true;
+        self
+    }
+
     /// Let the program connect (with [`Capability::Net`]) only to hosts a
     /// rule allows: `example.com`, `*.example.com`, `1.2.3.4`,
     /// `10.0.0.0/8`, `[::1]`, each optionally with `:port`. Names cover the
@@ -1530,6 +1538,7 @@ impl Sandbox {
             memory_mb: cfg.memory_mb,
             cpus: cfg.cpus,
             vm_stack: cfg.vm_stack(),
+            strict_network: false,
             tty: cfg.tty.is_some(),
             live: cfg
                 .live
@@ -1745,6 +1754,7 @@ pub(crate) fn run_snapshot(
     let file = std::fs::File::open(snap.path()).with_context(|| format!("opening {}", snap.path().display()))?;
     let mut net = NetPolicy {
         icmp: false,
+        strict: s.strict_network,
         enabled: s.net,
         allow: s
             .allow_hosts

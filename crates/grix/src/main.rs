@@ -94,6 +94,10 @@ struct McpArgs {
     /// Let runs ask for the host's time zone. Without it they're in UTC.
     #[arg(long)]
     host_timezone: bool,
+    /// Every run refuses unique local addresses (fc00::/7, where some
+    /// clouds' metadata services are) and more metadata addresses.
+    #[arg(long)]
+    strict_network: bool,
     /// How many tool calls run at once (default 2); more wait their turn.
     #[arg(long, value_name = "N")]
     max_parallel: Option<usize>,
@@ -111,6 +115,10 @@ struct BuildArgs {
     /// The Grixfile (default: ./Grixfile, if there is one).
     #[arg(short, long)]
     file: Option<PathBuf>,
+    /// Pulls and steps refuse unique local addresses (fc00::/7, where some
+    /// clouds' metadata services are) and more metadata addresses.
+    #[arg(long)]
+    strict_network: bool,
     /// The Docker/OCI image to start from (alpine:3.21, oci:DIR,
     /// docker-archive:FILE, docker:NAME, dir:DIR). Default: nothing.
     #[arg(long)]
@@ -209,6 +217,11 @@ struct RunArgs {
     /// Grant a capability (fs_write, threads, process, net, net_raw). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
+    /// Stricter than Linux: refuse unique local addresses (fc00::/7, where
+    /// some clouds' metadata services are) and Alibaba's and Azure's
+    /// metadata addresses, unless a rule names them.
+    #[arg(long = "strict-network")]
+    strict_network: bool,
     /// The network stack: none, native (sockets on the host's own stack,
     /// what `net` gives) or vm (TCP/IP in the sandbox). The last two grant
     /// `net`; the same rules hold on either.
@@ -401,6 +414,9 @@ fn run(args: RunArgs) -> Result<i32> {
         // net only as for an image, if granted here.
         if args.allow.iter().any(|c| c == "net") {
             snap = snap.allow_net(&args.allow_hosts)?;
+            if args.strict_network {
+                snap = snap.strict_network();
+            }
         } else if snap.asks_for_net() && !args.quiet {
             eprintln!("grix: the snapshot asks for net; grant it with `-a net` (and limit it with --allow-host)");
         }
@@ -712,6 +728,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     if let Some(network) = &args.network {
         b = b.network(grix::Network::parse(network)?);
     }
+    if args.strict_network {
+        b = b.strict_network();
+    }
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }
@@ -990,7 +1009,8 @@ fn build(args: BuildArgs, matches: Option<&clap::ArgMatches>) -> Result<i32> {
     );
     steps.sort_by_key(|(i, _)| *i);
     g.run.extend(steps.into_iter().map(|(_, s)| s));
-    let policy = grix::build::BuildPolicy { cache: !args.no_cache, ..Default::default() };
+    let policy =
+        grix::build::BuildPolicy { cache: !args.no_cache, strict_network: args.strict_network, ..Default::default() };
     let opts = grix::build::BuildOptions {
         arch: parse_arch(args.arch.as_deref())?,
         kernel: args.kernel.clone(),
@@ -1031,6 +1051,7 @@ fn mcp(args: McpArgs) -> Result<i32> {
     config.allow_hosts = args.allow_hosts.clone();
     config.registry_credentials = args.registry_credentials;
     config.host_timezone = args.host_timezone;
+    config.strict_network = args.strict_network;
     if let Some(n) = args.max_parallel {
         config.max_parallel = n.max(1);
     }

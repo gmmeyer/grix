@@ -53,11 +53,11 @@ dependencies = [
 
 [[package]]
 name = "grix-abi"
-version = "0.0.71"
+version = "0.0.72"
 
 [[package]]
 name = "grix-kernel"
-version = "0.0.71"
+version = "0.0.72"
 dependencies = [
  "grix-abi",
  "grix-netstack",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "grix-netstack"
-version = "0.0.71"
+version = "0.0.72"
 dependencies = [
  "grix-abi",
  "smoltcp",

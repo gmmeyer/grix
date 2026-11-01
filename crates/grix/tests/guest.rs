@@ -4998,6 +4998,16 @@ fn magic_links_are_links() {
     hardened(with("hardening"), &["magic"], "magic links refused");
 }
 
+/// O_PATH | O_NOFOLLOW opens a magic link as a link, and RESOLVE_* say of
+/// one what Linux's do. The fixture passes on Linux as it is.
+#[test]
+fn magic_links_open_as_links() {
+    let out = run(with("magiclink"), &["/bin/magiclink"]);
+    assert_eq!(out.stdout_str(), "magiclink ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// A stream keeps who wrote what, a run per writer, at most 256: writes
 /// that failed, or said nothing, must not take one, or a stream with
 /// nothing in it would leave both ends waiting for ever.

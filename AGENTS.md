@@ -204,8 +204,11 @@ on `Channel::Link`, the host checks its `NetPolicy` and connects, and data
 flows as `Data` messages with credit-based flow control (`link::WINDOW` per
 connection each way; stdin uses the same scheme). Everything the proxy or a build connects to goes through
 `net::reachable`, whose `special` addresses need a rule of their own:
-loopback, link-local, multicast, all of `fc00::/7`, and any IPv6 address
-that carries a special IPv4 one (`embedded_v4`). Connections to the
+loopback, link-local, multicast, and any IPv6 address that carries a
+special IPv4 one (`embedded_v4`). What a program on Linux reaches is
+reachable unless it's asked not to be: `--strict-network`
+(`NetPolicy::strict`) adds all of `fc00::/7` and Alibaba's and Azure's
+metadata addresses. Connections to the
 guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
 as `Incoming`, for a listener on the guest's address or all of them,
