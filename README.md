@@ -69,8 +69,8 @@ echo 'a b c' | ./target/release/grix run -i fixtures/build/alpine/bin/busybox.st
 # ping: ICMP echo takes net_raw on top of net, and goes through the host, which
 # checks it as it does a connection (a rule without a port). The host has to be
 # able to send it: root, or net.ipv4.ping_group_range including your group.
-./target/release/grix run -a net -a net_raw -a process --allow-host 1.1.1.1 \
-    -i fixtures/build/alpine-x86_64:/ -- /bin/busybox ping -c 3 1.1.1.1
+./target/release/grix run -a net -a net_raw --allow-host 1.1.1.1 \
+    -i fixtures/build/alpine/bin/busybox.static:/bin/busybox -- /bin/busybox ping -c 3 1.1.1.1
 
 # Results: the program fills /out, and it's copied to ./results when it ends.
 ./target/release/grix run -a fs_write -x /out:./results \
