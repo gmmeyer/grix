@@ -18,10 +18,15 @@ pub enum Capability {
     Process = 2,
     /// Sockets and networking.
     Net = 3,
+    /// ICMP echo (`ping`), on top of `Net`: packets that aren't a socket's,
+    /// so a capability of their own. Linux's CAP_NET_RAW, as far as grix has
+    /// any of it.
+    NetRaw = 4,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 4] = [Capability::FsWrite, Capability::Threads, Capability::Process, Capability::Net];
+    pub const ALL: [Capability; 5] =
+        [Capability::FsWrite, Capability::Threads, Capability::Process, Capability::Net, Capability::NetRaw];
 
     pub const fn bit(self) -> u64 {
         1u64 << (self as u8)
@@ -33,6 +38,7 @@ impl Capability {
             Capability::Threads => "threads",
             Capability::Process => "process",
             Capability::Net => "net",
+            Capability::NetRaw => "net_raw",
         }
     }
 
@@ -42,6 +48,7 @@ impl Capability {
             Capability::Threads => "spawn threads",
             Capability::Process => "spawn processes (fork/exec/wait)",
             Capability::Net => "open sockets",
+            Capability::NetRaw => "send ICMP echo requests (ping), with net",
         }
     }
 

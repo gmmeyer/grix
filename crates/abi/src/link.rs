@@ -28,6 +28,13 @@ pub const MAX_DATA: usize = MAX_FRAME - 8;
 /// Bigger ones aren't carried: the guest's sends fail with EMSGSIZE, and
 /// the host drops what comes in, as a network that can't fragment would.
 pub const MAX_UDP: usize = MAX_FRAME - 32;
+/// The port in UDP's messages that means ICMP: `UdpAllow`, `UdpSend`,
+/// `UdpVerdict` and `UdpRecv` are for a ping socket with it, and their data
+/// is an ICMP message without an IP header. No UDP datagram goes to port 0.
+pub const ICMP_PORT: u16 = 0;
+/// ICMP echo's types, for IPv4 and IPv6.
+pub const ICMP_ECHO: (u8, u8) = (8, 128);
+pub const ICMP_ECHO_REPLY: (u8, u8) = (0, 129);
 /// Peers each UDP port forwarded from the host remembers (the most recent
 /// senders), the only ones the guest may reply to through it.
 pub const MAX_FORWARD_PEERS: usize = 256;

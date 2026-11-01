@@ -13,8 +13,9 @@
 //! more than a window per connection.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -24,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use grix_abi::link::{self, Addr, HOST_ID, MAX_DATA, ToGuest, ToHost, WINDOW};
 use grix_abi::wire::{self, Input};
 
+use crate::at::check;
 use crate::event::GuestEvent;
 
 /// Connections at once, two threads each (the guest has its own, lower,
@@ -74,11 +76,162 @@ impl UdpForward {
     }
 }
 
+/// A socket here for a guest's echo requests: a ping socket where the host
+/// gives this user one (macOS does, and Linux by `net.ipv4.ping_group_range`,
+/// to root as to anyone), or else a raw one, which takes root. The host's
+/// kernel writes the IP header either way, so a guest can't forge one, and
+/// only an echo request is sent.
+struct IcmpSocket {
+    fd: OwnedFd,
+    v4: bool,
+    raw: bool,
+    /// What's sent has this identifier, not the program's. A raw socket
+    /// hears every echo reply the host gets, and this says which are ours.
+    ident: u16,
+}
+
+/// Each socket's `IcmpSocket::ident`.
+static NEXT_IDENT: AtomicU32 = AtomicU32::new(0);
+
+impl IcmpSocket {
+    fn open(v4: bool) -> io::Result<IcmpSocket> {
+        let (family, proto) =
+            if v4 { (libc::AF_INET, libc::IPPROTO_ICMP) } else { (libc::AF_INET6, libc::IPPROTO_ICMPV6) };
+        let socket = |ty| {
+            // SAFETY: a new descriptor, which we own.
+            check(unsafe { libc::socket(family, ty, proto) }).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        let (fd, raw) = match socket(libc::SOCK_DGRAM) {
+            Ok(fd) => (fd, false),
+            Err(_) => (socket(libc::SOCK_RAW)?, true),
+        };
+        let wait = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
+        let size = std::mem::size_of_val(&wait) as libc::socklen_t;
+        // SAFETY: plain calls on a descriptor we hold; `wait` is what's named.
+        unsafe {
+            check(libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
+            let wait = (&raw const wait).cast();
+            check(libc::setsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, wait, size))?;
+        }
+        let ident = NEXT_IDENT.fetch_add(1, Ordering::Relaxed).wrapping_add(std::process::id()) as u16;
+        Ok(IcmpSocket { fd, v4, raw, ident })
+    }
+
+    /// Send echo request `msg` to `to`, under this socket's identifier.
+    fn send(&self, to: IpAddr, msg: &[u8]) {
+        let mut m = msg.to_vec();
+        m[4..6].copy_from_slice(&self.ident.to_be_bytes());
+        // (IPv6's covers the addresses, so the host's kernel does it.)
+        if self.v4 {
+            m[2..4].fill(0);
+            let sum = icmp_checksum(&m);
+            m[2..4].copy_from_slice(&sum.to_be_bytes());
+        }
+        let (addr, len) = sockaddr_of(to);
+        // SAFETY: `m` and `addr` are what's named. Lost if it can't go now.
+        unsafe {
+            libc::sendto(self.fd.as_raw_fd(), m.as_ptr().cast(), m.len(), 0, (&raw const addr).cast(), len);
+        }
+    }
+
+    /// The next message for this socket, in `buf`: who from, and where in
+    /// `buf` it is. None for what's somebody else's.
+    fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(IpAddr, std::ops::Range<usize>)>> {
+        // SAFETY: zeros are a valid sockaddr_storage.
+        let mut from: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&from) as libc::socklen_t;
+        // SAFETY: `buf` and `from` are what's named, and how big.
+        let n = unsafe {
+            libc::recvfrom(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0, (&raw mut from).cast(), &mut len)
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(ip) = ip_from(&from) else { return Ok(None) };
+        // Linux picks a ping socket's replies itself, and has put its own
+        // identifier in them; macOS doesn't, and leaves the IP header on.
+        let macos = cfg!(target_os = "macos") && !self.raw;
+        let header = self.v4 && (self.raw || macos);
+        let ident = (self.raw || macos).then_some(self.ident);
+        Ok(echo_reply(&buf[..n as usize], self.v4, header, ident).map(|at| (ip, at)))
+    }
+}
+
+/// Where the echo reply in `packet` is, if it's one and it's ours: all that
+/// came off a raw socket, so nothing here is trusted. With `header` it
+/// starts with an IPv4 header, and with `ident` it must have that identifier.
+fn echo_reply(packet: &[u8], v4: bool, header: bool, ident: Option<u16>) -> Option<std::ops::Range<usize>> {
+    let at = if header { (*packet.first()? as usize & 0xf) * 4 } else { 0 };
+    let msg = packet.get(at..).filter(|m| m.len() >= 8)?;
+    let reply = if v4 { link::ICMP_ECHO_REPLY.0 } else { link::ICMP_ECHO_REPLY.1 };
+    if (msg[0], msg[1]) != (reply, 0) || ident.is_some_and(|i| msg[4..6] != i.to_be_bytes()) {
+        return None;
+    }
+    Some(at..packet.len())
+}
+
+/// Is `msg` something the host will send for a guest: an echo request?
+fn echo_request(msg: &[u8], v4: bool) -> bool {
+    let echo = if v4 { link::ICMP_ECHO.0 } else { link::ICMP_ECHO.1 };
+    msg.len() >= 8 && msg[0] == echo && msg[1] == 0
+}
+
+fn icmp_checksum(msg: &[u8]) -> u16 {
+    let mut sum: u32 = msg.chunks(2).map(|w| u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]) as u32).sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn sockaddr_of(ip: IpAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: zeros are a valid sockaddr_storage, and it's big enough for
+    // either, whose fields are what's written.
+    unsafe {
+        let mut st: libc::sockaddr_storage = std::mem::zeroed();
+        let at = &raw mut st;
+        let len = match ip {
+            IpAddr::V4(a) => {
+                let sa = at.cast::<libc::sockaddr_in>();
+                (*sa).sin_family = libc::AF_INET as _;
+                (*sa).sin_addr.s_addr = u32::from_ne_bytes(a.octets());
+                std::mem::size_of::<libc::sockaddr_in>()
+            }
+            IpAddr::V6(a) => {
+                let sa = at.cast::<libc::sockaddr_in6>();
+                (*sa).sin6_family = libc::AF_INET6 as _;
+                (*sa).sin6_addr.s6_addr = a.octets();
+                std::mem::size_of::<libc::sockaddr_in6>()
+            }
+        };
+        (st, len as libc::socklen_t)
+    }
+}
+
+fn ip_from(st: &libc::sockaddr_storage) -> Option<IpAddr> {
+    let at = std::ptr::from_ref(st);
+    // SAFETY: the family says which it is, and it's big enough for either.
+    unsafe {
+        match st.ss_family as libc::c_int {
+            libc::AF_INET => {
+                Some(IpAddr::V4(Ipv4Addr::from((*at.cast::<libc::sockaddr_in>()).sin_addr.s_addr.to_ne_bytes())))
+            }
+            libc::AF_INET6 => {
+                Some(IpAddr::V6(Ipv6Addr::from((*at.cast::<libc::sockaddr_in6>()).sin6_addr.s6_addr)).to_canonical())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A guest UDP socket's host side.
 struct Udp {
     /// Its sockets here, v4 and v6, made when first needed.
     v4: Mutex<Option<Arc<UdpSocket>>>,
     v6: Mutex<Option<Arc<UdpSocket>>>,
+    /// Or an ICMP socket's (`link::ICMP_PORT`).
+    icmp4: Mutex<Option<Arc<IcmpSocket>>>,
+    icmp6: Mutex<Option<Arc<IcmpSocket>>>,
     /// Destinations the policy allowed, as the guest names them, to where
     /// they really are (host.grix.internal is the host's loopback); and
     /// back, so only their replies come in.
@@ -215,6 +368,8 @@ pub(crate) struct NetPolicy {
     /// everything itself: the guest kernel (which an image may bring) isn't
     /// the only check.
     pub enabled: bool,
+    /// And `net_raw`: it may send ICMP echo requests, checked the same way.
+    pub icmp: bool,
     /// None: anywhere but the special addresses below. Some: only these.
     pub allow: Option<Vec<HostRule>>,
     /// Where the host listens, and the guest port it forwards to.
@@ -703,13 +858,18 @@ impl Shared {
     /// Networking without the `net` capability: the guest kernel should
     /// have refused it already.
     fn deny_capability(&self, what: &str) {
+        self.without("net", what);
+    }
+
+    /// What a capability the sandbox hasn't got would be needed for, once.
+    fn without(&self, capability: &str, what: &str) {
         let mut reported = self.reported.lock().unwrap();
-        if reported.insert(format!("no net: {what}")) {
+        if reported.insert(format!("no {capability}: {what}")) {
             drop(reported);
             self.report(GuestEvent::Denied {
                 syscall: what.into(),
-                capability: "net".into(),
-                detail: "the sandbox doesn't have the net capability".into(),
+                capability: capability.into(),
+                detail: format!("the sandbox doesn't have the {capability} capability"),
             });
         }
     }
@@ -881,6 +1041,15 @@ impl Proxy {
             ToHost::UdpSend { id, addr, port, data } => {
                 let Some(u) = s.udps.lock().unwrap().get(&id).cloned() else { return };
                 let Some(&to) = u.allowed.lock().unwrap().get(&(addr, port)) else { return };
+                if port == link::ICMP_PORT {
+                    let sock = if to.is_ipv4() { &u.icmp4 } else { &u.icmp6 };
+                    let sock = sock.lock().unwrap().clone();
+                    // (The guest checked too, but an image brings its own kernel.)
+                    if let Some(sock) = sock.filter(|_| s.policy.icmp && echo_request(data, to.is_ipv4())) {
+                        sock.send(to.ip(), data);
+                    }
+                    return;
+                }
                 let sock = if to.is_ipv4() { u.v4.lock().unwrap().clone() } else { u.v6.lock().unwrap().clone() };
                 if let Some(sock) = sock {
                     // UDP: lost if it can't go now.
@@ -917,6 +1086,11 @@ impl Proxy {
             s.deny_capability("sendto");
             return s.reply(verdict(link::UDP_REFUSED));
         }
+        let icmp = port == link::ICMP_PORT;
+        if icmp && !s.policy.icmp {
+            s.without("net_raw", "sendto");
+            return s.reply(verdict(link::UDP_REFUSED));
+        }
         let ip = ip_of(addr);
         if ip == IpAddr::V4(Ipv4Addr::from(link::DNS_V4)) {
             s.deny("sendto", format!("{ip}:{port}: the nameserver only answers DNS (port 53)"));
@@ -942,6 +1116,8 @@ impl Proxy {
                     let u = Arc::new(Udp {
                         v4: Mutex::new(None),
                         v6: Mutex::new(None),
+                        icmp4: Mutex::new(None),
+                        icmp6: Mutex::new(None),
                         allowed: Mutex::new(HashMap::new()),
                         reverse: Mutex::new(HashMap::new()),
                         closed: AtomicBool::new(false),
@@ -954,8 +1130,10 @@ impl Proxy {
         if u.allowed.lock().unwrap().contains_key(&(addr, port)) {
             return s.reply(verdict(link::UDP_ALLOWED));
         }
-        if udp_socket(s, id, &u, to.is_ipv4()).is_none() {
-            return s.reply(verdict(link::UDP_BUSY));
+        let made =
+            if icmp { icmp_socket(s, id, &u, to.is_ipv4()) } else { udp_socket(s, id, &u, to.is_ipv4()).is_some() };
+        if !made {
+            return s.reply(verdict(if icmp { link::UDP_REFUSED } else { link::UDP_BUSY }));
         }
         let (mut allowed, mut reverse) = (u.allowed.lock().unwrap(), u.reverse.lock().unwrap());
         // As many as the guest remembers: it forgets them all at once too.
@@ -1200,6 +1378,59 @@ fn udp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> Option<Arc<Ud
     Some(sock)
 }
 
+/// ICMP socket `id`'s socket here for one address family, made (with a
+/// thread taking its replies in) the first time. False if there's none to
+/// be had, which is said once as a host can't change that for itself.
+fn icmp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> bool {
+    let slot = if v4 { &u.icmp4 } else { &u.icmp6 };
+    let mut slot = slot.lock().unwrap();
+    if slot.is_some() {
+        return true;
+    }
+    if s.udp_threads.fetch_add(1, Ordering::Relaxed) >= MAX_UDP_THREADS {
+        s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+        return false;
+    }
+    let sock = match IcmpSocket::open(v4) {
+        Ok(sock) => Arc::new(sock),
+        Err(e) => {
+            s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+            s.deny(
+                "sendto",
+                format!("this host won't give ICMP sockets ({e}): it takes root, or net.ipv4.ping_group_range"),
+            );
+            return false;
+        }
+    };
+    let (shared, udp, rx) = (s.clone(), u.clone(), sock.clone());
+    let spawned = thread::Builder::new().spawn(move || {
+        let mut buf = vec![0u8; link::MAX_UDP + 64];
+        while !udp.closed.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
+            match rx.recv(&mut buf) {
+                Ok(Some((from, at))) => {
+                    // Only from where the guest sent, and what one frame holds.
+                    let Some(&(addr, port)) = udp.reverse.lock().unwrap().get(&SocketAddr::new(from, 0)) else {
+                        continue;
+                    };
+                    if at.len() <= link::MAX_UDP {
+                        shared.outbox.offer_lossy(frame(ToGuest::UdpRecv { id, addr, port, data: &buf[at] }));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                Err(_) => break,
+            }
+        }
+        shared.udp_threads.fetch_sub(1, Ordering::Relaxed);
+    });
+    if spawned.is_err() {
+        s.udp_threads.fetch_sub(1, Ordering::Relaxed);
+        return false;
+    }
+    *slot = Some(sock);
+    true
+}
+
 /// Hand datagrams to a forwarded UDP port to the guest, as long as there's
 /// room for them (dropped otherwise, as UDP may), remembering who sent
 /// them so the guest can reply.
@@ -1386,6 +1617,7 @@ mod tests {
     fn policy(rules: &[&str]) -> NetPolicy {
         NetPolicy {
             enabled: true,
+            icmp: false,
             allow: Some(rules.iter().map(|r| HostRule::parse(r).unwrap()).collect()),
             forwards: vec![],
             udp_forwards: vec![],
@@ -1588,6 +1820,78 @@ mod tests {
         assert!(!remembered.contains(&peers[0].local_addr().unwrap()));
         assert!(remembered.contains(&peers.last().unwrap().local_addr().unwrap()));
         proxy.stop();
+    }
+
+    /// What comes off a raw socket is anyone's: only echo replies get out
+    /// of it, ours if there's a way to tell, and nothing malformed.
+    #[test]
+    fn what_an_icmp_socket_lets_through() {
+        let reply = |ty: u8, code: u8, id: u16| {
+            let mut m = vec![ty, code, 0, 0];
+            m.extend_from_slice(&id.to_be_bytes());
+            m.extend_from_slice(&[0, 7, b'x']);
+            m
+        };
+        let with_header = |m: Vec<u8>| {
+            let mut p = vec![0x45];
+            p.resize(20, 0);
+            p.extend(m);
+            p
+        };
+        assert_eq!(echo_reply(&reply(0, 0, 9), true, false, None), Some(0..9));
+        assert_eq!(echo_reply(&with_header(reply(0, 0, 9)), true, true, Some(9)), Some(20..29));
+        assert_eq!(echo_reply(&reply(129, 0, 9), false, false, Some(9)), Some(0..9));
+        // Someone else's identifier, on a raw socket that hears everyone's.
+        assert_eq!(echo_reply(&with_header(reply(0, 0, 8)), true, true, Some(9)), None);
+        // Not an echo reply: a request, an error, the other family's.
+        for ty in [8, 3, 11, 129] {
+            assert_eq!(echo_reply(&reply(ty, 0, 9), true, false, None), None, "{ty}");
+        }
+        assert_eq!(echo_reply(&reply(0, 1, 9), true, false, None), None);
+        assert_eq!(echo_reply(&reply(0, 0, 9), false, false, None), None);
+        // Cut short, or claiming a header bigger than what's there.
+        assert_eq!(echo_reply(&reply(0, 0, 9)[..7], true, false, None), None);
+        assert_eq!(echo_reply(&[0x4f, 0, 0], true, true, None), None);
+        assert_eq!(echo_reply(&[], true, true, None), None);
+        // What's sent for a guest.
+        assert!(echo_request(&reply(8, 0, 9), true) && echo_request(&reply(128, 0, 9), false));
+        for bad in [reply(13, 0, 9), reply(8, 1, 9), reply(128, 0, 9), reply(8, 0, 9)[..7].to_vec()] {
+            assert!(!echo_request(&bad, true), "{bad:?}");
+        }
+    }
+
+    /// The capability and the policy are the proxy's to check: a kernel
+    /// that doesn't, because an image brought it, gets a refusal anyway.
+    #[test]
+    fn icmp_is_refused_by_the_proxy_itself() {
+        let ask = |policy: NetPolicy| {
+            let outbox = Outbox::new();
+            let proxy = Proxy::start(policy, outbox.clone(), Arc::new(|_| {})).unwrap();
+            proxy.handle(&ToHost::UdpAllow { id: 1, addr: Addr::V4([192, 0, 2, 1]), port: link::ICMP_PORT }.encode());
+            wait_for(|| !outbox.q.lock().unwrap().frames.is_empty());
+            let got = drain(&outbox);
+            (got, proxy.stop())
+        };
+        let refused = |got: &[Vec<u8>]| {
+            got.iter().any(|f| {
+                matches!(ToGuest::decode(f),
+                    Ok(ToGuest::UdpVerdict { verdict, .. }) if verdict == link::UDP_REFUSED)
+            })
+        };
+        // No net_raw, though the address is allowed.
+        let (got, events) = ask(NetPolicy { icmp: false, ..policy(&["192.0.2.1"]) });
+        assert!(refused(&got));
+        assert!(
+            matches!(&events[..], [GuestEvent::Denied { capability, .. }] if capability == "net_raw"),
+            "{events:?}"
+        );
+        // A rule for a port says nothing of ICMP.
+        let (got, events) = ask(NetPolicy { icmp: true, ..policy(&["192.0.2.1:443"]) });
+        assert!(refused(&got));
+        assert!(matches!(&events[..], [GuestEvent::Denied { .. }]), "{events:?}");
+        // Without net at all.
+        let (got, _) = ask(NetPolicy { enabled: false, icmp: true, ..policy(&["192.0.2.1"]) });
+        assert!(refused(&got));
     }
 
     /// Without `net`, the proxy neither hands datagrams in nor sends replies.

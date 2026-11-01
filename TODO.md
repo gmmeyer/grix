@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.69)
+## What's left (after 0.0.70)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -36,6 +36,9 @@ Linux behaviour:
 4. A node left unwatched on macOS, newer syscalls as programs ask for
    them.
 5. Raw sockets and ICMP (reported as unsupported; `ping` needs them).
+4. A node left unwatched on macOS, `TZ` from the host, newer syscalls as
+   programs ask for them.
+5. Raw sockets other than ICMP echo (reported as unsupported).
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
 
@@ -658,8 +661,17 @@ Left, none of it a way out of the sandbox:
       send/recv, nonblocking + epoll, `SO_ERROR` for async connect.
       Credit-based flow control (32 KiB per connection each way), half-close,
       `SO_RCVTIMEO`/`SO_SNDTIMEO`. Other socket options are accepted and ignored.
-- [~] UDP beyond DNS, raw sockets, ICMP. UDP works (round 2, item 13);
-      raw sockets and ICMP are reported as unsupported.
+- [~] UDP beyond DNS, raw sockets, ICMP. UDP works (round 2, item 13).
+      ICMP echo works with the `net_raw` capability, on top of `net` (`ping`,
+      ping sockets and `SOCK_RAW`, IPv4 and IPv6): it goes through the
+      proxy as UDP does, with `link::ICMP_PORT`, so the host checks the
+      capability and the policy (a rule without a port) and sends only
+      echo requests, by a ping socket or, where the host has none, a raw
+      one, which takes root. The guest answers for its own addresses.
+      An image can only ask for it, and a restored snapshot hasn't got it.
+      Left: raw sockets of any other kind (reported, as a program making
+      its own packets could forge them), `IP_TTL` and so traceroute, a
+      reply's real TTL (64 is what's read).
 - [x] Listening sockets with port forwarding to the host (bind/listen/accept4).
       `forward` / `-p` / `[[forward]]`. Node and Python servers work.
       UDP too: `forward_udp` / `-p HOST:GUEST/udp` / `protocol = "udp"`.

@@ -834,8 +834,10 @@ const AF_UNSPEC: u16 = 0;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const IPPROTO_IP: u64 = 0;
+const IPPROTO_ICMP: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
 const IPPROTO_UDP: u64 = 17;
+const IPPROTO_ICMPV6: u64 = 58;
 const IPPROTO_IPV6: u64 = 41;
 const EINPROGRESS: Errno = Errno(115);
 const EALREADY: Errno = Errno(114);
@@ -846,6 +848,14 @@ const READ_MAX: usize = 64 * 1024;
 
 fn new_inet(p: &mut Process, domain: u64, ty: u64, proto: u64, flags: u32, cloexec: bool) -> SysResult {
     require(p, nr::socket, Capability::Net, "")?;
+    let v6 = domain == AF_INET6;
+    if proto == if v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP } && matches!(ty & 0xf, SOCK_DGRAM | SOCK_RAW) {
+        require(p, nr::socket, Capability::NetRaw, "")?;
+        let mut s = Inet::new(v6, true);
+        s.icmp = Some(inet::Icmp { raw: ty & 0xf == SOCK_RAW, v6, ident: 0 });
+        let file = new_file(FileKind::Inet(s), flags);
+        return p.fds.alloc(FdEntry { file, cloexec }, 0);
+    }
     let dgram = match (ty & 0xf, proto) {
         (SOCK_STREAM, 0 | IPPROTO_TCP) => false,
         (SOCK_DGRAM, 0 | IPPROTO_UDP) => true,
@@ -893,6 +903,11 @@ fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
     let ours = a.is_unspecified() || a.is_local();
     if !ours {
         return Err(EADDRNOTAVAIL);
+    }
+    // No ports here, and nothing to take one from.
+    if s.icmp.is_some() {
+        s.bound = Some(a);
+        return Ok(0);
     }
     if s.dgram {
         let u = udp_of(s);
@@ -1024,9 +1039,14 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, raw: &[u8]) -> Sy
                 l.addr = ours;
             }
         }
+        // (What an ICMP socket hears from has no port, whatever connect
+        // was given.)
+        let to = if s.icmp.is_some() { SockAddr { addr: to.addr, port: link::ICMP_PORT } } else { to };
         s.peer = Some(to);
         u.lock().peer = Some(to);
-        udp_bind(s)?;
+        if s.icmp.is_none() {
+            udp_bind(s)?;
+        }
         return Ok(0);
     }
     match &s.state {
@@ -1226,6 +1246,7 @@ fn udp_of(s: &mut Inet) -> UdpRef {
         return u.clone();
     }
     let u = Udp::new(s.peer);
+    u.lock().icmp = s.icmp;
     s.state = State::Udp(u.clone());
     u
 }
@@ -1249,6 +1270,9 @@ fn udp_bind(s: &mut Inet) -> Result<SockAddr, Errno> {
 /// host's resolver (DNS), or through the host if it allows `to` (asked the
 /// first time; a refusal is EPERM, as a firewall's is).
 fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: bool) -> SysResult {
+    if s.icmp.is_some() {
+        return icmp_send(p, s, data, to, nonblock);
+    }
     if to.port == 0 {
         return Err(EINVAL);
     }
@@ -1287,6 +1311,35 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
         u.lock().query(data, to);
         return Ok(len);
     }
+    through_host(p, &u, data, to, nonblock)
+}
+
+/// Send an ICMP echo request to `to`: answered here for the guest's own
+/// addresses and its nameserver, or by way of the host if it allows `to`.
+/// Nothing else is sent, for a raw socket either: Linux's ping sockets take
+/// only this, and it leaves a host nothing to forge.
+fn icmp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: bool) -> SysResult {
+    let echo = if s.v6 { link::ICMP_ECHO.1 } else { link::ICMP_ECHO.0 };
+    if data.len() < 8 || data[0] != echo || data[1] != 0 {
+        return Err(EINVAL);
+    }
+    let u = udp_of(s);
+    if let Some(i) = u.lock().icmp.as_mut() {
+        i.ident = u16::from_be_bytes([data[4], data[5]]);
+    }
+    let to = SockAddr { addr: to.addr, port: link::ICMP_PORT }.or_loopback();
+    if to.is_local() || to.addr == Addr::V4(link::DNS_V4) {
+        let mut reply = data.to_vec();
+        reply[0] = if s.v6 { link::ICMP_ECHO_REPLY.1 } else { link::ICMP_ECHO_REPLY.0 };
+        u.lock().push_icmp(to, to.addr, &reply);
+        return Ok(data.len() as u64);
+    }
+    through_host(p, &u, data, to, nonblock)
+}
+
+/// A datagram for `to` by way of the host, which says first if it may go.
+fn through_host(p: &mut Process, u: &UdpRef, data: &[u8], to: SockAddr, nonblock: bool) -> SysResult {
+    let len = data.len() as u64;
     let verdict = u.lock().verdict(to);
     match verdict {
         Some(true) => {
@@ -1395,6 +1448,7 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
     const IPV6_V6ONLY: u64 = 26;
     let _ = p;
     Ok(match (level, name) {
+        (SOL_SOCKET, SO_TYPE) if s.icmp.is_some_and(|i| i.raw) => SOCK_RAW as u32,
         (SOL_SOCKET, SO_TYPE) => (if s.dgram { SOCK_DGRAM } else { SOCK_STREAM }) as u32,
         (SOL_SOCKET, SO_ERROR) => match &s.state {
             State::Remote(c) => match c.lock().state {
@@ -1406,6 +1460,7 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => link::WINDOW,
         (SOL_SOCKET, SO_KEEPALIVE | SO_REUSEADDR) => 0,
         (SOL_SOCKET, SO_ACCEPTCONN) => matches!(s.state, State::Listening(_)) as u32,
+        (SOL_SOCKET, SO_PROTOCOL) if s.icmp.is_some() => (if s.v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP }) as u32,
         (SOL_SOCKET, SO_PROTOCOL) => (if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP }) as u32,
         (SOL_SOCKET, SO_DOMAIN) => (if s.v6 { AF_INET6 } else { AF_INET }) as u32,
         (IPPROTO_TCP, TCP_NODELAY) => 1,
