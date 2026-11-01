@@ -487,6 +487,7 @@ pub struct SandboxBuilder {
     mounts: Vec<Mount>,
     live: Vec<LiveMount>,
     net: NetPolicy,
+    network: Option<Network>,
     control: Option<RunControl>,
     metrics: Option<Metrics>,
     grace: Duration,
@@ -536,6 +537,7 @@ impl Default for SandboxBuilder {
             mounts: Vec::new(),
             live: Vec::new(),
             net: NetPolicy::default(),
+            network: None,
             control: None,
             metrics: None,
             grace: DEFAULT_GRACE,
@@ -602,6 +604,14 @@ impl SandboxBuilder {
 
     pub fn allow(mut self, cap: Capability) -> Self {
         self.policy.grant(cap);
+        self
+    }
+
+    /// The network stack: this grants [`Capability::Net`], but for
+    /// [`Network::None`], which refuses to go with it. Unsaid, `net` means
+    /// the [native](Network::Native) stack (`GRIX_NETWORK` can say otherwise).
+    pub fn network(mut self, network: Network) -> Self {
+        self.network = Some(network);
         self
     }
 
@@ -1180,6 +1190,13 @@ impl SandboxBuilder {
                 crate::timezone::Zone::Rule(rule) => self.env("TZ", rule),
             };
         }
+        match self.network {
+            Some(Network::None) if self.policy.allows(Capability::Net) => {
+                bail!("`net` is granted and the network is none: one or the other")
+            }
+            Some(Network::Native | Network::Vm) => self.policy.grant(Capability::Net),
+            _ => {}
+        }
         // `arch` after `image`: the image's programs and kernel are another's.
         if let Some(image) = self.image_arch.filter(|&a| a != self.arch) {
             bail!("the image is for {image}, and --arch asks for {}: an image runs on its own architecture", self.arch);
@@ -1252,10 +1269,46 @@ fn check_imports_fit(imported: u64, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which network stack a sandbox has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    /// None at all: no sockets, whatever an image asks for.
+    None,
+    /// The host's: a socket's connection is one the host's proxy makes. What
+    /// [`Capability::Net`] gives unless told otherwise.
+    Native,
+    /// The sandbox's own TCP/IP, in its kernel, with IP packets on the
+    /// console. A gateway on the host ends them and asks the same proxy for
+    /// the same connections, so the same policy holds.
+    Vm,
+}
+
+impl Network {
+    pub fn parse(s: &str) -> Result<Network> {
+        match s {
+            "none" => Ok(Network::None),
+            "native" => Ok(Network::Native),
+            "vm" => Ok(Network::Vm),
+            _ => bail!("network {s:?}: it's none, native or vm"),
+        }
+    }
+
+    /// `GRIX_NETWORK`'s, if it names one.
+    fn env() -> Option<Network> {
+        std::env::var("GRIX_NETWORK").ok().and_then(|n| Network::parse(&n).ok())
+    }
+}
+
 /// A reusable sandbox configuration. Each [`run`](Sandbox::run) boots a fresh VM.
 #[derive(Clone)]
 pub struct Sandbox {
     cfg: SandboxBuilder,
+}
+
+impl SandboxBuilder {
+    fn vm_stack(&self) -> bool {
+        self.policy.allows(Capability::Net) && self.network.or(Network::env()) == Some(Network::Vm)
+    }
 }
 
 impl Sandbox {
@@ -1350,6 +1403,7 @@ impl Sandbox {
             entries.extend(image::entries(&i.files));
         }
         let boot_time_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let vm_stack = cfg.vm_stack();
         // Where the GIC's redistributors are (arm64 only).
         let gicr = match cfg.arch {
             Arch::X86_64 => 0,
@@ -1380,6 +1434,7 @@ impl Sandbox {
                 .collect(),
             forwards: cfg.net.forwards.iter().map(|&(_, port)| port).collect(),
             udp_forwards: cfg.net.udp_forwards.iter().map(|&(_, port)| port).collect(),
+            vm_stack,
             snapshot: take.is_some(),
             cpus: cfg.cpus,
             x86_64: cfg.x86_64.as_deref().unwrap_or(""),
@@ -1393,6 +1448,7 @@ impl Sandbox {
         net.icmp = net.enabled && cfg.policy.allows(Capability::NetRaw);
         let vm = VmConfig {
             net,
+            vm_stack,
             control: cfg.control.clone(),
             metrics: cfg.metrics.clone(),
             grace: cfg.grace,
@@ -1473,6 +1529,7 @@ impl Sandbox {
             grace_ms: cfg.grace.as_millis().try_into().unwrap_or(u64::MAX),
             memory_mb: cfg.memory_mb,
             cpus: cfg.cpus,
+            vm_stack: cfg.vm_stack(),
             tty: cfg.tty.is_some(),
             live: cfg
                 .live
@@ -1621,7 +1678,7 @@ fn execute(
             }
         }
         Channel::Export => exports.push(payload),
-        Channel::Exit | Channel::Link | Channel::Fs => {}
+        Channel::Exit | Channel::Link | Channel::Fs | Channel::Packet => {}
     })?;
     // The host's own events (network policy) were passed on as they came.
     out.events.extend(run.events);
@@ -1708,6 +1765,7 @@ pub(crate) fn run_snapshot(
     let (live, fs_state) = snap.live_mounts()?;
     let vm = VmConfig {
         net,
+        vm_stack: s.vm_stack,
         control: snap.control.clone(),
         metrics: snap.metrics.clone(),
         grace: Duration::from_millis(s.grace_ms),

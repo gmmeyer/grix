@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/abi", "crates/grix", "crates/vmm", "crates/python", "crates/web"]
+members = ["crates/abi", "crates/netstack", "crates/grix", "crates/vmm", "crates/python", "crates/web"]
 # `cargo build` alone builds these (grix-python needs Python to build).
-default-members = ["crates/abi", "crates/grix", "crates/vmm"]
+default-members = ["crates/abi", "crates/netstack", "crates/grix", "crates/vmm"]
 exclude = ["kernel"]
 
 [workspace.package]
-version = "0.0.70"
+version = "0.0.71"
 edition = "2024"
 license = "MIT"

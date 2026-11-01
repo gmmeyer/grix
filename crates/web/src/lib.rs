@@ -174,6 +174,7 @@ impl Builder {
             live_mounts: Vec::new(),
             forwards: Vec::new(),
             udp_forwards: Vec::new(),
+            vm_stack: false,
             snapshot: false,
             cpus: spec.cpus,
             x86_64: "",
@@ -315,7 +316,7 @@ impl Session {
                 // Nothing else comes without `net`, which the page never grants.
             }
             // Exports and live mounts: the page has neither. Nor metrics.
-            Channel::Exit | Channel::Export | Channel::Fs | Channel::Stats => {}
+            Channel::Exit | Channel::Export | Channel::Fs | Channel::Stats | Channel::Packet => {}
         });
         out
     }

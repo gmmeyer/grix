@@ -1,0 +1,11 @@
+[package]
+name = "grix-netstack"
+description = "grix's vm network stack: TCP/IP on the console, for both the guest kernel and the host's gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+grix-abi = { path = "../abi" }
+# Reno, not Cubic: Cubic needs floating point, and the kernel has none.
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno"] }

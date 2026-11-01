@@ -288,6 +288,27 @@ state. `run_streaming` delivers stdout/stderr as they arrive.
 
 ### Networking
 
+A sandbox has one of three network stacks, chosen with `--network` (or
+`.network(...)`, or `network =` in a manifest or in Python):
+
+| `--network` | Sockets | Who runs TCP/IP |
+|---|---|---|
+| `none` | None. The default without `net` | Nobody |
+| `native` | The host's own, one per connection. What `-a net` gives | The host |
+| `vm` | The sandbox's own, in its kernel | The sandbox, as IP packets |
+
+`native` and `vm` both grant `net`, and the same rules hold on both: the host
+checks every connection, datagram and DNS query against your policy. On `vm`
+a packet stops at a gateway on the host, which asks the same proxy for the same
+connection, so what a program puts in a packet reaches nothing the policy
+refuses, and packets it forges go no further. The VM has no network card on
+either: `vm`'s packets travel on the console it already has.
+
+What a program notices on `vm`: a datagram to a refused address leaves and is
+dropped, as a firewall would (no `EPERM`, though the denial is still reported),
+and a connection takes more of the kernel's memory, so fewer fit (over 400 at
+the default memory, each with 16 KiB buffers).
+
 With `Capability::Net`, sockets work, but the VM still has no network card.
 Each connection the program makes is made by the host on its behalf, after
 a policy check:
@@ -347,10 +368,10 @@ The CLI has `--allow-host RULE` and `-p/--publish
 [ADDR:]HOSTPORT:GUESTPORT[/udp]` (Docker's spelling: `-p 5353:53/udp`);
 manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host`,
 `guest` and `protocol` (`"tcp"`, the default, or `"udp"`); Python's
-`publish` takes the CLI's specs. TCP and UDP are supported (raw sockets and
-ICMP are reported as unsupported). A UDP socket's first datagram to a
-destination waits for the host's say; a refused one gets EPERM, as from a
-firewall, and only the destinations it sent to can answer it. Datagrams
+`publish` takes the CLI's specs. TCP, UDP and ICMP echo are supported (other
+raw sockets are reported as unsupported). On `native` a UDP socket's first
+datagram to a destination waits for the host's say, and a refused one gets
+EPERM, as from a firewall; only the destinations it sent to can answer it. Datagrams
 between the sandbox's own sockets stay in it; ones larger than about 4 KiB
 get EMSGSIZE (they'd be fragments on a real network).
 
@@ -698,6 +719,7 @@ The same sandbox written as TOML (`grix run -m file.toml [-- cmd...]`):
 ```toml
 command = ["/bin/busybox", "sha256sum", "/data/hello.c"]
 capabilities = []        # fs_write, threads, process, net, net_raw
+# network = "vm"         # none, native (what net gives) or vm: TCP/IP in the sandbox
 on_deny = "errno"        # "errno" (EPERM) or "kill" (SIGSYS, like seccomp)
 # allow_hosts = ["pypi.org", "*.pythonhosted.org"]   # with net: only these
 memory_mb = 256
@@ -878,7 +900,8 @@ subshells.
 ## Roadmap
 
 1. ~~**Networking**~~: done. Sockets are proxied through the host, which
-   enforces the allow-list and forwards ports. The guest has no TCP/IP stack.
+   enforces the allow-list and forwards ports. `--network vm` runs TCP/IP in
+   the guest instead, behind the same proxy.
 2. ~~**Host directories**~~: done. Live mounts (read-write or read-only,
    any size) and mounts whose changes are applied when the program ends.
 3. ~~**Signals from the host**~~: done (`RunControl`, Ctrl-C in the CLI,
@@ -900,6 +923,7 @@ subshells.
 ```
 crates/abi/        shared host<->guest definitions: boot image, policy, wire protocol (no_std)
 crates/grix/       host library + `grix` CLI (builds images, runs the VMM, decodes output)
+crates/netstack/   the vm network stack: TCP/IP for the guest kernel and the host's gateway
 crates/vmm/        grix-vmm: the VMM (Hypervisor.framework, KVM), PL011 + virtio console
 kernel/            the guest kernel (no_std, aarch64-unknown-none-softfloat and x86_64-unknown-none)
   src/arch/        per architecture (aarch64/, x86_64/): boot, traps, page tables, interrupts, signal frame, ABI layouts

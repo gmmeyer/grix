@@ -242,6 +242,32 @@ fn a_writable_server_builds_images_and_writes_mounts() {
 /// name for it, and not anywhere the list doesn't name.
 /// An agent gets the host's time zone only if the server was told it may:
 /// what zone it's in says something of where the host is.
+/// A stack is `net`, so it's the server's to give: asking isn't enough.
+#[test]
+fn the_network_stack_is_the_servers_to_give() {
+    let fixtures = fixtures();
+    let busybox = busybox(&fixtures);
+    let args = json!({"command": ["/bin/busybox", "true"], "network": "vm",
+                      "imports": [{"host": busybox, "guest": "/bin/busybox"}]});
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let mut plain = Server::start(&[], &[fixtures.as_path()]);
+    plain.call(initialize.clone());
+    let r = plain.tool("run", args.clone());
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r.to_string().contains("net capability"), "{r}");
+    // No stack needs nobody's leave.
+    let none = json!({"command": ["/bin/busybox", "true"], "network": "none",
+                      "imports": [{"host": busybox, "guest": "/bin/busybox"}]});
+    let r = plain.tool("run", none);
+    assert_eq!(r["isError"], false, "{r}");
+    plain.end();
+    let mut allowing = Server::start(&["--allow", "net"], &[fixtures.as_path()]);
+    allowing.call(initialize);
+    let r = allowing.tool("run", args);
+    assert_eq!(r["isError"], false, "{r}");
+    allowing.end();
+}
+
 #[test]
 fn the_time_zone_is_the_servers_to_give() {
     let fixtures = fixtures();

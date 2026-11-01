@@ -209,6 +209,11 @@ struct RunArgs {
     /// Grant a capability (fs_write, threads, process, net, net_raw). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
+    /// The network stack: none, native (sockets on the host's own stack,
+    /// what `net` gives) or vm (TCP/IP in the sandbox). The last two grant
+    /// `net`; the same rules hold on either.
+    #[arg(long = "network", value_name = "STACK")]
+    network: Option<String>,
     /// Set an environment variable KEY=VALUE, or KEY to pass on the
     /// host's value of KEY (if it's set, as Docker's `-e KEY`: a secret
     /// stays off the command line). Repeatable.
@@ -704,6 +709,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     }
     // Before the run, so its results have somewhere to go.
     let exports = grix::results::check_destinations(&exports, &mounted)?.links(links_of(args));
+    if let Some(network) = &args.network {
+        b = b.network(grix::Network::parse(network)?);
+    }
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;
     }

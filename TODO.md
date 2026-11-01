@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.70)
+## What's left (after 0.0.71)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce.
@@ -35,7 +35,10 @@ Linux behaviour:
    groups. Nothing surveyed needs them yet: wait for a program that does.
 4. A node left unwatched on macOS, newer syscalls as programs ask for
    them.
-5. Raw sockets other than ICMP echo (reported as unsupported).
+5. Raw sockets other than ICMP echo (reported as unsupported). The `vm`
+   stack is where they'd go: nothing a program sends leaves the gateway,
+   so a raw socket there forges nothing. Also what it leaves undone:
+   `IP_TTL`, `TCP_INFO`, and `eth0` still saying 1500.
 6. `/proc/<pid>/fd/N/name`: left, as few tools go there and it means
    another process's table under the filesystem's lock.
 

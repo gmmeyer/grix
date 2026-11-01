@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grix::{
-    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, Limit, Metrics, Resource, RunControl,
-    RunOutput, Sandbox, SandboxBuilder, Stream,
+    Capability, DenyAction, ExitStatus, ExportContent, ExportState, GuestEvent, Limit, Metrics, Network, Resource,
+    RunControl, RunOutput, Sandbox, SandboxBuilder, Stream,
 };
 
 fn x86_64_guest() -> bool {
@@ -34,6 +34,13 @@ fn fixture(name: &str) -> PathBuf {
 
 fn with(name: &str) -> SandboxBuilder {
     Sandbox::builder().timeout(Duration::from_secs(60)).import(fixture(name), &format!("/bin/{name}")).unwrap()
+}
+
+/// For a fixture that tries what the policy refuses: a datagram isn't asked
+/// about on the `vm` stack, and the fixture's to expect that. (`Denied` is
+/// reported either way, which is the test's to check.)
+fn may_drop(b: SandboxBuilder) -> SandboxBuilder {
+    if std::env::var("GRIX_NETWORK").as_deref() == Ok("vm") { b.env("DROPPED", "1") } else { b }
 }
 
 fn run(b: SandboxBuilder, argv: &[&str]) -> RunOutput {
@@ -206,6 +213,24 @@ fn free_port() -> u16 {
 
 #[test]
 fn networking_through_the_host() {
+    through_the_host(None);
+}
+
+/// The `vm` stack whatever `GRIX_NETWORK` says: TCP/IP in the guest, with
+/// nothing about the program or the policy any different.
+#[test]
+fn networking_on_the_vm_stack() {
+    through_the_host(Some(Network::Vm));
+}
+
+fn on(network: Option<Network>, b: SandboxBuilder) -> SandboxBuilder {
+    match network {
+        Some(n) => b.network(n),
+        None => b.allow(Capability::Net),
+    }
+}
+
+fn through_the_host(network: Option<Network>) {
     // Blocking and nonblocking connects to the host, 1 MiB each way,
     // half-close, refusals and policy denials, loopback, and DNS (see the
     // fixture).
@@ -216,9 +241,8 @@ fn networking_through_the_host() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let s = seen.clone();
     control.on_event(move |e| s.lock().unwrap().push(e.to_string()));
-    let b = with("inet")
+    let b = on(network, with("inet"))
         .control(&control)
-        .allow(Capability::Net)
         .allow_host(&format!("host.grix.internal:{port}"))
         .unwrap()
         .allow_host(&format!("host.grix.internal:{closed}"))
@@ -248,10 +272,10 @@ fn networking_through_the_host() {
 
     // Names the guest doesn't know go to the host's resolver; with an
     // allow-list, only names on it.
-    let b = with("inet").allow(Capability::Net).file("/etc/hosts", "127.0.0.1 localhost\n", 0o644).unwrap();
+    let b = on(network, with("inet")).file("/etc/hosts", "127.0.0.1 localhost\n", 0o644).unwrap();
     let out = run(b, &["/bin/inet", "resolve", "host.grix.internal"]);
     assert_eq!(out.stdout_str(), "host.grix.internal is 10.0.2.2\n");
-    let b = with("inet").allow(Capability::Net).allow_host("example.com").unwrap();
+    let b = on(network, with("inet")).allow_host("example.com").unwrap();
     let out = run(b, &["/bin/inet", "resolve", "elsewhere.example"]);
     assert!(out.stdout_str().starts_with("elsewhere.example: "), "{}", out.stdout_str());
     assert!(
@@ -329,10 +353,82 @@ fn forwarded_ports_skip_loopback_only_listeners() {
 
 #[test]
 fn serving_through_a_forwarded_port() {
+    serving(None);
+}
+
+#[test]
+fn serving_on_the_vm_stack() {
+    serving(Some(Network::Vm));
+}
+
+/// No stack: no sockets, whatever else was said, and what says otherwise
+/// is an error.
+#[test]
+fn no_network_at_all() {
+    let out = run(with("net").network(Network::None), &["/bin/net"]);
+    assert_eq!(out.stdout_str(), "socket: Operation not permitted\n");
+    assert_eq!(out.missing_capabilities(), ["net"]);
+    let refused = with("net").allow(Capability::Net).network(Network::None).build();
+    assert!(refused.err().unwrap().to_string().contains("one or the other"));
+    assert!(Network::parse("tap").is_err());
+}
+
+/// The program ends with what it wrote still on its way, nothing closed,
+/// more than the buffers between it and a slow peer hold: every one of them
+/// is full as it ends. On Linux it all arrives, as the kernel outlives the
+/// program; here the kernel doesn't.
+#[test]
+fn what_a_program_wrote_outlives_it() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    for network in [Network::Native, Network::Vm] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Inherited by the proxy's end: it holds little, so the rest waits
+        // in what's the sandbox's to get across.
+        let small: libc::c_int = 4096;
+        let size = std::mem::size_of_val(&small) as libc::socklen_t;
+        // SAFETY: a socket of ours, and the value's size.
+        let set = unsafe {
+            let value = (&raw const small).cast();
+            libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, value, size)
+        };
+        assert_eq!(set, 0);
+        let sb = with("inet").network(network).forward_listener(listener, 8000).unwrap().build().unwrap();
+        let guest = std::thread::spawn(move || sb.run(&["/bin/inet", "parting", "8000"]).unwrap());
+        let started = std::time::Instant::now();
+        let got = loop {
+            assert!(started.elapsed() < Duration::from_secs(30), "{network:?}: nobody answered");
+            let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            if c.write_all(b"p").is_err() {
+                continue;
+            }
+            let (mut got, mut chunk) = (Vec::new(), [0u8; 16 * 1024]);
+            while let Ok(n) = c.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk[..n]);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if !got.is_empty() {
+                break got;
+            }
+        };
+        let out = guest.join().unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0), "{network:?}: {}", out.stdout_str());
+        let want: Vec<u8> = (0..1usize << 20).map(|i| (i * 7 + (i >> 11)) as u8).collect();
+        assert_eq!(got.len(), want.len(), "{network:?}");
+        assert!(got == want, "{network:?}");
+    }
+}
+
+fn serving(network: Option<Network>) {
     use std::io::{BufRead, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
-    let sb = with("inet").allow(Capability::Net).forward_listener(listener, 8000).unwrap().build().unwrap();
+    let sb = on(network, with("inet")).forward_listener(listener, 8000).unwrap().build().unwrap();
     let guest = std::thread::spawn(move || sb.run(&["/bin/inet", "server", "8000"]).unwrap());
     // Until the program listens, the guest refuses what the host accepts.
     let started = std::time::Instant::now();
@@ -697,10 +793,10 @@ fn ping_with_net_raw() {
     assert!(out.events.is_empty(), "{:?}", out.events);
     // A rule for a port says nothing of ICMP, and an address nobody named
     // isn't reached.
-    let b = raw().allow_host("host.grix.internal:80").unwrap();
+    let b = may_drop(raw()).allow_host("host.grix.internal:80").unwrap();
     let out = run(b, &["/bin/pingsock", "refused", "10.0.2.2"]);
     assert_eq!(out.stdout_str(), "pingsock refused ok\n", "{}", out.kernel_log);
-    let b = raw().allow_host("example.com").unwrap();
+    let b = may_drop(raw()).allow_host("example.com").unwrap();
     let out = run(b, &["/bin/pingsock", "refused", "192.0.2.1"]);
     assert_eq!(out.stdout_str(), "pingsock refused ok\n", "{}", out.kernel_log);
     assert!(out.events.iter().any(|e| matches!(e, GuestEvent::Denied { .. })), "{:?}", out.events);
@@ -3574,8 +3670,8 @@ fn udp_beyond_dns() {
     assert!(out.events.is_empty(), "{:?}", out.events);
     server.join().unwrap();
 
-    // Anywhere else: EPERM, and the host says why.
-    let b = with("udp").allow(Capability::Net).allow_host(&format!("host.grix.internal:{port}")).unwrap();
+    // Anywhere else: EPERM (on the `vm` stack, dropped), and the host says why.
+    let b = may_drop(with("udp")).allow(Capability::Net).allow_host(&format!("host.grix.internal:{port}")).unwrap();
     let out = run(b, &["/bin/udp", "denied", &(port ^ 1).to_string()]);
     assert_eq!(out.stdout_str(), "udp denied ok\n", "{}", out.kernel_log);
     assert!(
@@ -3593,7 +3689,7 @@ fn serving_udp_through_a_forwarded_port() {
     use std::net::UdpSocket;
     let forwarded = UdpSocket::bind("127.0.0.1:0").unwrap();
     let host = forwarded.local_addr().unwrap();
-    let sb = with("udp").allow(Capability::Net).forward_udp_socket(forwarded, 5300).unwrap().build().unwrap();
+    let sb = may_drop(with("udp")).allow(Capability::Net).forward_udp_socket(forwarded, 5300).unwrap().build().unwrap();
     let guest = std::thread::spawn(move || sb.run(&["/bin/udp", "serve", "5300"]).unwrap());
     let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     // The next reply that isn't to one of the hellos sent while waiting.

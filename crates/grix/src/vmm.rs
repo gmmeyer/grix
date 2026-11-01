@@ -19,15 +19,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use grix_abi::link;
 use grix_abi::wire::{self, Channel, ExitKind, FrameDecoder, Input};
 
 use crate::event::GuestEvent;
+use crate::gateway::Gateway;
 use crate::metrics::REPORT_EVERY;
 use crate::net::{NetPolicy, Outbox, Proxy, StdinGate};
 use crate::sandbox::HostUsage;
 
 pub(crate) struct VmConfig {
     pub net: NetPolicy,
+    /// Sockets are the guest's own TCP/IP, with a gateway here for them.
+    pub vm_stack: bool,
     pub control: Option<crate::control::RunControl>,
     /// Counts the run; the kernel is asked for reports while it goes on.
     pub metrics: Option<crate::metrics::Metrics>,
@@ -347,7 +351,16 @@ pub(crate) fn run(
             c.event(e);
         }
     });
-    let proxy = Proxy::start(cfg.net.clone(), to_guest.clone(), on_event)?;
+    // On the guest's own stack the proxy's messages go to the gateway, which
+    // sends the guest packets.
+    let (proxy, gateway) = if cfg.vm_stack {
+        let messages = Outbox::new();
+        let proxy = Arc::new(Proxy::start(cfg.net.clone(), messages.clone(), on_event)?);
+        let gateway = Gateway::start(proxy.clone(), messages, to_guest.clone())?;
+        (proxy, Some(gateway))
+    } else {
+        (Arc::new(Proxy::start(cfg.net.clone(), to_guest.clone(), on_event)?), None)
+    };
     let mut fs = match &cfg.fs_state {
         Some(state) => crate::hostfs::Server::restore(&cfg.live, state)?,
         None => crate::hostfs::Server::new(&cfg.live)?,
@@ -444,7 +457,7 @@ pub(crate) fn run(
     let mut child = ChildGuard::new(child);
     let uart = accept_uart(&listener, &mut child)?;
     drop(listener);
-    run_vm(cfg, child, uart, to_guest, proxy, fs, timeout, stdin, &mut on_frame)
+    run_vm(cfg, child, uart, to_guest, proxy, gateway, fs, timeout, stdin, &mut on_frame)
 }
 
 /// QEMU's command line for the machine.
@@ -482,13 +495,30 @@ fn qemu_command(cfg: &VmConfig, uart_path: &std::path::Path, image: &std::path::
     cmd
 }
 
+/// The gateway first, as what it has left goes to the proxy, which closes
+/// the guest's input in the `native` stack: here it's not what it writes to.
+/// With `finished` the program ended by itself, and what it wrote goes on;
+/// otherwise the run's being stopped, and everything goes now.
+fn stop_network(proxy: &Proxy, gateway: Option<&Gateway>, to_guest: &Outbox, finished: bool) -> Vec<GuestEvent> {
+    if let Some(g) = gateway {
+        g.stop(finished);
+    }
+    if finished {
+        proxy.finish();
+    }
+    let events = proxy.stop();
+    to_guest.close();
+    events
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_vm(
     cfg: &VmConfig,
     mut child: ChildGuard,
     uart: Option<UnixStream>,
     to_guest: Arc<Outbox>,
-    proxy: Proxy,
+    proxy: Arc<Proxy>,
+    gateway: Option<Gateway>,
     mut fs: crate::hostfs::Server,
     timeout: Duration,
     stdin: Option<Box<dyn Read + Send>>,
@@ -574,7 +604,8 @@ fn run_vm(
             };
             timed_out |= matches!(end, VmEnd::Timeout);
             let usage = child.reap(true).ok().map(|(_, usage)| usage);
-            return Ok(VmRun { end, events: proxy.stop(), timed_out, fs_state: None, usage });
+            let events = stop_network(&proxy, gateway.as_ref(), &to_guest, false);
+            return Ok(VmRun { end, events, timed_out, fs_state: None, usage });
         }
         if let Some(at) = next_report
             && now >= at
@@ -607,13 +638,21 @@ fn run_vm(
                 }
             }
             Channel::Exit => {}
-            Channel::Link => proxy.handle(payload),
+            // With a gateway the proxy hears only from it, or a guest could
+            // tell it things packets don't say. Stdin is no one's but ours.
+            Channel::Link if gateway.is_none() || link::is_stdin_credit(payload) => proxy.handle(payload),
+            Channel::Link => {}
+            Channel::Packet => {
+                if let Some(g) = &gateway {
+                    g.packet(payload);
+                }
+            }
             Channel::Fs => to_guest.urgent(fs.handle(payload)),
             _ => on_frame(ch, payload),
         });
     }
     let (status, usage) = child.reap(false)?;
-    let events = proxy.stop();
+    let events = stop_network(&proxy, gateway.as_ref(), &to_guest, exit.is_some());
     // A panic's message and status come on the serial port.
     let early = uart_thread.join().unwrap_or_default();
     FrameDecoder::new().push(&early, |ch, payload| match ch {

@@ -1,4 +1,6 @@
-//! Network sockets (AF_INET, AF_INET6) without a TCP/IP stack.
+//! Network sockets (AF_INET, AF_INET6). The `native` stack, described here,
+//! has no TCP/IP in the guest; in the `vm` one (`netstack`) the same sockets
+//! sit on the guest's own, which takes what would go to the host.
 //! - A TCP connection to anywhere but the guest itself is one the host makes
 //!   and polices (`grix_abi::link`): data and credit go back and forth in
 //!   messages, so no buffer here outgrows `link::WINDOW`.
@@ -21,6 +23,7 @@ use spin::{Mutex, Once};
 use crate::errno::*;
 use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, SocketEnd};
 use crate::kmem::Charge;
+use crate::netstack;
 
 pub const ECONNREFUSED: Errno = Errno(111);
 
@@ -163,7 +166,28 @@ impl SockAddr {
 }
 
 fn send(msg: ToHost) {
-    crate::console::write(grix_abi::wire::Channel::Link, &msg.encode());
+    if netstack::active() {
+        netstack::handle(msg);
+    } else {
+        crate::console::write(grix_abi::wire::Channel::Link, &msg.encode());
+    }
+}
+
+/// What a connection may have on its way to the peer: what's written has
+/// to fit in the `vm` stack's socket, or in the host's window.
+fn send_window() -> u32 {
+    if netstack::active() { netstack::BUFFER as u32 } else { WINDOW }
+}
+
+/// `data` for connection `id`, within its credit, or false if there's no
+/// room now. (Never for a kernel's own message, which waits for room: a
+/// program's write doesn't.)
+pub fn write_data(id: u32, data: &[u8]) -> bool {
+    if netstack::active() {
+        netstack::handle(ToHost::Data { id, data });
+        return true;
+    }
+    crate::console::try_write(grix_abi::wire::Channel::Link, &ToHost::Data { id, data }.encode())
 }
 
 // ---------------------------------------------------------------- connections through the host
@@ -203,7 +227,7 @@ static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
 /// Connections through the host, and DNS lookups, still going: what a
 /// snapshot can't carry (the host's ends don't come with it).
 pub fn host_state() -> usize {
-    let conns = CONNS.lock().values().filter(|w| w.strong_count() > 0).count();
+    let conns = CONNS.lock().values().filter(|w| w.strong_count() > 0).count() + netstack::sockets();
     let udps = UDPS
         .lock()
         .values()
@@ -238,7 +262,7 @@ impl Conn {
 
     fn new(id: u32, state: ConnState, local: SockAddr, peer: SockAddr) -> Result<Conn, Errno> {
         let charge = Charge::new(WINDOW as u64).map_err(|_| Errno(105))?;
-        let tx_credit = if state == ConnState::Open { WINDOW } else { 0 };
+        let tx_credit = if state == ConnState::Open { send_window() } else { 0 };
         // All of it now: data never outgrows the window, and the charge
         // then matches what's really held.
         let mut rx = VecDeque::new();
@@ -265,7 +289,11 @@ impl Conn {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) & !link::HOST_ID;
         let local = SockAddr { addr: source_for(peer.addr), port: ephemeral_port() };
         let c = Conn::register(Conn::new(id, ConnState::Connecting, local, peer)?)?;
-        send(ToHost::Connect { id, addr: peer.addr, port: peer.port });
+        if netstack::active() {
+            netstack::connect(id, local, peer);
+        } else {
+            send(ToHost::Connect { id, addr: peer.addr, port: peer.port });
+        }
         Ok(c)
     }
 
@@ -743,7 +771,13 @@ impl Udp {
         }
         self.waiting += 1;
         self.last_query_ns = crate::time::monotonic_ns();
-        send(ToHost::Dns { id: self.id, query: q });
+        match self.local.filter(|_| netstack::active()) {
+            Some(local) => {
+                self.used_host = true;
+                netstack::datagram(local.port, server, q);
+            }
+            None => send(ToHost::Dns { id: self.id, query: q }),
+        }
     }
 
     /// Where the answer `a` came from.
@@ -754,6 +788,11 @@ impl Udp {
 
     /// What the host said of sending to `to`, if it has.
     pub fn verdict(&self, to: SockAddr) -> Option<bool> {
+        // On the guest's own stack it goes, and the gateway's the one to
+        // stop it: a firewall's silence, not an answer.
+        if netstack::active() {
+            return Some(true);
+        }
         self.verdicts.get(&to).copied()
     }
 
@@ -788,6 +827,16 @@ impl Udp {
 
     /// A datagram to `to`, which the host allowed.
     pub fn send_host(&mut self, to: SockAddr, data: &[u8]) {
+        if netstack::active() {
+            self.used_host = true;
+            self.talking = true;
+            match self.local {
+                _ if to.port == link::ICMP_PORT => netstack::echo(to.addr, data),
+                Some(local) => netstack::datagram(local.port, to, data),
+                None => {}
+            }
+            return;
+        }
         send(ToHost::UdpSend { id: self.id, addr: to.addr, port: to.port, data });
     }
 
@@ -880,16 +929,51 @@ pub fn forget_forward_peers() {
     FORWARD_PEERS.lock().clear();
 }
 
+/// Is something listening there, for a connection from outside? As
+/// `Incoming` says: the guest's own address or all of them, never loopback.
+pub fn listening(local: SockAddr) -> bool {
+    Listener::find(local).is_some()
+}
+
+/// A datagram from the network, for the socket bound at `port`.
+pub fn datagram_in(from: SockAddr, port: u16, data: &[u8]) {
+    let Some(u) = UDP_PORTS.lock().get(&port).and_then(Weak::upgrade) else { return };
+    let mut u = u.lock();
+    if from.port == 53 {
+        u.waiting = u.waiting.saturating_sub(1);
+    }
+    u.push(from, data);
+}
+
+/// An echo reply from `from` with identifier `ident`, for the ICMP socket
+/// that sent the request.
+pub fn echo_in(from: Addr, ident: u16, msg: &[u8]) {
+    let v6 = matches!(from, Addr::V6(_));
+    let udps: Vec<_> = UDPS.lock().values().filter_map(Weak::upgrade).collect();
+    if let Some(id) = udps.iter().find_map(|u| {
+        let u = u.lock();
+        u.icmp.is_some_and(|i| i.ident == ident && i.v6 == v6).then_some(u.id)
+    }) {
+        deliver(ToGuest::UdpRecv { id, addr: from, port: link::ICMP_PORT, data: msg });
+    }
+}
+
 /// A message from the host's network proxy.
 pub fn from_host(payload: &[u8]) {
-    let Ok(msg) = ToGuest::decode(payload) else { return };
+    if let Ok(msg) = ToGuest::decode(payload) {
+        deliver(msg);
+    }
+}
+
+/// What the host's proxy said, or the guest's own stack in its place.
+pub fn deliver(msg: ToGuest) {
     match msg {
         ToGuest::Connected { id } => {
             if let Some(c) = conn(id) {
                 let mut c = c.lock();
                 if c.state == ConnState::Connecting {
                     c.state = ConnState::Open;
-                    c.tx_credit = WINDOW;
+                    c.tx_credit = send_window();
                     if c.tx_shut {
                         send(ToHost::Shutdown { id });
                     }
@@ -919,7 +1003,7 @@ pub fn from_host(payload: &[u8]) {
         ToGuest::Credit { id, bytes } => {
             if let Some(c) = conn(id) {
                 let mut c = c.lock();
-                c.tx_credit = c.tx_credit.saturating_add(bytes).min(WINDOW);
+                c.tx_credit = c.tx_credit.saturating_add(bytes).min(send_window());
                 c.touch();
             }
         }
@@ -1020,7 +1104,7 @@ pub fn host_pending() -> bool {
         let c = c.lock();
         match c.state {
             ConnState::Connecting => true,
-            ConnState::Open => !c.rx_eof || c.tx_credit < WINDOW,
+            ConnState::Open => !c.rx_eof || c.tx_credit < send_window(),
             ConnState::Failed(_) => false,
         }
     }) {

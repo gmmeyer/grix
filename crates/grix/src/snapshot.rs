@@ -65,6 +65,9 @@ pub(crate) struct Settings {
     /// The machine's CPUs (each run has as many).
     #[serde(default = "one_cpu")]
     pub cpus: u32,
+    /// Its sockets are its own TCP/IP, which needs the gateway.
+    #[serde(default)]
+    pub vm_stack: bool,
     /// Taken in TTY mode: the program's stdio is a terminal.
     #[serde(default)]
     pub tty: bool,
@@ -461,6 +464,7 @@ mod tests {
             grace_ms: u64::MAX,
             memory_mb: 512,
             cpus: 1,
+            vm_stack: false,
             tty: false,
             live: vec![],
             fs_state: String::new(),

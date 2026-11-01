@@ -55,6 +55,15 @@ class Common:
         self.assertGreater(r.guest_stats["usage"]["memory"]["peak"], 0)
         self.assertGreater(r.host_usage["peak_memory_bytes"], 0)
 
+    def test_the_network_stacks(self):
+        # Interfaces are what any socket lists: `eth0` means there's a stack.
+        run = ["/bin/busybox", "cat", "/proc/net/dev"]
+        imports = {BUSYBOX: "/bin/busybox"}
+        self.assertNotIn("eth0", grix.Sandbox(imports=imports).run(run).stdout)
+        self.assertNotIn("eth0", grix.Sandbox(imports=imports, network="none").run(run).stdout)
+        for stack in ("native", "vm"):
+            self.assertIn("eth0", grix.Sandbox(imports=imports, network=stack).run(run).stdout)
+
     def test_the_hosts_time_zone(self):
         run = ["/bin/busybox", "date", "+%Z %z"]
         sb = grix.Sandbox(imports={BUSYBOX: "/bin/busybox"})
