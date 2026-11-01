@@ -117,6 +117,17 @@ impl Watcher {
     pub fn remove(&self, id: u64) {
         self.state.lock().unwrap().remove(id);
     }
+
+    /// Nodes `add` had no descriptor to spare for.
+    pub fn unwatched(&self) -> Vec<u64> {
+        self.state.lock().unwrap().unwatched()
+    }
+
+    /// Watch a node of `unwatched` as `fd`, if there's a descriptor to spare
+    /// now. False if there isn't: the rest can wait too.
+    pub fn watch_again(&self, id: u64, fd: OwnedFd) -> bool {
+        self.state.lock().unwrap().watch_again(id, fd)
+    }
 }
 
 impl Drop for Watcher {
@@ -162,6 +173,15 @@ mod os {
 
         pub fn count(&self) -> usize {
             self.ids.len()
+        }
+
+        /// inotify takes no descriptor per watch, so none go without.
+        pub fn unwatched(&self) -> Vec<u64> {
+            Vec::new()
+        }
+
+        pub fn watch_again(&mut self, _id: u64, _fd: OwnedFd) -> bool {
+            true
         }
 
         pub fn add(&mut self, id: u64, node: OwnedFd) -> Result<(), u16> {
@@ -402,6 +422,26 @@ mod os {
 
         pub fn count(&self) -> usize {
             self.watches.len() + self.blind.len()
+        }
+
+        pub fn unwatched(&self) -> Vec<u64> {
+            self.blind.iter().copied().collect()
+        }
+
+        pub fn watch_again(&mut self, id: u64, fd: OwnedFd) -> bool {
+            if !self.blind.contains(&id) {
+                return true;
+            }
+            if !take_fd() {
+                return false;
+            }
+            if self.add_held(id, fd).is_err() {
+                give_fd();
+            }
+            self.blind.remove(&id);
+            // What changed meanwhile, nobody saw.
+            self.lost = true;
+            true
         }
 
         /// Tell kqueue about `fd`, as `token`.

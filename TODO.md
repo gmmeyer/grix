@@ -98,6 +98,9 @@ Live mounts:
       must fail on macOS as on Linux. It's the one part of it only macOS can
       prove, as kqueue holds a descriptor per watched file.
 - [ ] Listings past `MAX_LISTED`, and names of the most bytes, on APFS.
+- [ ] A watched node with no descriptor to spare is watched again once there's
+      one (`Server::rewatch`): inotify on more files than `at::take_fd` allows,
+      then close the others, and a change is seen, after an IN_Q_OVERFLOW.
 
 Snapshots:
 
@@ -414,8 +417,9 @@ Left, none of it a way out of the sandbox:
       another process's are ENOENT past their own name. Few tools go
       there, and it means another process's table under the filesystem's
       lock (`FdTable::walking`).
-- [ ] A node with no descriptor left for it (macOS, `at::take_fd`)
-      stays unwatched until the guest watches it again.
+- [x] A node with no descriptor left for it (macOS, `at::take_fd`) is
+      watched again once there's one (`Server::rewatch`), and the guest told
+      by an overflow that it missed what changed meanwhile.
 
 ## Agent integrations
 
