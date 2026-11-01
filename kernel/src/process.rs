@@ -1087,6 +1087,7 @@ pub fn load_program(
     let strings = (argv.len() + envp.len()) as u64;
     let need = bytes + strings * 8 + (128 << 10);
     aspace.set_stack(crate::mm::page_up(p.rlimits[3].0.min(MAX_STACK).max(need)).unwrap_or(MAX_STACK));
+    aspace.stack_limit = p.rlimits[3].0;
     let loaded = elf::load(&mut aspace, &src, ino, Some(elf::DYN_BASE))
         .map_err(|e| exec_error(ENOEXEC, alloc::format!("{exe}: {e}")))?;
     let (entry, interp_base) = match &loaded.interp {
@@ -1129,7 +1130,11 @@ pub fn load_program(
 
     aspace.brk_start = loaded.end;
     aspace.brk = loaded.end;
-    aspace.map(Vma::anon(aspace.stack_bottom(), STACK_TOP, Prot::RW));
+    // What the arguments need and 128 KiB, as Linux's setup_arg_pages: it
+    // grows from there as RLIMIT_STACK says at the time.
+    let mut stack = Vma::anon(STACK_TOP - crate::mm::page_up(need).unwrap_or(need), STACK_TOP, Prot::RW);
+    stack.grows_down = true;
+    aspace.map(stack);
     aspace.map(Vma::new(SIGPAGE, SIGPAGE + PAGE_SIZE, Prot::RX, Backing::Sigpage));
     let (vvar, vdso) = crate::vdso::frames();
     let read_only = Prot { read: true, write: false, exec: false };

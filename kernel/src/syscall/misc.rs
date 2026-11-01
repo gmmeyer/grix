@@ -530,6 +530,7 @@ fn mincore(p: &mut Process, addr: u64, len: u64, vec: u64) -> SysResult {
     copy_out(&mut p.aspace, at, &out).map(|_| 0)
 }
 
+const RLIMIT_STACK: usize = 3;
 const RLIMIT_NOFILE: usize = 7;
 
 fn prlimit(p: &mut Process, pid: u64, res: u64, new: u64, old: u64) -> SysResult {
@@ -554,6 +555,9 @@ fn prlimit(p: &mut Process, pid: u64, res: u64, new: u64, old: u64) -> SysResult
         p.rlimits[i] = (cur, max);
         if i == RLIMIT_NOFILE {
             p.fds.set_limit(cur);
+        }
+        if i == RLIMIT_STACK {
+            p.aspace.stack_limit = cur;
         }
     }
     Ok(0)

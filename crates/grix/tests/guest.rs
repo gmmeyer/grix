@@ -667,6 +667,17 @@ fn madvise_does_what_it_says() {
     assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
+/// The stack and MAP_GROWSDOWN mappings grow on a fault, as far as
+/// RLIMIT_STACK says at the time and a guard gap allows. The fixture passes
+/// on Linux as it is.
+#[test]
+fn stacks_grow_as_they_are_used() {
+    let out = run(with("stackgrow").allow(Capability::Process), &["/bin/stackgrow"]);
+    assert_eq!(out.stdout_str(), "stackgrow ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// Holes in files and shared memory, by fallocate and by MADV_REMOVE. The
 /// fixture passes on Linux as it is, on tmpfs.
 #[test]
