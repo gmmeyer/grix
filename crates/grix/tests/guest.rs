@@ -5049,6 +5049,18 @@ fn magic_links_are_links() {
     hardened(with("hardening"), &["magic"], "magic links refused");
 }
 
+/// A name is looked up in a directory only with search permission there,
+/// by the owner's, group's or other's bits, as they apply. The fixture
+/// passes on Linux as it is.
+#[test]
+fn directories_need_search_permission() {
+    let b = with("searchperm").user("0:0").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/searchperm"]);
+    assert_eq!(out.stdout_str(), "searchperm ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// O_PATH | O_NOFOLLOW opens a magic link as a link, and RESOLVE_* say of
 /// one what Linux's do. The fixture passes on Linux as it is.
 #[test]

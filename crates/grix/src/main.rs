@@ -217,6 +217,10 @@ struct RunArgs {
     /// Grant a capability (fs_write, threads, process, net, net_raw). Repeatable.
     #[arg(short, long = "allow", value_name = "CAP")]
     allow: Vec<String>,
+    /// Run as this user (uid[:gid], or names in the sandbox's /etc/passwd
+    /// and /etc/group), as Docker's --user, whatever an image says.
+    #[arg(short = 'u', long = "user", value_name = "USER[:GROUP]")]
+    user: Option<String>,
     /// Stricter than Linux: refuse unique local addresses (fc00::/7, where
     /// some clouds' metadata services are) and Alibaba's and Azure's
     /// metadata addresses, unless a rule names them.
@@ -730,6 +734,9 @@ fn prepare(args: &RunArgs, metrics: Option<&Metrics>, streamed: bool) -> Result<
     }
     if args.strict_network {
         b = b.strict_network();
+    }
+    if let Some(user) = &args.user {
+        b = b.user(user);
     }
     for rule in &args.allow_hosts {
         b = b.allow_host(rule)?;

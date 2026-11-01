@@ -104,6 +104,7 @@ pub fn handle(tf: &mut TrapFrame) {
     if p.aio.polling() {
         aio::complete_polls(p);
     }
+    crate::fs::set_walker(p.who());
     // A seccomp filter's SECCOMP_RET_TRAP leaves the registers as they
     // were (Linux's syscall_rollback): no result to set.
     let mut trapped = false;

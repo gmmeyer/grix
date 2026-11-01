@@ -14,7 +14,7 @@ use crate::fd::{
     Epoll, FdEntry, FifoFile, FileKind, O_ACCMODE, O_APPEND, O_ASYNC, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile,
     Registration, new_file,
 };
-use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
+use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_EXEC, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
 use crate::procfs::{self, ProcFile};
 use crate::{landlock, locks};
 
@@ -1842,6 +1842,10 @@ fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
     let mut fs = fs::lock();
     if !fs.is_dir(ino) {
         return Err(ENOTDIR);
+    }
+    // Being there is searching it, as Linux's MAY_CHDIR.
+    if !fs.permits(ino, p.who(), MAY_EXEC) {
+        return Err(EACCES);
     }
     let pin = Some(fs.pin(ino));
     p.fs.update(|f| (f.cwd, f.cwd_pin) = (ino, pin));

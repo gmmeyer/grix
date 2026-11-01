@@ -493,6 +493,8 @@ pub struct SandboxBuilder {
     grace: Duration,
     uid: u32,
     gid: u32,
+    /// `user`'s, resolved in `build` when the files are all there.
+    user: Option<String>,
     arch: Arch,
     /// Who chose `arch`, if anyone did (`GRIX_ARCH`, or `arch`): an image
     /// for another is an error then, rather than a reason to switch.
@@ -542,6 +544,7 @@ impl Default for SandboxBuilder {
             metrics: None,
             grace: DEFAULT_GRACE,
             uid: 1000,
+            user: None,
             gid: 1000,
             arch,
             arch_chosen_by: Arch::env().map(|_| "GRIX_ARCH"),
@@ -912,6 +915,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run as `user` (`uid[:gid]`, or names in the sandbox's `/etc/passwd`
+    /// and `/etc/group`), as Docker's `--user`, whatever an image says.
+    /// Ids only mean anything inside the sandbox.
+    pub fn user(mut self, user: &str) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
     /// Stricter than Linux: refuse unique local addresses (`fc00::/7`, which
     /// holds some clouds' metadata services) and Alibaba's and Azure's
     /// metadata addresses, unless a rule names them.
@@ -1200,6 +1211,9 @@ impl SandboxBuilder {
                 crate::timezone::Zone::Rule(_) if self.env.iter().any(|(k, _)| k == "TZ") => self,
                 crate::timezone::Zone::Rule(rule) => self.env("TZ", rule),
             };
+        }
+        if let Some(user) = &self.user {
+            (self.uid, self.gid) = crate::container::resolve_user(user, &self.files)?;
         }
         match self.network {
             Some(Network::None) if self.policy.allows(Capability::Net) => {

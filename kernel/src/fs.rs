@@ -17,7 +17,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use grix_abi::hostfs::mask::{
     IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF,
     IN_MOVED_FROM, IN_MOVED_TO, IN_OPEN,
@@ -818,6 +818,34 @@ impl Who<'_> {
     /// Linux's in_group_p: the group, or a supplementary one.
     pub fn in_group(&self, group: u32) -> bool {
         self.gid == group || self.groups.contains(&group)
+    }
+}
+
+/// Whose path walks these are, on one CPU: the running process's, set as a
+/// system call starts (`set_walker`), as nothing that walks a path says who
+/// for. Root's until then, for the kernel's own at boot.
+struct Walker {
+    uid: AtomicU32,
+    gid: AtomicU32,
+    groups: Mutex<Vec<u32>>,
+}
+
+static WALKERS: [Walker; grix_abi::machine::MAX_CPUS as usize] = [const {
+    Walker { uid: AtomicU32::new(0), gid: AtomicU32::new(0), groups: Mutex::new(Vec::new()) }
+}; grix_abi::machine::MAX_CPUS as usize];
+
+/// Path walks on this CPU are `who`'s, from now on.
+pub fn set_walker(who: Who) {
+    let w = &WALKERS[crate::smp::me()];
+    w.uid.store(who.uid, Ordering::Relaxed);
+    w.gid.store(who.gid, Ordering::Relaxed);
+    // (Root's never asked for, and a process's are at most `MAX_GROUPS`.)
+    if who.uid != 0 {
+        let mut groups = w.groups.lock();
+        if groups[..] != *who.groups {
+            groups.clear();
+            groups.extend_from_slice(who.groups);
+        }
     }
 }
 
@@ -1907,6 +1935,19 @@ impl Fs {
         self.lookup_in(start, path, follow_last, &Scope::NONE)
     }
 
+    /// Linux's may_lookup: a name is looked up in a directory only with
+    /// search permission there. Root's walk costs a load.
+    fn may_search(&self, dir: Ino) -> Result<(), Errno> {
+        let w = &WALKERS[crate::smp::me()];
+        let uid = w.uid.load(Ordering::Relaxed);
+        if uid == 0 {
+            return Ok(());
+        }
+        let (n, groups) = (&self.nodes[dir], w.groups.lock());
+        let who = Who { uid, gid: w.gid.load(Ordering::Relaxed), groups: &groups };
+        if mode_permits(n.perm, n.uid, n.gid, true, who, MAY_EXEC) { Ok(()) } else { Err(EACCES) }
+    }
+
     /// `lookup`, as openat2's `resolve` allows.
     pub fn lookup_in(&mut self, start: Ino, path: &str, follow_last: bool, scope: &Scope) -> Result<Ino, Errno> {
         let mut links = 0;
@@ -1939,6 +1980,7 @@ impl Fs {
             if !self.is_dir(cur) {
                 return Err(ENOTDIR);
             }
+            self.may_search(cur)?;
             match *c {
                 "." => {}
                 // follow_dotdot: the scope's root is as far up as it goes
@@ -2102,6 +2144,10 @@ impl Fs {
         };
         if !self.is_dir(dir) {
             return Err(ENOTDIR);
+        }
+        // The walk stopped short of the last name: it's looked up here too.
+        if !name.is_empty() {
+            self.may_search(dir)?;
         }
         if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
