@@ -124,7 +124,7 @@ fn load_with(source: &str, base: &Path, store: Store, reach: Reach, arch: Arch) 
 /// at `dir`, for offline use. Returns the manifest's digest.
 pub fn pull_to_layout(source: &str, dir: &Path, arch: Arch) -> Result<String> {
     let reference = Reference::parse(source)?;
-    let mut registry = Registry::new(&reference, Store::user(), Reach { allow: None, local: true })?;
+    let mut registry = Registry::new(&reference, Store::user(), Reach { allow: None, local: true, strict: false })?;
     let digest = registry.resolve(&reference.tag_or_digest, arch)?;
     let cache = Layout::cache()?;
     let (manifest, digest) = registry.manifest(&digest, &cache)?;
@@ -693,6 +693,8 @@ pub(crate) struct Reach {
     pub allow: Option<Vec<crate::net::HostRule>>,
     /// Registries on this machine: the reference's own host may be one.
     pub local: bool,
+    /// As `NetPolicy::strict`.
+    pub strict: bool,
 }
 
 /// Every connection a pull makes (to the registry, its token service,
@@ -728,7 +730,13 @@ impl ureq::Resolver for Resolver {
                 ok.push(addr);
                 continue;
             }
-            match crate::net::reachable(self.reach.allow.as_deref(), addr.ip(), addr.port(), Some(host)) {
+            match crate::net::reachable(
+                self.reach.allow.as_deref(),
+                addr.ip(),
+                addr.port(),
+                Some(host),
+                self.reach.strict,
+            ) {
                 Ok(()) => ok.push(addr),
                 Err(why) => refused = Some(why),
             }
@@ -1465,7 +1473,7 @@ mod tests {
     }
 
     fn local() -> Reach {
-        Reach { allow: None, local: true }
+        Reach { allow: None, local: true, strict: false }
     }
 
     /// A pull connects only where the build's network policy allows, by
@@ -1474,7 +1482,11 @@ mod tests {
     fn pulls_connect_where_the_policy_allows() {
         use ureq::Resolver as _;
         let resolver = |reach: Reach, registry: &str| Resolver { reach, registry: registry.into() };
-        let only = |rule: &str| Reach { allow: Some(vec![crate::net::HostRule::parse(rule).unwrap()]), local: false };
+        let only = |rule: &str| Reach {
+            allow: Some(vec![crate::net::HostRule::parse(rule).unwrap()]),
+            local: false,
+            strict: false,
+        };
         // This machine: only a local registry's own host, when allowed.
         assert!(resolver(local(), "localhost:5000").resolve("localhost:5000").is_ok());
         assert!(resolver(local(), "localhost:5000").resolve("127.0.0.1:5001").is_ok());

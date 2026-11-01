@@ -328,10 +328,13 @@ let sandbox = Sandbox::builder()
 
 - Without `allow_host` rules, the program may connect anywhere except the
   host itself and special addresses: loopback, link-local such as cloud
-  metadata at 169.254.169.254, multicast, IPv6 unique local addresses
-  (`fc00::/7`, where AWS's and GCP's metadata services also are; IPv4's
-  private ranges aren't special), and any IPv6 address that carries a
-  special IPv4 one (NAT64, 6to4, Teredo and the like). With rules, only
+  metadata at 169.254.169.254, multicast, and any IPv6 address that carries
+  a special IPv4 one (NAT64, 6to4, Teredo and the like). Private addresses,
+  IPv4's and IPv6's unique local ones (`fc00::/7`), are reachable, as from a
+  program on Linux. That includes some clouds' other metadata services: AWS's
+  and GCP's IPv6 ones are in `fc00::/7`, Alibaba's is 100.100.100.200 and
+  Azure's wire server 168.63.129.16. On a cloud host, give rules, or
+  `--strict-network`, which refuses all of these. With rules, only
   what they match, and DNS answers only names they cover, so lookups can't
   carry data out either. Special addresses need a rule for them
   specifically: `0.0.0.0/0` and `::/0` don't open them.

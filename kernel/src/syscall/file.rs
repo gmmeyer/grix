@@ -415,20 +415,16 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         None => fs::lock().lookup_in(base, path, follow, &scope),
     };
     // A descriptor reached through a symlink or a relative path.
-    if found == Err(ENOENT)
-        && let Some((pid, fd)) = fs::lock().fd_link_in(base, path, follow, &scope)
+    // (On its own: the lock would last through the `if let`'s body.)
+    let magic = if found == Err(ENOENT) { fs::lock().fd_link_in(base, path, follow, &scope) } else { None };
+    if let Some((pid, fd)) = magic
         && pid == p.pid
     {
         // It's a magic link, as Linux's /proc/<pid>/fd/N.
         if excl {
             return Err(EEXIST);
         }
-        // Not followed, it's a link: ELOOP, whatever else is asked. O_PATH
-        // opens the link itself on Linux, where there's a node for it; here
-        // that would be what it leads to, past any RESOLVE_* asked for.
-        if !follow && (flags & O_PATH == 0 || resolve != 0) {
-            return Err(ELOOP);
-        }
+        // RESOLVE_* are about following it, as nd_jump_link's checks are.
         if follow && resolve & (fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS) != 0 {
             return Err(ELOOP);
         }
@@ -436,6 +432,17 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             return Err(EXDEV);
         }
         let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
+        if !follow {
+            // Not followed, it's a link: ELOOP, unless O_PATH asks for the
+            // link itself, which reads as where it leads.
+            if flags & O_PATH == 0 {
+                return Err(ELOOP);
+            }
+            let target = procfs::fd_link(&file.lock().kind, fd);
+            let who = p.who();
+            let ino = fs::lock().create_magic_link(target, who)?;
+            return open_path(p, ino, cloexec);
+        }
         match reopened(&file, flags) {
             Some((ino, content)) => (found, kept) = (Ok(ino), content),
             None => return p.fds.alloc(FdEntry { file, cloexec }, 0),
@@ -470,15 +477,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         if flags & O_DIRECTORY != 0 && !fs::lock().is_dir(ino) {
             return Err(ENOTDIR);
         }
-        let file = new_file(FileKind::Node(ino), O_RDONLY);
-        let mut f = file.lock();
-        // Its contents too: execveat can run it once it's unlinked.
-        let fs = fs::lock();
-        (f.path_only, f.pin, f.content) = (true, Some(fs.pin(ino)), fs.content(ino));
-        drop(fs);
-        f.pinned = f.content.as_ref().and_then(|c| c.lock().pin(false));
-        drop(f);
-        return p.fds.alloc(FdEntry { file, cloexec }, 0);
+        return open_path(p, ino, cloexec);
     }
     let writes = acc != O_RDONLY || flags & O_TRUNC != 0;
     // The opener's Landlock domain, checked (after the errors the kind of
@@ -697,6 +696,19 @@ fn reopened(file: &crate::fd::FileRef, flags: u32) -> Option<(Ino, Option<Conten
     let f = file.lock();
     let FileKind::Node(ino) = f.kind else { return None };
     (flags & O_PATH == 0).then(|| (ino, f.content.clone()))
+}
+
+/// An O_PATH descriptor of `ino`.
+fn open_path(p: &mut Process, ino: Ino, cloexec: bool) -> SysResult {
+    let file = new_file(FileKind::Node(ino), O_RDONLY);
+    let mut f = file.lock();
+    // Its contents too: execveat can run it once it's unlinked.
+    let fs = fs::lock();
+    (f.path_only, f.pin, f.content) = (true, Some(fs.pin(ino)), fs.content(ino));
+    drop(fs);
+    f.pinned = f.content.as_ref().and_then(|c| c.lock().pin(false));
+    drop(f);
+    p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
 fn open_node(p: &mut Process, ino: Ino, content: Option<Content>, flags: u32, cloexec: bool, denied: u16) -> SysResult {

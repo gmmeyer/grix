@@ -374,6 +374,9 @@ pub(crate) struct NetPolicy {
     pub icmp: bool,
     /// None: anywhere but the special addresses below. Some: only these.
     pub allow: Option<Vec<HostRule>>,
+    /// Stricter than Linux, on request: `special`'s `strict` addresses are
+    /// refused too.
+    pub strict: bool,
     /// Where the host listens, and the guest port it forwards to.
     pub forwards: Vec<(ForwardFrom, u16)>,
     /// The same for UDP.
@@ -518,33 +521,36 @@ fn embedded_v4(a: Ipv6Addr) -> Option<(Ipv4Addr, u8)> {
 /// Addresses that only a rule for them (or their range) reaches, and the
 /// shortest prefix such a rule may have, so a broad rule like `0.0.0.0/0`
 /// doesn't open them: loopback, link-local (cloud metadata services live at
-/// 169.254.169.254), multicast, broadcast and "this network", and the
-/// metadata services that live elsewhere.
+/// 169.254.169.254), multicast, broadcast and "this network".
 ///
-/// IPv6's own are the same, with what has no IPv4 twin: unique local
-/// addresses (AWS's metadata is fd00:ec2::254, GCP's fd20:ce::254, Oracle's
-/// fd00:c1::a9fe:a9fe: no list of them would be complete, so unlike RFC
-/// 1918's ranges, the whole of fc00::/7), site-local, Teredo (two v4
-/// addresses, one obfuscated) and NAT64's local-use prefix (RFC 8215: its
-/// v4 address can be anywhere in it). An address that carries a v4 one is
-/// as special as that is, or it would be a way round it.
-fn special(ip: IpAddr) -> Option<u8> {
+/// IPv6's own are the same, with what has no IPv4 twin: site-local, Teredo
+/// (two v4 addresses, one obfuscated) and NAT64's local-use prefix (RFC 8215:
+/// its v4 address can be anywhere in it). An address that carries a v4 one
+/// is as special as that is, or it would be a way round it.
+///
+/// `strict` (`--strict-network`) adds what a program on Linux reaches but
+/// a sandbox on a cloud host may not want it to: unique local addresses,
+/// where AWS's metadata is (fd00:ec2::254, as GCP's is fd20:ce::254 and
+/// Oracle's fd00:c1::a9fe:a9fe: no list of them would be complete, so the
+/// whole of fc00::/7), and Alibaba's metadata service and Azure's wire
+/// server. By default they're as RFC 1918's ranges are, which a LAN needs.
+fn special(ip: IpAddr, strict: bool) -> Option<u8> {
     match ip {
         IpAddr::V4(a) if a.is_loopback() || a.octets()[0] == 0 => Some(8),
         IpAddr::V4(a) if a.is_link_local() => Some(16),
         IpAddr::V4(a) if a.is_multicast() => Some(4),
         IpAddr::V4(a) if a.is_broadcast() => Some(32),
         // Alibaba's metadata service, and Azure's wire server.
-        IpAddr::V4(a) if [[100, 100, 100, 200], [168, 63, 129, 16]].contains(&a.octets()) => Some(32),
+        IpAddr::V4(a) if strict && [[100, 100, 100, 200], [168, 63, 129, 16]].contains(&a.octets()) => Some(32),
         IpAddr::V4(_) => None,
         IpAddr::V6(a) if a.is_loopback() || a.is_unspecified() => Some(128),
         IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfe80 => Some(10),
         IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfec0 => Some(10),
-        IpAddr::V6(a) if a.segments()[0] & 0xfe00 == 0xfc00 => Some(7),
+        IpAddr::V6(a) if strict && a.segments()[0] & 0xfe00 == 0xfc00 => Some(7),
         IpAddr::V6(a) if a.is_multicast() => Some(8),
         IpAddr::V6(a) if a.segments()[..2] == [0x2001, 0] => Some(32),
         IpAddr::V6(a) if a.segments()[..3] == [0x64, 0xff9b, 1] => Some(48),
-        IpAddr::V6(a) => embedded_v4(a).and_then(|(v4, bits)| Some(bits + special(v4.into())?)),
+        IpAddr::V6(a) => embedded_v4(a).and_then(|(v4, bits)| Some(bits + special(v4.into(), strict)?)),
     }
 }
 
@@ -581,7 +587,7 @@ impl NetPolicy {
         if in_guest_v6_net(ip) {
             return Err(format!("{ip}:{port} is on the guest's own network, where nothing is"));
         }
-        reachable(self.allow.as_deref(), ip, port, name).map(|()| SocketAddr::new(ip, port))
+        reachable(self.allow.as_deref(), ip, port, name, self.strict).map(|()| SocketAddr::new(ip, port))
     }
 
     /// May the guest look up `name`?
@@ -600,10 +606,16 @@ impl NetPolicy {
 /// for them. What the proxy checks of the program's connections, past the
 /// guest's own addresses, and the host of those it makes for a build
 /// (`oci`'s registry pulls).
-pub(crate) fn reachable(allow: Option<&[HostRule]>, ip: IpAddr, port: u16, name: Option<&str>) -> Result<(), String> {
+pub(crate) fn reachable(
+    allow: Option<&[HostRule]>,
+    ip: IpAddr,
+    port: u16,
+    name: Option<&str>,
+    strict: bool,
+) -> Result<(), String> {
     let ip = ip.to_canonical();
     let rules = allow.unwrap_or(&[]);
-    if let Some(min) = special(ip)
+    if let Some(min) = special(ip, strict)
         && !rules.iter().any(|r| r.port_ok(port) && r.matches_ip(ip) && r.prefix() >= min)
     {
         return Err(format!("{ip}:{port} is a special address; allow it with allow_host(\"{ip}\")"));
@@ -1649,6 +1661,7 @@ pub(crate) mod tests {
             enabled: true,
             icmp: false,
             allow: Some(rules.iter().map(|r| HostRule::parse(r).unwrap()).collect()),
+            strict: false,
             forwards: vec![],
             udp_forwards: vec![],
         }
@@ -1691,7 +1704,6 @@ pub(crate) mod tests {
         assert!(broad.check(ip("169.254.169.254"), 80, None).is_err());
         assert!(broad.check(ip("127.0.0.1"), 80, None).is_err());
         assert!(broad.check(ip("fe80::1"), 80, None).is_err());
-        assert!(broad.check(ip("fd00:ec2::254"), 80, None).is_err());
         assert!(broad.check(ip("10.0.2.15"), 80, None).is_err());
         assert!(broad.check(ip("fd00::15"), 80, None).is_err());
         assert!(broad.check(ip("fd00::7"), 80, None).is_err());
@@ -1977,18 +1989,43 @@ pub(crate) mod tests {
     /// IPv6 has as many ways to a metadata service or this machine as IPv4
     /// has, and some of its own: none opens with `net` and no allow-list, or
     /// with a broad rule, and a rule for exactly that does.
+    /// What a program on Linux reaches, and a sandbox only without being
+    /// asked not to: a LAN's unique local addresses, and the metadata
+    /// services that aren't on link-local ones.
+    #[test]
+    fn strict_network_refuses_what_linux_reaches() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let strict = NetPolicy { strict: true, ..NetPolicy::default() };
+        let broad = NetPolicy { strict: true, ..policy(&["0.0.0.0/0", "::/0"]) };
+        for addr in [
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "fd00:c1::a9fe:a9fe",
+            "fc00::1",
+            "fdff:ffff::1",
+            "100.100.100.200",
+            "168.63.129.16",
+        ] {
+            assert!(NetPolicy::default().check(ip(addr), 80, None).is_ok(), "{addr}");
+            assert!(reachable(None, ip(addr), 443, Some("registry.example"), false).is_ok(), "{addr}");
+            assert!(strict.check(ip(addr), 80, None).is_err(), "{addr}");
+            assert!(broad.check(ip(addr), 80, None).is_err(), "{addr} with a broad rule");
+            assert!(reachable(None, ip(addr), 443, Some("registry.example"), true).is_err(), "{addr}");
+        }
+        // A rule for it opens it, as for any special address.
+        let named = NetPolicy { strict: true, ..policy(&["fc00::/7", "168.63.129.16"]) };
+        assert!(named.check(ip("fd12::1"), 80, None).is_ok());
+        assert!(named.check(ip("168.63.129.16"), 80, None).is_ok());
+        // Neither way does link-local open: that wasn't asked of the default.
+        assert!(NetPolicy::default().check(ip("169.254.169.254"), 80, None).is_err());
+    }
+
     #[test]
     fn special_addresses_in_ipv6_clothes() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let (open, broad) = (NetPolicy::default(), policy(&["0.0.0.0/0", "::/0"]));
         for bad in [
-            // Metadata services, on unique local addresses.
-            "fd00:ec2::254",
-            "fd20:ce::254",
-            "fd00:c1::a9fe:a9fe",
-            // Any unique local address, and site-local.
-            "fc00::1",
-            "fdff:ffff::1",
+            // Site-local.
             "fec0::1",
             // v4's special addresses in every way of carrying one.
             "64:ff9b::a9fe:a9fe",
@@ -2010,8 +2047,6 @@ pub(crate) mod tests {
             // As v4, and mapped.
             "169.254.169.254",
             "::ffff:169.254.169.254",
-            "100.100.100.200",
-            "168.63.129.16",
             // What was special before.
             "::",
             "::1",
@@ -2022,7 +2057,7 @@ pub(crate) mod tests {
             assert!(broad.check(ip(bad), 80, None).is_err(), "{bad} with a broad rule");
             // The same whatever name DNS gave it, and for a pull.
             assert!(open.check(ip(bad), 80, Some("registry.example")).is_err(), "{bad}");
-            assert!(reachable(None, ip(bad), 443, Some("registry.example")).is_err(), "{bad}");
+            assert!(reachable(None, ip(bad), 443, Some("registry.example"), false).is_err(), "{bad}");
             assert!(policy(&[&format!("[{bad}]")]).check(ip(bad), 80, None).is_ok() || bad.contains('.'), "{bad}");
         }
         for fine in ["2600:1f18::1", "2a00:1450:4001::1", "64:ff9b::808:808", "2002:808:808::", "10.1.2.3", "8.8.8.8"] {

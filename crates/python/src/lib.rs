@@ -38,6 +38,7 @@ struct Config {
     default_env: bool,
     host_timezone: bool,
     network: Option<String>,
+    strict_network: bool,
     capabilities: Vec<String>,
     memory_mb: Option<u64>,
     cpus: Option<u32>,
@@ -87,6 +88,9 @@ impl Config {
         }
         if let Some(network) = &self.network {
             b = b.network(grix::Network::parse(network)?);
+        }
+        if self.strict_network {
+            b = b.strict_network();
         }
         for name in &self.capabilities {
             b = b.allow(Capability::from_name(name).with_context(|| format!("unknown capability {name:?}"))?);

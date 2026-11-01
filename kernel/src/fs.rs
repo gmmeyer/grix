@@ -2472,6 +2472,21 @@ impl Fs {
         Ok((ino, content))
     }
 
+    /// A magic link as an O_PATH | O_NOFOLLOW descriptor has it: Linux has a
+    /// node for /proc/<pid>/fd/N, and this is one that only ever lives in
+    /// descriptors, reading as `target`. It keeps to the limits any node does.
+    pub fn create_magic_link(&mut self, target: String, who: Who) -> Result<Ino, Errno> {
+        let label = String::from("fd");
+        let mut node =
+            Node::new(Kind::Symlink(target), 0o777, (who.uid, who.gid), ROOT, &label, crate::time::realtime_ns());
+        (node.nlink, node.changed, node.anonymous) = (0, true, true);
+        self.reclaim();
+        charge(node.cost() + label.len() as u64)?;
+        let ino = self.alloc_node(node);
+        self.orphans.push(ino);
+        Ok(ino)
+    }
+
     /// Drop one name of `ino` (already removed from its directory).
     fn drop_name(&mut self, ino: Ino) {
         let now = crate::time::realtime_ns();

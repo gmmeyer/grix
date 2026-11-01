@@ -166,6 +166,9 @@ pub struct BuildPolicy {
     /// but the host and special addresses).
     pub net: bool,
     pub allow_hosts: Vec<String>,
+    /// As [`SandboxBuilder::strict_network`](crate::SandboxBuilder::strict_network),
+    /// for steps and pulls.
+    pub strict_network: bool,
     /// `from` may name a registry image (the host fetches it).
     pub registries: bool,
     /// `from` may be `docker:NAME` (the host's Docker daemon).
@@ -188,6 +191,7 @@ impl Default for BuildPolicy {
         BuildPolicy {
             net: true,
             allow_hosts: Vec::new(),
+            strict_network: false,
             registries: true,
             docker: true,
             credentials: true,
@@ -265,6 +269,7 @@ impl Grixfile {
                 let reach = crate::oci::Reach {
                     allow: (!allow.is_empty()).then_some(allow),
                     local: opts.policy.local_registries,
+                    strict: opts.policy.strict_network,
                 };
                 let pulled = crate::oci::load(source, base, opts.policy.credentials, reach, arch)
                     .with_context(|| format!("from {source}"))?;
@@ -399,7 +404,8 @@ fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     let kernel: String = Sha256::digest(image.kernel_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     let arch = image.arch().map_or("?", |a| a.name());
     let c = &image.config;
-    let net = if policy.net { policy.allow_hosts.join("\0") } else { "\0no net".into() };
+    let strict = if policy.strict_network { "\0strict" } else { "" };
+    let net = if policy.net { policy.allow_hosts.join("\0") + strict } else { "\0no net".into() };
     let parts = [
         arch.as_bytes(),
         tree.as_bytes(),
@@ -453,6 +459,9 @@ fn run_step(
         b = b.allow(Capability::Net);
         for rule in &policy.allow_hosts {
             b = b.allow_host(rule)?;
+        }
+        if policy.strict_network {
+            b = b.strict_network();
         }
     }
     if let Some(c) = control {

@@ -56,6 +56,8 @@ pub struct McpConfig {
     pub registry_credentials: bool,
     /// A run may ask for the host's time zone (`--host-timezone`).
     pub host_timezone: bool,
+    /// Every run refuses what `--strict-network` does, whatever it asks.
+    pub strict_network: bool,
     /// How many tool calls run at once (each boots a VM, with up to
     /// `max_memory_mb`); more wait their turn.
     pub max_parallel: usize,
@@ -80,6 +82,7 @@ impl McpConfig {
             writable: false,
             registry_credentials: false,
             host_timezone: false,
+            strict_network: false,
             max_parallel: 2,
             metrics: None,
         })
@@ -101,6 +104,7 @@ impl McpConfig {
         BuildPolicy {
             net,
             allow_hosts: self.allow_hosts.clone(),
+            strict_network: self.strict_network,
             registries: net,
             docker: false,
             credentials: self.registry_credentials,
@@ -506,6 +510,9 @@ fn sandbox_schema(caps: &[&str]) -> Value {
                     "default_env": {"type": "boolean",
                                     "description": "Give the program HOME, PATH, LANG and TMPDIR, unless env sets them."},
                     "capabilities": {"type": "array", "items": {"type": "string", "enum": caps}},
+                    "strict_network": {"type": "boolean",
+                                       "description": "Refuse unique local addresses and more cloud metadata \
+                                                       addresses than Linux would."},
                     "network": {"type": "string", "enum": ["none", "native", "vm"],
                                 "description": "The network stack, if the server allows net: native \
                                                 (sockets on the host's own stack, what net gives) or vm \
@@ -563,6 +570,9 @@ fn run(config: &McpConfig, args: &Value, control: &RunControl, progress: &Progre
             );
             if config.capabilities.contains(&Capability::Net) {
                 snap = snap.allow_net(&config.allow_hosts)?;
+                if config.strict_network {
+                    snap = snap.strict_network();
+                }
             }
             // Its live mounts' host directories, under the roots; writable
             // only if this server lets agents change host files.
@@ -727,6 +737,9 @@ fn sandbox(config: &McpConfig, args: &Value, control: &RunControl) -> Result<(Sa
             bail!("this server doesn't allow the net capability");
         }
         b = b.network(network);
+    }
+    if config.strict_network || args["strict_network"].as_bool() == Some(true) {
+        b = b.strict_network();
     }
     for rule in &config.allow_hosts {
         b = b.allow_host(rule)?;

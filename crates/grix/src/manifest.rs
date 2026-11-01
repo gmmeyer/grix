@@ -4,6 +4,7 @@
 //! command = ["/bin/hello", "world"]
 //! capabilities = []          # fs_write, threads, process, net, net_raw
 //! network = "vm"             # none, native (what `net` gives) or vm
+//! strict_network = true      # refuse fc00::/7 and more metadata addresses
 //! on_deny = "errno"          # or "kill"
 //! memory_mb = 256
 //! hostname = "worker-1"      # grix unless given
@@ -68,6 +69,8 @@ pub struct Manifest {
     pub host_timezone: bool,
     /// The network stack: none, native or vm.
     pub network: Option<String>,
+    #[serde(default)]
+    pub strict_network: bool,
     pub memory_mb: Option<u64>,
     /// 0: no time limit.
     pub timeout_secs: Option<u64>,
@@ -199,6 +202,9 @@ impl Manifest {
         }
         if let Some(network) = &self.network {
             b = b.network(crate::Network::parse(network)?);
+        }
+        if self.strict_network {
+            b = b.strict_network();
         }
         for rule in &self.allow_hosts {
             b = b.allow_host(rule)?;
