@@ -1336,8 +1336,10 @@ impl Fs {
         };
         for e in entries {
             let path = e.path.trim_end_matches('/');
+            let owner = e.owner.unwrap_or((uid, gid));
             if path.is_empty() {
                 fs.nodes[ROOT].perm = e.mode & 0o7777;
+                (fs.nodes[ROOT].uid, fs.nodes[ROOT].gid) = owner;
                 continue;
             }
             let Some(slash) = path.rfind('/') else { continue };
@@ -1353,7 +1355,7 @@ impl Fs {
             };
             let ino = fs.insert(parent, name, kind, e.mode & 0o7777);
             let n = &mut fs.nodes[ino];
-            (n.uid, n.gid) = (uid, gid);
+            (n.uid, n.gid) = owner;
             if e.mtime_ns != 0 {
                 (n.atime, n.mtime, n.ctime) = (e.mtime_ns, e.mtime_ns, e.mtime_ns);
             }

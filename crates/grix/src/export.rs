@@ -55,6 +55,9 @@ pub struct ExportEntry {
     /// Permission bits, including setuid, setgid and sticky.
     pub mode: u32,
     pub mtime: SystemTime,
+    /// Whose it is in the sandbox: nothing outside it goes by this.
+    pub uid: u32,
+    pub gid: u32,
     pub content: ExportContent,
 }
 
@@ -315,6 +318,8 @@ struct Pending {
     kind: ExportKind,
     mode: u32,
     mtime_ns: u64,
+    uid: u32,
+    gid: u32,
     path_len: usize,
     data_len: usize,
     path: Vec<u8>,
@@ -402,7 +407,7 @@ impl Collector {
                     self.exports[index].state = ExportState::Missing;
                 }
             }
-            ExportMsg::Entry { kind, mode, mtime_ns, path_len, data_len } => {
+            ExportMsg::Entry { kind, mode, mtime_ns, uid, gid, path_len, data_len } => {
                 let cur = self.current?;
                 let path_len = path_len as usize;
                 let data_len = usize::try_from(data_len).ok()?;
@@ -428,7 +433,7 @@ impl Collector {
                 }
                 let path = Vec::with_capacity(path_len);
                 self.pending =
-                    Some(Pending { kind, mode, mtime_ns, path_len, data_len, path, data, keep, received: 0 });
+                    Some(Pending { kind, mode, mtime_ns, uid, gid, path_len, data_len, path, data, keep, received: 0 });
             }
             ExportMsg::Data(bytes) => {
                 let p = self.pending.as_mut()?;
@@ -481,7 +486,14 @@ impl Collector {
             }
         };
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_nanos(p.mtime_ns);
-        self.exports[cur].entries.push(ExportEntry { path, mode: p.mode & 0o7777, mtime, content });
+        self.exports[cur].entries.push(ExportEntry {
+            path,
+            mode: p.mode & 0o7777,
+            mtime,
+            uid: p.uid,
+            gid: p.gid,
+            content,
+        });
         Some(())
     }
 
@@ -525,6 +537,8 @@ mod tests {
                 kind,
                 mode: 0o644,
                 mtime_ns: 7,
+                uid: 0,
+                gid: 0,
                 path_len: path.len() as u32,
                 data_len: data.len() as u64,
             }
@@ -651,22 +665,49 @@ mod tests {
         // a root, absurd lengths, random bytes: no panic, nothing kept after.
         let over = stream(vec![
             vec![ExportMsg::Root { index: 0, found: true }.encode()],
-            vec![ExportMsg::Entry { kind: ExportKind::File, mode: 0, mtime_ns: 0, path_len: 1, data_len: 1 }.encode()],
+            vec![
+                ExportMsg::Entry {
+                    kind: ExportKind::File,
+                    mode: 0,
+                    mtime_ns: 0,
+                    uid: 0,
+                    gid: 0,
+                    path_len: 1,
+                    data_len: 1,
+                }
+                .encode(),
+            ],
             vec![ExportMsg::Data(b"abc").encode()],
         ]);
         assert_eq!(collect(&["/out"], 1 << 20, &over)[0].state, ExportState::Incomplete);
         let huge = vec![
             ExportMsg::Root { index: 0, found: true }.encode(),
-            ExportMsg::Entry { kind: ExportKind::File, mode: 0, mtime_ns: 0, path_len: u32::MAX, data_len: u64::MAX }
-                .encode(),
+            ExportMsg::Entry {
+                kind: ExportKind::File,
+                mode: 0,
+                mtime_ns: 0,
+                uid: 0,
+                gid: 0,
+                path_len: u32::MAX,
+                data_len: u64::MAX,
+            }
+            .encode(),
         ];
         assert_eq!(collect(&["/out"], 1 << 20, &huge)[0].state, ExportState::Incomplete);
         // Lengths whose sum wraps (a panic, in a debug build).
         let wraps = stream(vec![
             vec![ExportMsg::Root { index: 0, found: true }.encode()],
             vec![
-                ExportMsg::Entry { kind: ExportKind::File, mode: 0, mtime_ns: 0, path_len: 1, data_len: u64::MAX }
-                    .encode(),
+                ExportMsg::Entry {
+                    kind: ExportKind::File,
+                    mode: 0,
+                    mtime_ns: 0,
+                    uid: 0,
+                    gid: 0,
+                    path_len: 1,
+                    data_len: u64::MAX,
+                }
+                .encode(),
             ],
             vec![ExportMsg::Data(b"ab").encode()],
         ]);
@@ -690,7 +731,7 @@ mod tests {
     #[test]
     fn writes_a_tree_without_following_links() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let e = |path: &str, mode, content| ExportEntry { path: path.into(), mode, mtime: t, content };
+        let e = |path: &str, mode, content| ExportEntry { path: path.into(), mode, mtime: t, uid: 0, gid: 0, content };
         let export = Export {
             dir: "/out".into(),
             state: ExportState::Complete,
@@ -755,7 +796,7 @@ mod tests {
     #[test]
     fn links_inside_only() {
         let t = SystemTime::UNIX_EPOCH;
-        let e = |path: &str, content| ExportEntry { path: path.into(), mode: 0o755, mtime: t, content };
+        let e = |path: &str, content| ExportEntry { path: path.into(), mode: 0o755, mtime: t, uid: 0, gid: 0, content };
         let link = |path: &str, target: &str| e(path, ExportContent::Symlink(target.into()));
         let tree = |more: Vec<ExportEntry>| {
             let mut entries = vec![e("d", ExportContent::Dir), e("d/e", ExportContent::Dir)];

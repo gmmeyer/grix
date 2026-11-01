@@ -57,6 +57,8 @@ pub struct Entry<'a> {
     pub mode: u32,
     /// Modification time on the host, in ns since the Unix epoch (0: boot time).
     pub mtime_ns: u64,
+    /// Its (uid, gid), or None for the sandbox's user (`Image::uid`, `gid`).
+    pub owner: Option<(u32, u32)>,
     pub data: &'a [u8],
 }
 
@@ -197,6 +199,10 @@ impl<'a> Image<'a> {
             w.u8(e.kind as u8);
             w.u32(e.mode);
             w.u64(e.mtime_ns);
+            w.u8(e.owner.is_some() as u8);
+            let (uid, gid) = e.owner.unwrap_or((0, 0));
+            w.u32(uid);
+            w.u32(gid);
             w.bytes(e.data);
         }
         w.strs(&self.exports);
@@ -261,8 +267,11 @@ impl<'a> Image<'a> {
             };
             let mode = r.u32()?;
             let mtime_ns = r.u64()?;
+            let owned = r.u8()? != 0;
+            let (uid, gid) = (r.u32()?, r.u32()?);
+            let owner = owned.then_some((uid, gid));
             let data = r.bytes()?;
-            entries.push(Entry { path, kind, mode, mtime_ns, data });
+            entries.push(Entry { path, kind, mode, mtime_ns, owner, data });
         }
         let exports = r.strs()?;
         let export_budget = r.u64()?;
@@ -353,9 +362,23 @@ mod tests {
             argv: vec!["hello", "world"],
             envp: vec!["A=1"],
             entries: vec![
-                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, mtime_ns: 0, data: b"" },
-                Entry { path: "/bin/hello", kind: EntryKind::File, mode: 0o755, mtime_ns: 5, data: b"\x7fELF" },
-                Entry { path: "/bin/hi", kind: EntryKind::Symlink, mode: 0o777, mtime_ns: 9, data: b"hello" },
+                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, mtime_ns: 0, owner: Some((0, 7)), data: b"" },
+                Entry {
+                    path: "/bin/hello",
+                    kind: EntryKind::File,
+                    owner: None,
+                    mode: 0o755,
+                    mtime_ns: 5,
+                    data: b"\x7fELF",
+                },
+                Entry {
+                    path: "/bin/hi",
+                    kind: EntryKind::Symlink,
+                    owner: None,
+                    mode: 0o777,
+                    mtime_ns: 9,
+                    data: b"hello",
+                },
             ],
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,

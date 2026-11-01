@@ -1208,6 +1208,57 @@ fn images_with_no_other_os() {
     assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
+/// A layer's owners and a build step's `chown` are still there when the
+/// image runs, by way of the export, the step cache and the image's file.
+#[test]
+fn an_images_files_keep_their_owners() {
+    use grix::build::{BuildOptions, Grixfile, Step};
+    let step = |args: &[&str]| Step::Exec(args.iter().map(|a| a.to_string()).collect());
+    let g = Grixfile {
+        from: Some(format!("oci:{}", fixture("oci/alpine").display())),
+        from_outside_context: true,
+        command: Some(
+            ["/bin/busybox", "stat", "-c", "%u:%g %n", "/data", "/data/f", "/data/l", "/data/own", "/etc/shadow"]
+                .map(String::from)
+                .to_vec(),
+        ),
+        run: vec![
+            step(&["/bin/busybox", "mkdir", "/data"]),
+            step(&["/bin/busybox", "touch", "/data/f", "/data/own"]),
+            step(&["/bin/busybox", "ln", "-s", "f", "/data/l"]),
+            step(&["/bin/busybox", "chown", "1234:5678", "/data"]),
+            step(&["/bin/busybox", "chown", "99:88", "/data/f"]),
+            step(&["/bin/busybox", "chown", "-h", "7:6", "/data/l"]),
+        ],
+        ..Default::default()
+    };
+    let build = |g: &Grixfile| {
+        let opts = BuildOptions {
+            arch: None,
+            kernel: None,
+            on_output: &mut |_, _| {},
+            policy: Default::default(),
+            control: None,
+        };
+        g.build(Path::new("."), opts).unwrap()
+    };
+    // (Alpine's shadow file is the shadow group's: that's the layer's.)
+    let want = "1234:5678 /data\n99:88 /data/f\n7:6 /data/l\n0:0 /data/own\n0:42 /etc/shadow\n";
+    let image = build(&g);
+    let shows = |image: &grix::Image| {
+        let sb = Sandbox::builder().image(image).unwrap().build().unwrap();
+        sb.run(sb.command()).unwrap().stdout_str().to_string()
+    };
+    assert_eq!(shows(&image), want);
+    // Again, out of the step cache.
+    assert_eq!(shows(&build(&g)), want);
+    // And by way of a file.
+    let dir = temp_dir("owners");
+    let path = dir.join("owners.grix");
+    image.write_to(&path).unwrap();
+    assert_eq!(shows(&grix::Image::open(&path).unwrap()), want);
+}
+
 #[test]
 fn images_built_on_images_and_cached_steps() {
     // A base image whose build step leaves something new every time it

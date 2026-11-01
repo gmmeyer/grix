@@ -328,6 +328,21 @@ impl Image {
     }
 }
 
+/// In a tar's uid: the sandbox's user, for a node with no owner of its own.
+/// Past any real id that fits a header's octal field, so it can't be one.
+const NO_OWNER: u64 = 0o7777777;
+
+fn set_owner(h: &mut tar::Header, owner: &crate::image::Owner) {
+    let (uid, gid) = owner.map_or((NO_OWNER, 0), |(u, g)| (u as u64, g as u64));
+    h.set_uid(uid);
+    h.set_gid(gid);
+}
+
+fn owner_of(h: &tar::Header) -> crate::image::Owner {
+    let (uid, gid) = (h.uid().unwrap_or(NO_OWNER), h.gid().unwrap_or(0));
+    (uid != NO_OWNER).then_some((uid as u32, gid as u32))
+}
+
 /// Write `files` to a tar, under `prefix`.
 pub(crate) fn append_files<W: Write>(
     b: &mut tar::Builder<W>,
@@ -338,21 +353,24 @@ pub(crate) fn append_files<W: Write>(
         let name = format!("{prefix}{p}");
         let mut h = tar::Header::new_gnu();
         match node {
-            Node::File { data, mode, mtime_ns } => {
+            Node::File { data, mode, mtime_ns, owner } => {
+                set_owner(&mut h, owner);
                 h.set_entry_type(tar::EntryType::Regular);
                 h.set_size(data.len() as u64);
                 h.set_mode(*mode);
                 h.set_mtime(mtime_ns / 1_000_000_000);
                 b.append_data(&mut h, &name, &data[..])?
             }
-            Node::Dir { mode, mtime_ns } => {
+            Node::Dir { mode, mtime_ns, owner } => {
+                set_owner(&mut h, owner);
                 h.set_entry_type(tar::EntryType::Directory);
                 h.set_size(0);
                 h.set_mode(*mode);
                 h.set_mtime(mtime_ns / 1_000_000_000);
                 b.append_data(&mut h, &name, &[][..])?;
             }
-            Node::Symlink { target, mtime_ns } => {
+            Node::Symlink { target, mtime_ns, owner } => {
+                set_owner(&mut h, owner);
                 h.set_entry_type(tar::EntryType::Symlink);
                 h.set_size(0);
                 h.set_mode(0o777);
@@ -380,11 +398,12 @@ pub(crate) fn read_node<R: Read>(
     // anyone's, and nothing in the sandbox honours them.
     let mode = h.mode().unwrap_or(0o644) & 0o1777;
     let mtime_ns = h.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
+    let owner = owner_of(h);
     Ok(Some(match h.entry_type() {
-        tar::EntryType::Directory => Node::Dir { mode, mtime_ns },
+        tar::EntryType::Directory => Node::Dir { mode, mtime_ns, owner },
         tar::EntryType::Symlink => {
             let target = entry.link_name()?.context("link without a target")?;
-            Node::Symlink { target: target.to_string_lossy().into_owned(), mtime_ns }
+            Node::Symlink { target: target.to_string_lossy().into_owned(), mtime_ns, owner }
         }
         tar::EntryType::Regular => {
             let size = h.size()?;
@@ -394,7 +413,7 @@ pub(crate) fn read_node<R: Read>(
             }
             let mut data = Vec::with_capacity(size.min(1 << 20) as usize);
             (&mut *entry).take(size).read_to_end(&mut data)?;
-            Node::File { data, mode, mtime_ns }
+            Node::File { data, mode, mtime_ns, owner }
         }
         _ => return Ok(None),
     }))

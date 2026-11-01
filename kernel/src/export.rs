@@ -248,6 +248,8 @@ impl Walk<'_> {
                 kind: ExportKind::Removed,
                 mode: 0,
                 mtime_ns: 0,
+                uid: 0,
+                gid: 0,
                 path_len: path.len() as u32,
                 data_len: 0,
             });
@@ -268,6 +270,8 @@ impl Walk<'_> {
             kind,
             mode: node.perm,
             mtime_ns: node.mtime,
+            uid: node.uid,
+            gid: node.gid,
             path_len: path.len() as u32,
             data_len,
         });

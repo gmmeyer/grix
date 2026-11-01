@@ -42,7 +42,7 @@ pub(crate) fn take_fd() -> bool {
 
 /// One more of `budget`, whoever else is taking one.
 fn take_within(held: &AtomicUsize, budget: usize) -> bool {
-    held.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < budget).then_some(n + 1)).is_ok()
+    held.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < budget).then_some(n + 1)).is_ok()
 }
 
 pub(crate) fn give_fd() {

@@ -580,7 +580,10 @@ impl SandboxBuilder {
     /// Create a file with the given contents at `guest`.
     pub fn file(mut self, guest: &str, data: impl Into<Vec<u8>>, mode: u32) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::File { data: data.into(), mode: mode & 0o7777, mtime_ns: image::now_ns() });
+        self.files.insert(
+            path,
+            Node::File { data: data.into(), mode: mode & 0o7777, mtime_ns: image::now_ns(), owner: None },
+        );
         Ok(self)
     }
 
@@ -591,14 +594,14 @@ impl SandboxBuilder {
         if target.is_empty() || target.contains('\0') {
             bail!("symlink target {target:?} for {guest} must be non-empty, without NUL");
         }
-        self.files.insert(path, Node::Symlink { target: target.into(), mtime_ns: image::now_ns() });
+        self.files.insert(path, Node::Symlink { target: target.into(), mtime_ns: image::now_ns(), owner: None });
         Ok(self)
     }
 
     /// Create an empty directory at `guest`.
     pub fn dir(mut self, guest: &str) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
+        self.files.insert(path, Node::Dir { mode: 0o755, mtime_ns: image::now_ns(), owner: None });
         Ok(self)
     }
 
@@ -1232,7 +1235,7 @@ impl SandboxBuilder {
                 .iter()
                 .all(|(p, n)| matches!(n, Node::Dir { .. }) || !(p == "/" || dir.starts_with(&format!("{p}/"))));
             if !exists && room {
-                self.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
+                self.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns: image::now_ns(), owner: None });
             }
         }
         if !self.cwd.starts_with('/') {
@@ -1902,8 +1905,8 @@ pub(crate) mod tests {
     #[test]
     fn programs_must_be_the_kernels() {
         use crate::container::check_programs;
-        let file = |data: Vec<u8>| Node::File { data, mode: 0o755, mtime_ns: 0 };
-        let link = |t: &str| Node::Symlink { target: t.into(), mtime_ns: 0 };
+        let file = |data: Vec<u8>| Node::File { data, mode: 0o755, mtime_ns: 0, owner: None };
+        let link = |t: &str| Node::Symlink { target: t.into(), mtime_ns: 0, owner: None };
         let mut files: BTreeMap<String, Node> = [
             ("/bin/busybox".to_string(), file(elf(183))),
             ("/bin/sh".to_string(), link("busybox")),
