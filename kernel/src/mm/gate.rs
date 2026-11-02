@@ -6,7 +6,9 @@
 //! checked out (from `smp::lock`, or `sched::schedule` switching to it,
 //! until `smp::unlock` or the next switch puts it back), by a fast entry
 //! on its own, and briefly by code that looks at another process's
-//! (`Mm::access`). Lock order: a gate (only ever one more than the
+//! (`Mm::access`). Processes that share an address space (CLONE_VM) share
+//! its gate, each with an `Mm` of its own, and the one that took the gate
+//! is the one that gives it back (`Mm::took`). Lock order: a gate (only ever one more than the
 //! running process's, taken through `access`), then the filesystem, then
 //! a `FileData`. Nothing that holds a gate waits for another CPU but in
 //! `arch::flush_tlb`, which doesn't wait for a CPU in the kernel, and
@@ -39,7 +41,13 @@ pub fn none_held() -> bool {
 /// The address space's gate and contents, and its page table's root (which
 /// never changes), kept here too so the CPUs that switch to it don't read
 /// another cache line for it.
-pub struct Mm(Arc<Inner>, u64);
+pub struct Mm(Arc<Inner>, u64, Took);
+
+/// This `Mm` has the gate: `Drop`'s to give back. Whether this CPU has it
+/// isn't enough to go by, as a process ending may share the address space
+/// with the one this CPU is running.
+#[derive(Default)]
+struct Took(AtomicBool);
 
 pub struct Inner {
     /// The CPU holding the gate, or `FREE`.
@@ -66,7 +74,25 @@ impl Mm {
                 aspace: UnsafeCell::new(aspace),
             }),
             root,
+            Took::default(),
         )
+    }
+
+    /// The same address space, for another process (CLONE_VM).
+    pub fn another(&self) -> Mm {
+        Mm(self.0.clone(), self.1, Took::default())
+    }
+
+    /// Is `other` the same address space?
+    pub fn same(&self, other: &Mm) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// This CPU's switching from `from`, with the same address space, to
+    /// this: the gate stays held, this being the one to give it back.
+    pub fn takes_over(&self, from: &Mm) {
+        from.2.0.store(false, Ordering::Relaxed);
+        self.2.0.store(true, Ordering::Relaxed);
     }
 
     /// One held by this CPU (a process it has checked out).
@@ -80,9 +106,11 @@ impl Mm {
     /// entry, or exclusive code looking at it (each brief).
     pub fn lock(&self) {
         self.0.lock();
+        self.2.0.store(true, Ordering::Relaxed);
     }
 
     pub fn unlock(&self) {
+        self.2.0.store(false, Ordering::Relaxed);
         self.0.unlock();
     }
 
@@ -111,7 +139,7 @@ impl Mm {
     pub fn access(&self) -> Guard<'_> {
         let take = !self.held();
         if take {
-            self.lock();
+            self.0.lock();
         }
         Guard { inner: &self.0, release: take }
     }
@@ -178,7 +206,7 @@ impl Drop for Mm {
     /// A process going lets its gate go (the address space itself goes
     /// with the last reference).
     fn drop(&mut self) {
-        if self.held() {
+        if self.2.0.load(Ordering::Relaxed) {
             self.unlock();
         }
     }

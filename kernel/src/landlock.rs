@@ -233,8 +233,13 @@ pub fn check(p: &Process, dir: Ino, access: u16) -> Result<(), Errno> {
 /// descriptors, pidfd_getfd)? Not from a domain into a process outside it
 /// (Linux's hook_ptrace_access_check): `q` must have all of `p`'s layers.
 pub fn may_inspect(p: &Process, q: &Process) -> bool {
-    let Some(mine) = domain(p) else { return true };
-    let theirs = q.threads.get(&q.pid).or(q.threads.values().next()).and_then(|t| t.landlock.as_deref());
+    inspects(domain(p).as_ref(), q)
+}
+
+/// `may_inspect`, from domain `mine`.
+pub fn inspects(mine: Option<&Arc<Domain>>, q: &Process) -> bool {
+    let Some(mine) = mine else { return true };
+    let theirs = q.threads.get(&q.pid).or(q.threads.values().next()).and_then(|t| t.landlock.as_ref());
     theirs.is_some_and(|d| mine.scope_le(d))
 }
 

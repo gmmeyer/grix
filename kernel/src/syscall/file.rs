@@ -64,7 +64,7 @@ fn dir_base(p: &Process, dirfd: u64) -> Result<Ino, Errno> {
 
 /// The directory a path is relative to.
 pub(super) fn base_of(p: &Process, dirfd: u64, path: &str) -> Result<Ino, Errno> {
-    p.fds.walking(p.pid);
+    p.fds.walking(p);
     if path.starts_with('/') { Ok(ROOT) } else { dir_base(p, dirfd) }
 }
 
@@ -379,6 +379,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
         match reopened(&file, flags) {
             Some((ino, content)) => (again, kept) = (Some(ino), content),
+            None if file.lock().is_socket() => return Err(ENXIO),
             None => return p.fds.alloc(FdEntry { file, cloexec }, 0),
         }
     }
@@ -423,9 +424,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
     // A descriptor reached through a symlink or a relative path.
     // (On its own: the lock would last through the `if let`'s body.)
     let magic = if found == Err(ENOENT) { fs::lock().fd_link_in(base, path, follow, &scope) } else { None };
-    if let Some((pid, fd)) = magic
-        && pid == p.pid
-    {
+    if let Some((pid, fd)) = magic {
         // It's a magic link, as Linux's /proc/<pid>/fd/N.
         if excl {
             return Err(EEXIST);
@@ -437,7 +436,11 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         if follow && resolve & (fs::RESOLVE_NO_XDEV | fs::RESOLVE_BENEATH | fs::RESOLVE_IN_ROOT) != 0 {
             return Err(EXDEV);
         }
-        let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
+        let file = if pid == p.pid {
+            p.fds.get_raw(fd).map_err(|_| ENOENT)?
+        } else {
+            with_other(p, pid, |q| q.fds.get_raw(fd).map_err(|_| ENOENT))?
+        };
         if !follow {
             // Not followed, it's a link: ELOOP, unless O_PATH asks for the
             // link itself, which reads as where it leads.
@@ -451,6 +454,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
         }
         match reopened(&file, flags) {
             Some((ino, content)) => (found, kept) = (Ok(ino), content),
+            None if file.lock().is_socket() => return Err(ENXIO),
             None => return p.fds.alloc(FdEntry { file, cloexec }, 0),
         }
     }
@@ -789,7 +793,8 @@ pub(crate) fn closing(p: &Process, file: &crate::fd::FileRef) {
     let f = file.lock();
     // Whoever asked to hear of a queue's messages stops, as mqueue_flush_file.
     if let FileKind::Mqueue(q) = &f.kind {
-        q.lock().closed_by(p.pid);
+        let was = q.lock().closed_by(p.pid);
+        crate::mqueue::removed(was);
     }
     // (An O_PATH descriptor doesn't count, as on Linux.)
     if !f.path_only && p.fds.posix_locks() {

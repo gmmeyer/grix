@@ -409,8 +409,16 @@ mappings grow on a fault (`AddressSpace::grow_down`, from `fault` and
 `ensure`), by `RLIMIT_STACK` as it is then (`AddressSpace::stack_limit`). What clone can share between processes is a handle to
 one value: the descriptor table (`fd::FdTable`, CLONE_FILES), the
 working directory and umask (`Process::fs`, a `process::Shared<FsInfo>`,
-CLONE_FS) and the signal actions (`Process::sigactions`, CLONE_SIGHAND,
-which needs CLONE_VM: vfork only). Fork copies each (`share`/`copy`);
+CLONE_FS), the signal actions (`Process::sigactions`, CLONE_SIGHAND,
+which needs CLONE_VM) and the address space (`Mm::another`, CLONE_VM
+without CLONE_VFORK or CLONE_THREAD: each process has its own `Mm`, one
+gate between them, and the `Mm` that took it is the one that gives it
+back, as a sharer can end on the CPU running another; `sched::schedule`
+hands it over, `Mm::takes_over`). Private futex words are then
+`futex::Key`s of the address space, for good (`AddressSpace::vm_shared`,
+sleepers moved by `futex::vm_shared`), as `Process::futexes` is one
+process's, and a process leaving that memory, however, clears its threads'
+CLONE_CHILD_CLEARTID words (`futex::left_memory`, Linux's mm_release). Fork copies each (`share`/`copy`);
 `execve` unshares the table and the actions (Linux's `unshare_files`,
 `de_thread`), `unshare(2)` the table and fs. POSIX record locks belong
 to the table (`locks::Owner::Files`, as Linux's to the files_struct) and
@@ -782,10 +790,13 @@ read-only mount EROFS (`landlock::domain_changing`). What matters after the open
 made any other way has them). A new way to make, remove, open, execute
 or move a node, or to bind or connect a TCP socket, needs its check.
 `/proc/self/fd/N` of a node opens it again (`procfs::fd_path`,
-`file::reopened`), checked as any open. A path going on through it
-(`/proc/self/fd/N/name`) is an ordinary walk from that directory
-(`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
-only, from `FdTable::walking`), checked as any other. execveat of a
+`file::reopened`), checked as any open, and a socket's is ENXIO. A path
+going on through it (`/proc/<pid>/fd/N/name`) is an ordinary walk from that
+directory (`Fs::through_fd`, a magic link to openat2), checked as any
+other; another process's table is found under `PROCS` with a `try_lock`, as
+the walk has the filesystem's lock, which comes after it, and every other
+user of `PROCS` has the kernel lock (`fd::table_of`, checking what
+`procs::may_inspect` does, from what `FdTable::walking` noted of the walker). execveat of a
 descriptor runs the file (`process::Start::File`), and is checked as one. `landlock::may_inspect` keeps a
 domain out of processes outside it, as Linux's ptrace hook.
 

@@ -14,6 +14,7 @@ use super::{require, table};
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
 use crate::fd::{FdEntry, FileKind, O_NONBLOCK, O_RDWR, new_file};
+use crate::mm::gate::Mm;
 use crate::process::{self, JobReport, Process, Share, SigAction, Thread, WaitOn};
 use crate::procs::{MAX_PROCESSES, PROCS};
 use crate::signal::{self, SIG_IGN, SIGCHLD, SigInfo};
@@ -34,19 +35,16 @@ const CLONE_SYSVSEM: u64 = 0x4_0000;
 /// The descriptor table (CLONE_FILES), working directory and umask
 /// (CLONE_FS) and signal actions (CLONE_SIGHAND, which Linux allows only
 /// with CLONE_VM, so here only for vfork) are shared instead of copied
-/// when asked. With CLONE_PARENT the child is the caller's parent's, and
+/// when asked. CLONE_VM without CLONE_VFORK or CLONE_THREAD is a process
+/// of its own in this address space. With CLONE_PARENT the child is the caller's parent's, and
 /// tells it of its end as the caller would (Linux's copy_process).
 pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResult {
-    let (name, _) = table::info(n);
     let flags = args.flags;
     require(p, n, Capability::Process, "")?;
     let vfork = flags & CLONE_VFORK != 0;
     // Shared handlers imply shared memory (copy_process).
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
         return Err(EINVAL);
-    }
-    if flags & CLONE_VM != 0 && !vfork {
-        return p.unimplemented(n, name, "CLONE_VM without CLONE_THREAD or CLONE_VFORK", EINVAL);
     }
     let exit_signal = (flags & 0xff) as u32;
     if exit_signal > signal::NSIG {
@@ -63,7 +61,14 @@ pub fn fork(p: &mut Process, tf: &TrapFrame, n: u32, args: CloneArgs) -> SysResu
     if flags & CLONE_PARENT_SETTID != 0 {
         write_u32(&mut p.aspace, args.parent_tid, pid)?;
     }
-    let aspace = p.aspace.fork(flags & CLONE_VFORK != 0)?;
+    // Its own address space, but for a process in this one: vfork's is a
+    // copy even with CLONE_VM (above).
+    let aspace = if flags & CLONE_VM != 0 && !vfork {
+        crate::futex::vm_shared(p);
+        p.aspace.another()
+    } else {
+        Mm::new(p.aspace.fork(vfork)?)
+    };
     let share =
         Share { files: flags & CLONE_FILES != 0, fs: flags & CLONE_FS != 0, sighand: flags & CLONE_SIGHAND != 0 };
     let mut c = p.fork(pid, aspace, share)?;
@@ -182,6 +187,11 @@ pub fn unshare(p: &mut Process, flags: u64) -> SysResult {
         return Err(EINVAL);
     }
     if flags & CLONE_SIGHAND != 0 && p.sigactions.shared() {
+        return Err(EINVAL);
+    }
+    // An address space that's another's can't be left this way. (Or has
+    // been: it can't be told any more, and it's as rare as it gets.)
+    if flags & CLONE_VM != 0 && p.aspace.vm_shared {
         return Err(EINVAL);
     }
     let (name, _) = table::info(table::nr::unshare);
@@ -313,6 +323,11 @@ pub fn execve(
     // leaves the caller running.
     let own_fds = if p.fds.shared() { Some(p.fds.copy()?) } else { None };
     // The point of no return.
+    // Every thread leaves this memory, which may be someone else's too.
+    if p.aspace.vm_shared {
+        let words: Vec<u64> = p.threads.values().map(|t| t.clear_child_tid).collect();
+        words.into_iter().for_each(|addr| super::thread::left_memory(p, addr));
+    }
     let (entry, sp) = program.install(p);
     // As on Linux, the saved ids become the effective ones.
     (p.ids.suid, p.ids.sgid) = (p.uid, p.gid);
@@ -372,9 +387,11 @@ const WUNTRACED: u64 = 2;
 const WEXITED: u64 = 4;
 const WCONTINUED: u64 = 8;
 const WNOWAIT: u64 = 0x0100_0000;
-/// __WNOTHREAD, __WALL, __WCLONE: about threads and clone children, which
-/// are all the same here.
-const WTHREADS: u64 = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+/// __WNOTHREAD is about whose children a thread sees: its process's, here.
+const WNOTHREAD: u64 = 0x2000_0000;
+const WALL: u64 = 0x4000_0000;
+const WCLONE: u64 = 0x8000_0000;
+const WTHREADS: u64 = WNOTHREAD | WALL | WCLONE;
 
 /// Which children a wait looks at.
 #[derive(Clone, Copy)]
@@ -382,6 +399,13 @@ enum Which {
     Any,
     Pid(u32),
     Group(u32),
+}
+
+/// Do `options` see this child? One that tells its parent with anything
+/// but SIGCHLD is a clone child, seen by __WCLONE alone or __WALL (Linux's
+/// eligible_child).
+fn eligible(options: u64, exit_signal: u32) -> bool {
+    options & WALL != 0 || (exit_signal != SIGCHLD) == (options & WCLONE != 0)
 }
 
 impl Which {
@@ -402,8 +426,11 @@ impl Which {
 fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<Option<(u32, i32, u64)>, Errno> {
     let mut procs = PROCS.lock();
     let me = p.pid;
-    let zombie =
-        procs.zombies.iter().find(|(pid, z)| z.ppid == me && which.matches(**pid, z.pgid)).map(|(pid, _)| *pid);
+    let zombie = procs
+        .zombies
+        .iter()
+        .find(|(pid, z)| z.ppid == me && which.matches(**pid, z.pgid) && eligible(options, z.exit_signal))
+        .map(|(pid, _)| *pid);
     if let Some(pid) = zombie.filter(|_| options & WEXITED != 0) {
         let z = &procs.zombies[&pid];
         let r = (pid, z.status, z.cpu_ns);
@@ -416,6 +443,9 @@ fn waitable(p: &mut Process, which: Which, options: u64, reap: bool) -> Result<O
     }
     let mut children = zombie.is_some();
     for q in procs.others_mut().filter(|q| q.ppid == me && which.matches(q.pid, q.pgid)) {
+        if !eligible(options, q.exit_signal) {
+            continue;
+        }
         children = true;
         let status = match q.job_report {
             Some(JobReport::Stopped(sig)) if options & WUNTRACED != 0 => 0x7f | (sig as i32) << 8,
@@ -447,6 +477,8 @@ fn rusage(p: &mut Process, ptr: u64, cpu_ns: u64) -> Result<(), Errno> {
 }
 
 pub fn wait4(p: &mut Process, pid: u64, wstatus: u64, options: u64, ru: u64) -> SysResult {
+    // An int: __WCLONE is its sign bit.
+    let options = options as u32 as u64;
     if options & !(WNOHANG | WUNTRACED | WCONTINUED | WTHREADS) != 0 {
         return Err(EINVAL);
     }
@@ -470,6 +502,7 @@ pub fn wait4(p: &mut Process, pid: u64, wstatus: u64, options: u64, ru: u64) -> 
 }
 
 pub fn waitid(p: &mut Process, idtype: u64, id: u64, infop: u64, options: u64, ru: u64) -> SysResult {
+    let options = options as u32 as u64;
     const P_ALL: u64 = 0;
     const P_PID: u64 = 1;
     const P_PGID: u64 = 2;

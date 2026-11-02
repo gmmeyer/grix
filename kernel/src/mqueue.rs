@@ -49,10 +49,32 @@ const ETIMEDOUT: Errno = Errno(110);
 const EMSGSIZE: Errno = Errno(90);
 
 /// Who's told when an empty queue gets a message, once.
-struct Notify {
+pub struct Notify {
     pid: u32,
     signal: u32,
     value: u64,
+    /// SIGEV_THREAD: libc's netlink socket and its cookie (its own
+    /// thread does the rest), told of this or of its being taken back.
+    thread: Option<(crate::fd::FileRef, [u8; COOKIE])>,
+}
+
+const COOKIE: usize = 32;
+const NOTIFY_WOKENUP: u8 = 1;
+const NOTIFY_REMOVED: u8 = 2;
+
+impl Notify {
+    /// The cookie, its last byte saying why. Lost if there's no memory for
+    /// it, as Linux's netlink_sendskb is, or the socket has no room.
+    fn tell_thread(self, why: u8) {
+        let Some((sock, mut cookie)) = self.thread else { return };
+        cookie[COOKIE - 1] = why;
+        let mut f = sock.lock();
+        if let FileKind::Netlink(nl) = &mut f.kind {
+            nl.deliver(&cookie);
+        }
+        drop(f);
+        ipc::changed();
+    }
 }
 
 pub struct Queue {
@@ -120,10 +142,9 @@ impl Queue {
     }
 
     /// A descriptor of it was closed by `pid`: its notification goes.
-    pub fn closed_by(&mut self, pid: u32) {
-        if self.notify.as_ref().is_some_and(|n| n.pid == pid) {
-            self.notify = None;
-        }
+    /// (Which the caller tells, with no queue held.)
+    pub fn closed_by(&mut self, pid: u32) -> Option<Notify> {
+        self.notify.take_if(|n| n.pid == pid)
     }
 }
 
@@ -307,8 +328,18 @@ fn someone_receiving(q: &mut Queue, p: &Process) -> bool {
     !q.receivers.is_empty()
 }
 
+/// A notification taken back, by closing or by mq_notify.
+pub fn removed(n: Option<Notify>) {
+    if let Some(n) = n {
+        n.tell_thread(NOTIFY_REMOVED);
+    }
+}
+
 /// A message came for whoever asked to hear of it.
 fn tell(p: &mut Process, n: Notify) {
+    if n.thread.is_some() {
+        return n.tell_thread(NOTIFY_WOKENUP);
+    }
     if n.signal == 0 {
         return;
     }
@@ -362,18 +393,31 @@ pub fn mq_notify(p: &mut Process, fd: u64, event: u64) -> SysResult {
     };
     let pid = p.pid;
     if event == 0 {
-        q.lock().closed_by(pid);
+        let was = q.lock().closed_by(pid);
+        removed(was);
         return Ok(0);
     }
     // struct sigevent: sigev_value, sigev_signo, sigev_notify.
     let value = read_u64(&mut p.aspace, event)?;
     let signal = read_u32(&mut p.aspace, event + 8)?;
     let how = read_u32(&mut p.aspace, event + 12)?;
+    let mut thread = None;
     let signal = match how {
         SIGEV_NONE => 0,
         SIGEV_SIGNAL if (1..=64).contains(&signal) => signal,
         SIGEV_THREAD => {
-            return p.unimplemented(crate::syscall::table::nr::mq_notify, "mq_notify", "SIGEV_THREAD", EINVAL);
+            let mut cookie = [0; COOKIE];
+            copy_in(&mut p.aspace, value, &mut cookie)?;
+            let sock = p.fds.get(signal as u64)?;
+            let f = sock.lock();
+            match f.kind {
+                FileKind::Netlink(_) => {}
+                _ if f.is_socket() => return Err(EINVAL),
+                _ => return Err(Errno(88)), // ENOTSOCK
+            }
+            drop(f);
+            thread = Some((sock, cookie));
+            0
         }
         _ => return Err(EINVAL),
     };
@@ -381,7 +425,7 @@ pub fn mq_notify(p: &mut Process, fd: u64, event: u64) -> SysResult {
     if g.notify.is_some() {
         return Err(EBUSY);
     }
-    g.notify = Some(Notify { pid, signal, value });
+    g.notify = Some(Notify { pid, signal, value, thread });
     g.touch();
     Ok(0)
 }

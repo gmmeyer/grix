@@ -5096,7 +5096,9 @@ fn system_v_queues_and_semaphores() {
 /// POSIX message queues. The fixture passes on Linux as it is.
 #[test]
 fn posix_message_queues() {
-    let out = run(with("mqueue").allow(Capability::Process), &["/bin/mqueue"]);
+    // (SIGEV_THREAD's a thread of libc's.)
+    let b = with("mqueue").allow(Capability::Process).allow(Capability::Threads);
+    let out = run(b, &["/bin/mqueue"]);
     assert_eq!(out.stdout_str().lines().last(), Some("mqueue ok"), "{}{}", out.stdout_str(), out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
@@ -5186,6 +5188,31 @@ fn proc_net_lists_sockets() {
     let b = with("procnet").allow(Capability::NetRaw).network(Network::Vm);
     let out = run(b, &["/bin/procnet", "raw"]);
     assert_eq!(out.stdout_str(), "procnet ok\n", "{}", out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Processes of their own in one address space, however they end, and
+/// with more CPUs at it at once. The fixture passes on Linux as it is.
+#[test]
+fn processes_sharing_memory() {
+    for cpus in [1, 4] {
+        let b = with("clonevm").allow(Capability::Process).allow(Capability::Threads).cpus(cpus);
+        let out = run(b, &["/bin/clonevm"]);
+        assert_eq!(out.stdout_str(), "clonevm ok\n", "{cpus} {}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+}
+
+/// A path goes on through another process's descriptor, as through one's
+/// own, for whoever may look into that process. The fixture passes on Linux
+/// as it is.
+#[test]
+fn paths_through_another_process() {
+    let b = with("fdwalk").allow(Capability::Process).allow(Capability::FsWrite).user("0:0");
+    let out = run(b, &["/bin/fdwalk"]);
+    assert_eq!(out.stdout_str(), "fdwalk ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 

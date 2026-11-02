@@ -191,6 +191,14 @@ pub struct Netlink {
 }
 
 impl Netlink {
+    /// A datagram for it that isn't a reply, if there's memory for it.
+    pub fn deliver(&mut self, data: &[u8]) {
+        if let Ok(charge) = crate::kmem::Charge::new(data.len() as u64) {
+            self.rx.push_back((data.to_vec(), charge));
+            self.version += 1;
+        }
+    }
+
     pub fn new(port: u32) -> Self {
         Netlink { port, uevent: false, rx: VecDeque::new(), version: 0 }
     }

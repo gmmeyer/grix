@@ -367,6 +367,9 @@ pub enum FaultError {
 pub struct AddressSpace {
     /// This address space and no other, ever (/proc/<pid>/mem's).
     pub id: u64,
+    /// Processes have it between them (CLONE_VM), or have had: their futex
+    /// waiters are in `futex.rs`, as a word here is any of theirs.
+    pub vm_shared: bool,
     pub pt: PageTable,
     vmas: BTreeMap<u64, Vma>,
     /// How many of `vmas` are counted in VMAS_TOTAL.
@@ -407,6 +410,7 @@ impl AddressSpace {
     pub fn new() -> Option<Self> {
         let mut a = Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            vm_shared: false,
             pt: PageTable::new()?,
             vmas: BTreeMap::new(),
             counted: 0,
