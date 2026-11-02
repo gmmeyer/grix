@@ -458,7 +458,15 @@ mod tests {
     fn export_messages_roundtrip_and_reject_garbage() {
         let msgs = [
             ExportMsg::Root { index: 3, found: true },
-            ExportMsg::Entry { kind: ExportKind::Symlink, mode: 0o777, mtime_ns: 5, path_len: 4, data_len: 9 },
+            ExportMsg::Entry {
+                kind: ExportKind::Symlink,
+                mode: 0o777,
+                mtime_ns: 5,
+                uid: 1000,
+                gid: 1001,
+                path_len: 4,
+                data_len: 9,
+            },
             ExportMsg::Data(b"a/b/c"),
             ExportMsg::Data(b""),
             ExportMsg::Truncated,

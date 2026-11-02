@@ -63,7 +63,9 @@ jobs:
           ./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci-x86_64/debian
           ./target/release/grix pull --arch aarch64 alpine:3.21 --oci fixtures/build/oci/alpine
       - name: Unit tests
-        run: cargo test -p grix --lib
+        run: |
+          cargo test -p grix --lib
+          cargo test -p grix-abi -p grix-netstack
       - name: A first run in grix-vmm
         run: |
           printf 'fn main() { println!("hello from {}", std::env::args().nth(1).unwrap()); std::process::exit(7); }\n' > hello.rs
