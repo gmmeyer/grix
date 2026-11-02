@@ -1065,7 +1065,8 @@ impl SandboxBuilder {
         }
         let (_, bytes) = image.size();
         let needed = (RESERVED_LOW + bytes + MIN_FREE).div_ceil(1 << 20) + 128;
-        self.memory_mb = self.memory_mb.max(needed).max(c.memory_mb.unwrap_or(0));
+        let asked = c.memory_mb.unwrap_or(0).min(MAX_IMAGE_MEMORY_MB);
+        self.memory_mb = self.memory_mb.max(needed).max(asked);
         self.command = c.command.clone();
         Ok(self)
     }
@@ -1296,6 +1297,11 @@ fn check_imports_fit(imported: u64, what: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// The most an image may ask for on its own: it's the file's say, and
+/// what a program in it can then make the host hold. Past that it's the
+/// caller's to give (`SandboxBuilder::memory_mb`, `--mem`).
+const MAX_IMAGE_MEMORY_MB: u64 = 8192;
 
 /// Which network stack a sandbox has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

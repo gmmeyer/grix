@@ -130,8 +130,17 @@ fn import_at(
                 return Ok(());
             }
             seen(guest, &st);
+            // Said now, rather than once it's all in memory here, as a root
+            // an agent writes in may hold anything.
+            let limit = grix_abi::image::LOW_RAM;
+            if st.st_size as u64 > limit {
+                bail!("{} is more than any sandbox can boot from", host.display());
+            }
             let mut data = Vec::new();
-            f.read_to_end(&mut data)?;
+            f.by_ref().take(limit + 1).read_to_end(&mut data)?;
+            if data.len() as u64 > limit {
+                bail!("{} is more than any sandbox can boot from", host.display());
+            }
             files.insert(
                 guest.into(),
                 Node::File { data, mode: at::mode(&st), mtime_ns: at::mtime_ns(&st), owner: None },
@@ -194,6 +203,18 @@ mod tests {
         ));
         fs::create_dir(&d).unwrap();
         d.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_file_too_big_to_boot_isnt_read_in() {
+        let root = tempdir();
+        let path = root.join("sparse");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(grix_abi::image::LOW_RAM + 1).unwrap();
+        let mut files = BTreeMap::new();
+        let err = import(&mut files, &path, "/sparse").unwrap_err();
+        assert!(format!("{err:#}").contains("more than any sandbox"), "{err:#}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -5229,6 +5229,29 @@ fn processes_sharing_memory() {
     }
 }
 
+/// An image says how much memory it wants, within reason: it's the file's
+/// say, and past that the caller's. (`--mem` for more.)
+#[test]
+fn an_image_cant_ask_for_all_the_memory() {
+    let dir = temp_dir("memimage");
+    let image = |mb: u64| {
+        let g = grix::build::Grixfile::parse(&format!("memory_mb = {mb}\n")).unwrap();
+        let opts = grix::build::BuildOptions {
+            arch: None,
+            kernel: None,
+            on_output: &mut |_, _| {},
+            control: None,
+            policy: Default::default(),
+        };
+        g.build(&dir, opts).unwrap()
+    };
+    let asked = |mb| Sandbox::builder().image(&image(mb)).unwrap().current_memory_mb();
+    assert_eq!(asked(1024), 1024);
+    assert_eq!(asked(65536), 8192);
+    let given = Sandbox::builder().image(&image(65536)).unwrap().memory_mb(16384);
+    assert_eq!(given.current_memory_mb(), 16384);
+}
+
 /// A path goes on through another process's descriptor, as through one's
 /// own, for whoever may look into that process. The fixture passes on Linux
 /// as it is.

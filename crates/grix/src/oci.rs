@@ -10,8 +10,10 @@
 //! (`treecache`). Registries that want a login get one from `auth`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::at;
 use crate::auth::{Credential, Store};
 use crate::image::{self, Node};
 use crate::sandbox::Arch;
@@ -262,10 +265,33 @@ struct Layout {
 
 impl Layout {
     fn open(dir: &Path) -> Result<Layout> {
-        if !dir.join("index.json").is_file() {
-            bail!("{} isn't an OCI image layout (no index.json)", dir.display());
+        let layout = Layout { dir: dir.to_path_buf() };
+        layout
+            .file(&["index.json"])
+            .with_context(|| format!("{} isn't an OCI image layout (no index.json)", dir.display()))?;
+        Ok(layout)
+    }
+
+    /// A file of the layout, walked down to from its directory without
+    /// following a link: a build's context may be anyone's, and a link in
+    /// a layout would bring in whatever's beside it, which is the host's.
+    fn file(&self, path: &[&str]) -> Result<File> {
+        let Some((name, dirs)) = path.split_last() else { bail!("no such file") };
+        let mut at: OwnedFd = File::open(&self.dir)?.into();
+        for dir in dirs {
+            at = at::open_dir_at(at.as_raw_fd(), &at::cname(OsStr::new(dir))?)?;
         }
-        Ok(Layout { dir: dir.to_path_buf() })
+        // O_NONBLOCK: it may be a FIFO, whose open would wait.
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let fd = at::openat(at.as_raw_fd(), &at::cname(OsStr::new(name))?, flags, 0)?;
+        if at::kind(&at::stat_fd(fd.as_raw_fd())?) != at::Kind::File {
+            bail!("{name} in {} isn't a file", self.dir.display());
+        }
+        Ok(File::from(fd))
+    }
+
+    fn blob(&self, digest: &str) -> Result<File> {
+        self.file(&["blobs", "sha256", check_digest(digest)?]).with_context(|| format!("blob {digest} is missing"))
     }
 
     /// The blob cache: private, since images may be.
@@ -281,8 +307,7 @@ impl Layout {
 
     /// A blob's bytes, checked against its digest.
     fn json(&self, digest: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(digest)?;
-        let data = read_limited(File::open(&path).with_context(|| format!("blob {digest} is missing"))?, MAX_JSON)?;
+        let data = read_limited(self.blob(digest)?, MAX_JSON)?;
         if sha256(&data) != check_digest(digest)? {
             bail!("blob {digest} doesn't match its digest");
         }
@@ -291,7 +316,7 @@ impl Layout {
 
     /// The image for `arch` in this layout.
     fn load(&self, arch: Arch) -> Result<Pulled> {
-        let index: Value = serde_json::from_slice(&read_limited(File::open(self.dir.join("index.json"))?, MAX_JSON)?)?;
+        let index: Value = serde_json::from_slice(&read_limited(self.file(&["index.json"])?, MAX_JSON)?)?;
         let mut digest = pick_platform(&index, arch)?;
         let mut manifest: Value = serde_json::from_slice(&self.json(&digest)?)?;
         // An index may point at another index.
@@ -329,7 +354,7 @@ impl Layout {
             let d = layer["digest"].as_str().context("layer without a digest")?;
             fetch(d, layer["size"].as_u64())?;
             // Checked as it's read: what's applied is what was checked.
-            let mut blob = Hashing::new(File::open(self.blob_path(d)?)?);
+            let mut blob = Hashing::new(self.blob(d)?);
             apply_layer(&mut files, &mut blob, &mut totals).with_context(|| format!("applying layer {d}"))?;
             if blob.finish()? != check_digest(d)? {
                 bail!("layer {d} doesn't match its digest");
@@ -492,6 +517,9 @@ pub(crate) fn apply_layer(
     let too_big = || anyhow::anyhow!("the image is bigger than grix can run ({} GiB)", MAX_BYTES >> 30);
     // What this layer added: an opaque marker hides only lower layers.
     let mut added = std::collections::HashSet::new();
+    // (Each directory's once: a layer full of the same marker would be a
+    // walk of the tree for each.)
+    let mut opaque = std::collections::HashSet::new();
     for entry in ar.entries()? {
         let mut entry = entry?;
         let raw = entry.path()?.to_string_lossy().into_owned();
@@ -512,6 +540,9 @@ pub(crate) fn apply_layer(
         let (dir, name) = path.rsplit_once('/').unwrap();
         let dir = if dir.is_empty() { "/" } else { dir };
         if name == ".wh..wh..opq" {
+            if !opaque.insert(dir.to_string()) {
+                continue;
+            }
             let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
             let lower: Vec<String> = files
                 .range(prefix.clone()..)
@@ -1098,6 +1129,53 @@ fn tempdir(what: &str) -> Result<TempDir> {
 mod tests {
     use super::*;
     use crate::container::random_suffix;
+
+    /// A layout's files are what's in it, not what a link there leads to:
+    /// a project's directory is no reason to read the host's.
+    #[test]
+    fn a_layouts_links_lead_nowhere() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("grix-layout-{}", random_suffix()));
+        let (outside, dir) = (root.join("outside"), root.join("layout"));
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let name = "ab".repeat(32);
+        fs::create_dir_all(outside.join("blobs/sha256")).unwrap();
+        fs::write(outside.join("index.json"), "{}").unwrap();
+        fs::write(outside.join("blobs/sha256").join(&name), "secret").unwrap();
+        fs::create_dir_all(&dir).unwrap();
+
+        symlink(outside.join("index.json"), dir.join("index.json")).unwrap();
+        assert!(Layout::open(&dir).is_err(), "a linked index.json");
+        fs::remove_file(dir.join("index.json")).unwrap();
+        fs::write(dir.join("index.json"), "{}").unwrap();
+        let layout = Layout::open(&dir).unwrap();
+
+        symlink(outside.join("blobs"), dir.join("blobs")).unwrap();
+        assert!(layout.blob(&digest).is_err(), "a linked blobs");
+        fs::remove_file(dir.join("blobs")).unwrap();
+        fs::create_dir(dir.join("blobs")).unwrap();
+        symlink(outside.join("blobs/sha256"), dir.join("blobs/sha256")).unwrap();
+        assert!(layout.blob(&digest).is_err(), "a linked blobs/sha256");
+        fs::remove_file(dir.join("blobs/sha256")).unwrap();
+        fs::create_dir(dir.join("blobs/sha256")).unwrap();
+        symlink(outside.join("blobs/sha256").join(&name), dir.join("blobs/sha256").join(&name)).unwrap();
+        assert!(layout.blob(&digest).is_err(), "a linked blob");
+        fs::remove_file(dir.join("blobs/sha256").join(&name)).unwrap();
+
+        // A FIFO would wait for ever.
+        let path = std::ffi::CString::new(dir.join("blobs/sha256").join(&name).to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(layout.blob(&digest).is_err(), "a FIFO");
+        fs::remove_file(dir.join("blobs/sha256").join(&name)).unwrap();
+
+        // What's really there is read.
+        fs::write(dir.join("blobs/sha256").join(&name), "here").unwrap();
+        let mut got = String::new();
+        layout.blob(&digest).unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "here");
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     /// Whose a layer says its files are, and a later layer's say on a
     /// directory (`RUN chown` leaves it in that layer, and nothing else).
