@@ -8,7 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/netlink.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -221,6 +224,69 @@ static void removing(void) {
     printf("removing ok\n");
 }
 
+static volatile int fired;
+static void on_thread(union sigval v) { fired = v.sival_int; }
+
+// SIGEV_THREAD: libc's thread waits on a netlink socket, which the kernel
+// tells in 32 bytes of libc's own choosing, the last of them saying why.
+static void notifying_a_thread(void) {
+    struct mq_attr attr = {.mq_maxmsg = 4, .mq_msgsize = 16};
+    mqd_t q = mq_open(name, O_CREAT | O_EXCL | O_RDWR, 0600, &attr);
+    CHECK(q != (mqd_t)-1);
+    char buf[16];
+
+    struct sigevent e = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = on_thread};
+    e.sigev_value.sival_int = 42;
+    CHECK(mq_notify(q, &e) == 0);
+    CHECK(mq_send(q, "x", 1, 0) == 0);
+    for (int i = 0; i < 2000 && !fired; i++) usleep(5000);
+    CHECK(fired == 42);
+    CHECK(mq_receive(q, buf, sizeof buf, 0) == 1);
+
+    int s = socket(AF_NETLINK, SOCK_RAW, 0);
+    CHECK(s >= 0);
+    char cookie[32], got[64];
+    memset(cookie, 'c', sizeof cookie);
+    struct sigevent raw = {.sigev_notify = SIGEV_THREAD, .sigev_signo = s};
+    raw.sigev_value.sival_ptr = cookie;
+    CHECK(syscall(SYS_mq_notify, q, &raw) == 0);
+    CHECK(mq_send(q, "x", 1, 0) == 0);
+    CHECK(recv(s, got, sizeof got, 0) == 32);
+    CHECK(!memcmp(got, cookie, 31) && got[31] == 1); // NOTIFY_WOKENUP
+    CHECK(mq_receive(q, buf, sizeof buf, 0) == 1);
+
+    // Taken back: it's told that too.
+    CHECK(syscall(SYS_mq_notify, q, &raw) == 0);
+    FAILS(syscall(SYS_mq_notify, q, &raw), EBUSY);
+    CHECK(syscall(SYS_mq_notify, q, NULL) == 0);
+    CHECK(recv(s, got, sizeof got, 0) == 32);
+    CHECK(!memcmp(got, cookie, 31) && got[31] == 2); // NOTIFY_REMOVED
+
+    // Only a netlink socket will do.
+    raw.sigev_signo = 999;
+    FAILS(syscall(SYS_mq_notify, q, &raw), EBADF);
+    raw.sigev_signo = 1;
+    int p[2];
+    CHECK(pipe(p) == 0);
+    raw.sigev_signo = p[0];
+    FAILS(syscall(SYS_mq_notify, q, &raw), ENOTSOCK);
+    int u = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(u >= 0);
+    raw.sigev_signo = u;
+    FAILS(syscall(SYS_mq_notify, q, &raw), EINVAL);
+    raw.sigev_signo = s;
+    raw.sigev_value.sival_ptr = (void *)8;
+    FAILS(syscall(SYS_mq_notify, q, &raw), EFAULT);
+
+    // Its descriptor closing is its being taken back as well.
+    raw.sigev_value.sival_ptr = cookie;
+    CHECK(syscall(SYS_mq_notify, q, &raw) == 0);
+    CHECK(mq_close(q) == 0);
+    CHECK(recv(s, got, sizeof got, 0) == 32 && got[31] == 2);
+    CHECK(mq_unlink(name) == 0);
+    close(s), close(p[0]), close(p[1]), close(u);
+}
+
 int main(void) {
     setvbuf(stdout, 0, _IOLBF, 0);
     snprintf(name, sizeof name, "/mq%d", getpid());
@@ -228,6 +294,7 @@ int main(void) {
     messages();
     notifying();
     removing();
+    notifying_a_thread();
     printf("mqueue ok\n");
     return 0;
 }

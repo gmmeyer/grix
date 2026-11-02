@@ -18,11 +18,9 @@ stricter than Linux: Linux's behaviour by default, and stricter on request
 Linux behaviour:
 
 1. Newer syscalls as programs ask for them: `statmount` and `listmount` are
-   reported, fanotify and the new mount API refused for now, and
-   `mq_notify` with SIGEV_THREAD is reported.
-2. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
-   process's table under the filesystem's lock.
-3. What's left of networking, none of it asked for by anything yet:
+   reported, fanotify and the new mount API refused, as they are in a
+   container without CAP_SYS_ADMIN.
+2. What's left of networking, none of it asked for by anything yet:
    `IP_TTL` reaches the `vm` stack's packets but no further, as the host's
    sockets are the host's, so traceroute sees nothing (it'd take the proxy
    setting a socket's TTL per datagram, and hearing `IP_RECVERR` back); no
@@ -33,13 +31,13 @@ Linux behaviour:
 
 Bigger:
 
-4. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+3. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-5. Finer locking: phase 2, a reader/writer lock with per-process
+4. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-6. Faster live-mount round trips, multi-architecture images, and the
+5. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-7. A security review of everything since the last one, by a team of agents.
+6. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
    interest.
 
@@ -426,10 +424,8 @@ Left, none of it a way out of the sandbox:
       (`Fs::may_search`, Linux's may_lookup; `searchperm` passes there).
 - [x] An image's user gets its supplementary groups from `/etc/group`, as
       Docker's does (`container::supplementary_groups`).
-- [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
-      another process's are ENOENT past their own name. Few tools go
-      there, and it means another process's table under the filesystem's
-      lock (`FdTable::walking`).
+- [x] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
+      now anyone's that `procs::may_inspect` would allow (`fd::table_of`).
 - [x] A node with no descriptor left for it (macOS, `at::take_fd`) is
       watched again once there's one (`Server::rewatch`), and the guest told
       by an overflow that it missed what changed meanwhile.

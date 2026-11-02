@@ -235,6 +235,17 @@ pub fn next_ino() -> u64 {
 }
 
 impl OpenFile {
+    pub fn is_socket(&self) -> bool {
+        matches!(
+            self.kind,
+            FileKind::Socket(_)
+                | FileKind::Netlink(_)
+                | FileKind::UnixUnbound(_)
+                | FileKind::Inet(_)
+                | FileKind::Unix(_)
+        )
+    }
+
     /// It's this `unix::Sock` now: bound or connected, the same socket.
     pub fn set_unix(&mut self, sock: crate::unix::SockRef) {
         sock.lock().ino = self.ino;
@@ -390,19 +401,42 @@ impl Drop for Slots {
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
-/// Each CPU's last `FdTable::walking`. Weak, so it isn't a user of the
-/// table (`FdTable::shared`) and doesn't keep it.
-#[allow(clippy::type_complexity)]
-static WALKING: [Mutex<Option<(u32, Weak<Mutex<Slots>>)>>; grix_abi::machine::MAX_CPUS as usize] =
+/// Who's walking a path, for `walked_node`: a path walk has the filesystem's
+/// lock and no process to ask. The table's weak, so it isn't a user of it
+/// (`FdTable::shared`) and doesn't keep it.
+struct Walking {
+    pid: u32,
+    table: Weak<Mutex<Slots>>,
+    uid: u32,
+    gid: u32,
+    domain: Option<Arc<crate::landlock::Domain>>,
+}
+
+/// Each CPU's last `FdTable::walking`.
+static WALKING: [Mutex<Option<Walking>>; grix_abi::machine::MAX_CPUS as usize] =
     [const { Mutex::new(None) }; grix_abi::machine::MAX_CPUS as usize];
 
+/// Process `pid`'s table, if `w` may look at it, as for any other way into
+/// /proc/<pid>/fd. Every user of `PROCS` has the kernel lock, as this has, so
+/// it's only ever held here by this CPU's own caller, which comes before the
+/// filesystem's lock and may not be waited for.
+fn table_of(w: &Walking, pid: u32) -> Result<Arc<Mutex<Slots>>, Errno> {
+    let procs = crate::procs::PROCS.try_lock().ok_or(ENOENT)?;
+    let q = procs.others.get(&pid).ok_or(ENOENT)?;
+    let ours = crate::procs::same_ids(w.uid, w.gid, q.uid, q.gid, &q.ids);
+    if (w.uid != 0 && !ours) || !crate::landlock::inspects(w.domain.as_ref(), q) {
+        return Err(EACCES);
+    }
+    Ok(q.fds.slots.clone())
+}
+
 /// The node descriptor `fd` of `pid` has open, for a path going on through
-/// /proc/<pid>/fd/N: ENOENT without such a descriptor (or for another
-/// process's, whose fd directories are only looked at, not walked through),
-/// and ENOTDIR if it's no file with a node.
+/// /proc/<pid>/fd/N: ENOENT without such a descriptor, EACCES for a process
+/// the walker may not look into, and ENOTDIR if it's no file with a node.
 pub fn walked_node(pid: u32, fd: u64) -> Result<crate::fs::Ino, Errno> {
     let walking = WALKING[crate::smp::me()].lock();
-    let table = walking.as_ref().filter(|w| w.0 == pid).and_then(|w| w.1.upgrade()).ok_or(ENOENT)?;
+    let w = walking.as_ref().ok_or(ENOENT)?;
+    let table = if w.pid == pid { w.table.upgrade().ok_or(ENOENT)? } else { table_of(w, pid)? };
     drop(walking);
     let i = FdTable::index(fd).map_err(|_| ENOENT)?;
     let file = table.lock().entries.get(i).and_then(|s| s.as_ref()).ok_or(ENOENT)?.file.clone();
@@ -577,10 +611,11 @@ impl FdTable {
         Ok(())
     }
 
-    /// Process `pid`, whose table this is, is about to walk a path:
-    /// `walked_node` needs it, and the path walk has no process to ask.
-    pub fn walking(&self, pid: u32) {
-        *WALKING[crate::smp::me()].lock() = Some((pid, Arc::downgrade(&self.slots)));
+    /// `p`, whose table this is, is about to walk a path.
+    pub fn walking(&self, p: &crate::process::Process) {
+        let table = Arc::downgrade(&self.slots);
+        let domain = crate::landlock::domain(p);
+        *WALKING[crate::smp::me()].lock() = Some(Walking { pid: p.pid, table, uid: p.uid, gid: p.gid, domain });
     }
 
     /// Install at the lowest free descriptor >= `min`, below the

@@ -782,10 +782,13 @@ read-only mount EROFS (`landlock::domain_changing`). What matters after the open
 made any other way has them). A new way to make, remove, open, execute
 or move a node, or to bind or connect a TCP socket, needs its check.
 `/proc/self/fd/N` of a node opens it again (`procfs::fd_path`,
-`file::reopened`), checked as any open. A path going on through it
-(`/proc/self/fd/N/name`) is an ordinary walk from that directory
-(`Fs::through_fd`, a magic link to openat2, the caller's own descriptors
-only, from `FdTable::walking`), checked as any other. execveat of a
+`file::reopened`), checked as any open, and a socket's is ENXIO. A path
+going on through it (`/proc/<pid>/fd/N/name`) is an ordinary walk from that
+directory (`Fs::through_fd`, a magic link to openat2), checked as any
+other; another process's table is found under `PROCS` with a `try_lock`, as
+the walk has the filesystem's lock, which comes after it, and every other
+user of `PROCS` has the kernel lock (`fd::table_of`, checking what
+`procs::may_inspect` does, from what `FdTable::walking` noted of the walker). execveat of a
 descriptor runs the file (`process::Start::File`), and is checked as one. `landlock::may_inspect` keeps a
 domain out of processes outside it, as Linux's ptrace hook.
 

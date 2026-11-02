@@ -67,7 +67,12 @@ pub fn may_inspect(p: &Process, q: &Process, real: bool) -> bool {
 /// `may_inspect` for a process with these credentials (a zombie's).
 pub fn may_inspect_creds(p: &Process, quid: u32, qgid: u32, qids: &Ids, real: bool) -> bool {
     let (uid, gid) = if real { (p.ids.ruid, p.ids.rgid) } else { (p.uid, p.gid) };
-    p.uid == 0 || ([quid, qids.ruid, qids.suid] == [uid; 3] && [qgid, qids.rgid, qids.sgid] == [gid; 3])
+    p.uid == 0 || same_ids(uid, gid, quid, qgid, qids)
+}
+
+/// Are this user and group all of a process's?
+pub fn same_ids(uid: u32, gid: u32, quid: u32, qgid: u32, qids: &Ids) -> bool {
+    [quid, qids.ruid, qids.suid] == [uid; 3] && [qgid, qids.rgid, qids.sgid] == [gid; 3]
 }
 
 /// A process has ended and may need finishing off (`reap_others`).
