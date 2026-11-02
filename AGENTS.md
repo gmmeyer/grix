@@ -213,7 +213,8 @@ guest's own addresses (loopback, 10.0.2.15) never leave the guest: they're
 socket pairs queued on the listener. Ports forwarded from the host arrive
 as `Incoming`, for a listener on the guest's address or all of them,
 never one bound to loopback only (as on Linux, and Docker's published
-ports). UDP (`inet::Udp`): a query to port 53 goes to the host's
+ports), and from where `guest_view` says: 10.0.2.2 for the host's
+loopback, or a server here would take them for its own. UDP (`inet::Udp`): a query to port 53 goes to the host's
 resolver; a datagram to the guest's own address to the socket bound there
 (`deliver_local`); any other through the host (`ToHost::UdpSend`), to
 destinations the host allowed (`UdpAllow`, asked once per destination:
@@ -237,9 +238,37 @@ way, by a rule without a port. The guest answers for its own addresses
 (`icmp_send`); anything else goes through the host, which checks the
 capability itself and sends only echo requests (`net::IcmpSocket`: a ping
 socket, or a raw one where the host won't give one, its kernel writing the
-IP header either way). Any other raw socket stays unimplemented: it's what
-keeps a program from forging packets. An image can only ask for it, as for
-`net`, and a restored snapshot hasn't got it.
+IP header either way). A ping socket's port is its identifier, as bind or
+its first send gives it one, and requests carry that whatever the program
+wrote. Any other raw socket is `vm`'s (`inet::new_raw`, `Udp::raw`): packets
+go out as they are (`netstack::raw_out`), round inside the guest for its own
+addresses, and every packet of the protocol that comes in reaches them
+(`inet::raw_in`). What keeps a program from forging anything is the gateway:
+`on_packet` refuses a packet that isn't from the sandbox's addresses, or of
+anything but TCP, UDP and ICMP, with a `Denied` event. `native` has no IP layer
+to give one to, so there it's unimplemented. An image can only ask for
+`net_raw`, as for `net`, and a restored snapshot hasn't got it.
+Socket options are `sockopt.rs`: `Opts`, what was set, a fixed table per
+socket, each option's kind and bounds saying what reads back; the ones with
+an effect (TTL, keepalive) reach the `vm` stack through
+`Inet::apply_opts`. Datagrams go up to `link::MAX_DATAGRAM`, however small a
+frame is: on `native` what one message doesn't hold follows it, `ToGuest`'s
+first message saying how many bytes (`more`, then `UdpMore`, `link::Arriving`
+at the other end, as the console may lose any datagram's message, and a part
+of one is nothing; `Outbox::offer_all` queues them together), and going the
+other way ahead of it (`ToHost::UdpMore`, which nothing loses; `Shared::ahead`
+caps it). On `vm` they're IP fragments (`packet::fragments`,
+`packet::Reassembly`, in order or not at all: the link keeps its order, and
+overlaps are how a filter is fooled). `eth0`'s MTU is `netlink::eth0_mtu`:
+`link::MTU` on `vm`, 1500 on `native`, which is nothing but what a program
+expects there; `IP_MTU` and `IP_PMTUDISC_DO` go by it (`path_mtu`). Sockets are
+listed in /proc/net (`procnet.rs`, Linux's layouts, which programs read by
+column): `inet::each_tcp` and `each_dgram` walk `LISTENERS`, `CONNS`, `UDPS`
+and `LOCAL_ENDS` (a connection inside the guest is a socket pair nothing
+else lists, so each end has a `Listed`), `unix::each_named` the named AF_UNIX
+ones. `SockId` is what they show of a socket: `OpenFile::ino` (what fstat and
+`socket:[N]` say, the same for every descriptor), the uid of who made it, and
+its family, which decides the table whatever it's connected to.
 The `vm` stack (`--network vm`, `SandboxBuilder::network`, `Image::vm_stack`;
 `native` is all of the above, and `none` is no `net`): the same sockets, on
 TCP/IP in the guest. `crates/netstack` (`no_std`, smoltcp, Reno as Cubic

@@ -492,7 +492,8 @@ fn kill_on_deny() {
 
 #[test]
 fn granted_but_unimplemented_is_reported_as_such() {
-    let out = run(with("net").allow(Capability::Net), &["/bin/net", "raw"]);
+    // The native stack's: the vm stack has raw sockets.
+    let out = run(with("net").allow(Capability::Net).network(Network::Native), &["/bin/net", "raw"]);
     assert_eq!(out.status, ExitStatus::Exited(1));
     assert!(out.missing_capabilities().is_empty());
     assert!(out.events.iter().any(|e| matches!(e, GuestEvent::Unimplemented { syscall, .. } if syscall == "socket")));
@@ -769,7 +770,7 @@ fn madvise_does_what_it_says() {
 /// with -DON_LINUX, apart from what's marked.
 #[test]
 fn ping_with_net_raw() {
-    let raw = || with("pingsock").allow(Capability::Net).allow(Capability::NetRaw);
+    let raw = || may_drop(with("pingsock")).allow(Capability::Net).allow(Capability::NetRaw);
     // Not without it: net alone is sockets, and it's said which is missing.
     let out = run(with("pingsock").allow(Capability::Net), &["/bin/pingsock", "denied"]);
     assert_eq!(out.stdout_str(), "pingsock denied ok\n", "{}", out.kernel_log);
@@ -777,9 +778,11 @@ fn ping_with_net_raw() {
     let out = run(raw(), &["/bin/pingsock", "local"]);
     assert_eq!(out.stdout_str(), "pingsock local ok\n", "{}", out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
-    // Raw IP of any other kind isn't here, and says so.
+    // Raw IP of any other kind isn't here, and says so (but it is on the
+    // vm stack: raw_sockets_on_the_vm_stack).
+    let native = std::env::var("GRIX_NETWORK").as_deref() != Ok("vm");
     assert!(
-        matches!(&out.events[..], [GuestEvent::Unimplemented { detail, .. }] if detail == "raw IP sockets"),
+        !native || matches!(&out.events[..], [GuestEvent::Unimplemented { detail, .. }] if detail == "raw IP sockets"),
         "{:?}",
         out.events
     );
@@ -3766,10 +3769,9 @@ fn serving_udp_through_a_forwarded_port() {
         }
     }
     peer.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    // Too big for one frame: dropped on the way in.
+    // More than a frame holds, in and back out.
     peer.send_to(&[b'x'; 5000], host).unwrap();
-    peer.send_to(b"after", host).unwrap();
-    assert_eq!(reply(&peer), "echo 5: after");
+    assert_eq!(reply(&peer), format!("echo 5000: {}", "x".repeat(5000)));
     // Another sender gets its own replies.
     let other = UdpSocket::bind("127.0.0.1:0").unwrap();
     other.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -5098,6 +5100,148 @@ fn posix_message_queues() {
     assert_eq!(out.stdout_str().lines().last(), Some("mqueue ok"), "{}{}", out.stdout_str(), out.kernel_log);
     assert_eq!(out.status, ExitStatus::Exited(0));
     assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Socket options read back as they were set, and TCP_INFO says how a
+/// connection is, on both stacks. The fixture passes on Linux as it is.
+#[test]
+fn socket_options_read_back() {
+    let port = echo_server();
+    for network in [Network::Native, Network::Vm] {
+        let b = with("sockopts").network(network).allow_host(&format!("host.grix.internal:{port}")).unwrap();
+        let out = run(b, &["/bin/sockopts", "10.0.2.2", &port.to_string()]);
+        assert_eq!(out.stdout_str().lines().last(), Some("sockopts ok"), "{network:?}: {}", out.stdout_str());
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+}
+
+/// Raw IP sockets, on the stack that has an IP layer: with the capability
+/// for them, and not without. The fixture passes on Linux as it is.
+#[test]
+fn raw_sockets_on_the_vm_stack() {
+    let raw = || with("rawsock").network(Network::Vm);
+    let out = run(raw().allow(Capability::NetRaw), &["/bin/rawsock"]);
+    assert_eq!(out.stdout_str(), "rawsock ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Without it, it's said which is missing.
+    let out = run(raw(), &["/bin/rawsock"]);
+    assert_eq!(out.missing_capabilities(), ["net_raw"]);
+}
+
+/// /proc/net lists a program's sockets as Linux does, with the inodes fstat
+/// and /proc/self/fd give, which is how lsof and netstat -p find a process.
+/// The fixture passes on Linux as it is.
+#[test]
+fn proc_net_lists_sockets() {
+    use std::io::{Read, Write};
+    for network in [Network::Native, Network::Vm] {
+        let sandbox = || {
+            with("procnet")
+                .allow(Capability::Net)
+                .allow(Capability::Process)
+                .allow(Capability::FsWrite)
+                .network(network)
+                .user("0:0")
+        };
+        let out = run(sandbox(), &["/bin/procnet"]);
+        assert_eq!(out.stdout_str(), "procnet ok\n", "{network:?} {}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+
+        // A connection through the host: it says something and hangs up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            c.read_exact(&mut [0]).unwrap();
+            c.write_all(b"hello").unwrap();
+        });
+        let b = sandbox().allow_host(&format!("host.grix.internal:{port}")).unwrap();
+        let out = run(b, &["/bin/procnet", "host", &port.to_string()]);
+        assert_eq!(out.stdout_str(), "procnet ok\n", "{network:?} {}", out.kernel_log);
+        server.join().unwrap();
+
+        // One from the host, waiting to be accepted and then accepted.
+        let host_port = free_port();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        // Until something listens, a connection is turned away at once.
+        let client = std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", host_port)) {
+                    let _ = c.read(&mut [0]);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let b = sandbox().forward(&format!("127.0.0.1:{host_port}"), 8000).unwrap();
+        let out = run(b, &["/bin/procnet", "forwarded", "8000"]);
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(out.stdout_str(), "listening\nprocnet ok\n", "{network:?} {}", out.kernel_log);
+        client.join().unwrap();
+    }
+    // Raw sockets, where there are any, and ping sockets in their table.
+    let b = with("procnet").allow(Capability::NetRaw).network(Network::Vm);
+    let out = run(b, &["/bin/procnet", "raw"]);
+    assert_eq!(out.stdout_str(), "procnet ok\n", "{}", out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// A UDP echo server on the host, until the run's `done`.
+fn udp_echo() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    // macOS starts at less than a big datagram needs.
+    let room: libc::c_int = 1 << 17;
+    let size = std::mem::size_of_val(&room) as libc::socklen_t;
+    // SAFETY: a socket of ours, and the value's size.
+    let set = unsafe {
+        use std::os::fd::AsRawFd;
+        let value = (&raw const room).cast();
+        libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, value, size)
+    };
+    assert_eq!(set, 0);
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let stop = done.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0; 65536];
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let _ = socket.send_to(&buf[..n], from);
+            }
+        }
+    });
+    (port, done)
+}
+
+/// Datagrams go as big as IP takes them, on the guest's own addresses and
+/// through the host, however small the link's frames are, and a socket that
+/// asks is held to the MTU eth0 shows. The fixture passes on Linux as it is.
+#[test]
+fn datagrams_as_big_as_ip_carries() {
+    for network in [Network::Native, Network::Vm] {
+        let sandbox = || with("bigudp").allow(Capability::Net).network(network);
+        // The link's own on the stack that has one.
+        let mtu = if network == Network::Vm { grix_abi::link::MTU } else { 1500 };
+        let out = run(sandbox(), &["/bin/bigudp", "mtu"]);
+        assert_eq!(out.stdout_str(), format!("eth0 mtu {mtu}\n"), "{}", out.kernel_log);
+
+        let out = run(sandbox(), &["/bin/bigudp"]);
+        assert_eq!(out.stdout_str(), "bigudp ok\n", "{network:?} {}", out.kernel_log);
+        assert!(out.events.is_empty(), "{:?}", out.events);
+
+        let (port, done) = udp_echo();
+        let b = sandbox().allow_host(&format!("host.grix.internal:{port}")).unwrap();
+        let b = b.allow_host("host.grix.internal:9").unwrap();
+        let out = run(b, &["/bin/bigudp", "host", &port.to_string()]);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(out.stdout_str(), "bigudp ok\n", "{network:?} {}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+    }
 }
 
 /// The user's groups in the sandbox's /etc/group are the program's, as

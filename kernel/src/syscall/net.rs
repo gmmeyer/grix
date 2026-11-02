@@ -4,6 +4,7 @@
 //! gated by `net`. The per-socket calls here need no capability: they only
 //! act on sockets that already exist.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use grix_abi::policy::Capability;
 
@@ -38,7 +39,7 @@ const MSG_DONTWAIT: u64 = 0x40;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const SOL_SOCKET: u64 = 1;
 const ENOTSOCK: Errno = Errno(88);
-const ENOPROTOOPT: Errno = Errno(92);
+use crate::sockopt::ENOPROTOOPT;
 const EPROTONOSUPPORT: Errno = Errno(93);
 const EISCONN: Errno = Errno(106);
 
@@ -353,11 +354,11 @@ fn recv(p: &mut Process, file: &FileRef, buf: u64, len: u64, flags: u64) -> SysR
 pub fn recvfrom(p: &mut Process, fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> SysResult {
     let file = socket_file(p, fd)?;
     if is_inet(&file) {
-        let (n, from, v6) = inet_recv(p, fd, &[(buf, len)], flags)?;
-        if let Some(from) = from {
-            write_addr(p, addr, addrlen, &from.encode(v6))?;
+        let r = inet_recv(p, fd, &[(buf, len)], flags)?;
+        if let Some(from) = r.from {
+            write_addr(p, addr, addrlen, &from.encode(r.v6))?;
         }
-        return Ok(n);
+        return Ok(if flags & MSG_TRUNC != 0 { r.full } else { r.n });
     }
     if is_netlink(&file) {
         let (n, full) = recv_netlink(p, &file, &[(buf, len)], flags)?;
@@ -529,11 +530,11 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
     let m = read_msghdr(p, msg)?;
     if is_inet(&file) {
         let bufs = iovecs(p, m.iov, m.iovlen)?;
-        let (n, from, v6) = inet_recv(p, fd, &bufs, flags)?;
+        let r = inet_recv(p, fd, &bufs, flags)?;
         if m.name != 0 {
-            match from {
+            match r.from {
                 Some(from) => {
-                    let sa = from.encode(v6);
+                    let sa = from.encode(r.v6);
                     let room = read_u32(&mut p.aspace, msg + 8)? as usize;
                     copy_out(&mut p.aspace, m.name, &sa[..room.min(sa.len())])?;
                     write_u32(&mut p.aspace, msg + 8, sa.len() as u32)?;
@@ -542,8 +543,8 @@ pub fn recvmsg(p: &mut Process, fd: u64, msg: u64, flags: u64) -> SysResult {
             }
         }
         write_u64(&mut p.aspace, msg + 40, 0)?;
-        write_u32(&mut p.aspace, msg + 48, 0)?;
-        return Ok(n);
+        write_u32(&mut p.aspace, msg + 48, if r.full > r.n { MSG_TRUNC as u32 } else { 0 })?;
+        return Ok(if flags & MSG_TRUNC != 0 { r.full } else { r.n });
     }
     if is_netlink(&file) {
         let bufs = iovecs(p, m.iov, m.iovlen)?;
@@ -646,7 +647,40 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
         return write_u32(&mut p.aspace, len, 16).map(|_| 0);
     }
     if is_inet(&file) {
-        let v = with_inet(p, fd, |p, s, _| inet_getsockopt(p, s, level, name))??;
+        use crate::sockopt::{SO_LINGER, TCP_CONGESTION, TCP_INFO, TCP_INFO_BYTES, TCP_MAXSEG, tcp_info};
+        // What isn't an int: as much as there's room for, as Linux.
+        let more: Option<alloc::vec::Vec<u8>> = with_inet(p, fd, |_, s, _| match (level, name) {
+            (IPPROTO_TCP, TCP_INFO) if !s.dgram => {
+                let (state, unacked) = s.tcp_state();
+                Some(tcp_info(state, tcp_mss(s), unacked)[..TCP_INFO_BYTES].to_vec())
+            }
+            // (The host's, on `native`: what's usual there, and Reno on `vm`.)
+            (IPPROTO_TCP, TCP_CONGESTION) if !s.dgram => {
+                let name: &[u8] = if crate::netstack::active() { b"reno\0" } else { b"cubic\0" };
+                Some(name.to_vec())
+            }
+            (SOL_SOCKET, SO_LINGER) => {
+                let (on, seconds) = s.opts.linger();
+                let mut b = on.to_le_bytes().to_vec();
+                b.extend_from_slice(&seconds.to_le_bytes());
+                Some(b)
+            }
+            _ => None,
+        })?;
+        if let Some(bytes) = more {
+            let room = read_u32(&mut p.aspace, len)? as i32;
+            if room < 0 {
+                return Err(EINVAL);
+            }
+            let n = bytes.len().min(room as usize);
+            copy_out(&mut p.aspace, val, &bytes[..n])?;
+            return write_u32(&mut p.aspace, len, n as u32).map(|_| 0);
+        }
+        let v = if (level, name) == (IPPROTO_TCP, TCP_MAXSEG) {
+            with_inet(p, fd, |_, s, _| if s.dgram { Err(ENOPROTOOPT) } else { Ok(tcp_mss(s)) })??
+        } else {
+            with_inet(p, fd, |p, s, _| inet_getsockopt(p, s, level, name))??
+        };
         if read_u32(&mut p.aspace, len)? < 4 {
             return Err(EINVAL);
         }
@@ -727,9 +761,8 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
             Ok(0)
         })?;
     }
-    // TCP and IP options don't change connections the host makes.
-    if is_inet(&file) && matches!(level, IPPROTO_IP | IPPROTO_TCP | IPPROTO_IPV6 | IPPROTO_UDP) {
-        return Ok(0);
+    if is_inet(&file) && !(level == SOL_SOCKET && is_timeout(name)) {
+        return inet_setsockopt(p, fd, level, name, val, len);
     }
     if is_inet(&file) && level == SOL_SOCKET && is_timeout(name) {
         if len < 16 {
@@ -772,7 +805,7 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
             &mut FileKind::UnixUnbound(ty) => {
                 let sock = crate::unix::Sock::new(ty, crate::unix::State::Idle, super::unix::cred(p));
                 sock.lock().passcred = on;
-                f.kind = FileKind::Unix(sock);
+                f.set_unix(sock);
             }
             _ => {}
         }
@@ -851,19 +884,32 @@ fn new_inet(p: &mut Process, domain: u64, ty: u64, proto: u64, flags: u32, cloex
     let v6 = domain == AF_INET6;
     if proto == if v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP } && matches!(ty & 0xf, SOCK_DGRAM | SOCK_RAW) {
         require(p, nr::socket, Capability::NetRaw, "")?;
-        let mut s = Inet::new(v6, true);
+        let mut s = Inet::new(v6, true, p.uid);
         s.icmp = Some(inet::Icmp { raw: ty & 0xf == SOCK_RAW, v6, ident: 0 });
-        let file = new_file(FileKind::Inet(s), flags);
+        // A raw socket's in /proc/net/raw from the start.
+        if ty & 0xf == SOCK_RAW {
+            udp_of(&mut s);
+        }
+        let file = new_file(FileKind::Inet(Box::new(s)), flags);
         return p.fds.alloc(FdEntry { file, cloexec }, 0);
     }
     let dgram = match (ty & 0xf, proto) {
         (SOCK_STREAM, 0 | IPPROTO_TCP) => false,
         (SOCK_DGRAM, 0 | IPPROTO_UDP) => true,
         (SOCK_STREAM | SOCK_DGRAM, _) => return Err(EPROTONOSUPPORT),
+        // On the guest's own stack it's a packet like any other, and the
+        // gateway's where it stops: there's nothing to forge with.
+        (SOCK_RAW, 1..=255) if crate::netstack::active() => {
+            require(p, nr::socket, Capability::NetRaw, "")?;
+            let mut s = Inet::new(v6, true, p.uid);
+            inet::new_raw(&mut s, proto as u8);
+            let file = new_file(FileKind::Inet(Box::new(s)), flags);
+            return p.fds.alloc(FdEntry { file, cloexec }, 0);
+        }
         (SOCK_RAW, _) => return p.unimplemented(nr::socket, "socket", "raw IP sockets", EPROTONOSUPPORT),
         _ => return Err(ESOCKTNOSUPPORT),
     };
-    let file = new_file(FileKind::Inet(Inet::new(domain == AF_INET6, dgram)), flags);
+    let file = new_file(FileKind::Inet(Box::new(Inet::new(domain == AF_INET6, dgram, p.uid))), flags);
     p.fds.alloc(FdEntry { file, cloexec }, 0)
 }
 
@@ -905,8 +951,18 @@ fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
         return Err(EADDRNOTAVAIL);
     }
     // No ports here, and nothing to take one from.
+    if s.icmp.is_some_and(|i| !i.raw) {
+        s.bound = Some(SockAddr { port: 0, ..a });
+        ping_ident(s, a.port)?;
+        return Ok(0);
+    }
     if s.icmp.is_some() {
         s.bound = Some(a);
+        return Ok(0);
+    }
+    if s.raw.is_some() {
+        s.bound = Some(a);
+        udp_of(s).lock().local = Some(a);
         return Ok(0);
     }
     if s.dgram {
@@ -945,7 +1001,7 @@ fn inet_listen(s: &mut Inet) -> SysResult {
     }
     let unspecified = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
     let bound = s.bound.unwrap_or(unspecified);
-    let l = Listener::listen(bound.addr, bound.port, s.v6only)?;
+    let l = Listener::listen(bound.addr, bound.port, s.v6only, s.sock)?;
     s.bound = Some(SockAddr { port: l.lock().port, ..bound });
     s.state = State::Listening(l);
     Ok(0)
@@ -978,16 +1034,18 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
     };
     let v6 = s.v6;
     drop(of);
-    let mut new = Inet::new(v6, false);
+    let mut new = Inet::new(v6, false, p.uid);
     let peer = match pending {
-        Pending::Local { end, peer, local, .. } => {
+        Pending::Local { end, peer, local, listed, .. } => {
+            listed.accepted(new.sock);
             new.bound = Some(local);
-            new.state = State::Local { end, local, peer };
+            new.state = State::Local { end, local, peer, _listed: listed };
             peer
         }
         Pending::Remote(c, _) => {
             let (local, peer) = {
-                let c = c.lock();
+                let mut c = c.lock();
+                c.sock = new.sock;
                 (c.local, c.peer)
             };
             new.bound = Some(local);
@@ -996,8 +1054,10 @@ pub fn accept4(p: &mut Process, fd: u64, addr: u64, addrlen: u64, flags: u64) ->
         }
     };
     let fflags = O_RDWR | if flags & SOCK_NONBLOCK != 0 { O_NONBLOCK } else { 0 };
-    let nfd =
-        p.fds.alloc(FdEntry { file: new_file(FileKind::Inet(new), fflags), cloexec: flags & SOCK_CLOEXEC != 0 }, 0)?;
+    let nfd = p.fds.alloc(
+        FdEntry { file: new_file(FileKind::Inet(Box::new(new)), fflags), cloexec: flags & SOCK_CLOEXEC != 0 },
+        0,
+    )?;
     if let Err(e) = write_addr(p, addr, addrlen, &peer.encode(v6)) {
         let _ = p.fds.close(nfd);
         return Err(e);
@@ -1069,14 +1129,15 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, raw: &[u8]) -> Sy
         State::Idle => {}
     }
     if to.is_local() {
-        let (end, local) = inet::connect_local(to)?;
-        s.state = State::Local { end, local, peer: to };
+        let (end, local, listed) = inet::connect_local(to, s.sock)?;
+        s.state = State::Local { end, local, peer: to, _listed: listed };
         return Ok(0);
     }
     if to.port == 0 {
         return Err(ECONNREFUSED);
     }
-    s.state = State::Remote(Conn::connect(to)?);
+    s.state = State::Remote(Conn::connect(to, s.sock)?);
+    s.apply_opts();
     if nonblock {
         return Err(EINPROGRESS);
     }
@@ -1150,16 +1211,10 @@ pub(super) fn inet_read(
                 .map(|n| (n, Some(*peer))),
             None => Ok((0, Some(*peer))),
         },
-        State::Udp(u) => {
-            let datagram = u.lock().pop(peek);
-            let Some((from, data)) = datagram else {
-                return wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, None));
-            };
-            let n = (count as usize).min(data.len());
-            copy_out(&mut p.aspace, buf, &data[..n])?;
-            Ok((n as u64, Some(from)))
+        State::Udp(_) | State::Idle if s.dgram => {
+            datagram_read(p, s, &[(buf, count)], nonblock, peek).map(|(n, _, from)| (n, from))
         }
-        State::Idle if s.dgram => wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, None)),
+        State::Udp(_) => unreachable!(),
         State::Idle | State::Listening(_) => Err(ENOTCONN),
     }
 }
@@ -1183,10 +1238,12 @@ pub(super) fn inet_write(
     };
     if s.dgram {
         let to = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        if count > link::MAX_UDP as u64 {
+        if count > datagram_max(s) {
             return Err(EMSGSIZE);
         }
-        let mut q = alloc::vec![0u8; count as usize];
+        let mut q = Vec::new();
+        q.try_reserve_exact(count as usize).map_err(|_| ENOBUFS)?;
+        q.resize(count as usize, 0);
         src.read(p, 0, &mut q)?;
         return udp_send(p, s, &q, to, nonblock);
     }
@@ -1244,7 +1301,7 @@ fn udp_of(s: &mut Inet) -> UdpRef {
     if let State::Udp(u) = &s.state {
         return u.clone();
     }
-    let u = Udp::new(s.peer);
+    let u = Udp::new(s.peer, s.sock);
     u.lock().icmp = s.icmp;
     s.state = State::Udp(u.clone());
     u
@@ -1264,6 +1321,40 @@ fn udp_bind(s: &mut Inet) -> Result<SockAddr, Errno> {
     Ok(local)
 }
 
+/// The largest datagram this socket sends: a raw one's header is its own
+/// to fill in, or the kernel's, within what IP carries.
+fn datagram_max(s: &Inet) -> u64 {
+    if s.raw.is_some() {
+        return 65_515;
+    }
+    (if s.v6 { link::MAX_DATAGRAM } else { link::MAX_DATAGRAM_V4 }) as u64
+}
+
+/// A connected socket's path MTU, as far as the guest knows: Linux has
+/// IPv4's stop at IP_MAX_MTU, whatever the device says.
+fn path_mtu(s: &Inet, to: SockAddr) -> u32 {
+    match to.is_local() {
+        true if s.v6 => crate::netlink::LOOPBACK_MTU,
+        true => crate::netlink::LOOPBACK_MTU - 1,
+        false => crate::netlink::eth0_mtu(),
+    }
+}
+
+/// A datagram that a socket with IP_PMTUDISC_DO won't send, as it would
+/// need fragmenting: EMSGSIZE.
+fn fits_path(s: &Inet, data: usize, to: SockAddr) -> Result<(), Errno> {
+    const IP_MTU_DISCOVER: u64 = 10;
+    const IPV6_MTU_DISCOVER: u64 = 23;
+    const PMTUDISC_DO: i32 = 2;
+    let (level, name, headers) =
+        if s.v6 { (IPPROTO_IPV6, IPV6_MTU_DISCOVER, 48) } else { (IPPROTO_IP, IP_MTU_DISCOVER, 28) };
+    let strict = s.opts.get(level, name, s.dgram, s.v6).is_ok_and(|v| v == PMTUDISC_DO);
+    if strict && data + headers > path_mtu(s, to) as usize {
+        return Err(EMSGSIZE);
+    }
+    Ok(())
+}
+
 /// Send one UDP datagram to `to`: back to a peer that sent to it through
 /// a port forwarded from the host, to a socket of the guest's own, to the
 /// host's resolver (DNS), or through the host if it allows `to` (asked the
@@ -1272,9 +1363,13 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
     if s.icmp.is_some() {
         return icmp_send(p, s, data, to, nonblock);
     }
+    if let Some(proto) = s.raw {
+        return raw_send(s, proto, data, to);
+    }
     if to.port == 0 {
         return Err(EINVAL);
     }
+    fits_path(s, data.len(), to)?;
     let local = udp_bind(s)?;
     let u = udp_of(s);
     let len = data.len() as u64;
@@ -1322,18 +1417,70 @@ fn icmp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock:
     if data.len() < 8 || data[0] != echo || data[1] != 0 {
         return Err(EINVAL);
     }
+    let raw = s.icmp.is_some_and(|i| i.raw);
+    let ident = if raw { u16::from_be_bytes([data[4], data[5]]) } else { ping_ident(s, 0)? };
     let u = udp_of(s);
     if let Some(i) = u.lock().icmp.as_mut() {
-        i.ident = u16::from_be_bytes([data[4], data[5]]);
+        i.ident = ident;
     }
+    let mut data = data.to_vec();
+    data[4..6].copy_from_slice(&ident.to_be_bytes());
     let to = SockAddr { addr: to.addr, port: link::ICMP_PORT }.or_loopback();
     if to.is_local() || to.addr == Addr::V4(link::DNS_V4) {
-        let mut reply = data.to_vec();
-        reply[0] = if s.v6 { link::ICMP_ECHO_REPLY.1 } else { link::ICMP_ECHO_REPLY.0 };
-        u.lock().push_icmp(to, to.addr, &reply);
+        data[0] = if s.v6 { link::ICMP_ECHO_REPLY.1 } else { link::ICMP_ECHO_REPLY.0 };
+        u.lock().push_icmp(to, to.addr, &data);
         return Ok(data.len() as u64);
     }
-    through_host(p, &u, data, to, nonblock)
+    through_host(p, &u, &data, to, nonblock)
+}
+
+/// A ping socket's identifier: its port, which bind says (`want`, which
+/// another may have too, as Linux's ping sockets all have SO_REUSEADDR) or
+/// its first send picks, one no other has.
+fn ping_ident(s: &mut Inet, want: u16) -> Result<u16, Errno> {
+    let have = s.bound.map_or(0, |b| b.port);
+    if want == 0 && have != 0 {
+        return Ok(have);
+    }
+    let ident = if want != 0 {
+        want
+    } else {
+        let mut free = None;
+        for _ in 0..1000 {
+            let port = inet::ephemeral_port();
+            if !inet::ident_taken(port, s.v6)? {
+                free = Some(port);
+                break;
+            }
+        }
+        free.ok_or(Errno(98))?
+    };
+    let any = if s.v6 { SockAddr { addr: Addr::V6([0; 16]), port: 0 } } else { SockAddr::UNSPECIFIED_V4 };
+    s.bound = Some(SockAddr { port: ident, ..s.bound.unwrap_or(any) });
+    if let Some(i) = s.icmp.as_mut() {
+        i.ident = ident;
+    }
+    if let Some(i) = udp_of(s).lock().icmp.as_mut() {
+        i.ident = ident;
+    }
+    Ok(ident)
+}
+
+/// A raw socket's packet. It's the guest's own stack that has it: nothing
+/// about it reaches anything but the gateway, whatever's in its header.
+fn raw_send(s: &Inet, proto: u8, data: &[u8], to: SockAddr) -> SysResult {
+    use grix_netstack::packet;
+    const IP_HDRINCL: u64 = 3;
+    let to = to.or_loopback();
+    let hdrincl = s.opts.get(IPPROTO_IP, IP_HDRINCL, true, s.v6)? != 0;
+    let built = if hdrincl {
+        packet::with_header(data).ok_or(EINVAL)?
+    } else {
+        let from = if to.is_loopback() { to.addr } else { inet::source_for(to.addr) };
+        packet::raw(from, to.addr, proto, data).ok_or(EMSGSIZE)?
+    };
+    crate::netstack::raw_out(built);
+    Ok(data.len() as u64)
 }
 
 /// A datagram for `to` by way of the host, which says first if it may go.
@@ -1364,25 +1511,36 @@ fn through_host(p: &mut Process, u: &UdpRef, data: &[u8], to: SockAddr, nonblock
     }
 }
 
+/// The buffers as one datagram, to `to` or the peer.
+pub(super) fn datagram_write(
+    p: &mut Process,
+    s: &mut Inet,
+    bufs: &[(u64, u64)],
+    to: Option<SockAddr>,
+    nonblock: bool,
+) -> SysResult {
+    let total = bufs.iter().try_fold(0u64, |t, b| t.checked_add(b.1)).ok_or(EINVAL)?;
+    if total > datagram_max(s) {
+        return Err(EMSGSIZE);
+    }
+    let mut q = Vec::new();
+    q.try_reserve_exact(total as usize).map_err(|_| ENOBUFS)?;
+    for &(base, len) in bufs {
+        let at = q.len();
+        q.resize(at + len as usize, 0);
+        copy_in(&mut p.aspace, base, &mut q[at..])?;
+    }
+    let dest = to.or(s.peer).ok_or(EDESTADDRREQ)?;
+    udp_send(p, s, &q, dest, nonblock)
+}
+
 fn inet_send(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64, to: Option<SockAddr>) -> SysResult {
     let file = socket_file(p, fd)?;
     let mut of = file.lock();
     let nonblock = of.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Inet(s) = &mut of.kind else { return Err(ENOTSOCK) };
     if s.dgram {
-        // One datagram: gather the iovecs.
-        let total = bufs.iter().try_fold(0u64, |t, b| t.checked_add(b.1)).ok_or(EINVAL)?;
-        if total > link::MAX_UDP as u64 {
-            return Err(EMSGSIZE);
-        }
-        let mut q = Vec::with_capacity(total as usize);
-        for &(base, len) in bufs {
-            let at = q.len();
-            q.resize(at + len as usize, 0);
-            copy_in(&mut p.aspace, base, &mut q[at..])?;
-        }
-        let dest = to.or(s.peer).ok_or(EDESTADDRREQ)?;
-        return udp_send(p, s, &q, dest, nonblock);
+        return datagram_write(p, s, bufs, to, nonblock);
     }
     let mut total = 0;
     for (i, &(base, len)) in bufs.iter().enumerate() {
@@ -1401,18 +1559,26 @@ fn inet_send(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64, to: Opti
     Ok(total)
 }
 
-fn inet_recv(
-    p: &mut Process,
-    fd: u64,
-    bufs: &[(u64, u64)],
-    flags: u64,
-) -> Result<(u64, Option<SockAddr>, bool), Errno> {
+/// What a receive got.
+struct Received {
+    n: u64,
+    /// A datagram's whole length, which `n` may be less of (MSG_TRUNC).
+    full: u64,
+    from: Option<SockAddr>,
+    v6: bool,
+}
+
+fn inet_recv(p: &mut Process, fd: u64, bufs: &[(u64, u64)], flags: u64) -> Result<Received, Errno> {
     let file = socket_file(p, fd)?;
     let of = file.lock();
     let nonblock = of.nonblocking() || flags & MSG_DONTWAIT != 0;
     let FileKind::Inet(s) = &of.kind else { return Err(ENOTSOCK) };
     let peek = flags & MSG_PEEK != 0;
     let v6 = s.v6;
+    if s.dgram {
+        let (n, full, from) = datagram_read(p, s, bufs, nonblock, peek)?;
+        return Ok(Received { n, full, from, v6 });
+    }
     let mut total = 0;
     let mut from = None;
     for (i, &(base, len)) in bufs.iter().enumerate() {
@@ -1421,8 +1587,7 @@ fn inet_recv(
             Ok((n, f)) => {
                 total += n;
                 from = from.or(f);
-                // A datagram is read once, into the first buffer.
-                if n < len || s.dgram {
+                if n < len {
                     break;
                 }
             }
@@ -1430,24 +1595,47 @@ fn inet_recv(
             Err(_) => break,
         }
     }
-    Ok((total, from, v6))
+    Ok(Received { n: total, full: total, from, v6 })
+}
+
+/// One datagram, across the buffers, however many there are: (what they
+/// took, its whole length, who sent it). What they don't hold is gone.
+pub(super) fn datagram_read(
+    p: &mut Process,
+    s: &Inet,
+    bufs: &[(u64, u64)],
+    nonblock: bool,
+    peek: bool,
+) -> Result<(u64, u64, Option<SockAddr>), Errno> {
+    let State::Udp(u) = &s.state else {
+        return wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, n, None));
+    };
+    let datagram = u.lock().pop(peek);
+    let Some((from, data)) = datagram else {
+        return wait(p, nonblock, s.rcvtimeo, EAGAIN).map(|n| (n, n, None));
+    };
+    let mut rest = &data[..];
+    for &(base, len) in bufs {
+        let (now, after) = rest.split_at(rest.len().min(len as usize));
+        copy_out(&mut p.aspace, base, now)?;
+        rest = after;
+    }
+    Ok(((data.len() - rest.len()) as u64, data.len() as u64, Some(from)))
 }
 
 fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u32, Errno> {
     const SO_TYPE: u64 = 3;
     const SO_ERROR: u64 = 4;
-    const SO_SNDBUF: u64 = 7;
-    const SO_RCVBUF: u64 = 8;
-    const SO_KEEPALIVE: u64 = 9;
-    const SO_REUSEADDR: u64 = 2;
     const SO_ACCEPTCONN: u64 = 30;
     const SO_PROTOCOL: u64 = 38;
     const SO_DOMAIN: u64 = 39;
-    const TCP_NODELAY: u64 = 1;
     const IPV6_V6ONLY: u64 = 26;
+    const IP_MTU: u64 = 14;
+    const IPV6_MTU: u64 = 24;
     let _ = p;
     Ok(match (level, name) {
-        (SOL_SOCKET, SO_TYPE) if s.icmp.is_some_and(|i| i.raw) => SOCK_RAW as u32,
+        (IPPROTO_IP, IP_MTU) | (IPPROTO_IPV6, IPV6_MTU) => path_mtu(s, s.peer_addr().ok_or(ENOTCONN)?),
+        (SOL_SOCKET, SO_TYPE) if s.icmp.is_some_and(|i| i.raw) || s.raw.is_some() => SOCK_RAW as u32,
         (SOL_SOCKET, SO_TYPE) => (if s.dgram { SOCK_DGRAM } else { SOCK_STREAM }) as u32,
         (SOL_SOCKET, SO_ERROR) => match &s.state {
             State::Remote(c) => match c.lock().state {
@@ -1456,17 +1644,67 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
             },
             _ => 0,
         },
-        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => link::WINDOW,
-        (SOL_SOCKET, SO_KEEPALIVE | SO_REUSEADDR) => 0,
         (SOL_SOCKET, SO_ACCEPTCONN) => matches!(s.state, State::Listening(_)) as u32,
+        (SOL_SOCKET, SO_PROTOCOL) if s.raw.is_some() => s.raw.unwrap_or(0) as u32,
         (SOL_SOCKET, SO_PROTOCOL) if s.icmp.is_some() => (if s.v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP }) as u32,
         (SOL_SOCKET, SO_PROTOCOL) => (if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP }) as u32,
         (SOL_SOCKET, SO_DOMAIN) => (if s.v6 { AF_INET6 } else { AF_INET }) as u32,
-        (IPPROTO_TCP, TCP_NODELAY) => 1,
         (IPPROTO_IPV6, IPV6_V6ONLY) if s.v6 => s.v6only as u32,
-        (IPPROTO_TCP | IPPROTO_IP | IPPROTO_IPV6, _) => 0,
-        _ => return Err(ENOPROTOOPT),
+        _ => s.opts.get(level, name, s.dgram, s.v6)? as u32,
     })
+}
+
+/// The segments a TCP socket sends: before it's connected, what Linux says
+/// of one that's never heard from a peer.
+fn tcp_mss(s: &Inet) -> u32 {
+    const DEFAULT_MSS: u32 = 536;
+    const NATIVE_MSS: u32 = 1460;
+    const HEADERS: u32 = 40;
+    match s.state {
+        State::Remote(_) | State::Local { .. } if crate::netstack::active() => link::MTU as u32 - HEADERS,
+        State::Remote(_) | State::Local { .. } => NATIVE_MSS,
+        _ => DEFAULT_MSS,
+    }
+}
+
+fn inet_setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len: u64) -> SysResult {
+    use crate::sockopt::SO_LINGER;
+    /// Joining a multicast group or choosing where it's sent from: there
+    /// are no multicast routes through the proxy, or the guest's stack.
+    const IP_MULTICAST_IF: u64 = 32;
+    const IP_ADD_MEMBERSHIP: u64 = 35;
+    const IP_DROP_MEMBERSHIP: u64 = 36;
+    const IPV6_MULTICAST_IF: u64 = 17;
+    const IPV6_ADD_MEMBERSHIP: u64 = 20;
+    const IPV6_DROP_MEMBERSHIP: u64 = 21;
+    if matches!(
+        (level, name),
+        (IPPROTO_IP, IP_MULTICAST_IF | IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP)
+            | (IPPROTO_IPV6, IPV6_MULTICAST_IF | IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP)
+    ) {
+        return p.unimplemented(nr::setsockopt, "setsockopt", "multicast", ENODEV);
+    }
+    if (level, name) == (SOL_SOCKET, SO_LINGER) {
+        if len < 8 {
+            return Err(EINVAL);
+        }
+        let on = read_u32(&mut p.aspace, val)? as i32;
+        let seconds = read_u32(&mut p.aspace, val + 4)? as i32;
+        return with_inet(p, fd, |_, s, _| {
+            s.opts.set_linger((on != 0) as i32, seconds);
+            0
+        });
+    }
+    if len < 4 {
+        return Err(EINVAL);
+    }
+    let value = read_u32(&mut p.aspace, val)? as i32;
+    with_inet(p, fd, |_, s, _| {
+        let (dgram, v6) = (s.dgram, s.v6);
+        s.opts.set(level, name, value, dgram, v6)?;
+        s.apply_opts();
+        Ok(0)
+    })?
 }
 
 fn inet_shutdown(s: &mut Inet, how: u64) -> SysResult {

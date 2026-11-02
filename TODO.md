@@ -8,7 +8,7 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.73)
+## What's left (after 0.0.74)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce. The rule for what's
@@ -20,11 +20,16 @@ Linux behaviour:
 1. Newer syscalls as programs ask for them: `statmount` and `listmount` are
    reported, fanotify and the new mount API refused for now, and
    `mq_notify` with SIGEV_THREAD is reported.
-2. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
-   (nothing a program sends leaves the gateway, so a raw socket there
-   forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
-3. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
+2. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
    process's table under the filesystem's lock.
+3. What's left of networking, none of it asked for by anything yet:
+   `IP_TTL` reaches the `vm` stack's packets but no further, as the host's
+   sockets are the host's, so traceroute sees nothing (it'd take the proxy
+   setting a socket's TTL per datagram, and hearing `IP_RECVERR` back); no
+   AF_PACKET; `/proc/net/snmp` and `netstat`, whose counters nothing here
+   keeps; `/proc/net/unix` shows named sockets, not a pair's unnamed ends;
+   a closed connection has no TIME_WAIT line; `MSG_TRUNC` on a TCP `recv`
+   reads rather than discards.
 
 Bigger:
 
@@ -81,6 +86,13 @@ Network:
       168.63.129.16, and a rule opens each.
 - [ ] Throughput of `vm` against `native` on Hypervisor.framework: it's only
       been measured under emulation.
+- [ ] `datagrams_as_big_as_ip_carries` through the host, both stacks: macOS
+      refuses a send past a socket's buffer, which starts at 9216 bytes
+      (`net.inet.udp.maxdgram`), so `takes_any_datagram` raises it. That's
+      never run. Also `serving_udp_through_a_forwarded_port`'s big datagram.
+- [ ] `proc_net_lists_sockets`, both stacks: nothing in it is the host's, but
+      the forwarded connection's peer comes through `guest_view` there too.
+- [ ] `raw_sockets_on_the_vm_stack`.
 
 Time zone:
 

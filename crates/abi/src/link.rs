@@ -24,10 +24,13 @@ pub const WINDOW: u32 = 32 * 1024;
 pub const STDIN_WINDOW: u32 = 64 * 1024;
 /// The most data one `Data` message carries.
 pub const MAX_DATA: usize = MAX_FRAME - 8;
-/// The largest UDP datagram that goes through the host (one frame).
-/// Bigger ones aren't carried: the guest's sends fail with EMSGSIZE, and
-/// the host drops what comes in, as a network that can't fragment would.
+/// The most of a datagram that one message carries. What's more goes ahead
+/// of it in `UdpMore` messages, as many as it takes.
 pub const MAX_UDP: usize = MAX_FRAME - 32;
+/// The largest datagrams, as IP's length field has it: IPv6's payload is
+/// its length and IPv4's has a 20-byte header in there.
+pub const MAX_DATAGRAM: usize = 65_535 - 8;
+pub const MAX_DATAGRAM_V4: usize = MAX_DATAGRAM - 20;
 /// The port in UDP's messages that means ICMP: `UdpAllow`, `UdpSend`,
 /// `UdpVerdict` and `UdpRecv` are for a ping socket with it, and their data
 /// is an ICMP message without an IP header. No UDP datagram goes to port 0.
@@ -65,8 +68,7 @@ pub const HOST_V6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 pub const NET_V6_PREFIX: u8 = 64;
 /// A name for `HOST_V4`.
 /// The largest IP packet on the `vm` network stack's link: a frame each, in
-/// one of the console's buffers, as nothing here is a real Ethernet. It
-/// carries `MAX_UDP` over IPv4.
+/// one of the console's buffers, as nothing here is a real Ethernet.
 pub const MTU: usize = crate::wire::MAX_FRAME - crate::wire::FRAME_HEADER;
 
 pub const HOST_NAME: &str = "host.grix.internal";
@@ -134,6 +136,8 @@ pub enum ToHost<'a> {
     /// `addr:peer_port`, which sent to it (`ToGuest::UdpIncoming`): it goes
     /// out from the forwarded port, and only to such a peer.
     UdpReply { port: u16, addr: Addr, peer_port: u16, data: &'a [u8] },
+    /// The start of the datagram the next `UdpSend` or `UdpReply` ends.
+    UdpMore { data: &'a [u8] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,11 +184,12 @@ pub enum ToGuest<'a> {
         verdict: u8,
     },
     /// A datagram for UDP socket `id` from `addr:port` (a destination it
-    /// sent to).
+    /// sent to). `more` bytes of it follow in `UdpMore`s.
     UdpRecv {
         id: u32,
         addr: Addr,
         port: u16,
+        more: u32,
         data: &'a [u8],
     },
     /// A datagram to a UDP port forwarded from the host, for the guest
@@ -194,8 +199,79 @@ pub enum ToGuest<'a> {
         port: u16,
         peer: Addr,
         peer_port: u16,
+        more: u32,
         data: &'a [u8],
     },
+    /// The next of the bytes a `UdpRecv` or `UdpIncoming` said would follow.
+    /// A guest may lose any datagram's message under load, so it's the first
+    /// that says how much there is, and nothing comes of a part of one.
+    UdpMore {
+        data: &'a [u8],
+    },
+}
+
+/// Where a datagram that takes more than one message is going.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    Socket { id: u32, addr: Addr, port: u16 },
+    Forwarded { port: u16, peer: Addr, peer_port: u16 },
+}
+
+impl Bound {
+    /// All of a datagram's data, as one message.
+    pub fn message(self, data: &[u8]) -> ToGuest<'_> {
+        match self {
+            Bound::Socket { id, addr, port } => ToGuest::UdpRecv { id, addr, port, more: 0, data },
+            Bound::Forwarded { port, peer, peer_port } => ToGuest::UdpIncoming { port, peer, peer_port, more: 0, data },
+        }
+    }
+}
+
+/// A long datagram coming in, at most one at a time: the host queues a
+/// datagram's messages together, so a new one means the last has lost a part.
+#[derive(Default)]
+pub struct Arriving {
+    now: Option<(Bound, Vec<u8>, usize)>,
+}
+
+impl Arriving {
+    pub const fn new() -> Arriving {
+        Arriving { now: None }
+    }
+
+    fn start(&mut self, to: Bound, more: u32, data: &[u8]) {
+        self.now = None;
+        let (more, mut held) = (more as usize, Vec::new());
+        if more + data.len() <= MAX_DATAGRAM && held.try_reserve_exact(more + data.len()).is_ok() {
+            held.extend_from_slice(data);
+            self.now = Some((to, held, more));
+        }
+    }
+
+    /// Take a message with `more` to it, or a `UdpMore`: the whole datagram
+    /// if that was the last of it.
+    pub fn add(&mut self, msg: &ToGuest) -> Option<(Bound, Vec<u8>)> {
+        match *msg {
+            ToGuest::UdpRecv { id, addr, port, more, data } => self.start(Bound::Socket { id, addr, port }, more, data),
+            ToGuest::UdpIncoming { port, peer, peer_port, more, data } => {
+                self.start(Bound::Forwarded { port, peer, peer_port }, more, data)
+            }
+            ToGuest::UdpMore { data } => {
+                let (_, held, more) = self.now.as_mut()?;
+                if data.len() > *more {
+                    self.now = None;
+                    return None;
+                }
+                held.extend_from_slice(data);
+                *more -= data.len();
+                if *more == 0 {
+                    return self.now.take().map(|(to, held, _)| (to, held));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 impl<'a> ToHost<'a> {
@@ -255,6 +331,10 @@ impl<'a> ToHost<'a> {
                 w.raw(&peer_port.to_le_bytes());
                 w.raw(data);
             }
+            ToHost::UdpMore { data } => {
+                w.u8(11);
+                w.raw(data);
+            }
         }
         w.buf
     }
@@ -290,6 +370,7 @@ impl<'a> ToHost<'a> {
                 let peer_port = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
                 ToHost::UdpReply { port, addr, peer_port, data: r.rest() }
             }
+            11 => ToHost::UdpMore { data: r.rest() },
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -301,7 +382,7 @@ impl<'a> ToHost<'a> {
 /// but the sender's pace bounds them, where a connection's data has its
 /// window, paid for when the connection was made.
 pub fn is_datagram(msg: &[u8]) -> bool {
-    matches!(msg.first(), Some(9 | 10))
+    matches!(msg.first(), Some(9..=11))
 }
 
 impl<'a> ToGuest<'a> {
@@ -343,11 +424,12 @@ impl<'a> ToGuest<'a> {
                 w.raw(&port.to_le_bytes());
                 w.u8(verdict);
             }
-            ToGuest::UdpRecv { id, addr, port, data } => {
+            ToGuest::UdpRecv { id, addr, port, more, data } => {
                 w.u8(9);
                 w.u32(id);
                 addr.put(&mut w);
                 w.raw(&port.to_le_bytes());
+                w.u32(more);
                 w.raw(data);
             }
             ToGuest::Incoming { id, port, peer, peer_port } => {
@@ -357,11 +439,16 @@ impl<'a> ToGuest<'a> {
                 peer.put(&mut w);
                 w.raw(&peer_port.to_le_bytes());
             }
-            ToGuest::UdpIncoming { port, peer, peer_port, data } => {
+            ToGuest::UdpIncoming { port, peer, peer_port, more, data } => {
                 w.u8(10);
                 w.raw(&port.to_le_bytes());
                 peer.put(&mut w);
                 w.raw(&peer_port.to_le_bytes());
+                w.u32(more);
+                w.raw(data);
+            }
+            ToGuest::UdpMore { data } => {
+                w.u8(11);
                 w.raw(data);
             }
         }
@@ -395,14 +482,17 @@ impl<'a> ToGuest<'a> {
                 let id = r.u32()?;
                 let addr = Addr::get(&mut r)?;
                 let port = u16_at(&mut r)?;
-                ToGuest::UdpRecv { id, addr, port, data: r.rest() }
+                let more = r.u32()?;
+                ToGuest::UdpRecv { id, addr, port, more, data: r.rest() }
             }
             10 => {
                 let port = u16_at(&mut r)?;
                 let peer = Addr::get(&mut r)?;
                 let peer_port = u16_at(&mut r)?;
-                ToGuest::UdpIncoming { port, peer, peer_port, data: r.rest() }
+                let more = r.u32()?;
+                ToGuest::UdpIncoming { port, peer, peer_port, more, data: r.rest() }
             }
+            11 => ToGuest::UdpMore { data: r.rest() },
             _ => return Err(DecodeError),
         };
         r.done()?;
@@ -425,11 +515,40 @@ mod tests {
     #[test]
     fn only_datagrams_are_datagrams() {
         let (peer, data) = (Addr::V4([1, 2, 3, 4]), &b"d"[..]);
-        assert!(is_datagram(&ToGuest::UdpRecv { id: 1, addr: peer, port: 2, data }.encode()));
-        assert!(is_datagram(&ToGuest::UdpIncoming { port: 2, peer, peer_port: 3, data }.encode()));
+        assert!(is_datagram(&ToGuest::UdpRecv { id: 1, addr: peer, port: 2, more: 0, data }.encode()));
+        assert!(is_datagram(&ToGuest::UdpIncoming { port: 2, peer, peer_port: 3, more: 0, data }.encode()));
+        assert!(is_datagram(&ToGuest::UdpMore { data }.encode()));
         assert!(!is_datagram(&ToGuest::Data { id: 1, data }.encode()));
         assert!(!is_datagram(&ToGuest::Incoming { id: 1, port: 2, peer, peer_port: 3 }.encode()));
         assert!(!is_datagram(&[]));
+    }
+
+    /// A long datagram is all of it or nothing, whichever message is lost.
+    #[test]
+    fn a_long_datagram_is_all_there() {
+        let (addr, data) = (Addr::V4([1, 2, 3, 4]), &[7u8; 10][..]);
+        let first = ToGuest::UdpRecv { id: 1, addr, port: 2, more: 20, data };
+        let more = ToGuest::UdpMore { data };
+        let mut a = Arriving::default();
+        assert_eq!(a.add(&first), None);
+        assert_eq!(a.add(&more), None);
+        let (to, whole) = a.add(&more).unwrap();
+        assert_eq!((to, whole.len()), (Bound::Socket { id: 1, addr, port: 2 }, 30));
+        // Its start went, or the rest of it never came and another began.
+        assert_eq!(a.add(&more), None);
+        assert_eq!(a.add(&first), None);
+        assert_eq!(a.add(&more), None);
+        assert_eq!(a.add(&first), None);
+        assert_eq!(a.add(&more), None);
+        assert_eq!(a.add(&more).map(|w| w.1.len()), Some(30));
+        // Too much, of what it said or of what a datagram can be.
+        assert_eq!(a.add(&ToGuest::UdpRecv { id: 1, addr, port: 2, more: 5, data }), None);
+        assert_eq!(a.add(&more), None);
+        assert_eq!(a.add(&ToGuest::UdpMore { data: &data[..5] }), None);
+        let huge = MAX_DATAGRAM as u32;
+        assert_eq!(a.add(&ToGuest::UdpRecv { id: 1, addr, port: 2, more: huge, data }), None);
+        assert_eq!(a.add(&ToGuest::UdpMore { data: &[0; 1 << 16] }), None);
+        assert_eq!(a.add(&ToGuest::UdpRecv { id: 1, addr, port: 2, more: u32::MAX, data }), None);
     }
 
     #[test]
@@ -459,9 +578,9 @@ mod tests {
             ToGuest::DnsAnswer { id: 9, answer: &[4] },
             ToGuest::Incoming { id: HOST_ID | 1, port: 8000, peer: Addr::V4([127, 0, 0, 1]), peer_port: 5555 },
             ToGuest::UdpVerdict { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, verdict: UDP_ALLOWED },
-            ToGuest::UdpRecv { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, data: b"time" },
-            ToGuest::UdpIncoming { port: 53, peer: Addr::V4(HOST_V4), peer_port: 40000, data: b"query" },
-            ToGuest::UdpIncoming { port: 53, peer: Addr::V6([3; 16]), peer_port: 2, data: b"" },
+            ToGuest::UdpRecv { id: 4, addr: Addr::V4([8, 8, 8, 8]), port: 123, more: 0, data: b"time" },
+            ToGuest::UdpIncoming { port: 53, peer: Addr::V4(HOST_V4), peer_port: 40000, more: 0, data: b"query" },
+            ToGuest::UdpIncoming { port: 53, peer: Addr::V6([3; 16]), peer_port: 2, more: 9, data: b"" },
         ];
         for m in to_guest {
             assert_eq!(ToGuest::decode(&m.encode()), Ok(m));

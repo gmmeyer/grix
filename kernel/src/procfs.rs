@@ -14,6 +14,7 @@ use crate::kmem::Charge;
 use crate::mm::aspace::{AddressSpace, Backing, STACK_TOP, Usage, VVAR};
 use crate::mm::frame;
 use crate::process::{Ids, Process};
+use crate::procnet::Table;
 use crate::procs::Zombie;
 use crate::time;
 
@@ -85,6 +86,8 @@ pub enum ProcFile {
     NetRoute,
     NetIfInet6,
     NetIpv6Route,
+    Sockets(crate::procnet::Table),
+    Eth0Mtu,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
     /// /proc/sys/kernel/threads-max and /sys/fs/cgroup/pids.max.
@@ -206,6 +209,17 @@ pub const FILES: &[(&str, ProcFile)] = &[
     ("/proc/net/route", ProcFile::NetRoute),
     ("/proc/net/if_inet6", ProcFile::NetIfInet6),
     ("/proc/net/ipv6_route", ProcFile::NetIpv6Route),
+    ("/proc/net/tcp", ProcFile::Sockets(Table::Tcp)),
+    ("/proc/net/tcp6", ProcFile::Sockets(Table::Tcp6)),
+    ("/proc/net/udp", ProcFile::Sockets(Table::Udp)),
+    ("/proc/net/udp6", ProcFile::Sockets(Table::Udp6)),
+    ("/proc/net/raw", ProcFile::Sockets(Table::Raw)),
+    ("/proc/net/raw6", ProcFile::Sockets(Table::Raw6)),
+    ("/proc/net/icmp", ProcFile::Sockets(Table::Icmp)),
+    ("/proc/net/icmp6", ProcFile::Sockets(Table::Icmp6)),
+    ("/proc/net/unix", ProcFile::Sockets(Table::Unix)),
+    ("/proc/net/sockstat", ProcFile::Sockets(Table::Sockstat)),
+    ("/proc/net/sockstat6", ProcFile::Sockets(Table::Sockstat6)),
     // lo as sysfs shows it (as netlink.rs describes it).
     ("/sys/class/net/lo/address", ProcFile::Text("00:00:00:00:00:00\n")),
     ("/sys/class/net/lo/addr_len", ProcFile::Text("6\n")),
@@ -237,7 +251,7 @@ pub const ETH0_FILES: &[(&str, ProcFile)] = &[
     ("/sys/class/net/eth0/carrier", ProcFile::Text("1\n")),
     ("/sys/class/net/eth0/flags", ProcFile::Text("0x1003\n")),
     ("/sys/class/net/eth0/ifindex", ProcFile::Text("2\n")),
-    ("/sys/class/net/eth0/mtu", ProcFile::Text("1500\n")),
+    ("/sys/class/net/eth0/mtu", ProcFile::Eth0Mtu),
     ("/sys/class/net/eth0/operstate", ProcFile::Text("up\n")),
     ("/sys/class/net/eth0/type", ProcFile::Text("1\n")),
 ];
@@ -388,6 +402,10 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         ProcFile::NetRoute => crate::netlink::proc_net_route(&mut s),
         ProcFile::NetIfInet6 => crate::netlink::proc_net_if_inet6(&mut s),
         ProcFile::NetIpv6Route => crate::netlink::proc_net_ipv6_route(&mut s),
+        ProcFile::Sockets(table) => crate::procnet::generate(table, &mut s)?,
+        ProcFile::Eth0Mtu => {
+            let _ = writeln!(s, "{}", crate::netlink::eth0_mtu());
+        }
     }
     Ok(s.into_bytes())
 }
@@ -838,8 +856,8 @@ fn uuid(s: &mut String, seed: Option<[u8; 16]>) {
 }
 
 /// `readlink("/proc/self/fd/N")`: what the descriptor refers to.
-pub fn fd_link(kind: &FileKind, fd: u64) -> String {
-    match kind {
+pub fn fd_link(file: &crate::fd::OpenFile, fd: u64) -> String {
+    match &file.kind {
         FileKind::Stdin | FileKind::Stdout | FileKind::Stderr => format!("pipe:[{}]", 0x1000_0000 + fd),
         FileKind::Node(ino) | FileKind::Dev(_, ino) | FileKind::Fifo(crate::fd::FifoFile { ino, .. }) => {
             fs::lock().path_of(*ino)
@@ -848,8 +866,8 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::Mqueue(_) => String::from("/dev/mqueue/queue"),
         FileKind::Generated(_) => String::from("/proc/self/generated"),
         FileKind::ProcMem(pid, _) => format!("/proc/{pid}/mem"),
-        FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64 & 0xffff_ffff),
-        FileKind::Socket(_) => format!("socket:[{}]", 0x3000_0000 + fd),
+        FileKind::Pipe(end) => format!("pipe:[{}]", alloc::sync::Arc::as_ptr(&end.pipe) as u64),
+        FileKind::Socket(_) => format!("socket:[{}]", file.ino),
         FileKind::EventFd(_) => String::from("anon_inode:[eventfd]"),
         FileKind::Epoll(_) => String::from("anon_inode:[eventpoll]"),
         FileKind::Inotify(_) => String::from("anon_inode:inotify"),
@@ -858,7 +876,7 @@ pub fn fd_link(kind: &FileKind, fd: u64) -> String {
         FileKind::PidFd(_) => String::from("anon_inode:[pidfd]"),
         FileKind::Landlock(_) => String::from("anon_inode:[landlock-ruleset]"),
         FileKind::Netlink(_) | FileKind::UnixUnbound(_) | FileKind::Inet(_) | FileKind::Unix(_) => {
-            alloc::format!("socket:[{}]", 0x3000_0000 + fd)
+            alloc::format!("socket:[{}]", file.ino)
         }
     }
 }

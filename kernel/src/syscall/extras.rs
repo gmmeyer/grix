@@ -11,7 +11,6 @@ use crate::mm::aspace::{Backing, Vma};
 use crate::mm::{PAGE_SIZE, page_up};
 use crate::process::Process;
 use crate::uaccess::*;
-use SysResult;
 
 const MAX_PID: u64 = i32::MAX as u64;
 

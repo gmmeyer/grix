@@ -228,7 +228,7 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Netlink(_)
         | FileKind::UnixUnbound(_)
         | FileKind::Inet(_)
-        | FileKind::Unix(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
+        | FileKind::Unix(_) => anon(f.ino, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         FileKind::ProcMem(..) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o600, 0),
         FileKind::Mqueue(q) => {
@@ -444,7 +444,7 @@ fn open(p: &mut Process, n: u32, dirfd: u64, path: &str, flags: u32, mode: u32, 
             if flags & O_PATH == 0 {
                 return Err(ELOOP);
             }
-            let target = procfs::fd_link(&file.lock().kind, fd);
+            let target = procfs::fd_link(&file.lock(), fd);
             let who = p.who();
             let ino = fs::lock().create_magic_link(target, who)?;
             return open_path(p, ino, cloexec);
@@ -1462,6 +1462,17 @@ fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Opti
         }
     }
     let bufs = iovecs(p, iov, cnt)?;
+    // A datagram is one message, however many buffers it's in.
+    let nonblock = f.nonblocking();
+    if let FileKind::Inet(s) = &mut f.kind
+        && s.dgram
+    {
+        return if write {
+            super::net::datagram_write(p, s, &bufs, None, nonblock)
+        } else {
+            super::net::datagram_read(p, s, &bufs, nonblock, false).map(|r| r.0)
+        };
+    }
     vectored_bufs(p, f, bufs, at, write)
 }
 
@@ -1720,11 +1731,11 @@ pub fn readlinkat(p: &mut Process, dirfd: u64, pathp: u64, buf: u64, size: u64) 
         }
         (Some(fd), _) if path.contains("/fd/") => {
             let file = p.fds.get_raw(fd).map_err(|_| ENOENT)?;
-            procfs::fd_link(&file.lock().kind, fd)
+            procfs::fd_link(&file.lock(), fd)
         }
         (_, Some((pid, fd))) => with_other(p, pid, |q| {
             let file = q.fds.get_raw(fd).map_err(|_| ENOENT)?;
-            Ok(procfs::fd_link(&file.lock().kind, fd))
+            Ok(procfs::fd_link(&file.lock(), fd))
         })?,
         _ => {
             let ino = resolve(p, dirfd, &path, false)?;

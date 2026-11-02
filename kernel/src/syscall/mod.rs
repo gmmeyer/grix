@@ -63,6 +63,7 @@ fn overflow_stack(to: u64, fault: bool) -> u64 {
     }
     if fault {
         // SAFETY: none; it faults (nothing is mapped at 8), on purpose.
+        #[allow(clippy::manual_dangling_ptr)]
         return unsafe { (8 as *const u64).read_volatile() };
     }
     frame[0]

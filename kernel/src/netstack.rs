@@ -58,6 +58,9 @@ struct Guest {
     /// Connections from outside, until they're made and `inet` can have
     /// them: their local port and peer.
     accepted: BTreeMap<u32, (u16, SockAddr)>,
+    /// Fragments from the gateway, and what tells this end's apart.
+    reassembly: packet::Reassembly,
+    next_ip_id: u32,
     /// What can't be said with `STACK` held, as it may send something back.
     later: Vec<ToGuest<'static>>,
     /// Handshakes from outside that came to nothing: no `Conn` holds them,
@@ -102,6 +105,8 @@ pub fn init() {
         stack,
         charge: Charge::default(),
         accepted: BTreeMap::new(),
+        reassembly: packet::Reassembly::default(),
+        next_ip_id: 0,
         later: Vec::new(),
         failed: Vec::new(),
     });
@@ -175,6 +180,14 @@ pub fn connect(id: u32, local: SockAddr, peer: SockAddr) {
     poke();
 }
 
+/// What of a socket's options mean anything to connection `id`.
+pub fn configure(id: u32, hop_limit: Option<u8>, keepalive_secs: Option<u32>) {
+    if let Some(g) = STACK.lock().as_mut() {
+        g.stack.configure(id, hop_limit, keepalive_secs);
+    }
+    poke();
+}
+
 fn own(to: Addr) -> Addr {
     if matches!(to, Addr::V6(_)) { Addr::V6(link::GUEST_V6) } else { Addr::V4(link::GUEST_V4) }
 }
@@ -182,8 +195,11 @@ fn own(to: Addr) -> Addr {
 fn transmit(p: Option<Vec<u8>>) {
     let mut guard = STACK.lock();
     let (Some(g), Some(p)) = (guard.as_mut(), p) else { return };
+    g.next_ip_id = g.next_ip_id.wrapping_add(1);
     // No room: lost, as on any link.
-    g.stack.transmit(p);
+    for piece in packet::fragments(p, g.next_ip_id).unwrap_or_default() {
+        g.stack.transmit(piece);
+    }
     drop(guard);
     poke();
 }
@@ -199,8 +215,25 @@ pub fn echo(to: Addr, message: &[u8]) {
     transmit(packet::echo(own(to), to, message));
 }
 
+/// A raw socket's packet, ready to go: to the guest's own raw sockets (and
+/// a UDP one, as it's a datagram) if that's where it's for, and otherwise
+/// out, where the gateway has the last word on it.
+pub fn raw_out(p: Vec<u8>) {
+    let Some((_, _, to, _)) = packet::header(&p) else { return };
+    if !(SockAddr { addr: to, port: 0 }).is_local() {
+        return transmit(Some(p));
+    }
+    inet::raw_in(&p);
+    if let Some(Packet::Udp { from, to, data }) = packet::parse(&p) {
+        inet::deliver_local(sockaddr(from), sockaddr(to), data);
+    }
+}
+
 /// A packet from the host.
 pub fn received(p: Vec<u8>) {
+    let whole = STACK.lock().as_mut().and_then(|g| g.reassembly.add(p));
+    let Some(p) = whole else { return };
+    inet::raw_in(&p);
     match packet::parse(&p) {
         Some(Packet::Tcp { from, to, syn }) => {
             let listening = syn && inet::listening(sockaddr(to));

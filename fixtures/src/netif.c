@@ -153,7 +153,9 @@ static int eth0(void) {
     CHECK(ioctl(u, SIOCGIFNETMASK, &ifr) == 0 && sin->sin_addr.s_addr == inet_addr("255.255.255.0"));
     CHECK(ioctl(u, SIOCGIFBRDADDR, &ifr) == 0 && sin->sin_addr.s_addr == inet_addr("10.0.2.255"));
     CHECK(ioctl(u, SIOCGIFFLAGS, &ifr) == 0 && ifr.ifr_flags & IFF_UP && !(ifr.ifr_flags & IFF_LOOPBACK));
-    CHECK(ioctl(u, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu == 1500);
+    // (Ethernet's, or the link's on the vm stack: sockopts and bigudp go
+    // by which.)
+    CHECK(ioctl(u, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu >= 1500);
     CHECK(ioctl(u, SIOCGIFHWADDR, &ifr) == 0 && ifr.ifr_hwaddr.sa_family == 1);
     CHECK(!memcmp(ifr.ifr_hwaddr.sa_data, "\x52\x54\x00\x12\x34\x56", 6));
     CHECK(ioctl(u, SIOCSIFADDR, &ifr) == -1 && errno == EPERM);

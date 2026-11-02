@@ -381,8 +381,8 @@ fn udp_and_echoes_are_what_they_say() {
     let (from, to) = (Addr::V6(link::HOST_V6), Addr::V6(link::GUEST_V6));
     let p = packet::echo(from, to, &m).unwrap();
     assert!(matches!(packet::parse(&p), Some(Packet::Echo { request: false, .. })));
-    // Too much for the link, and mixed families.
-    assert_eq!(packet::udp(a, a, &vec![0; link::MTU]), None);
+    // Too much for IP, and mixed families.
+    assert_eq!(packet::udp(a, a, &vec![0; link::MAX_DATAGRAM + 1]), None);
     assert_eq!(packet::udp(a, v4([1, 1, 1, 1], 1), b""), None);
 }
 
@@ -413,5 +413,163 @@ fn garbage_is_nothing() {
         let _ = packet::parse(&q);
         let _ = packet::error(&q, Unreachable::Network);
         let _ = packet::reset(&q);
+    }
+}
+
+mod fragments {
+    use grix_abi::link::{self, Addr};
+    use grix_netstack::packet::{self, Endpoint, Packet, Reassembly};
+
+    fn ends(v6: bool) -> (Endpoint, Endpoint) {
+        if v6 {
+            let (a, b) = (Addr::V6(link::GUEST_V6), Addr::V6(link::HOST_V6));
+            (Endpoint { addr: a, port: 1000 }, Endpoint { addr: b, port: 2000 })
+        } else {
+            let (a, b) = (Addr::V4(link::GUEST_V4), Addr::V4(link::HOST_V4));
+            (Endpoint { addr: a, port: 1000 }, Endpoint { addr: b, port: 2000 })
+        }
+    }
+
+    fn datagram(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 + (i >> 8)) as u8).collect()
+    }
+
+    /// What goes in comes out, at every size that matters, on both families.
+    #[test]
+    fn a_datagram_comes_back_whole() {
+        for v6 in [false, true] {
+            let most = if v6 { link::MAX_DATAGRAM } else { link::MAX_DATAGRAM_V4 };
+            for len in [1, link::MTU - 48, link::MTU - 28, link::MTU, link::MTU + 1, 9000, most] {
+                let (from, to) = ends(v6);
+                let data = datagram(len);
+                let p = packet::udp(from, to, &data).unwrap();
+                let pieces = packet::fragments(p, 7).unwrap();
+                assert!(pieces.iter().all(|f| f.len() <= link::MTU), "{len}");
+                let mut r = Reassembly::default();
+                let last = pieces.len() - 1;
+                let mut whole = None;
+                for (i, f) in pieces.into_iter().enumerate() {
+                    let got = r.add(f);
+                    assert_eq!(got.is_some(), i == last, "{len}: fragment {i} of {last}");
+                    whole = got.or(whole);
+                }
+                let whole = whole.unwrap();
+                let Some(Packet::Udp { from: f, to: t, data: got }) = packet::parse(&whole) else {
+                    panic!("{len}: not a datagram");
+                };
+                assert_eq!((f, t, got), (from, to, &data[..]), "{len}");
+            }
+        }
+    }
+
+    /// One byte more than IP carries isn't a packet.
+    #[test]
+    fn too_big_for_ip() {
+        let (from, to) = ends(false);
+        assert!(packet::udp(from, to, &vec![0; link::MAX_DATAGRAM_V4]).is_some());
+        assert!(packet::udp(from, to, &vec![0; link::MAX_DATAGRAM_V4 + 1]).is_none());
+        let (from, to) = ends(true);
+        assert!(packet::udp(from, to, &vec![0; link::MAX_DATAGRAM]).is_some());
+        assert!(packet::udp(from, to, &vec![0; link::MAX_DATAGRAM + 1]).is_none());
+    }
+
+    fn pieces(v6: bool, len: usize, id: u32) -> Vec<Vec<u8>> {
+        let (from, to) = ends(v6);
+        packet::fragments(packet::udp(from, to, &datagram(len)).unwrap(), id).unwrap()
+    }
+
+    /// Whatever arrives, nothing comes of a fragment out of its place: a
+    /// guest's raw socket can write them, and overlaps are how a filter
+    /// gets fooled.
+    #[test]
+    fn only_fragments_in_order_make_a_packet() {
+        for v6 in [false, true] {
+            // A piece missing.
+            let mut r = Reassembly::default();
+            let f = pieces(v6, 12_000, 1);
+            assert!(f.len() >= 3);
+            assert!(r.add(f[0].clone()).is_none());
+            assert!(r.add(f[2].clone()).is_none());
+            for p in &f[3..] {
+                assert!(r.add(p.clone()).is_none());
+            }
+            // The first again, overlapping what it already gave.
+            let mut r = Reassembly::default();
+            assert!(r.add(f[0].clone()).is_none());
+            assert!(r.add(f[1].clone()).is_none());
+            assert!(r.add(f[1].clone()).is_none());
+            for p in &f[2..] {
+                assert!(r.add(p.clone()).is_none(), "a repeat should end it");
+            }
+            // Backwards.
+            let mut r = Reassembly::default();
+            for p in f.iter().rev() {
+                assert!(r.add(p.clone()).is_none());
+            }
+            // After a failed one, a whole one still goes through.
+            let mut r = Reassembly::default();
+            assert!(r.add(f[1].clone()).is_none());
+            let mut whole = None;
+            for p in pieces(v6, 12_000, 2) {
+                whole = r.add(p).or(whole);
+            }
+            assert!(whole.is_some());
+        }
+    }
+
+    /// Two packets' fragments mixed are kept apart, and what's held is
+    /// bounded however many are started.
+    #[test]
+    fn packets_under_way_are_kept_apart_and_bounded() {
+        let mut r = Reassembly::default();
+        let (a, b) = (pieces(false, 9000, 1), pieces(false, 9000, 2));
+        assert!(r.add(a[0].clone()).is_none());
+        assert!(r.add(b[0].clone()).is_none());
+        assert!(r.add(a[1].clone()).is_none());
+        assert!(r.add(b[1].clone()).is_none());
+        assert!(r.add(a[2].clone()).is_some());
+        assert!(r.add(b[2].clone()).is_some());
+        let mut r = Reassembly::default();
+        for id in 0..1000 {
+            assert!(r.add(pieces(false, 9000, id)[0].clone()).is_none());
+        }
+        // The latest is one of the few kept; the first went long ago.
+        assert!(r.add(pieces(false, 9000, 999)[1].clone()).is_none());
+        assert!(r.add(pieces(false, 9000, 999)[2].clone()).is_some());
+        assert!(r.add(pieces(false, 9000, 0)[1].clone()).is_none());
+        assert!(r.add(pieces(false, 9000, 0)[2].clone()).is_none());
+    }
+
+    /// Fragments that add up to more than IP allows make nothing.
+    #[test]
+    fn no_packet_past_ips_limit() {
+        let mut r = Reassembly::default();
+        let f = pieces(false, link::MAX_DATAGRAM_V4, 1);
+        let last = f.len() - 1;
+        for p in &f[..last] {
+            assert!(r.add(p.clone()).is_none());
+        }
+        // One more, in its place, longer than the rest of the packet is.
+        let mut long = f[last - 1].clone();
+        let (from, to) = (long[12..16].to_vec(), long[16..20].to_vec());
+        assert_eq!(from.len() + to.len(), 8);
+        let at = (u16::from_be_bytes([long[6], long[7]]) & 0x1fff) as usize * 8;
+        let next = at + long.len() - 20;
+        long[6..8].copy_from_slice(&((next / 8) as u16 | 0x2000).to_be_bytes());
+        long[10..12].fill(0);
+        let sum = !sum16(&long[..20]);
+        long[10..12].copy_from_slice(&sum.to_be_bytes());
+        assert!(r.add(long).is_none());
+    }
+
+    fn sum16(b: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for w in b.chunks(2) {
+            sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
     }
 }

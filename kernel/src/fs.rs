@@ -1556,7 +1556,9 @@ impl Fs {
             self.fd_dirs.insert(fd, pid);
             let task = self.add_node(dir, "task", Kind::Dir(BTreeMap::new()), 0o555, owner)?;
             self.task_add(task, pid, pid, owner)?;
-            for (name, target) in [("exe", exe), ("cwd", cwd), ("root", "/")] {
+            // (Linux's /proc/net is the link and this the directory. There's
+            // one network namespace, and nobody reads the difference.)
+            for (name, target) in [("exe", exe), ("cwd", cwd), ("root", "/"), ("net", "/proc/net")] {
                 self.add_node(dir, name, Kind::Symlink(target.into()), 0o777, owner)?;
             }
             Ok(())
