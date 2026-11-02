@@ -402,14 +402,15 @@ impl Drop for Slots {
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
 /// Who's walking a path, for `walked_node`: a path walk has the filesystem's
-/// lock and no process to ask. The table's weak, so it isn't a user of it
-/// (`FdTable::shared`) and doesn't keep it.
+/// lock and no process to ask. This outlives the walk, so what it holds is
+/// weak: the table isn't a user of it (`FdTable::shared`), and a domain's
+/// rules are a budget a process's end gives back.
 struct Walking {
     pid: u32,
     table: Weak<Mutex<Slots>>,
     uid: u32,
     gid: u32,
-    domain: Option<Arc<crate::landlock::Domain>>,
+    domain: Option<Weak<crate::landlock::Domain>>,
 }
 
 /// Each CPU's last `FdTable::walking`.
@@ -424,7 +425,9 @@ fn table_of(w: &Walking, pid: u32) -> Result<Arc<Mutex<Slots>>, Errno> {
     let procs = crate::procs::PROCS.try_lock().ok_or(ENOENT)?;
     let q = procs.others.get(&pid).ok_or(ENOENT)?;
     let ours = crate::procs::same_ids(w.uid, w.gid, q.uid, q.gid, &q.ids);
-    if (w.uid != 0 && !ours) || !crate::landlock::inspects(w.domain.as_ref(), q) {
+    // (The walker's thread has its domain, for as long as this takes.)
+    let domain = w.domain.as_ref().map(|d| d.upgrade().ok_or(EACCES)).transpose()?;
+    if (w.uid != 0 && !ours) || !crate::landlock::inspects(domain.as_ref(), q) {
         return Err(EACCES);
     }
     Ok(q.fds.slots.clone())
@@ -614,7 +617,7 @@ impl FdTable {
     /// `p`, whose table this is, is about to walk a path.
     pub fn walking(&self, p: &crate::process::Process) {
         let table = Arc::downgrade(&self.slots);
-        let domain = crate::landlock::domain(p);
+        let domain = crate::landlock::domain(p).map(|d| Arc::downgrade(&d));
         *WALKING[crate::smp::me()].lock() = Some(Walking { pid: p.pid, table, uid: p.uid, gid: p.gid, domain });
     }
 

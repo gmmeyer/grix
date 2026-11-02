@@ -26,6 +26,8 @@ pub struct Zombie {
     pub sid: u32,
     /// As wait4 reports it.
     pub status: i32,
+    /// What it told its parent with: which waits see it.
+    pub exit_signal: u32,
     /// CPU time of the process and of the children it reaped.
     pub cpu_ns: u64,
     /// What its /proc/<pid> still shows.
@@ -166,6 +168,7 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     threads_gone(dead.threads.len());
     // What /proc/<pid> keeps of it, before anything goes.
     let remains = crate::procfs::Remains::of(dead);
+    crate::futex::left_memory(dead, cur.as_deref_mut(), procs);
     let charge = dead.threads.values_mut().next().map(|t| core::mem::take(&mut t.charge)).unwrap_or_default();
     // Its POSIX locks go with its descriptor table, unless another process
     // (CLONE_FILES) still uses that.
@@ -192,14 +195,18 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     {
         crate::tty::disassociate(cur.as_deref_mut(), procs, &tty, pid, true);
     }
+    // (Whatever they'd have told it with, init hears SIGCHLD: Linux's
+    // reparent_leader.)
     for q in procs.others_mut().chain(cur.as_deref_mut()) {
         if q.ppid == pid {
             q.ppid = INIT;
+            q.exit_signal = SIGCHLD;
         }
     }
     for z in procs.zombies.values_mut() {
         if z.ppid == pid {
             z.ppid = INIT;
+            z.exit_signal = SIGCHLD;
         }
     }
     // Its children's getppid, which may be a fast call on another CPU.
@@ -226,13 +233,15 @@ pub fn finalize(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut P
     };
     let act = parent.action(SIGCHLD);
     // Linux reaps at once for a parent that ignores SIGCHLD (or asked with
-    // SA_NOCLDWAIT): its wait4 then just waits for the last child.
+    // SA_NOCLDWAIT), if that's what it'd have been told with: its wait4
+    // then just waits for the last child.
     // Its /proc/<pid> stays while it's a zombie, its threads' entries
     // but the leader's going with what paid for them.
-    if act.handler != SIG_IGN && act.flags & SA_NOCLDWAIT == 0 {
-        procs
-            .zombies
-            .insert(pid, Zombie { ppid, pgid: dead.pgid, sid: dead.sid, status, cpu_ns, remains, _charge: charge });
+    let exit_signal = dead.exit_signal;
+    if exit_signal != SIGCHLD || (act.handler != SIG_IGN && act.flags & SA_NOCLDWAIT == 0) {
+        let (pgid, sid) = (dead.pgid, dead.sid);
+        let zombie = Zombie { ppid, pgid, sid, status, exit_signal, cpu_ns, remains, _charge: charge };
+        procs.zombies.insert(pid, zombie);
         crate::fs::proc_zombie(pid);
     } else {
         crate::fs::proc_gone(pid);

@@ -511,7 +511,7 @@ const MAX_REPORT_BYTES: usize = 512;
 const RLIM_INFINITY: u64 = u64::MAX;
 
 impl Process {
-    fn new(pid: u32, policy: Policy, uid: u32, gid: u32, aspace: AddressSpace) -> Self {
+    fn new(pid: u32, policy: Policy, uid: u32, gid: u32, aspace: Mm) -> Self {
         let mut rlimits = [(RLIM_INFINITY, RLIM_INFINITY); 16];
         rlimits[3] = (STACK_SIZE, RLIM_INFINITY); // RLIMIT_STACK
         rlimits[4] = (0, 0); // RLIMIT_CORE
@@ -527,7 +527,7 @@ impl Process {
             running: false,
             vfork_parent: None,
             children_cpu_ns: 0,
-            aspace: Mm::new(aspace),
+            aspace,
             fds: FdTable::with_stdio(),
             fs: Shared::new(FsInfo { cwd: ROOT, cwd_pin: None, umask: 0o022 }),
             policy,
@@ -574,7 +574,7 @@ impl Process {
     /// thread, which the caller sets up. Descriptors, working directory
     /// and handlers are copies, or the same ones for what `share` says.
     /// Timers aren't inherited (timerfds are, being files).
-    pub fn fork(&self, pid: u32, aspace: AddressSpace, share: Share) -> Result<Process, Errno> {
+    pub fn fork(&self, pid: u32, aspace: Mm, share: Share) -> Result<Process, Errno> {
         let args_charge = crate::kmem::Charge::new(self.args_charge.bytes())?;
         let mut c = Process::new(pid, self.policy, self.uid, self.gid, aspace);
         c.args_charge = args_charge;
@@ -998,7 +998,7 @@ pub fn start(img: Image<'static>) -> ! {
     let (stdin, gicr) = (img.stdin, img.gicr);
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
-    let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    let mut p = Process::new(INIT, img.policy, img.uid, img.gid, Mm::new(aspace));
     // Whoever says so: nothing but this program's own files go by them.
     p.ids.groups.extend(img.groups.iter().copied().filter(|&g| g != img.gid).take(MAX_GROUPS - 1));
     p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");

@@ -409,8 +409,16 @@ mappings grow on a fault (`AddressSpace::grow_down`, from `fault` and
 `ensure`), by `RLIMIT_STACK` as it is then (`AddressSpace::stack_limit`). What clone can share between processes is a handle to
 one value: the descriptor table (`fd::FdTable`, CLONE_FILES), the
 working directory and umask (`Process::fs`, a `process::Shared<FsInfo>`,
-CLONE_FS) and the signal actions (`Process::sigactions`, CLONE_SIGHAND,
-which needs CLONE_VM: vfork only). Fork copies each (`share`/`copy`);
+CLONE_FS), the signal actions (`Process::sigactions`, CLONE_SIGHAND,
+which needs CLONE_VM) and the address space (`Mm::another`, CLONE_VM
+without CLONE_VFORK or CLONE_THREAD: each process has its own `Mm`, one
+gate between them, and the `Mm` that took it is the one that gives it
+back, as a sharer can end on the CPU running another; `sched::schedule`
+hands it over, `Mm::takes_over`). Private futex words are then
+`futex::Key`s of the address space, for good (`AddressSpace::vm_shared`,
+sleepers moved by `futex::vm_shared`), as `Process::futexes` is one
+process's, and a process leaving that memory, however, clears its threads'
+CLONE_CHILD_CLEARTID words (`futex::left_memory`, Linux's mm_release). Fork copies each (`share`/`copy`);
 `execve` unshares the table and the actions (Linux's `unshare_files`,
 `de_thread`), `unshare(2)` the table and fs. POSIX record locks belong
 to the table (`locks::Owner::Files`, as Linux's to the files_struct) and

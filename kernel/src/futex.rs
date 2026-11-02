@@ -51,8 +51,18 @@ pub const COST: u64 = 2 * (core::mem::size_of::<Key>() + core::mem::size_of::<Ve
 
 static QUEUES: Mutex<BTreeMap<Key, VecDeque<Waiter>>> = Mutex::new(BTreeMap::new());
 
+/// The word at `addr` as a futex call means it (FUTEX_PRIVATE_FLAG says
+/// it's this address space's, wherever it is), if it's one to look for in
+/// `QUEUES`: one that's in shared memory, or any at all in an address space
+/// processes share, as `Process::futexes` is one process's.
+pub fn word(a: &AddressSpace, private: bool, addr: u64) -> Option<Key> {
+    let shared = if private { None } else { key(a, addr) };
+    // An id isn't an address anything's at, so it's no shared object's.
+    shared.or(a.vm_shared.then_some(Key { object: a.id as usize, at: addr }))
+}
+
 /// The word at `addr`, if it's in memory processes can share.
-pub fn key(a: &AddressSpace, addr: u64) -> Option<Key> {
+fn key(a: &AddressSpace, addr: u64) -> Option<Key> {
     let v = a.find(addr)?;
     let into = addr - v.start;
     match &v.backing {
@@ -63,6 +73,58 @@ pub fn key(a: &AddressSpace, addr: u64) -> Option<Key> {
             Some(Key { object: Arc::as_ptr(data) as *const () as usize, at: offset + into })
         }
         _ => None,
+    }
+}
+
+/// `p`'s address space is about to be another process's too: its waiters
+/// from now on are looked for here, whoever wakes them, and so are the ones
+/// already asleep.
+pub fn vm_shared(p: &mut Process) {
+    if p.aspace.vm_shared {
+        return;
+    }
+    p.aspace.vm_shared = true;
+    for (addr, waiters) in core::mem::take(&mut p.futexes) {
+        let key = Key { object: p.aspace.id as usize, at: addr };
+        for (tid, bitset) in waiters {
+            enqueue(key, p.pid, tid, bitset);
+            p.futex_moved(tid, Word::Private(addr), Word::Shared(key));
+        }
+    }
+}
+
+/// `dead`'s threads have left memory someone else may still be using, or
+/// may have: each has its CLONE_CHILD_CLEARTID word cleared and whoever
+/// waits on it woken, however it ended, as Linux's mm_release has it.
+pub fn left_memory(dead: &mut Process, mut cur: Option<&mut Process>, procs: &mut crate::procs::Procs) {
+    let words: Vec<u64> = dead.threads.values().map(|t| t.clear_child_tid).filter(|&a| a != 0).collect();
+    if words.is_empty() || !dead.aspace.access().vm_shared {
+        return;
+    }
+    let mut keys = Vec::new();
+    {
+        let mut a = dead.aspace.access();
+        a.activate();
+        for addr in words {
+            if crate::uaccess::write_u32(&mut a, addr, 0).is_ok() {
+                keys.extend(word(&a, false, addr));
+            }
+        }
+    }
+    if let Some(c) = cur.as_deref() {
+        c.aspace.activate();
+    }
+    for key in keys {
+        for w in take(key, 1, u32::MAX) {
+            let q = match cur.as_deref_mut() {
+                Some(c) if c.pid == w.pid => Some(c),
+                _ => procs.other_mut(w.pid),
+            };
+            if let Some(q) = q {
+                let index = q.futexv_index(w.tid, Word::Shared(key));
+                q.wake(w.tid, Some(index));
+            }
+        }
     }
 }
 

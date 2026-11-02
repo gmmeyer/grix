@@ -4,12 +4,15 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/landlock.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -34,7 +37,9 @@ static pid_t holder(int *fd, int *gone, uid_t uid) {
     CHECK(pid >= 0);
     if (pid == 0) {
         close(stop[1]);
-        if (uid) CHECK(setuid(uid) == 0);
+        // Not all of it: root's still its saved user.
+        if (uid == 1000) CHECK(setresuid(1000, 1000, 0) == 0);
+        else if (uid) CHECK(setuid(uid) == 0);
         int d = open(dir, O_RDONLY | O_DIRECTORY);
         CHECK(d >= 0);
         CHECK(write(ready[1], &d, sizeof d) == sizeof d);
@@ -124,6 +129,27 @@ int main(void) {
     FAILS(open(path, O_RDONLY), ENOTDIR);
     release(pid, stop);
 
+    // A Landlock domain doesn't reach out of itself, even with nothing
+    // handled that a path would need.
+    pid = holder(&fd, &stop, 0);
+    pid_t locked = fork();
+    CHECK(locked >= 0);
+    if (locked == 0) {
+        struct landlock_ruleset_attr attr = {.handled_access_fs = LANDLOCK_ACCESS_FS_MAKE_DIR};
+        int rs = syscall(SYS_landlock_create_ruleset, &attr, sizeof attr, 0);
+        CHECK(rs >= 0);
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+        CHECK(syscall(SYS_landlock_restrict_self, rs, 0) == 0);
+        snprintf(path, sizeof path, "/proc/%d/fd/%d/name", pid, fd);
+        FAILS(open(path, O_RDONLY), EACCES);
+        snprintf(path, sizeof path, "/proc/%d/fd/%d", pid, fd);
+        FAILS(open(path, O_RDONLY), EACCES);
+        _exit(0);
+    }
+    int locked_status;
+    CHECK(waitpid(locked, &locked_status, 0) == locked && locked_status == 0);
+    release(pid, stop);
+
     // Once it's gone, so is that.
     snprintf(path, sizeof path, "/proc/%d/fd/%d/name", pid, fd);
     FAILS(open(path, O_RDONLY), ENOENT);
@@ -142,6 +168,20 @@ int main(void) {
         _exit(0);
     }
     int status;
+    CHECK(waitpid(child, &status, 0) == child && status == 0);
+    release(pid, stop);
+
+    // The same user, but that's not all it can be: as ptrace would be
+    // refused, for what it could go back to.
+    pid = holder(&fd, &stop, 1000);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d/name", pid, fd);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        CHECK(setuid(1000) == 0);
+        FAILS(open(path, O_RDONLY), EACCES);
+        _exit(0);
+    }
     CHECK(waitpid(child, &status, 0) == child && status == 0);
     release(pid, stop);
 

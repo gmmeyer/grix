@@ -197,15 +197,25 @@ pub fn exit_thread(p: &mut Process, code: i32) -> SysResult {
     crate::procs::threads_gone(1);
     // Its queued signals went with it, perhaps a timer's.
     crate::timer::resync(p);
-    if p.threads.is_empty() {
+    let last = p.threads.is_empty();
+    // Nobody's left in the memory to hear of the last, unless it's shared.
+    if !last || p.aspace.vm_shared {
+        left_memory(p, t.clear_child_tid);
+    }
+    if last {
         p.terminate(process::exited(code));
         return Err(EBLOCKED);
     }
     crate::fs::task_changed(p.pid, t.tid, false);
-    if t.clear_child_tid != 0 && write_u32(&mut p.aspace, t.clear_child_tid, 0).is_ok() {
-        word_wake(p, false, t.clear_child_tid, 1, u32::MAX);
-    }
     Err(EBLOCKED)
+}
+
+/// A thread with CLONE_CHILD_CLEARTID's word at `addr` (0: none) is leaving
+/// this memory.
+pub fn left_memory(p: &mut Process, addr: u64) {
+    if addr != 0 && write_u32(&mut p.aspace, addr, 0).is_ok() {
+        word_wake(p, false, addr, 1, u32::MAX);
+    }
 }
 
 pub fn set_tid_address(p: &mut Process, addr: u64) -> SysResult {
@@ -264,10 +274,8 @@ pub fn futex_wake(p: &mut Process, addr: u64, n: u32, bitset: u32) -> u32 {
     woken.len() as u32
 }
 
-/// The word at `addr` as a futex call means it: FUTEX_PRIVATE_FLAG says it's
-/// this process's, wherever it is.
 fn word_key(p: &Process, private: bool, addr: u64) -> Option<crate::futex::Key> {
-    if private { None } else { crate::futex::key(&p.aspace, addr) }
+    crate::futex::word(&p.aspace, private, addr)
 }
 
 /// `futex_wake`, of a word that may be shared.

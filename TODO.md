@@ -31,13 +31,11 @@ Linux behaviour:
 
 Bigger:
 
-3. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
-   shared between processes.
-4. Finer locking: phase 2, a reader/writer lock with per-process
+3. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-5. Faster live-mount round trips, multi-architecture images, and the
+4. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-6. A security review of everything since the last one, by a team of agents.
+5. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
    interest.
 
@@ -507,24 +505,13 @@ Left, none of it a way out of the sandbox:
       directory and umask, signal actions (with `CLONE_VM`, so only for vfork).
       `execve` unshares the table and actions; `unshare(2)` the table and
       working directory (and allows what it allows with nothing to unshare).
-- [ ] `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` (and so `CLONE_SIGHAND`
-      without vfork): a process sharing the caller's memory (reported).
-      `CLONE_INTO_CGROUP` (reported). Threads with their own descriptor table or
-      working directory: `CLONE_THREAD` without `CLONE_FILES`/`CLONE_FS` (they
-      share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more threads (reported).
-      Few programs need it (glibc's and musl's posix_spawn use
-      `CLONE_VM|CLONE_VFORK`, which works; LinuxThreads-era code and some
-      runtimes' helper processes don't), and it's large, so it waits.
-      What it would take: `Process::aspace` a handle to one
-      `AddressSpace` (as `Process::fs` is a `Shared<FsInfo>`), through its
-      ~300 uses; freed with its last sharer, never while active (invariant
-      13 then holds as it does for threads); futex queues keyed by the
-      address space, not the process, so a wake reaches every sharer's
-      waiters; flushes are by root already (x86's `ROOTS`), but
-      `smp::alone` and execve's unsharing must take sharers into account
-      (execve gives the caller a fresh space, as vfork's child gets);
-      `/proc/<pid>/maps` and the mapping budgets (`MAX_VMAS_TOTAL`) count
-      a shared space once.
+- [x] `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: processes of their
+      own in one address space (`Mm::another`), with `__WCLONE` and `__WALL`
+      telling clone children apart in wait.
+- [ ] `CLONE_INTO_CGROUP` (reported). Threads with their own descriptor table
+      or working directory: `CLONE_THREAD` without `CLONE_FILES`/`CLONE_FS`
+      (they share them anyway), `unshare(CLONE_FILES|CLONE_FS)` with more
+      threads (reported).
 - [x] `/proc/<pid>/…` for every process (`ps`), with `exe`, `cwd`, `root` and `fd/`;
       `/proc/self` is the caller's. Another process's descriptors need its user (or root).
 - [x] Job control: stopping and continuing (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`).
