@@ -44,6 +44,7 @@ mod sched;
 mod seccomp;
 mod signal;
 mod smp;
+mod sockopt;
 mod snapshot;
 mod stats;
 mod syscall;

@@ -5100,6 +5100,20 @@ fn posix_message_queues() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// Socket options read back as they were set, and TCP_INFO says how a
+/// connection is, on both stacks. The fixture passes on Linux as it is.
+#[test]
+fn socket_options_read_back() {
+    let port = echo_server();
+    for network in [Network::Native, Network::Vm] {
+        let b = with("sockopts").network(network).allow_host(&format!("host.grix.internal:{port}")).unwrap();
+        let out = run(b, &["/bin/sockopts", "10.0.2.2", &port.to_string()]);
+        assert_eq!(out.stdout_str().lines().last(), Some("sockopts ok"), "{network:?}: {}", out.stdout_str());
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+}
+
 /// The user's groups in the sandbox's /etc/group are the program's, as
 /// Docker's are, and it can't be given what /etc/group doesn't say.
 #[test]

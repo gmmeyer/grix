@@ -38,7 +38,7 @@ const MSG_DONTWAIT: u64 = 0x40;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const SOL_SOCKET: u64 = 1;
 const ENOTSOCK: Errno = Errno(88);
-const ENOPROTOOPT: Errno = Errno(92);
+use crate::sockopt::ENOPROTOOPT;
 const EPROTONOSUPPORT: Errno = Errno(93);
 const EISCONN: Errno = Errno(106);
 
@@ -646,7 +646,40 @@ pub fn getsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
         return write_u32(&mut p.aspace, len, 16).map(|_| 0);
     }
     if is_inet(&file) {
-        let v = with_inet(p, fd, |p, s, _| inet_getsockopt(p, s, level, name))??;
+        use crate::sockopt::{SO_LINGER, TCP_CONGESTION, TCP_INFO, TCP_MAXSEG, TCP_INFO_BYTES, tcp_info};
+        // What isn't an int: as much as there's room for, as Linux.
+        let more: Option<alloc::vec::Vec<u8>> = with_inet(p, fd, |_, s, _| match (level, name) {
+            (IPPROTO_TCP, TCP_INFO) if !s.dgram => {
+                let (state, unacked) = s.tcp_state();
+                Some(tcp_info(state, tcp_mss(s), unacked)[..TCP_INFO_BYTES].to_vec())
+            }
+            // (The host's, on `native`: what's usual there, and Reno on `vm`.)
+            (IPPROTO_TCP, TCP_CONGESTION) if !s.dgram => {
+                let name: &[u8] = if crate::netstack::active() { b"reno\0" } else { b"cubic\0" };
+                Some(name.to_vec())
+            }
+            (SOL_SOCKET, SO_LINGER) => {
+                let (on, seconds) = s.opts.linger();
+                let mut b = on.to_le_bytes().to_vec();
+                b.extend_from_slice(&seconds.to_le_bytes());
+                Some(b)
+            }
+            _ => None,
+        })?;
+        if let Some(bytes) = more {
+            let room = read_u32(&mut p.aspace, len)? as i32;
+            if room < 0 {
+                return Err(EINVAL);
+            }
+            let n = bytes.len().min(room as usize);
+            copy_out(&mut p.aspace, val, &bytes[..n])?;
+            return write_u32(&mut p.aspace, len, n as u32).map(|_| 0);
+        }
+        let v = if (level, name) == (IPPROTO_TCP, TCP_MAXSEG) {
+            with_inet(p, fd, |_, s, _| if s.dgram { Err(ENOPROTOOPT) } else { Ok(tcp_mss(s)) })??
+        } else {
+            with_inet(p, fd, |p, s, _| inet_getsockopt(p, s, level, name))??
+        };
         if read_u32(&mut p.aspace, len)? < 4 {
             return Err(EINVAL);
         }
@@ -727,9 +760,8 @@ pub fn setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len
             Ok(0)
         })?;
     }
-    // TCP and IP options don't change connections the host makes.
-    if is_inet(&file) && matches!(level, IPPROTO_IP | IPPROTO_TCP | IPPROTO_IPV6 | IPPROTO_UDP) {
-        return Ok(0);
+    if is_inet(&file) && !(level == SOL_SOCKET && is_timeout(name)) {
+        return inet_setsockopt(p, fd, level, name, val, len);
     }
     if is_inet(&file) && level == SOL_SOCKET && is_timeout(name) {
         if len < 16 {
@@ -1077,6 +1109,7 @@ fn inet_connect(p: &mut Process, s: &mut Inet, nonblock: bool, raw: &[u8]) -> Sy
         return Err(ECONNREFUSED);
     }
     s.state = State::Remote(Conn::connect(to)?);
+    s.apply_opts();
     if nonblock {
         return Err(EINPROGRESS);
     }
@@ -1436,14 +1469,9 @@ fn inet_recv(
 fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u32, Errno> {
     const SO_TYPE: u64 = 3;
     const SO_ERROR: u64 = 4;
-    const SO_SNDBUF: u64 = 7;
-    const SO_RCVBUF: u64 = 8;
-    const SO_KEEPALIVE: u64 = 9;
-    const SO_REUSEADDR: u64 = 2;
     const SO_ACCEPTCONN: u64 = 30;
     const SO_PROTOCOL: u64 = 38;
     const SO_DOMAIN: u64 = 39;
-    const TCP_NODELAY: u64 = 1;
     const IPV6_V6ONLY: u64 = 26;
     let _ = p;
     Ok(match (level, name) {
@@ -1456,17 +1484,66 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
             },
             _ => 0,
         },
-        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => link::WINDOW,
-        (SOL_SOCKET, SO_KEEPALIVE | SO_REUSEADDR) => 0,
         (SOL_SOCKET, SO_ACCEPTCONN) => matches!(s.state, State::Listening(_)) as u32,
         (SOL_SOCKET, SO_PROTOCOL) if s.icmp.is_some() => (if s.v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP }) as u32,
         (SOL_SOCKET, SO_PROTOCOL) => (if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP }) as u32,
         (SOL_SOCKET, SO_DOMAIN) => (if s.v6 { AF_INET6 } else { AF_INET }) as u32,
-        (IPPROTO_TCP, TCP_NODELAY) => 1,
         (IPPROTO_IPV6, IPV6_V6ONLY) if s.v6 => s.v6only as u32,
-        (IPPROTO_TCP | IPPROTO_IP | IPPROTO_IPV6, _) => 0,
-        _ => return Err(ENOPROTOOPT),
+        _ => s.opts.get(level, name, s.dgram, s.v6)? as u32,
     })
+}
+
+/// The segments a TCP socket sends: before it's connected, what Linux says
+/// of one that's never heard from a peer.
+fn tcp_mss(s: &Inet) -> u32 {
+    const DEFAULT_MSS: u32 = 536;
+    const NATIVE_MSS: u32 = 1460;
+    const HEADERS: u32 = 40;
+    match s.state {
+        State::Remote(_) | State::Local { .. } if crate::netstack::active() => link::MTU as u32 - HEADERS,
+        State::Remote(_) | State::Local { .. } => NATIVE_MSS,
+        _ => DEFAULT_MSS,
+    }
+}
+
+fn inet_setsockopt(p: &mut Process, fd: u64, level: u64, name: u64, val: u64, len: u64) -> SysResult {
+    use crate::sockopt::SO_LINGER;
+    /// Joining a multicast group or choosing where it's sent from: there
+    /// are no multicast routes through the proxy, or the guest's stack.
+    const IP_MULTICAST_IF: u64 = 32;
+    const IP_ADD_MEMBERSHIP: u64 = 35;
+    const IP_DROP_MEMBERSHIP: u64 = 36;
+    const IPV6_MULTICAST_IF: u64 = 17;
+    const IPV6_ADD_MEMBERSHIP: u64 = 20;
+    const IPV6_DROP_MEMBERSHIP: u64 = 21;
+    if matches!(
+        (level, name),
+        (IPPROTO_IP, IP_MULTICAST_IF | IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP)
+            | (IPPROTO_IPV6, IPV6_MULTICAST_IF | IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP)
+    ) {
+        return p.unimplemented(nr::setsockopt, "setsockopt", "multicast", ENODEV);
+    }
+    if (level, name) == (SOL_SOCKET, SO_LINGER) {
+        if len < 8 {
+            return Err(EINVAL);
+        }
+        let on = read_u32(&mut p.aspace, val)? as i32;
+        let seconds = read_u32(&mut p.aspace, val + 4)? as i32;
+        return with_inet(p, fd, |_, s, _| {
+            s.opts.set_linger((on != 0) as i32, seconds);
+            0
+        });
+    }
+    if len < 4 {
+        return Err(EINVAL);
+    }
+    let value = read_u32(&mut p.aspace, val)? as i32;
+    with_inet(p, fd, |_, s, _| {
+        let (dgram, v6) = (s.dgram, s.v6);
+        s.opts.set(level, name, value, dgram, v6)?;
+        s.apply_opts();
+        Ok(0)
+    })?
 }
 
 fn inet_shutdown(s: &mut Inet, how: u64) -> SysResult {

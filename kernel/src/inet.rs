@@ -1166,6 +1166,8 @@ pub struct Inet {
     pub addr_bound: bool,
     /// An ICMP socket, which is a UDP one otherwise.
     pub icmp: Option<Icmp>,
+    /// What setsockopt was told.
+    pub opts: crate::sockopt::Opts,
 }
 
 impl Inet {
@@ -1182,6 +1184,37 @@ impl Inet {
             v6only: false,
             addr_bound: false,
             icmp: None,
+            opts: crate::sockopt::Opts::default(),
+        }
+    }
+
+    /// What of its options the `vm` stack goes by, for the connection it has.
+    pub fn apply_opts(&self) {
+        if let State::Remote(c) = &self.state
+            && netstack::active()
+        {
+            netstack::configure(c.lock().id, self.opts.hop_limit(self.v6), self.opts.keepalive());
+        }
+    }
+
+    /// What `TCP_INFO` says its state is, and how much is on its way.
+    pub fn tcp_state(&self) -> (u8, u32) {
+        use crate::sockopt::*;
+        match &self.state {
+            State::Listening(_) => (TCP_LISTEN, 0),
+            State::Local { .. } => (TCP_ESTABLISHED, 0),
+            State::Remote(c) => {
+                let c = c.lock();
+                let unacked = send_window().saturating_sub(c.tx_credit);
+                match c.state {
+                    ConnState::Connecting => (TCP_SYN_SENT, 0),
+                    ConnState::Failed(_) => (TCP_CLOSE, 0),
+                    ConnState::Open if c.tx_shut => (TCP_FIN_WAIT1, unacked),
+                    ConnState::Open if c.rx_eof => (TCP_CLOSE_WAIT, unacked),
+                    ConnState::Open => (TCP_ESTABLISHED, unacked),
+                }
+            }
+            _ => (TCP_CLOSE, 0),
         }
     }
 

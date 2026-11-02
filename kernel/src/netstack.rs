@@ -175,6 +175,14 @@ pub fn connect(id: u32, local: SockAddr, peer: SockAddr) {
     poke();
 }
 
+/// What of a socket's options mean anything to connection `id`.
+pub fn configure(id: u32, hop_limit: Option<u8>, keepalive_secs: Option<u32>) {
+    if let Some(g) = STACK.lock().as_mut() {
+        g.stack.configure(id, hop_limit, keepalive_secs);
+    }
+    poke();
+}
+
 fn own(to: Addr) -> Addr {
     if matches!(to, Addr::V6(_)) { Addr::V6(link::GUEST_V6) } else { Addr::V4(link::GUEST_V4) }
 }

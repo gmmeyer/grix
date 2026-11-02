@@ -253,6 +253,15 @@ impl Stack {
             .map(|(id, _)| *id)
     }
 
+    /// A flow's hop limit, and seconds between keepalives if it has them.
+    pub fn configure(&mut self, id: u32, hop_limit: Option<u8>, keepalive_secs: Option<u32>) {
+        if let Some(f) = self.flows.get(&id) {
+            let s = self.sockets.get_mut::<tcp::Socket>(f.socket);
+            s.set_hop_limit(hop_limit);
+            s.set_keep_alive(keepalive_secs.map(|n| Duration::from_secs(n as u64)));
+        }
+    }
+
     /// Hand the peer `data`: whatever fits, and the rest is the caller's to
     /// keep (`Room` says when). The sender's credit keeps it from happening.
     pub fn write(&mut self, id: u32, data: &[u8]) -> usize {
