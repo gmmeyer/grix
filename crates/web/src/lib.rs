@@ -147,11 +147,20 @@ impl Builder {
             .files
             .iter()
             .map(|(path, node)| match node {
-                Node::File { data, mode } => Entry { path, kind: EntryKind::File, mode: *mode, mtime_ns: 0, data },
-                Node::Dir { mode } => Entry { path, kind: EntryKind::Dir, mode: *mode, mtime_ns: 0, data: &[] },
-                Node::Symlink { target } => {
-                    Entry { path, kind: EntryKind::Symlink, mode: 0o777, mtime_ns: 0, data: target.as_bytes() }
+                Node::File { data, mode } => {
+                    Entry { path, kind: EntryKind::File, mode: *mode, mtime_ns: 0, owner: None, data }
                 }
+                Node::Dir { mode } => {
+                    Entry { path, kind: EntryKind::Dir, mode: *mode, mtime_ns: 0, owner: None, data: &[] }
+                }
+                Node::Symlink { target } => Entry {
+                    path,
+                    kind: EntryKind::Symlink,
+                    mode: 0o777,
+                    mtime_ns: 0,
+                    owner: None,
+                    data: target.as_bytes(),
+                },
             })
             .collect();
         Ok(Image {
@@ -162,6 +171,7 @@ impl Builder {
             policy,
             uid: spec.uid,
             gid: spec.gid,
+            groups: Vec::new(),
             cwd: &spec.cwd,
             stdin: spec.stdin || spec.tty.is_some(),
             exe,

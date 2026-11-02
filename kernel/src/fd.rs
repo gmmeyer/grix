@@ -115,6 +115,8 @@ pub enum FileKind {
     Unix(crate::unix::SockRef),
     /// A pidfd: refers to process `pid` (pids aren't reused).
     PidFd(u32),
+    /// A POSIX message queue.
+    Mqueue(crate::mqueue::QueueRef),
     /// /proc/<pid>/mem, for the process itself: reads and writes at its
     /// virtual addresses (the offset), through `uaccess`.
     ProcMem(u32, u64),
@@ -153,6 +155,7 @@ impl FileKind {
             // Depend on the reader's pending signals, or on other
             // processes: see file::poll_kind.
             FileKind::SignalFd(_) | FileKind::PidFd(_) => (0, 0),
+            FileKind::Mqueue(q) => q.lock().poll(),
             // No poll of its own: Linux's DEFAULT_POLLMASK.
             FileKind::Landlock(_) => (EPOLLIN | EPOLLOUT, 0),
             FileKind::Socket(s) => s.poll(),

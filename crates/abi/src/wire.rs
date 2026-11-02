@@ -281,6 +281,8 @@ pub enum ExportMsg<'a> {
         kind: ExportKind,
         mode: u32,
         mtime_ns: u64,
+        uid: u32,
+        gid: u32,
         path_len: u32,
         data_len: u64,
     },
@@ -307,11 +309,13 @@ impl<'a> ExportMsg<'a> {
                 w.u32(index);
                 w.u8(found as u8);
             }
-            ExportMsg::Entry { kind, mode, mtime_ns, path_len, data_len } => {
+            ExportMsg::Entry { kind, mode, mtime_ns, uid, gid, path_len, data_len } => {
                 w.u8(1);
                 w.u8(kind as u8);
                 w.u32(mode);
                 w.u64(mtime_ns);
+                w.u32(uid);
+                w.u32(gid);
                 w.u32(path_len);
                 w.u64(data_len);
             }
@@ -338,7 +342,15 @@ impl<'a> ExportMsg<'a> {
                     3 => ExportKind::Removed,
                     _ => return Err(DecodeError),
                 };
-                ExportMsg::Entry { kind, mode: r.u32()?, mtime_ns: r.u64()?, path_len: r.u32()?, data_len: r.u64()? }
+                ExportMsg::Entry {
+                    kind,
+                    mode: r.u32()?,
+                    mtime_ns: r.u64()?,
+                    uid: r.u32()?,
+                    gid: r.u32()?,
+                    path_len: r.u32()?,
+                    data_len: r.u64()?,
+                }
             }
             Self::DATA_TAG => return Ok(ExportMsg::Data(&buf[1..])),
             3 => ExportMsg::Done,
@@ -446,7 +458,15 @@ mod tests {
     fn export_messages_roundtrip_and_reject_garbage() {
         let msgs = [
             ExportMsg::Root { index: 3, found: true },
-            ExportMsg::Entry { kind: ExportKind::Symlink, mode: 0o777, mtime_ns: 5, path_len: 4, data_len: 9 },
+            ExportMsg::Entry {
+                kind: ExportKind::Symlink,
+                mode: 0o777,
+                mtime_ns: 5,
+                uid: 1000,
+                gid: 1001,
+                path_len: 4,
+                data_len: 9,
+            },
             ExportMsg::Data(b"a/b/c"),
             ExportMsg::Data(b""),
             ExportMsg::Truncated,

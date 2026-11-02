@@ -57,6 +57,8 @@ pub struct Entry<'a> {
     pub mode: u32,
     /// Modification time on the host, in ns since the Unix epoch (0: boot time).
     pub mtime_ns: u64,
+    /// Its (uid, gid), or None for the sandbox's user (`Image::uid`, `gid`).
+    pub owner: Option<(u32, u32)>,
     pub data: &'a [u8],
 }
 
@@ -75,6 +77,8 @@ pub struct Image<'a> {
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
+    /// Its supplementary groups, from the sandbox's `/etc/group`.
+    pub groups: Vec<u32>,
     pub cwd: &'a str,
     /// The host sends stdin over the console (see `wire::Input`). Without
     /// it, stdin reads return end-of-file at once.
@@ -186,6 +190,10 @@ impl<'a> Image<'a> {
         w.u8(self.policy.on_deny as u8);
         w.u32(self.uid);
         w.u32(self.gid);
+        w.u32(self.groups.len() as u32);
+        for g in &self.groups {
+            w.u32(*g);
+        }
         w.str(self.cwd);
         w.u8(self.stdin as u8);
         w.str(self.exe);
@@ -197,6 +205,10 @@ impl<'a> Image<'a> {
             w.u8(e.kind as u8);
             w.u32(e.mode);
             w.u64(e.mtime_ns);
+            w.u8(e.owner.is_some() as u8);
+            let (uid, gid) = e.owner.unwrap_or((0, 0));
+            w.u32(uid);
+            w.u32(gid);
             w.bytes(e.data);
         }
         w.strs(&self.exports);
@@ -241,6 +253,8 @@ impl<'a> Image<'a> {
         let on_deny = DenyAction::from_u8(r.u8()?).ok_or(DecodeError)?;
         let uid = r.u32()?;
         let gid = r.u32()?;
+        let n = r.u32()? as usize;
+        let groups = (0..n).map(|_| r.u32()).collect::<Result<_, _>>()?;
         let cwd = r.str()?;
         let stdin = r.u8()? != 0;
         let exe = r.str()?;
@@ -261,8 +275,11 @@ impl<'a> Image<'a> {
             };
             let mode = r.u32()?;
             let mtime_ns = r.u64()?;
+            let owned = r.u8()? != 0;
+            let (uid, gid) = (r.u32()?, r.u32()?);
+            let owner = owned.then_some((uid, gid));
             let data = r.bytes()?;
-            entries.push(Entry { path, kind, mode, mtime_ns, data });
+            entries.push(Entry { path, kind, mode, mtime_ns, owner, data });
         }
         let exports = r.strs()?;
         let export_budget = r.u64()?;
@@ -304,6 +321,7 @@ impl<'a> Image<'a> {
             policy: Policy { caps, on_deny },
             uid,
             gid,
+            groups,
             cwd,
             stdin,
             exe,
@@ -346,6 +364,7 @@ mod tests {
             seed: [7; 32],
             policy: Policy { caps: 0b101, on_deny: DenyAction::Kill },
             uid: 1000,
+            groups: vec![10, 20],
             gid: 1000,
             cwd: "/",
             stdin: true,
@@ -353,9 +372,23 @@ mod tests {
             argv: vec!["hello", "world"],
             envp: vec!["A=1"],
             entries: vec![
-                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, mtime_ns: 0, data: b"" },
-                Entry { path: "/bin/hello", kind: EntryKind::File, mode: 0o755, mtime_ns: 5, data: b"\x7fELF" },
-                Entry { path: "/bin/hi", kind: EntryKind::Symlink, mode: 0o777, mtime_ns: 9, data: b"hello" },
+                Entry { path: "/bin", kind: EntryKind::Dir, mode: 0o755, mtime_ns: 0, owner: Some((0, 7)), data: b"" },
+                Entry {
+                    path: "/bin/hello",
+                    kind: EntryKind::File,
+                    owner: None,
+                    mode: 0o755,
+                    mtime_ns: 5,
+                    data: b"\x7fELF",
+                },
+                Entry {
+                    path: "/bin/hi",
+                    kind: EntryKind::Symlink,
+                    owner: None,
+                    mode: 0o777,
+                    mtime_ns: 9,
+                    data: b"hello",
+                },
             ],
             exports: vec!["/out", "/tmp/results"],
             export_budget: 1 << 20,
@@ -389,6 +422,7 @@ mod tests {
             seed: [0; 32],
             policy: Policy::default(),
             uid: 0,
+            groups: vec![],
             gid: 0,
             cwd: "/",
             stdin: false,

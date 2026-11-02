@@ -583,6 +583,7 @@ fn run_vm(
         // Checked every time round, not just when the program is quiet: a
         // chatty one must stop or time out too.
         let stopped = live.as_ref().is_some_and(|l| l.stopped());
+        fs.rewatch();
         let now = Instant::now();
         if stopped || deadline.is_some_and(|d| now >= d) {
             // Out of time while the program runs: ask it to end, as a

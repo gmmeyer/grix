@@ -15,6 +15,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use grix_abi::hostfs::{self, Assembler, Attr, FileType, IO_MAX, LIST_MAX, ListEntry, MAX_MESSAGE, Reply, Request};
@@ -248,6 +249,9 @@ struct Listing {
     whole: bool,
 }
 
+/// How often `Server::rewatch` looks.
+const REWATCH_EVERY: Duration = Duration::from_secs(1);
+
 pub(crate) struct Server {
     /// Each mount's directory, and whether it's writable. Mount i's root
     /// has id i + 1.
@@ -280,6 +284,8 @@ pub(crate) struct Server {
     /// and the watcher, once something is watched.
     notices: Option<NoticeSink>,
     watcher: Option<crate::watch::Watcher>,
+    /// When `rewatch` last looked.
+    rewatched: Instant,
 }
 
 /// Sends a frame to the guest; false once it's gone.
@@ -312,6 +318,7 @@ impl Server {
             assembler: Assembler::default(),
             notices: None,
             watcher: None,
+            rewatched: Instant::now(),
         })
     }
 
@@ -966,6 +973,23 @@ impl Server {
         }
         self.files.push((id, write, fd));
         Ok(self.files.last().unwrap().2.as_raw_fd())
+    }
+
+    /// Nodes the watcher had no descriptor for get one when there's one to
+    /// spare, so one that was short of them isn't left unwatched for good.
+    /// The run's loop calls this, as a waiting guest asks nothing.
+    pub fn rewatch(&mut self) {
+        if self.rewatched.elapsed() < REWATCH_EVERY {
+            return;
+        }
+        self.rewatched = Instant::now();
+        let Some(ids) = self.watcher.as_ref().map(|w| w.unwatched()) else { return };
+        for id in ids {
+            let Ok(fd) = self.open_node(id) else { continue };
+            if self.watcher.as_ref().is_some_and(|w| !w.watch_again(id, fd)) {
+                return;
+            }
+        }
     }
 
     /// The watcher, started the first time it's needed.

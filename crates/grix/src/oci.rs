@@ -343,7 +343,7 @@ impl Layout {
 
 /// The treecache key for what `digest`'s layers add up to, for `arch`.
 fn applied_layers_key(digest: &str, arch: Arch) -> String {
-    treecache::key("applied-layers-v3", &[arch.oci_name().as_bytes(), digest.as_bytes()])
+    treecache::key("applied-layers-v4", &[arch.oci_name().as_bytes(), digest.as_bytes()])
 }
 
 /// `arch`'s manifest in an index (linux/arm64 or linux/amd64, as Docker
@@ -533,18 +533,19 @@ pub(crate) fn apply_layer(
         // nothing that leaves it should carry them.
         let mode = header.mode().unwrap_or(0o644) & 0o1777;
         let mtime_ns = header.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
+        let owner = Some((header.uid().unwrap_or(0) as u32, header.gid().unwrap_or(0) as u32));
         let node = match header.entry_type() {
-            tar::EntryType::Directory => Node::Dir { mode, mtime_ns },
+            tar::EntryType::Directory => Node::Dir { mode, mtime_ns, owner },
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 let size = header.size()?;
                 totals.charge(size).ok_or_else(too_big)?;
                 let mut data = Vec::with_capacity(size.min(1 << 20) as usize);
                 (&mut entry).take(size).read_to_end(&mut data)?;
-                Node::File { data, mode, mtime_ns }
+                Node::File { data, mode, mtime_ns, owner }
             }
             tar::EntryType::Symlink => {
                 let target = entry.link_name()?.context("symlink without a target")?.to_string_lossy().into_owned();
-                Node::Symlink { target, mtime_ns }
+                Node::Symlink { target, mtime_ns, owner }
             }
             // A hard link: a copy of what it links to (grix's imports have
             // no hard links).
@@ -1097,6 +1098,36 @@ fn tempdir(what: &str) -> Result<TempDir> {
 mod tests {
     use super::*;
     use crate::container::random_suffix;
+
+    /// Whose a layer says its files are, and a later layer's say on a
+    /// directory (`RUN chown` leaves it in that layer, and nothing else).
+    #[test]
+    fn layers_keep_owners() {
+        let entry = |b: &mut tar::Builder<Vec<u8>>, path: &str, dir: bool, uid: u64, gid: u64| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(if dir { tar::EntryType::Directory } else { tar::EntryType::Regular });
+            h.set_size(0);
+            h.set_mode(0o755);
+            h.set_uid(uid);
+            h.set_gid(gid);
+            b.append_data(&mut h, path, &[][..]).unwrap();
+        };
+        let mut b = tar::Builder::new(Vec::new());
+        entry(&mut b, "data/", true, 0, 0);
+        entry(&mut b, "data/f", false, 70, 71);
+        let first = b.into_inner().unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        entry(&mut b, "data/", true, 999, 998);
+        let second = b.into_inner().unwrap();
+        let (mut files, mut totals) = (BTreeMap::new(), Totals::default());
+        apply_layer(&mut files, &mut &first[..], &mut totals).unwrap();
+        assert!(matches!(files.get("/data"), Some(Node::Dir { owner: Some((0, 0)), .. })));
+        assert!(matches!(files.get("/data/f"), Some(Node::File { owner: Some((70, 71)), .. })));
+        apply_layer(&mut files, &mut &second[..], &mut totals).unwrap();
+        assert!(matches!(files.get("/data"), Some(Node::Dir { owner: Some((999, 998)), .. })));
+        // What the directory holds stays, and stays its own.
+        assert!(matches!(files.get("/data/f"), Some(Node::File { owner: Some((70, 71)), .. })));
+    }
 
     fn layer(entries: &[(&str, Option<&str>)]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());

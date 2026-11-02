@@ -45,24 +45,34 @@ pub(crate) fn key(kind: &str, parts: &[&[u8]]) -> String {
 /// What a tree holds, for keys: every path, its kind, mode and contents,
 /// but not its times (a file written again with the same bytes is the
 /// same file to a build).
+fn update_owner(h: &mut Sha256, owner: &crate::image::Owner) {
+    h.update([owner.is_some() as u8]);
+    let (uid, gid) = owner.unwrap_or((0, 0));
+    h.update(uid.to_le_bytes());
+    h.update(gid.to_le_bytes());
+}
+
 pub(crate) fn tree_hash(files: &BTreeMap<String, Node>) -> String {
     let mut h = Sha256::new();
     for (path, node) in files {
         h.update((path.len() as u64).to_le_bytes());
         h.update(path.as_bytes());
         match node {
-            Node::File { data, mode, .. } => {
+            Node::File { data, mode, owner, .. } => {
                 h.update(b"f");
                 h.update(mode.to_le_bytes());
+                update_owner(&mut h, owner);
                 h.update((data.len() as u64).to_le_bytes());
                 h.update(data);
             }
-            Node::Dir { mode, .. } => {
+            Node::Dir { mode, owner, .. } => {
                 h.update(b"d");
                 h.update(mode.to_le_bytes());
+                update_owner(&mut h, owner);
             }
-            Node::Symlink { target, .. } => {
+            Node::Symlink { target, owner, .. } => {
                 h.update(b"l");
+                update_owner(&mut h, owner);
                 h.update((target.len() as u64).to_le_bytes());
                 h.update(target.as_bytes());
             }
@@ -223,9 +233,12 @@ mod tests {
     #[test]
     fn trees_round_trip_and_bad_ones_go() {
         let mut files = BTreeMap::new();
-        files.insert("/etc".to_string(), Node::Dir { mode: 0o755, mtime_ns: 1_000_000_000 });
-        files.insert("/etc/a".to_string(), Node::File { data: b"hello".to_vec(), mode: 0o600, mtime_ns: 0 });
-        files.insert("/l".to_string(), Node::Symlink { target: "etc/a".into(), mtime_ns: 0 });
+        files.insert("/etc".to_string(), Node::Dir { mode: 0o755, mtime_ns: 1_000_000_000, owner: None });
+        files.insert(
+            "/etc/a".to_string(),
+            Node::File { data: b"hello".to_vec(), mode: 0o600, mtime_ns: 0, owner: None },
+        );
+        files.insert("/l".to_string(), Node::Symlink { target: "etc/a".into(), mtime_ns: 0, owner: Some((5, 6)) });
         let key = key("test", &[random_suffix().as_bytes()]);
         put(&key, &files).unwrap();
         let back = get(&key).unwrap();
@@ -233,9 +246,9 @@ mod tests {
         assert!(matches!(back.get("/etc/a"), Some(Node::File { data, mode: 0o600, .. }) if data == b"hello"));
         // Times don't count; contents and modes do.
         let mut later = files.clone();
-        later.insert("/etc/a".into(), Node::File { data: b"hello".to_vec(), mode: 0o600, mtime_ns: 5 });
+        later.insert("/etc/a".into(), Node::File { data: b"hello".to_vec(), mode: 0o600, mtime_ns: 5, owner: None });
         assert_eq!(tree_hash(&later), tree_hash(&files));
-        later.insert("/etc/a".into(), Node::File { data: b"hello".to_vec(), mode: 0o644, mtime_ns: 5 });
+        later.insert("/etc/a".into(), Node::File { data: b"hello".to_vec(), mode: 0o644, mtime_ns: 5, owner: None });
         assert_ne!(tree_hash(&later), tree_hash(&files));
         // A corrupted tree isn't used, and goes.
         let path = dir().unwrap().join(format!("{key}.tar"));

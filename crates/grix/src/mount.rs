@@ -113,7 +113,7 @@ impl Mount {
                 bail!("mounting {}: {rel:?} is nested too deep (over {MAX_EXPORT_PATH} bytes)", self.host.display());
             }
             let snap = match n {
-                &Node::File { ref data, mode, mtime_ns } => {
+                &Node::File { ref data, mode, mtime_ns, .. } => {
                     let (ino, ctime_ns) = stamps.get(p).copied().unwrap_or_default();
                     Snap::File { len: data.len() as u64, mtime_ns, mode, ino, ctime_ns }
                 }
@@ -437,12 +437,21 @@ mod tests {
             path: path.into(),
             mode: 0o644,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            uid: 0,
+            gid: 0,
             content: ExportContent::File(data.as_bytes().to_vec()),
         }
     }
 
     fn dir(path: &str) -> ExportEntry {
-        ExportEntry { path: path.into(), mode: 0o755, mtime: SystemTime::UNIX_EPOCH, content: ExportContent::Dir }
+        ExportEntry {
+            path: path.into(),
+            mode: 0o755,
+            mtime: SystemTime::UNIX_EPOCH,
+            uid: 0,
+            gid: 0,
+            content: ExportContent::Dir,
+        }
     }
 
     fn changes(entries: Vec<ExportEntry>, removed: &[&str]) -> Changes {

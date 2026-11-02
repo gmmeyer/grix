@@ -38,6 +38,9 @@ pub fn brk(p: &mut Process, addr: u64) -> SysResult {
             a.map(Vma::anon(old_end, new_end, Prot::RW));
         }
     } else if new_end < old_end {
+        if a.sealed_in(new_end, old_end) {
+            return Ok(a.brk);
+        }
         a.unmap(new_end, old_end);
     }
     a.brk = addr;
@@ -160,6 +163,9 @@ pub(super) fn map_at(p: &mut Process, addr: u64, len: u64, flags: u64, prot: Pro
     } else {
         a.find_free(len).ok_or(ENOMEM)?
     };
+    if a.sealed_in(start, start + len) {
+        return Err(EPERM);
+    }
     a.room_for(start, start + len, false, 1)?;
     let mut vma = Vma::new(start, start + len, prot, backing);
     vma.grows_down = flags & MAP_GROWSDOWN != 0;
@@ -172,6 +178,9 @@ pub fn munmap(p: &mut Process, addr: u64, len: u64) -> SysResult {
     let end = addr.checked_add(len).filter(|&e| e <= USER_TOP).ok_or(EINVAL)?;
     if !aligned(addr) {
         return Err(EINVAL);
+    }
+    if p.aspace.sealed_in(addr, end) {
+        return Err(EPERM);
     }
     p.aspace.room_for(addr, end, false, 0)?;
     p.aspace.unmap(addr, end);
@@ -209,6 +218,9 @@ pub fn mprotect(p: &mut Process, addr: u64, len: u64, prot: u64) -> SysResult {
         addr
     };
     let prot = Prot::from_linux(prot);
+    if p.aspace.sealed_in(addr, end) {
+        return Err(EPERM);
+    }
     p.aspace.room_for(addr, end, true, 0)?;
     if prot.write && p.aspace.has_read_only_shared_file(addr, end) {
         return Err(EACCES);
@@ -246,6 +258,11 @@ pub fn mremap(p: &mut Process, old: u64, old_len: u64, new_len: u64, flags: u64,
     } else {
         None
     };
+    let old_end = old.checked_add(old_len).ok_or(EINVAL)?;
+    let onto = fixed.is_some_and(|at| p.aspace.sealed_in(at, at + new_len));
+    if onto || p.aspace.sealed_in(old, old_end) {
+        return Err(EPERM);
+    }
     p.aspace.has_room(3)?;
     p.aspace.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed)
 }
@@ -281,6 +298,12 @@ pub fn madvise(p: &mut Process, addr: u64, len: u64, advice: u64) -> SysResult {
         return Err(EINVAL);
     }
     let end = page_up(len).and_then(|len| addr.checked_add(len)).ok_or(EINVAL)?;
+    // Taking away what a program couldn't change itself: what's read-only
+    // and private, as it would come back as zeros (Linux's is_ro_anon).
+    let discards = matches!(advice, MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE | MADV_REMOVE);
+    if discards && p.aspace.sealed_read_only_anon_in(addr, end) {
+        return Err(EPERM);
+    }
     let (mut at, mut hole) = (addr, false);
     while at < end {
         let Some(v) = p.aspace.first_in(at, end) else {

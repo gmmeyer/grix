@@ -156,6 +156,8 @@ pub struct Thread {
     /// signal handler runs before the call re-executes, the call may fail
     /// with EINTR instead (see `signal::return_to_user`).
     pub restarting: bool,
+    /// Its last System V IPC call was left waiting (`sysv::rerun`).
+    pub waited_on_ipc: bool,
     /// Rewound by a wakeup (a signal, an I/O change): the syscall re-runs
     /// once before any signal is delivered, so a call that can now complete
     /// does (and the handler runs after it), as Linux checks the wait's
@@ -218,6 +220,7 @@ impl Thread {
             robust_list: 0,
             restart_deadline: None,
             restarting: false,
+            waited_on_ipc: false,
             recheck: false,
             io_done: 0,
             cpu_ns: 0,
@@ -311,6 +314,9 @@ pub struct Ids {
 /// keeps its own, and fork copies them).
 pub const MAX_GROUPS: usize = 64;
 
+/// IOPRIO_CLASS_BE, level 4: Linux's for anyone who hasn't said.
+const IOPRIO_DEFAULT: u16 = 2 << 13 | 4;
+
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
@@ -338,6 +344,12 @@ pub struct Process {
     pub policy: Policy,
     pub uid: u32,
     pub gid: u32,
+    /// The nice value and I/O priority: a process's to set and read back,
+    /// as the scheduler is round-robin and there's no disk.
+    pub nice: i8,
+    pub ioprio: u16,
+    /// It has System V semaphore changes to undo when it ends.
+    pub sem_undo: bool,
     pub ids: Ids,
     /// Signal actions (`action`, `set_action`).
     pub sigactions: Shared<SigActions>,
@@ -522,6 +534,9 @@ impl Process {
             uid,
             gid,
             ids: Ids { ruid: uid, suid: uid, rgid: gid, sgid: gid, groups: alloc::vec![gid] },
+            nice: 0,
+            ioprio: IOPRIO_DEFAULT,
+            sem_undo: false,
             sigactions: Shared::new([SigAction::default(); 65]),
             shared_pending: SigQueue::default(),
             rlimits,
@@ -564,6 +579,7 @@ impl Process {
         let mut c = Process::new(pid, self.policy, self.uid, self.gid, aspace);
         c.args_charge = args_charge;
         c.ppid = self.pid;
+        (c.nice, c.ioprio) = (self.nice, self.ioprio);
         c.pgid = self.pgid;
         c.sid = self.sid;
         c.ctty = self.ctty.clone();
@@ -983,6 +999,8 @@ pub fn start(img: Image<'static>) -> ! {
     X86_64.call_once(|| String::from(img.x86_64));
     let aspace = AddressSpace::new().expect("out of memory at boot");
     let mut p = Process::new(INIT, img.policy, img.uid, img.gid, aspace);
+    // Whoever says so: nothing but this program's own files go by them.
+    p.ids.groups.extend(img.groups.iter().copied().filter(|&g| g != img.gid).take(MAX_GROUPS - 1));
     p.cur().charge = crate::kmem::Charge::new(THREAD_COST).expect("no kernel memory for the first thread");
     // This CPU's process from the start (`mm::gate`).
     p.aspace.lock();

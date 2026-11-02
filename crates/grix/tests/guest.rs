@@ -1208,6 +1208,57 @@ fn images_with_no_other_os() {
     assert_eq!(out.status, ExitStatus::Exited(0));
 }
 
+/// A layer's owners and a build step's `chown` are still there when the
+/// image runs, by way of the export, the step cache and the image's file.
+#[test]
+fn an_images_files_keep_their_owners() {
+    use grix::build::{BuildOptions, Grixfile, Step};
+    let step = |args: &[&str]| Step::Exec(args.iter().map(|a| a.to_string()).collect());
+    let g = Grixfile {
+        from: Some(format!("oci:{}", fixture("oci/alpine").display())),
+        from_outside_context: true,
+        command: Some(
+            ["/bin/busybox", "stat", "-c", "%u:%g %n", "/data", "/data/f", "/data/l", "/data/own", "/etc/shadow"]
+                .map(String::from)
+                .to_vec(),
+        ),
+        run: vec![
+            step(&["/bin/busybox", "mkdir", "/data"]),
+            step(&["/bin/busybox", "touch", "/data/f", "/data/own"]),
+            step(&["/bin/busybox", "ln", "-s", "f", "/data/l"]),
+            step(&["/bin/busybox", "chown", "1234:5678", "/data"]),
+            step(&["/bin/busybox", "chown", "99:88", "/data/f"]),
+            step(&["/bin/busybox", "chown", "-h", "7:6", "/data/l"]),
+        ],
+        ..Default::default()
+    };
+    let build = |g: &Grixfile| {
+        let opts = BuildOptions {
+            arch: None,
+            kernel: None,
+            on_output: &mut |_, _| {},
+            policy: Default::default(),
+            control: None,
+        };
+        g.build(Path::new("."), opts).unwrap()
+    };
+    // (Alpine's shadow file is the shadow group's: that's the layer's.)
+    let want = "1234:5678 /data\n99:88 /data/f\n7:6 /data/l\n0:0 /data/own\n0:42 /etc/shadow\n";
+    let image = build(&g);
+    let shows = |image: &grix::Image| {
+        let sb = Sandbox::builder().image(image).unwrap().build().unwrap();
+        sb.run(sb.command()).unwrap().stdout_str().to_string()
+    };
+    assert_eq!(shows(&image), want);
+    // Again, out of the step cache.
+    assert_eq!(shows(&build(&g)), want);
+    // And by way of a file.
+    let dir = temp_dir("owners");
+    let path = dir.join("owners.grix");
+    image.write_to(&path).unwrap();
+    assert_eq!(shows(&grix::Image::open(&path).unwrap()), want);
+}
+
 #[test]
 fn images_built_on_images_and_cached_steps() {
     // A base image whose build step leaves something new every time it
@@ -4996,6 +5047,81 @@ fn xattr_lists_are_bounded() {
 #[test]
 fn magic_links_are_links() {
     hardened(with("hardening"), &["magic"], "magic links refused");
+}
+
+/// A name is looked up in a directory only with search permission there,
+/// by the owner's, group's or other's bits, as they apply. The fixture
+/// passes on Linux as it is.
+#[test]
+fn directories_need_search_permission() {
+    let b = with("searchperm").user("0:0").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/searchperm"]);
+    assert_eq!(out.stdout_str(), "searchperm ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// Calls programs meet less often, as Linux has them: the fixture passes
+/// there, but for those newer than the kernel it was checked on.
+#[test]
+fn calls_programs_meet_less_often() {
+    let b = with("linuxcalls").allow(Capability::FsWrite).allow(Capability::Process);
+    let out = run(b, &["/bin/linuxcalls"]);
+    assert_eq!(out.stdout_str().lines().last(), Some("linuxcalls ok"), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    // Setting the clock is refused, and said to be: nothing else is.
+    assert!(
+        matches!(&out.events[..], [GuestEvent::Denied { syscall, detail, .. }]
+            if syscall == "adjtimex" && detail == "setting the clock"),
+        "{:?}",
+        out.events
+    );
+}
+
+/// System V message queues and semaphores, as root and not. The fixture
+/// passes on Linux as it is.
+#[test]
+fn system_v_queues_and_semaphores() {
+    for user in ["0:0", "1000:1000"] {
+        let b = with("sysvipc").user(user).allow(Capability::Process);
+        let out = run(b, &["/bin/sysvipc"]);
+        assert_eq!(out.stdout_str().lines().last(), Some("sysvipc ok"), "{}{}", out.stdout_str(), out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+    }
+}
+
+/// POSIX message queues. The fixture passes on Linux as it is.
+#[test]
+fn posix_message_queues() {
+    let out = run(with("mqueue").allow(Capability::Process), &["/bin/mqueue"]);
+    assert_eq!(out.stdout_str().lines().last(), Some("mqueue ok"), "{}{}", out.stdout_str(), out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
+/// The user's groups in the sandbox's /etc/group are the program's, as
+/// Docker's are, and it can't be given what /etc/group doesn't say.
+#[test]
+fn a_user_has_its_groups() {
+    let passwd = "root:x:0:0::/:/bin/sh\napp:x:1000:1000::/:/bin/sh\n";
+    let group = "app:x:1000:\nwheel:x:10:root,app\nvideo:x:27:app,other\nother:x:30:someone\n";
+    let sandbox = |user: &str| {
+        with("alpine/bin/busybox.static")
+            .file("/etc/passwd", passwd, 0o644)
+            .unwrap()
+            .file("/etc/group", group, 0o644)
+            .unwrap()
+            .user(user)
+    };
+    let name = "/bin/alpine/bin/busybox.static";
+    let out = run(sandbox("app"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "1000 10 27\n", "{}", out.kernel_log);
+    let out = run(sandbox("0:0"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "0 10\n", "{}", out.kernel_log);
+    // A number with no name in /etc/passwd is in no one's list.
+    let out = run(sandbox("4242:4242"), &[name, "id", "-G"]);
+    assert_eq!(out.stdout_str(), "4242\n", "{}", out.kernel_log);
 }
 
 /// O_PATH | O_NOFOLLOW opens a magic link as a link, and RESOLVE_* say of

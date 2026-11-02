@@ -8,42 +8,35 @@ read the `unsupported` / `denied` / `missing` events.
 Legend: `[ ]` todo, `[~]` partial, `[x]` done (kept for a while so the list
 shows progress).
 
-## What's left (after 0.0.72)
+## What's left (after 0.0.73)
 
 Each is written up in its section below; this is the order. No known way
 out of the sandbox, and no hang anyone can reproduce. The rule for what's
 stricter than Linux: Linux's behaviour by default, and stricter on request
 (`--strict-network`, `--no-outside-links`).
 
-Robustness, first:
-
-1. `hostfds` fails without the budget for files held open, on Linux too;
-   what it guards of kqueue's descriptors takes an unfixed build on macOS.
-
 Linux behaviour:
 
-2. An image's files keep their owners, then directories' search
-   permission, in that order; then an image's user's supplementary
-   groups.
-3. A node left unwatched on macOS, and newer syscalls as programs ask for
-   them.
-4. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
+1. Newer syscalls as programs ask for them: `statmount` and `listmount` are
+   reported, fanotify and the new mount API refused for now, and
+   `mq_notify` with SIGEV_THREAD is reported.
+2. The rest of the network stack, on `vm`: raw sockets beyond ICMP echo
    (nothing a program sends leaves the gateway, so a raw socket there
    forges nothing), `IP_TTL`, `TCP_INFO`, `eth0` saying 1500.
-5. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
+3. `/proc/<pid>/fd/N/name`: few tools go there, and it means another
    process's table under the filesystem's lock.
 
 Bigger:
 
-6. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
+4. `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK`: address spaces
    shared between processes.
-7. Finer locking: phase 2, a reader/writer lock with per-process
+5. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-8. Faster live-mount round trips, multi-architecture images, and the
+6. Faster live-mount round trips, multi-architecture images, and the
    rest of `/proc/grix/smp`'s counters.
-9. A security review of everything since the last one, here. An outside
-   one (round 2, item 20) can't be done from here: it has to be someone
-   else's.
+7. A security review of everything since the last one, by a team of agents.
+   Not an outside vendor's: this isn't worth paying for until it gets real
+   interest.
 
 Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
 in 32,000 runs since.
@@ -102,7 +95,13 @@ Live mounts:
 - [ ] `O_TMPFILE` and `linkat` on a live mount (`hosttmpfile`).
 - [ ] inotify on a live mount by kqueue: renames paired by inode, directories
       compared, the overflow past `fd_budget` (`hostfds`, `watch`).
+- [ ] `hostfds` tells on what it guards: with `at::take_within` always true it
+      must fail on macOS as on Linux. It's the one part of it only macOS can
+      prove, as kqueue holds a descriptor per watched file.
 - [ ] Listings past `MAX_LISTED`, and names of the most bytes, on APFS.
+- [ ] A watched node with no descriptor to spare is watched again once there's
+      one (`Server::rewatch`): inotify on more files than `at::take_fd` allows,
+      then close the others, and a change is seen, after an IN_Q_OVERFLOW.
 
 Snapshots:
 
@@ -138,9 +137,7 @@ pip, sqlite), Node (fs), `git init` and Go now pass.
    resolver), the image's user (Docker's `User`, root by default), Linux's
    real/effective/saved ids and setgroups, `O_PATH|O_DIRECTORY` on a file
    (ENOTDIR), and ENOENT/ECONNREFUSED for AF_UNIX connects to nothing.
-   Left: `capset` (setpriv), supplementary groups in permission checks,
-   `posix_openpt` (apt's log; item 10), a `--user` flag for `grix build`
-   and `grix run`.
+   Left: `capset` (setpriv), `posix_openpt` (apt's log; item 10).
 10. [x] **Interactive use**: TTY mode (`grix run -t`, `tty`), pseudo-terminals
     and termios, job control (SIGSTOP/SIGTSTP/SIGCONT, `WUNTRACED`, from the
     host too). Left: packet mode (`TIOCPKT`), `VMIN`+`VTIME`'s interbyte
@@ -410,22 +407,20 @@ makers; the alternate stack's end; kqueue's descriptors; `Server::restore`.
 
 Left, none of it a way out of the sandbox:
 
-- [ ] An image's files don't keep their owners (a layer's or a build
-      step's `chown`): everything imported is the sandbox user's. Docker's
-      own entrypoints (PostgreSQL, MariaDB, MySQL) work anyway, as they
-      `chown` at run time; it takes the image format, `Entry`, the export
-      messages and the tree cache. Do this before the next item, which
-      would otherwise refuse services their own directories.
-- [ ] A path's directories aren't searched by anyone's permission: only
-      the last component is checked (`MAY_EXEC` on the way down isn't).
-- [ ] An image's user gets no supplementary groups from its `/etc/group`,
-      as Docker's does; `initgroups` in the program works.
+- [x] An image's files keep their owners (a layer's or a build step's
+      `chown`), by way of the image format, `Entry`, the export messages
+      and the tree cache.
+- [x] A path's directories are searched by the walker's permission
+      (`Fs::may_search`, Linux's may_lookup; `searchperm` passes there).
+- [x] An image's user gets its supplementary groups from `/etc/group`, as
+      Docker's does (`container::supplementary_groups`).
 - [ ] `/proc/<pid>/fd/N/name` only for the caller's own descriptors:
       another process's are ENOENT past their own name. Few tools go
       there, and it means another process's table under the filesystem's
       lock (`FdTable::walking`).
-- [ ] A node with no descriptor left for it (macOS, `at::take_fd`)
-      stays unwatched until the guest watches it again.
+- [x] A node with no descriptor left for it (macOS, `at::take_fd`) is
+      watched again once there's one (`Server::rewatch`), and the guest told
+      by an overflow that it missed what changed meanwhile.
 
 ## Agent integrations
 

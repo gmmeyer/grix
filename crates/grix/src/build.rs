@@ -329,7 +329,7 @@ impl Grixfile {
         if let Some(cwd) = &config.cwd {
             let cwd = image::guest_path(cwd)?;
             if cwd != "/" && !files.contains_key(&cwd) {
-                files.insert(cwd, Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
+                files.insert(cwd, Node::Dir { mode: 0o755, mtime_ns: image::now_ns(), owner: None });
             }
         }
         for f in &self.files {
@@ -338,6 +338,7 @@ impl Grixfile {
                 data: f.content.clone().into_bytes(),
                 mode: f.mode.unwrap_or(0o644),
                 mtime_ns: image::now_ns(),
+                owner: None,
             };
             files.insert(path, node);
         }
@@ -418,7 +419,7 @@ fn step_key(image: &Image, argv: &[String], policy: &BuildPolicy) -> String {
     ]
     .map(|p| p.to_vec());
     let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    crate::treecache::key("build-step-v3", &parts)
+    crate::treecache::key("build-step-v4", &parts)
 }
 
 /// Run one build step in `image` and take the file tree it leaves (or
@@ -495,10 +496,11 @@ fn run_step(
     let mut files = BTreeMap::new();
     for e in &ex.entries {
         let mtime_ns = image::ns(e.mtime);
+        let owner = Some((e.uid, e.gid));
         let node = match &e.content {
-            ExportContent::Dir => Node::Dir { mode: e.mode, mtime_ns },
-            ExportContent::File(data) => Node::File { data: data.clone(), mode: e.mode, mtime_ns },
-            ExportContent::Symlink(t) => Node::Symlink { target: t.clone(), mtime_ns },
+            ExportContent::Dir => Node::Dir { mode: e.mode, mtime_ns, owner },
+            ExportContent::File(data) => Node::File { data: data.clone(), mode: e.mode, mtime_ns, owner },
+            ExportContent::Symlink(t) => Node::Symlink { target: t.clone(), mtime_ns, owner },
         };
         files.insert(format!("/{}", e.path), node);
     }
@@ -516,7 +518,9 @@ mod tests {
     #[test]
     fn steps_are_cached_per_architecture() {
         let files: BTreeMap<String, Node> =
-            [("/a".to_string(), Node::File { data: b"x".to_vec(), mode: 0o644, mtime_ns: 0 })].into_iter().collect();
+            [("/a".to_string(), Node::File { data: b"x".to_vec(), mode: 0o644, mtime_ns: 0, owner: None })]
+                .into_iter()
+                .collect();
         let argv = ["/bin/sh".to_string(), "-c".into(), "true".into()];
         let policy = BuildPolicy::default();
         let key =

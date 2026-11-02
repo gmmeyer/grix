@@ -17,10 +17,14 @@ use crate::at::{self, Kind};
 /// time in ns since the Unix epoch, as the host has it.
 #[derive(Clone, Debug)]
 pub(crate) enum Node {
-    File { data: Vec<u8>, mode: u32, mtime_ns: u64 },
-    Dir { mode: u32, mtime_ns: u64 },
-    Symlink { target: String, mtime_ns: u64 },
+    File { data: Vec<u8>, mode: u32, mtime_ns: u64, owner: Owner },
+    Dir { mode: u32, mtime_ns: u64, owner: Owner },
+    Symlink { target: String, mtime_ns: u64, owner: Owner },
 }
+
+/// Whose a node is: the (uid, gid) an image's layer or build step gave it, or
+/// None for the sandbox's own user, as anything imported from the host is.
+pub(crate) type Owner = Option<(u32, u32)>;
 
 /// A time as ns since the Unix epoch (0 before it).
 pub(crate) fn ns(t: SystemTime) -> u64 {
@@ -101,7 +105,7 @@ fn import_at(
                 .ok()
                 .with_context(|| format!("non UTF-8 symlink {}", host.display()))?;
             seen(guest, &st);
-            files.insert(guest.into(), Node::Symlink { target, mtime_ns: at::mtime_ns(&st) });
+            files.insert(guest.into(), Node::Symlink { target, mtime_ns: at::mtime_ns(&st), owner: None });
         }
         Kind::Dir => {
             // What's opened is what's described and listed, whatever has
@@ -110,7 +114,7 @@ fn import_at(
             let st = at::stat_fd(d.as_raw_fd())?;
             seen(guest, &st);
             if guest != "/" {
-                files.insert(guest.into(), Node::Dir { mode: at::mode(&st), mtime_ns: at::mtime_ns(&st) });
+                files.insert(guest.into(), Node::Dir { mode: at::mode(&st), mtime_ns: at::mtime_ns(&st), owner: None });
             }
             for child in at::read_dir(d.as_raw_fd())? {
                 let n = child.to_str().with_context(|| format!("non UTF-8 file name in {}", host.display()))?;
@@ -128,7 +132,10 @@ fn import_at(
             seen(guest, &st);
             let mut data = Vec::new();
             f.read_to_end(&mut data)?;
-            files.insert(guest.into(), Node::File { data, mode: at::mode(&st), mtime_ns: at::mtime_ns(&st) });
+            files.insert(
+                guest.into(),
+                Node::File { data, mode: at::mode(&st), mtime_ns: at::mtime_ns(&st), owner: None },
+            );
         }
         // Sockets, FIFOs and device nodes are skipped.
         Kind::Other => {}
@@ -140,11 +147,20 @@ pub(crate) fn entries(files: &BTreeMap<String, Node>) -> Vec<Entry<'_>> {
     files
         .iter()
         .map(|(path, node)| match node {
-            &Node::File { ref data, mode, mtime_ns } => Entry { path, kind: EntryKind::File, mode, mtime_ns, data },
-            &Node::Dir { mode, mtime_ns } => Entry { path, kind: EntryKind::Dir, mode, mtime_ns, data: &[] },
-            Node::Symlink { target, mtime_ns } => {
-                Entry { path, kind: EntryKind::Symlink, mode: 0o777, mtime_ns: *mtime_ns, data: target.as_bytes() }
+            &Node::File { ref data, mode, mtime_ns, owner } => {
+                Entry { path, kind: EntryKind::File, mode, mtime_ns, owner, data }
             }
+            &Node::Dir { mode, mtime_ns, owner } => {
+                Entry { path, kind: EntryKind::Dir, mode, mtime_ns, owner, data: &[] }
+            }
+            Node::Symlink { target, mtime_ns, owner } => Entry {
+                path,
+                kind: EntryKind::Symlink,
+                mode: 0o777,
+                mtime_ns: *mtime_ns,
+                owner: *owner,
+                data: target.as_bytes(),
+            },
         })
         .collect()
 }

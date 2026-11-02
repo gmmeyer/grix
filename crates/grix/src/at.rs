@@ -37,12 +37,12 @@ fn soft_limit() -> u64 {
 
 /// One more held for a guest, if the budget has room.
 pub(crate) fn take_fd() -> bool {
-    // (Two sandboxes at once may go one over: it's a share, not a limit.)
-    let room = HELD.load(Ordering::Relaxed) < fd_budget(soft_limit());
-    if room {
-        HELD.fetch_add(1, Ordering::Relaxed);
-    }
-    room
+    take_within(&HELD, fd_budget(soft_limit()))
+}
+
+/// One more of `budget`, whoever else is taking one.
+fn take_within(held: &AtomicUsize, budget: usize) -> bool {
+    held.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < budget).then_some(n + 1)).is_ok()
 }
 
 pub(crate) fn give_fd() {
@@ -275,6 +275,21 @@ mod tests {
     #[test]
     fn descriptors_are_a_share_of_the_limit() {
         // A macOS shell's default, and the most one host process holds.
+        // Sandboxes at once can't take it past what it is.
+        let held = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..10_000 {
+                        if take_within(&held, 1000) {
+                            taken.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!((held.into_inner(), taken.into_inner()), (1000, 1000));
         assert_eq!(fd_budget(256), 64);
         assert_eq!(fd_budget(64), 16);
         assert_eq!(fd_budget(u64::MAX), 64 * 1024);

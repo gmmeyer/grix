@@ -63,7 +63,9 @@ jobs:
           ./target/release/grix pull debian:bookworm-slim --oci fixtures/build/oci-x86_64/debian
           ./target/release/grix pull --arch aarch64 alpine:3.21 --oci fixtures/build/oci/alpine
       - name: Unit tests
-        run: cargo test -p grix --lib
+        run: |
+          cargo test -p grix --lib
+          cargo test -p grix-abi -p grix-netstack
       - name: A first run in grix-vmm
         run: |
           printf 'fn main() { println!("hello from {}", std::env::args().nth(1).unwrap()); std::process::exit(7); }\n' > hello.rs
@@ -99,7 +101,7 @@ jobs:
       # Alone, so its machine has the runner's cores to itself.
       - name: End-to-end tests on the vm network stack, in grix-vmm (KVM)
         run: |
-          GRIX_NETWORK=vm GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes --test mcp
+          GRIX_NETWORK=vm GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes --test mcp --test hostfds
           GRIX_NETWORK=vm GRIX_ARCH=x86_64 python3 -m unittest discover -s python/tests
       - name: Threads in parallel on 4 CPUs, in grix-vmm (KVM)
         run: GRIX_STRICT_SPEEDUP=1 GRIX_ARCH=x86_64 cargo test -p grix --test guest -- --exact threads_run_in_parallel_on_more_cpus

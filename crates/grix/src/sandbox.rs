@@ -493,6 +493,8 @@ pub struct SandboxBuilder {
     grace: Duration,
     uid: u32,
     gid: u32,
+    /// `user`'s, resolved in `build` when the files are all there.
+    user: Option<String>,
     arch: Arch,
     /// Who chose `arch`, if anyone did (`GRIX_ARCH`, or `arch`): an image
     /// for another is an error then, rather than a reason to switch.
@@ -542,6 +544,7 @@ impl Default for SandboxBuilder {
             metrics: None,
             grace: DEFAULT_GRACE,
             uid: 1000,
+            user: None,
             gid: 1000,
             arch,
             arch_chosen_by: Arch::env().map(|_| "GRIX_ARCH"),
@@ -580,7 +583,10 @@ impl SandboxBuilder {
     /// Create a file with the given contents at `guest`.
     pub fn file(mut self, guest: &str, data: impl Into<Vec<u8>>, mode: u32) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::File { data: data.into(), mode: mode & 0o7777, mtime_ns: image::now_ns() });
+        self.files.insert(
+            path,
+            Node::File { data: data.into(), mode: mode & 0o7777, mtime_ns: image::now_ns(), owner: None },
+        );
         Ok(self)
     }
 
@@ -591,14 +597,14 @@ impl SandboxBuilder {
         if target.is_empty() || target.contains('\0') {
             bail!("symlink target {target:?} for {guest} must be non-empty, without NUL");
         }
-        self.files.insert(path, Node::Symlink { target: target.into(), mtime_ns: image::now_ns() });
+        self.files.insert(path, Node::Symlink { target: target.into(), mtime_ns: image::now_ns(), owner: None });
         Ok(self)
     }
 
     /// Create an empty directory at `guest`.
     pub fn dir(mut self, guest: &str) -> Result<Self> {
         let path = image::guest_path(guest)?;
-        self.files.insert(path, Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
+        self.files.insert(path, Node::Dir { mode: 0o755, mtime_ns: image::now_ns(), owner: None });
         Ok(self)
     }
 
@@ -909,6 +915,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run as `user` (`uid[:gid]`, or names in the sandbox's `/etc/passwd`
+    /// and `/etc/group`), as Docker's `--user`, whatever an image says.
+    /// Ids only mean anything inside the sandbox.
+    pub fn user(mut self, user: &str) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
     /// Stricter than Linux: refuse unique local addresses (`fc00::/7`, which
     /// holds some clouds' metadata services) and Alibaba's and Azure's
     /// metadata addresses, unless a rule names them.
@@ -1198,6 +1212,9 @@ impl SandboxBuilder {
                 crate::timezone::Zone::Rule(rule) => self.env("TZ", rule),
             };
         }
+        if let Some(user) = &self.user {
+            (self.uid, self.gid) = crate::container::resolve_user(user, &self.files)?;
+        }
         match self.network {
             Some(Network::None) if self.policy.allows(Capability::Net) => {
                 bail!("`net` is granted and the network is none: one or the other")
@@ -1232,7 +1249,7 @@ impl SandboxBuilder {
                 .iter()
                 .all(|(p, n)| matches!(n, Node::Dir { .. }) || !(p == "/" || dir.starts_with(&format!("{p}/"))));
             if !exists && room {
-                self.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns: image::now_ns() });
+                self.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns: image::now_ns(), owner: None });
             }
         }
         if !self.cwd.starts_with('/') {
@@ -1425,6 +1442,7 @@ impl Sandbox {
             seed,
             policy: cfg.policy,
             uid: cfg.uid,
+            groups: crate::container::supplementary_groups(cfg.uid, &cfg.files),
             gid: cfg.gid,
             cwd: &cfg.cwd,
             stdin: stdin.is_some() || take.is_some() || cfg.tty.is_some(),
@@ -1902,8 +1920,8 @@ pub(crate) mod tests {
     #[test]
     fn programs_must_be_the_kernels() {
         use crate::container::check_programs;
-        let file = |data: Vec<u8>| Node::File { data, mode: 0o755, mtime_ns: 0 };
-        let link = |t: &str| Node::Symlink { target: t.into(), mtime_ns: 0 };
+        let file = |data: Vec<u8>| Node::File { data, mode: 0o755, mtime_ns: 0, owner: None };
+        let link = |t: &str| Node::Symlink { target: t.into(), mtime_ns: 0, owner: None };
         let mut files: BTreeMap<String, Node> = [
             ("/bin/busybox".to_string(), file(elf(183))),
             ("/bin/sh".to_string(), link("busybox")),

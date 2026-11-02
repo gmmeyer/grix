@@ -14,7 +14,7 @@ use crate::fd::{
     Epoll, FdEntry, FifoFile, FileKind, O_ACCMODE, O_APPEND, O_ASYNC, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, OpenFile,
     Registration, new_file,
 };
-use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
+use crate::fs::{self, Content, Dev, FileData, Ino, Kind, MAY_EXEC, MAY_READ, MAY_WRITE, ROOT, S_IFIFO, StatInfo};
 use crate::procfs::{self, ProcFile};
 use crate::{landlock, locks};
 
@@ -231,6 +231,12 @@ fn fd_stat(p: &Process, fd: u64) -> Result<StatInfo, Errno> {
         | FileKind::Unix(_) => anon(0x3000_0000 + fd, S_IFSOCK | 0o777, 0),
         FileKind::Generated(data) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o444, data.len() as u64),
         FileKind::ProcMem(..) => anon(0x4000_0000 + fd, fs::S_IFREG | 0o600, 0),
+        FileKind::Mqueue(q) => {
+            let q = q.lock();
+            let mut st = anon(0x4000_0000 + fd, fs::S_IFREG | q.mode(), q.bytes());
+            (st.uid, st.gid) = q.owner();
+            st
+        }
         // anon_inode files have no type bits on Linux.
         FileKind::EventFd(_)
         | FileKind::Epoll(_)
@@ -781,6 +787,10 @@ pub fn close(p: &mut Process, fd: u64) -> SysResult {
 /// CLONE_FILES a close in either process drops them, as on Linux.
 pub(crate) fn closing(p: &Process, file: &crate::fd::FileRef) {
     let f = file.lock();
+    // Whoever asked to hear of a queue's messages stops, as mqueue_flush_file.
+    if let FileKind::Mqueue(q) = &f.kind {
+        q.lock().closed_by(p.pid);
+    }
     // (An O_PATH descriptor doesn't count, as on Linux.)
     if !f.path_only && p.fds.posix_locks() {
         let key = f.lock_key();
@@ -836,6 +846,12 @@ fn read_into(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Option
         },
         FileKind::UnixUnbound(_) => Err(ENOTCONN),
         FileKind::PidFd(_) | FileKind::Landlock(_) => Err(EINVAL),
+        FileKind::Mqueue(q) => {
+            let status = q.lock().status();
+            let n = (count as usize).min(status.len());
+            copy_out(&mut p.aspace, buf, &status.as_bytes()[..n])?;
+            Ok(n as u64)
+        }
         FileKind::SignalFd(mask) => {
             // struct signalfd_siginfo is 128 bytes; read as many as fit.
             if count < 128 {
@@ -1101,7 +1117,7 @@ fn write_from(p: &mut Process, f: &mut OpenFile, buf: u64, count: u64, at: Optio
         }
         FileKind::TimerFd(_) => return Err(EINVAL),
         FileKind::UnixUnbound(_) => return Err(ENOTCONN),
-        FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Landlock(_) => return Err(EINVAL),
+        FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Landlock(_) | FileKind::Mqueue(_) => return Err(EINVAL),
         FileKind::Netlink(_) => {
             let FileKind::Netlink(nl) = &mut f.kind else { unreachable!() };
             return super::net::netlink_request(p, nl, &[(buf, count)]);
@@ -1842,6 +1858,10 @@ fn set_cwd(p: &mut Process, ino: Ino) -> SysResult {
     let mut fs = fs::lock();
     if !fs.is_dir(ino) {
         return Err(ENOTDIR);
+    }
+    // Being there is searching it, as Linux's MAY_CHDIR.
+    if !fs.permits(ino, p.who(), MAY_EXEC) {
+        return Err(EACCES);
     }
     let pin = Some(fs.pin(ino));
     p.fs.update(|f| (f.cwd, f.cwd_pin) = (ino, pin));
