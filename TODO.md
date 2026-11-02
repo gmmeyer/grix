@@ -33,8 +33,8 @@ Bigger:
 
 3. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-4. Faster live-mount round trips, and multi-architecture images if a use
-   turns up.
+4. A lookup in a live mount's directory too big to hold is a round trip
+   each, and multi-architecture images, if a use turns up.
 5. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
    interest. Under way, and not all of it can be: the pass over memory and
@@ -614,7 +614,7 @@ Left, none of it a way out of the sandbox:
       `unnamed_files_in_a_live_mount`. Left: its inode number changes
       then, and what has it open isn't pinned; naming one that's mapped
       shared is reported, as a mapping of its pages can't follow it.
-- [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
+- [~] Faster live-mount round trips. Reads: the console takes a frame's payload in one copy rather than a byte at a time, and a read going on from the last asks for all a message holds, so 64 MiB in 4 KiB reads went from 3.97 s to 0.84 s under emulation. Left: a lookup in a directory too big to hold is still a round trip each.
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): kept on the sandbox's nodes

@@ -134,35 +134,39 @@ impl InputDecoder {
         self.have == 0
     }
 
-    /// Feed one byte. Returns a complete frame when this byte ends one.
-    pub fn push(&mut self, b: u8) -> Option<(Input, &[u8])> {
-        if self.have < FRAME_HEADER {
+    /// Take what `bytes` has of a frame, as far as one ends: how much it
+    /// took, and the frame if that finished it. A payload is one copy, as
+    /// this is what everything from the host comes through, a byte each
+    /// of a live mount's file and a connection's data.
+    pub fn feed(&mut self, bytes: &[u8]) -> (usize, Option<(Input, &[u8])>) {
+        let mut used = 0;
+        while self.have < FRAME_HEADER {
+            let Some(&b) = bytes.get(used) else { return (used, None) };
+            used += 1;
             if self.have == 0 && b != FRAME_MAGIC {
-                return None;
+                continue;
             }
             self.header[self.have] = b;
             self.have += 1;
-            if self.have < FRAME_HEADER {
-                return None;
-            }
-            let len = self.header[2] as usize | (self.header[3] as usize) << 8;
-            if Input::from_u8(self.header[1]).is_none() || len > MAX_FRAME {
-                self.have = 0;
-                return None;
-            }
-            self.len = len;
-            if len > 0 {
-                return None;
-            }
-        } else {
-            self.payload[self.have - FRAME_HEADER] = b;
-            self.have += 1;
-            if self.have - FRAME_HEADER < self.len {
-                return None;
+            if self.have == FRAME_HEADER {
+                let len = self.header[2] as usize | (self.header[3] as usize) << 8;
+                if Input::from_u8(self.header[1]).is_none() || len > MAX_FRAME {
+                    self.have = 0;
+                    continue;
+                }
+                self.len = len;
             }
         }
+        let at = self.have - FRAME_HEADER;
+        let n = (self.len - at).min(bytes.len() - used);
+        self.payload[at..at + n].copy_from_slice(&bytes[used..used + n]);
+        self.have += n;
+        used += n;
+        if at + n < self.len {
+            return (used, None);
+        }
         self.have = 0;
-        Some((Input::from_u8(self.header[1]).unwrap(), &self.payload[..self.len]))
+        (used, Some((Input::from_u8(self.header[1]).unwrap(), &self.payload[..self.len])))
     }
 
     /// Is a frame partly received?
@@ -518,15 +522,45 @@ mod tests {
         stream.extend(input_header(Input::Stdin, 3));
         stream.extend(b"abc");
         stream.extend(input_header(Input::StdinEof, 0));
+        // However it's cut up, as buffers come: the same frames.
+        for size in 1..=stream.len() {
+            let mut d = InputDecoder::default();
+            let mut got = vec![];
+            for mut chunk in stream.chunks(size) {
+                while !chunk.is_empty() {
+                    let (used, frame) = d.feed(chunk);
+                    assert!(used > 0, "stuck, by {size}");
+                    chunk = &chunk[used..];
+                    if let Some((k, p)) = frame {
+                        got.push((k, p.to_vec()));
+                    }
+                }
+            }
+            assert_eq!(got, [(Input::Stdin, b"abc".to_vec()), (Input::StdinEof, vec![])], "by {size}");
+            assert!(!d.partial());
+        }
+    }
+
+    /// A frame's length is the sender's to say, and the most is the most,
+    /// however many buffers bring it.
+    #[test]
+    fn input_frames_stay_within_the_buffer() {
+        let mut too_long = input_header(Input::Stdin, MAX_FRAME).to_vec();
+        too_long[2..4].copy_from_slice(&((MAX_FRAME + 1) as u16).to_le_bytes());
+        let mut stream = too_long;
+        stream.extend(vec![0xaa; MAX_FRAME + 1]);
+        stream.extend(input_header(Input::Stdin, MAX_FRAME));
+        stream.extend(vec![0xbb; MAX_FRAME]);
         let mut d = InputDecoder::default();
-        let mut got = vec![];
-        for b in stream {
-            if let Some((k, p)) = d.push(b) {
-                got.push((k, p.to_vec()));
+        let (mut rest, mut got) = (&stream[..], vec![]);
+        while !rest.is_empty() {
+            let (used, frame) = d.feed(rest);
+            rest = &rest[used..];
+            if let Some((k, p)) = frame {
+                got.push((k, p.len(), p[0]));
             }
         }
-        assert_eq!(got, [(Input::Stdin, b"abc".to_vec()), (Input::StdinEof, vec![])]);
-        assert!(!d.partial());
+        assert_eq!(got, [(Input::Stdin, MAX_FRAME, 0xbb)]);
     }
 
     #[test]

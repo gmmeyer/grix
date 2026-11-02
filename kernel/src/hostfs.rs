@@ -149,7 +149,10 @@ pub fn read(id: u64, off: u64, out: &mut [u8]) -> Result<usize, Errno> {
                 continue;
             }
         }
-        let want = (out.len() - done).clamp(IO_MAX / 4, IO_MAX);
+        // Going on from where the last read ended, it's reading the file
+        // through, and the most a message holds saves a round trip or more.
+        let along = KEPT.lock().iter().any(|k| k.id == id && k.off + k.data.len() as u64 == pos);
+        let want = if along { IO_MAX } else { (out.len() - done).clamp(IO_MAX / 4, IO_MAX) };
         let data = call(&Request::Read { id, off: pos, len: want as u32 }, |r| match r {
             Reply::Data(d) if d.len() <= want => {
                 let mut data = Vec::new();
