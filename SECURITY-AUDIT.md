@@ -704,3 +704,51 @@ or wedge a reader's tab on the web path (R2), and tell one host from
 another (R4); those and the hardening (R3, R5–R8) are all fixed. The October 2026 audit's standing trust-model notes
 (I1 especially: an image brings its own kernel, and only the operator's
 policy — never the image's — gates the host) were re-checked and hold.
+
+---
+
+# A review of everything since 0.0.48 (2026-11-02)
+
+Four reviewers, agents rather than an outside vendor, each on one surface, at
+`bbde783` (0.0.75). **Two of the four didn't finish, so this is not a clean
+bill for the whole of it.**
+
+| Surface | Status |
+|---------|--------|
+| New system calls in the guest kernel (`extras.rs`, `sysv.rs`, `mqueue.rs`, `sockopt.rs`, raw sockets, `procnet.rs`) | Done |
+| Host files, images, settings (`container.rs`, `build.rs`, `oci.rs`, `export.rs`, `hostfs.rs`, `snapshot.rs`, MCP) | Done |
+| Guest to host network (`gateway.rs`, `net.rs`, `packet.rs`, `link.rs`) | **Stopped** by an API safeguard partway. Parsers and mutated packets were fuzzed and two findings came of it; whether a guest can reach what the policy refuses was not answered |
+| Memory and processes (`CLONE_VM`, the gate, mseal, another process's descriptors, Landlock's reach) | **Not reviewed**: stopped by a safety classifier before it found anything, and it's the newest code. Only the tests in `clonevm.c` and `fdwalk.c` and their mutants stand behind it |
+
+Those two need a person, or a pass someone approves.
+
+## Found, and fixed in 0.0.77
+
+| # | Severity | Component | Issue | Where |
+|---|----------|-----------|-------|-------|
+| S1 | High | host | An OCI layout's `index.json` and blobs were opened by path, so a context or an MCP root holding symlinks there read host files into the image | `crates/grix/src/oci.rs` `Layout` |
+| S2 | High | host | A connection the guest closed while its peer wasn't reading kept two threads and its sockets for ever, outside `MAX_CONNS`: 4,600 of them were 8,536 threads and 17,403 descriptors | `crates/grix/src/net.rs` `write_loop` |
+| S3 | High | kernel | A System V queue's charge went by its messages, not the slots a `VecDeque` keeps: 256 filled and drained queues ran the heap out, a panic for any program | `kernel/src/sysv.rs` |
+| S4 | Medium | host | A malformed TCP conversation panics smoltcp's sequence arithmetic in the gateway. The host goes on (nothing is `panic = "abort"`), but the sandbox's network silently stopped | `crates/grix/src/gateway.rs` `run` |
+| S5 | Medium | host | With `--no-outside-links`, each name of a guest's link target was a host allocation: 200 MiB of target was 5.8 GiB | `crates/grix/src/export.rs` `resolve_inside` |
+| S6 | Low | host | An image could ask for 64 GiB of RAM by itself | `crates/grix/src/sandbox.rs` |
+| S7 | Low | host | An import was read into memory before its size was looked at | `crates/grix/src/image.rs` |
+| S8 | Low | host | A layer full of one opaque whiteout walked the tree for each | `crates/grix/src/oci.rs` |
+
+S1 to S3 and S5 were each reproduced before the fix, and S2 and S3 again by a
+test that fails without it. S4 is contained, not cured: the panics are
+smoltcp's own (`wire/tcp.rs`), so a run can still lose its network to its own
+guest, but that's its own sandbox's and it's reported as a `Denied` event. It's
+worth reporting upstream, and updating smoltcp if that fixes it. S1, S5, S7 and
+S8 aren't new since 0.0.48; the review just got to them.
+
+## Found sound (recorded so it isn't re-derived)
+
+- `mqueue.rs`, SysV semaphores and `UNDO`, `extras.rs`, `sockopt.rs`,
+  `procnet.rs`, `Reassembly`: bounds, budgets, one read of user memory.
+- 200 million random packets through `packet.rs`, and 48 million mutated ones
+  through the gateway, with no panic in the parsers: S4 needs a conversation.
+- `Snapshot::open`: a file can't grant `net`, turn off `--strict-network` or
+  raise limits. `hostfs.rs` against 200,000+ malformed requests a run. Exports'
+  sizes, and their uid and gid, which nothing on the host uses to chown.
+  Tree cache keys. `--host-timezone`. MCP's output paths.

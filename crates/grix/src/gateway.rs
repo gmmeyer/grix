@@ -50,6 +50,8 @@ enum Work {
     Proxy(Vec<u8>),
     /// And is what the guest sent still to go on?
     Stop(bool),
+    #[cfg(test)]
+    Panic,
 }
 
 pub(crate) struct Gateway {
@@ -199,7 +201,24 @@ impl State {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// The TCP stack is a library's, with panics of its own (its sequence
+    /// numbers' arithmetic), and what it's given is a guest's to say. All
+    /// that comes of one is that this sandbox has no more network, and
+    /// it's told so: the host goes on, and so does the proxy's cleaning up.
     fn run(mut self, inbox: Receiver<Work>) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve(&inbox))).is_ok() {
+            return;
+        }
+        self.proxy.refuse("network", "the gateway's TCP stack failed: the sandbox's network has stopped".into());
+        // Nobody's told to stop sending, so what they send goes nowhere.
+        for work in inbox.iter() {
+            if matches!(work, Work::Stop(_)) {
+                return;
+            }
+        }
+    }
+
+    fn serve(&mut self, inbox: &Receiver<Work>) {
         loop {
             let now = self.ms();
             let wait = match self.stack.next_poll(now) {
@@ -221,8 +240,10 @@ impl State {
                             self.on_message(msg);
                         }
                     }
-                    Some(Work::Stop(true)) => return self.finish(&inbox),
+                    Some(Work::Stop(true)) => return self.finish(inbox),
                     Some(Work::Stop(false)) => return,
+                    #[cfg(test)]
+                    Some(Work::Panic) => panic!("as the TCP stack might"),
                     None => break,
                 }
                 next = inbox.try_recv().ok();
@@ -572,6 +593,24 @@ mod tests {
         let (messages, to_guest) = (Outbox::new(), Outbox::new());
         let proxy = Arc::new(Proxy::start(p, messages.clone(), Arc::new(|_| {})).unwrap());
         (Gateway::start(proxy.clone(), messages, to_guest.clone()).unwrap(), to_guest, proxy)
+    }
+
+    /// A panic in the stack, which is a library's, is the end of this
+    /// sandbox's network and nothing else, and it's reported.
+    #[test]
+    fn a_panic_in_the_stack_stays_there() {
+        let (gateway, _, proxy) = started(policy(&["127.0.0.1"]));
+        gateway.work.send(Work::Panic).unwrap();
+        // It still takes what's sent, and it still stops.
+        gateway.packet(&[0x45, 0, 0, 20]);
+        gateway.stop(false);
+        let events = proxy.stop();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, crate::GuestEvent::Denied { detail, .. } if detail.contains("TCP stack"))),
+            "{events:?}"
+        );
     }
 
     /// The next packet for the guest, within a few seconds. (By looking, not

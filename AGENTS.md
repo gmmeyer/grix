@@ -915,7 +915,11 @@ gets a `Limit` (and `stats::hit` where it refuses); a new budget, a
    leaves the host. The host never trusts the guest's flow control either: credit,
    threads, lookups and queued frames all have host-side caps. Nor its
    capability checks: the proxy itself refuses everything without `net`,
-   since an image brings its own kernel.
+   since an image brings its own kernel. A connection counts against those
+   caps until its last thread has gone (`Shared::live`), which a peer that
+   won't read holds up for `CLOSE_LINGER` at most (`write_out`), and a panic
+   in the TCP stack, a library's, ends that sandbox's network and no more
+   (`Gateway::run`).
 8. **No paths outside imports.** The guest filesystem is exactly the import
    list plus the synthetic nodes in `fs.rs`. `/dev` and `/proc` are reserved
    (`crates/grix/src/image.rs`).

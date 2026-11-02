@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -40,6 +40,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTBOX_BYTES: usize = 4 << 20;
 /// How long what a program wrote gets to reach its peer once it's ended.
 pub(crate) const LAST_DATA: Duration = Duration::from_secs(5);
+/// How long a peer that has stopped reading can hold what a closed
+/// connection still has to send, and the writer with it, as Linux gives up
+/// on an orphan: nothing else would end it, and nothing else counts it.
+const CLOSE_LINGER: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(60) };
+/// How often a writer looks up from a peer that isn't reading.
+const WRITE_TICK: Duration = Duration::from_millis(100);
 /// Denials reported, and addresses remembered with the names they were for.
 const MAX_REPORTED: usize = 512;
 const MAX_NAMES: usize = 4096;
@@ -811,6 +817,16 @@ struct Conn {
     window: Mutex<u32>,
     stream: Mutex<Option<TcpStream>>,
     closed: AtomicBool,
+    /// How long, once it's closed, a peer may not read (ms).
+    linger: AtomicU64,
+    /// `Shared::live`.
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -825,8 +841,11 @@ struct ToPeer {
 }
 
 impl Conn {
-    fn new() -> Arc<Conn> {
+    fn new(live: &Arc<AtomicUsize>) -> Arc<Conn> {
+        live.fetch_add(1, Ordering::Relaxed);
         Arc::new(Conn {
+            linger: AtomicU64::new(CLOSE_LINGER.as_millis() as u64),
+            live: live.clone(),
             to_peer: Mutex::new(ToPeer::default()),
             to_peer_ready: Condvar::new(),
             credit: Mutex::new(WINDOW),
@@ -853,6 +872,10 @@ struct Shared {
     outbox: Arc<Outbox>,
     /// The start of the guest's next long datagram (`ToHost::UdpMore`).
     ahead: Mutex<Vec<u8>>,
+    /// Connections with a thread or a socket here, closed or not, as
+    /// `conns` loses one at its `Close` while it's still writing to its
+    /// peer: what `MAX_CONNS` bounds.
+    live: Arc<AtomicUsize>,
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
     udps: Mutex<HashMap<u32, Arc<Udp>>>,
     udp_threads: AtomicU32,
@@ -1021,6 +1044,7 @@ impl Proxy {
             policy,
             outbox,
             ahead: Mutex::new(Vec::new()),
+            live: Arc::new(AtomicUsize::new(0)),
             conns: Mutex::new(HashMap::new()),
             udps: Mutex::new(HashMap::new()),
             udp_threads: AtomicU32::new(0),
@@ -1262,7 +1286,7 @@ impl Proxy {
             s.reply(ToGuest::Failed { id, errno: 1 }); // EPERM
             return;
         }
-        if conns.len() >= MAX_CONNS {
+        if s.live.load(Ordering::Relaxed) >= MAX_CONNS {
             drop(conns);
             s.reply(ToGuest::Failed { id, errno: ENOBUFS });
             return;
@@ -1285,7 +1309,7 @@ impl Proxy {
             s.reply(ToGuest::Failed { id, errno: ENOBUFS });
             return;
         }
-        let c = Conn::new();
+        let c = Conn::new(&s.live);
         conns.insert(id, c.clone());
         drop(conns);
         let shared = s.clone();
@@ -1362,9 +1386,7 @@ impl Proxy {
     /// for as long as `LAST_DATA` if a peer doesn't read.
     pub fn finish(&self) {
         for (_, c) in self.shared.conns.lock().unwrap().drain() {
-            if let Some(stream) = c.stream.lock().unwrap().as_ref() {
-                let _ = stream.set_write_timeout(Some(LAST_DATA));
-            }
+            c.linger.store(LAST_DATA.as_millis() as u64, Ordering::Relaxed);
             c.close();
         }
     }
@@ -1581,11 +1603,11 @@ fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &A
                 let Some((peer, peer_port)) = guest_view(peer) else { continue };
                 let _ = stream.set_nonblocking(false);
                 let mut conns = s.conns.lock().unwrap();
-                if conns.len() >= MAX_CONNS {
+                if s.live.load(Ordering::Relaxed) >= MAX_CONNS {
                     continue;
                 }
                 let id = HOST_ID | (next.fetch_add(1, Ordering::Relaxed) & !HOST_ID);
-                let c = Conn::new();
+                let c = Conn::new(&s.live);
                 conns.insert(id, c.clone());
                 drop(conns);
                 let shared = s.clone();
@@ -1606,6 +1628,8 @@ fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &A
 /// the guest about it once it's ready for the guest's data.
 fn run_conn(s: &Arc<Shared>, id: u32, c: &Arc<Conn>, stream: TcpStream, announce: ToGuest) {
     let _ = stream.set_nodelay(true);
+    // On the socket, so the writer's: `write_out` needs to look up.
+    let _ = stream.set_write_timeout(Some(WRITE_TICK));
     let threads = stream.try_clone().ok().zip(stream.try_clone().ok());
     *c.stream.lock().unwrap() = Some(stream);
     c.to_peer.lock().unwrap().open = true;
@@ -1676,6 +1700,34 @@ fn read_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
     }
 }
 
+/// All of `data` to a peer that may have stopped reading. It can do that
+/// for as long as it likes while the guest has the connection, and for
+/// `Conn::linger` once it hasn't, from when it last took anything.
+fn write_out(c: &Conn, stream: &mut TcpStream, mut data: &[u8]) -> std::io::Result<()> {
+    let mut stuck = None;
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                data = &data[n..];
+                stuck = None;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if c.closed.load(Ordering::Relaxed) {
+                    let since = *stuck.get_or_insert_with(std::time::Instant::now);
+                    let linger = Duration::from_millis(c.linger.load(Ordering::Relaxed));
+                    if since.elapsed() >= linger {
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
     let mut shut = false;
     loop {
@@ -1687,8 +1739,10 @@ fn write_loop(s: &Shared, id: u32, c: &Conn, mut stream: TcpStream) {
             (std::mem::take(&mut to_peer.data), to_peer.shutdown, to_peer.closed)
         };
         if !data.is_empty() {
-            if let Err(e) = stream.write_all(&data) {
-                s.send(ToGuest::Failed { id, errno: errno(&e) });
+            if let Err(e) = write_out(c, &mut stream, &data) {
+                if !c.closed.load(Ordering::Relaxed) {
+                    s.send(ToGuest::Failed { id, errno: errno(&e) });
+                }
                 break;
             }
             *c.window.lock().unwrap() += data.len() as u32;
@@ -1871,6 +1925,63 @@ pub(crate) mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "timed out");
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// A peer that takes nothing can't keep a connection the guest has
+    /// closed, or the threads and sockets that go with it, for ever: those
+    /// count against `MAX_CONNS` until they've gone, or they'd be without
+    /// limit, and they do go.
+    #[test]
+    fn a_peer_that_wont_read_cant_hold_a_closed_connection() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: a new socket, ours from here; its address and option
+        // are the right sizes.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            let small: libc::c_int = 4096;
+            let size = size_of::<libc::c_int>() as libc::socklen_t;
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, (&raw const small).cast(), size);
+            let mut a: libc::sockaddr_in = std::mem::zeroed();
+            a.sin_family = libc::AF_INET as _;
+            a.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, (&raw const a).cast(), len), 0);
+            assert_eq!(libc::listen(fd, 8), 0);
+            TcpListener::from_raw_fd(fd)
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert!(listener.as_raw_fd() >= 0);
+        let outbox = Outbox::new();
+        let proxy = Proxy::start(policy(&["127.0.0.1"]), outbox.clone(), Arc::new(|_| {})).unwrap();
+        proxy.handle(&ToHost::Connect { id: 1, addr: Addr::V4([127, 0, 0, 1]), port }.encode());
+        let (peer, _) = listener.accept().unwrap();
+        // Until it's stuck: as much as the window lets, and more as it's
+        // given back, until nothing comes back. (Its `Connected` first.)
+        let (chunk, mut window, mut quiet) = (vec![0; 4000], WINDOW, 0);
+        wait_for(|| {
+            while window >= chunk.len() as u32 {
+                proxy.handle(&ToHost::Data { id: 1, data: &chunk }.encode());
+                window -= chunk.len() as u32;
+            }
+            let back: u32 = drain(&outbox)
+                .iter()
+                .filter_map(|f| match ToGuest::decode(f) {
+                    Ok(ToGuest::Credit { bytes, .. }) => Some(bytes),
+                    _ => None,
+                })
+                .sum();
+            window += back;
+            quiet = if back == 0 { quiet + 1 } else { 0 };
+            quiet > 50
+        });
+        proxy.handle(&ToHost::Close { id: 1 }.encode());
+        // It's out of the table, and still counted...
+        let s = proxy.shared.clone();
+        assert!(s.conns.lock().unwrap().is_empty());
+        assert_eq!(s.live.load(Ordering::Relaxed), 1);
+        // ...until it gives up on the peer.
+        wait_for(|| s.live.load(Ordering::Relaxed) == 0);
+        drop(peer);
     }
 
     /// What a guest says is the start of a datagram is held for the next
