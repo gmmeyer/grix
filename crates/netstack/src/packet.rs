@@ -339,3 +339,41 @@ pub fn reset(original: &[u8]) -> Option<Vec<u8>> {
         t.fill_checksum(&src, &dst);
     })
 }
+
+/// A raw socket's `data` as a packet of `protocol`. None if it won't fit.
+pub fn raw(from: Addr, to: Addr, protocol: u8, data: &[u8]) -> Option<Vec<u8>> {
+    ip_packet(from, to, IpProtocol::from(protocol), data.len(), |b| b.copy_from_slice(data))
+}
+
+/// A raw socket's whole packet, with what a kernel fills in of one: its
+/// length and checksum. None if it isn't an IPv4 header and what it says.
+pub fn with_header(data: &[u8]) -> Option<Vec<u8>> {
+    let mut p = data.to_vec();
+    if p.len() > link::MTU || p.len() < V4_HEADER || p[0] >> 4 != 4 {
+        return None;
+    }
+    let header = (p[0] & 0xf) as usize * 4;
+    if header < V4_HEADER || header > p.len() {
+        return None;
+    }
+    let mut ip = Ipv4Packet::new_unchecked(&mut p[..]);
+    ip.set_total_len(data.len() as u16);
+    ip.fill_checksum();
+    Some(p)
+}
+
+/// An IP packet's protocol and addresses, for raw sockets. None if it
+/// hasn't got a whole header. IPv6's says where its payload starts too.
+pub fn header(p: &[u8]) -> Option<(u8, Addr, Addr, usize)> {
+    match p.first()? >> 4 {
+        4 => {
+            let (a, b): ([u8; 4], [u8; 4]) = (p.get(12..16)?.try_into().ok()?, p.get(16..20)?.try_into().ok()?);
+            Some((*p.get(9)?, Addr::V4(a), Addr::V4(b), 0))
+        }
+        6 => {
+            let (a, b): ([u8; 16], [u8; 16]) = (p.get(8..24)?.try_into().ok()?, p.get(24..40)?.try_into().ok()?);
+            Some((*p.get(6)?, Addr::V6(a), Addr::V6(b), V6_HEADER))
+        }
+        _ => None,
+    }
+}

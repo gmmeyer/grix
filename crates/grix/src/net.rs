@@ -1021,6 +1021,12 @@ impl Proxy {
         Ok(proxy)
     }
 
+    /// Something the policy doesn't let through, reported as what the
+    /// proxy refuses itself is.
+    pub fn refuse(&self, what: &str, detail: String) {
+        self.shared.deny(what, detail);
+    }
+
     /// What the stdin feeder waits on.
     pub fn stdin_gate(&self) -> StdinGate {
         StdinGate(self.shared.clone())

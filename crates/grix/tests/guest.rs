@@ -492,7 +492,8 @@ fn kill_on_deny() {
 
 #[test]
 fn granted_but_unimplemented_is_reported_as_such() {
-    let out = run(with("net").allow(Capability::Net), &["/bin/net", "raw"]);
+    // The native stack's: the vm stack has raw sockets.
+    let out = run(with("net").allow(Capability::Net).network(Network::Native), &["/bin/net", "raw"]);
     assert_eq!(out.status, ExitStatus::Exited(1));
     assert!(out.missing_capabilities().is_empty());
     assert!(out.events.iter().any(|e| matches!(e, GuestEvent::Unimplemented { syscall, .. } if syscall == "socket")));
@@ -5112,6 +5113,20 @@ fn socket_options_read_back() {
         assert_eq!(out.status, ExitStatus::Exited(0));
         assert!(out.events.is_empty(), "{:?}", out.events);
     }
+}
+
+/// Raw IP sockets, on the stack that has an IP layer: with the capability
+/// for them, and not without. The fixture passes on Linux as it is.
+#[test]
+fn raw_sockets_on_the_vm_stack() {
+    let raw = || with("rawsock").network(Network::Vm);
+    let out = run(raw().allow(Capability::NetRaw), &["/bin/rawsock"]);
+    assert_eq!(out.stdout_str(), "rawsock ok\n", "{}", out.kernel_log);
+    assert_eq!(out.status, ExitStatus::Exited(0));
+    assert!(out.events.is_empty(), "{:?}", out.events);
+    // Without it, it's said which is missing.
+    let out = run(raw(), &["/bin/rawsock"]);
+    assert_eq!(out.missing_capabilities(), ["net_raw"]);
 }
 
 /// The user's groups in the sandbox's /etc/group are the program's, as

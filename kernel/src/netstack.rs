@@ -207,8 +207,23 @@ pub fn echo(to: Addr, message: &[u8]) {
     transmit(packet::echo(own(to), to, message));
 }
 
+/// A raw socket's packet, ready to go: to the guest's own raw sockets (and
+/// a UDP one, as it's a datagram) if that's where it's for, and otherwise
+/// out, where the gateway has the last word on it.
+pub fn raw_out(p: Vec<u8>) {
+    let Some((_, _, to, _)) = packet::header(&p) else { return };
+    if !(SockAddr { addr: to, port: 0 }).is_local() {
+        return transmit(Some(p));
+    }
+    inet::raw_in(&p);
+    if let Some(Packet::Udp { from, to, data }) = packet::parse(&p) {
+        inet::deliver_local(sockaddr(from), sockaddr(to), data);
+    }
+}
+
 /// A packet from the host.
 pub fn received(p: Vec<u8>) {
+    inet::raw_in(&p);
     match packet::parse(&p) {
         Some(Packet::Tcp { from, to, syn }) => {
             let listening = syn && inet::listening(sockaddr(to));

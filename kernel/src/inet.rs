@@ -652,6 +652,8 @@ pub struct Udp {
     pub peer: Option<SockAddr>,
     /// An ICMP socket, not a UDP one.
     pub icmp: Option<Icmp>,
+    /// A raw socket of this protocol, on the `vm` stack.
+    pub raw: Option<u8>,
     pub version: u64,
 }
 
@@ -686,6 +688,7 @@ impl Udp {
             local: None,
             peer,
             icmp: None,
+            raw: None,
             version: 0,
         }));
         let mut all = UDPS.lock();
@@ -857,6 +860,9 @@ impl Udp {
 
 impl Drop for Udp {
     fn drop(&mut self) {
+        if self.raw.is_some() {
+            RAW_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+        }
         UDPS.lock().remove(&self.id);
         FORWARD_PEERS.lock().retain(|&(id, _), _| id != self.id);
         if let Some(local) = self.local {
@@ -867,6 +873,38 @@ impl Drop for Udp {
         }
         if self.used_host {
             send(ToHost::Close { id: self.id });
+        }
+    }
+}
+
+/// Raw sockets there are: every packet looks for them, and nearly always
+/// there are none.
+static RAW_SOCKETS: AtomicU32 = AtomicU32::new(0);
+
+/// A raw socket for protocol `proto`.
+pub fn new_raw(s: &mut Inet, proto: u8) -> UdpRef {
+    let u = Udp::new(None);
+    u.lock().raw = Some(proto);
+    RAW_SOCKETS.fetch_add(1, Ordering::Relaxed);
+    s.raw = Some(proto);
+    s.state = State::Udp(u.clone());
+    u
+}
+
+/// A packet of the guest's, or from the network, for its raw sockets: every
+/// one of that protocol that takes it, as Linux's raw_v4_input. IPv4's come
+/// with their header, IPv6's without.
+pub fn raw_in(packet: &[u8]) {
+    if RAW_SOCKETS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Some((proto, from, to, payload)) = grix_netstack::packet::header(packet) else { return };
+    let udps: Vec<_> = UDPS.lock().values().filter_map(Weak::upgrade).collect();
+    for u in udps {
+        let mut u = u.lock();
+        let bound = u.local.is_none_or(|l| l.is_unspecified() || l.addr == to);
+        if u.raw == Some(proto) && bound {
+            u.push(SockAddr { addr: from, port: 0 }, &packet[payload..]);
         }
     }
 }
@@ -1168,6 +1206,8 @@ pub struct Inet {
     pub icmp: Option<Icmp>,
     /// What setsockopt was told.
     pub opts: crate::sockopt::Opts,
+    /// A raw socket of this protocol.
+    pub raw: Option<u8>,
 }
 
 impl Inet {
@@ -1185,6 +1225,7 @@ impl Inet {
             addr_bound: false,
             icmp: None,
             opts: crate::sockopt::Opts::default(),
+            raw: None,
         }
     }
 

@@ -892,6 +892,15 @@ fn new_inet(p: &mut Process, domain: u64, ty: u64, proto: u64, flags: u32, cloex
         (SOCK_STREAM, 0 | IPPROTO_TCP) => false,
         (SOCK_DGRAM, 0 | IPPROTO_UDP) => true,
         (SOCK_STREAM | SOCK_DGRAM, _) => return Err(EPROTONOSUPPORT),
+        // On the guest's own stack it's a packet like any other, and the
+        // gateway's where it stops: there's nothing to forge with.
+        (SOCK_RAW, 1..=255) if crate::netstack::active() => {
+            require(p, nr::socket, Capability::NetRaw, "")?;
+            let mut s = Inet::new(v6, true);
+            inet::new_raw(&mut s, proto as u8);
+            let file = new_file(FileKind::Inet(s), flags);
+            return p.fds.alloc(FdEntry { file, cloexec }, 0);
+        }
         (SOCK_RAW, _) => return p.unimplemented(nr::socket, "socket", "raw IP sockets", EPROTONOSUPPORT),
         _ => return Err(ESOCKTNOSUPPORT),
     };
@@ -939,6 +948,11 @@ fn inet_bind(s: &mut Inet, raw: &[u8]) -> SysResult {
     // No ports here, and nothing to take one from.
     if s.icmp.is_some() {
         s.bound = Some(a);
+        return Ok(0);
+    }
+    if s.raw.is_some() {
+        s.bound = Some(a);
+        udp_of(s).lock().local = Some(a);
         return Ok(0);
     }
     if s.dgram {
@@ -1305,6 +1319,9 @@ fn udp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock: 
     if s.icmp.is_some() {
         return icmp_send(p, s, data, to, nonblock);
     }
+    if let Some(proto) = s.raw {
+        return raw_send(s, proto, data, to);
+    }
     if to.port == 0 {
         return Err(EINVAL);
     }
@@ -1367,6 +1384,23 @@ fn icmp_send(p: &mut Process, s: &mut Inet, data: &[u8], to: SockAddr, nonblock:
         return Ok(data.len() as u64);
     }
     through_host(p, &u, data, to, nonblock)
+}
+
+/// A raw socket's packet. It's the guest's own stack that has it: nothing
+/// about it reaches anything but the gateway, whatever's in its header.
+fn raw_send(s: &Inet, proto: u8, data: &[u8], to: SockAddr) -> SysResult {
+    use grix_netstack::packet;
+    const IP_HDRINCL: u64 = 3;
+    let to = to.or_loopback();
+    let hdrincl = s.opts.get(IPPROTO_IP, IP_HDRINCL, true, s.v6)? != 0;
+    let built = if hdrincl {
+        packet::with_header(data).ok_or(EINVAL)?
+    } else {
+        let from = if to.is_loopback() { to.addr } else { inet::source_for(to.addr) };
+        packet::raw(from, to.addr, proto, data).ok_or(EMSGSIZE)?
+    };
+    crate::netstack::raw_out(built);
+    Ok(data.len() as u64)
 }
 
 /// A datagram for `to` by way of the host, which says first if it may go.
@@ -1475,7 +1509,7 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
     const IPV6_V6ONLY: u64 = 26;
     let _ = p;
     Ok(match (level, name) {
-        (SOL_SOCKET, SO_TYPE) if s.icmp.is_some_and(|i| i.raw) => SOCK_RAW as u32,
+        (SOL_SOCKET, SO_TYPE) if s.icmp.is_some_and(|i| i.raw) || s.raw.is_some() => SOCK_RAW as u32,
         (SOL_SOCKET, SO_TYPE) => (if s.dgram { SOCK_DGRAM } else { SOCK_STREAM }) as u32,
         (SOL_SOCKET, SO_ERROR) => match &s.state {
             State::Remote(c) => match c.lock().state {
@@ -1485,6 +1519,7 @@ fn inet_getsockopt(p: &mut Process, s: &Inet, level: u64, name: u64) -> Result<u
             _ => 0,
         },
         (SOL_SOCKET, SO_ACCEPTCONN) => matches!(s.state, State::Listening(_)) as u32,
+        (SOL_SOCKET, SO_PROTOCOL) if s.raw.is_some() => s.raw.unwrap_or(0) as u32,
         (SOL_SOCKET, SO_PROTOCOL) if s.icmp.is_some() => (if s.v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP }) as u32,
         (SOL_SOCKET, SO_PROTOCOL) => (if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP }) as u32,
         (SOL_SOCKET, SO_DOMAIN) => (if s.v6 { AF_INET6 } else { AF_INET }) as u32,
