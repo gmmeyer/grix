@@ -155,8 +155,9 @@ static void refusals(void) {
     s = open_icmp(0, SOCK_RAW);
     FAILS(sendto(s, m, len, 0, (void *)&st, alen), EINVAL);
     close(s);
-    // Raw IP of any other kind isn't here at all.
-    FAILS(socket(AF_INET, SOCK_RAW, IPPROTO_UDP), EPROTONOSUPPORT);
+    // Raw IP of any other kind isn't here at all, but for on the vm stack
+    // (DROPPED), which has an IP layer to give it to.
+    if (!getenv("DROPPED")) FAILS(socket(AF_INET, SOCK_RAW, IPPROTO_UDP), EPROTONOSUPPORT);
 #endif
 }
 

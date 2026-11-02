@@ -59,6 +59,13 @@ pub enum Packet<'a> {
 const V4_HEADER: usize = 20;
 const V6_HEADER: usize = 40;
 const UDP_HEADER: usize = 8;
+/// The most a packet is, by IPv4's length field; IPv6's leaves out its header.
+const MAX_PACKET: usize = 65_535;
+/// Where an IPv6 header has these, and what says a fragment's next.
+const V6_LENGTH: usize = 4;
+const V6_NEXT_HEADER: usize = 6;
+const V6_FRAGMENT: u8 = 44;
+const FRAGMENT_HEADER: usize = 8;
 const TCP: u8 = 6;
 /// As much of a packet as an ICMP error quotes: enough to find its ports.
 const QUOTE: usize = 8;
@@ -194,16 +201,25 @@ pub fn parse(p: &[u8]) -> Option<Packet<'_>> {
     }
 }
 
-/// An IP packet from `from` to `to` around `len` bytes `fill` writes.
-/// None if the addresses aren't one family, or it won't fit the link.
+fn zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut p = Vec::new();
+    p.try_reserve_exact(len).ok()?;
+    p.resize(len, 0);
+    Some(p)
+}
+
+/// An IP packet from `from` to `to` around `len` bytes `fill` writes, of
+/// any size IP allows, as `fragments` makes it fit the link. None if the
+/// addresses aren't one family or it's too big for that, or there's no
+/// memory for it, which a kernel has to say.
 fn ip_packet(from: Addr, to: Addr, protocol: IpProtocol, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Vec<u8>> {
     match (from, to) {
         (Addr::V4(a), Addr::V4(b)) => {
             let total = V4_HEADER + len;
-            if total > link::MTU {
+            if total > MAX_PACKET {
                 return None;
             }
-            let mut p = vec![0; total];
+            let mut p = zeroed(total)?;
             let repr = Ipv4Repr {
                 src_addr: Ipv4Address::from_octets(a),
                 dst_addr: Ipv4Address::from_octets(b),
@@ -217,10 +233,10 @@ fn ip_packet(from: Addr, to: Addr, protocol: IpProtocol, len: usize, fill: impl 
         }
         (Addr::V6(a), Addr::V6(b)) => {
             let total = V6_HEADER + len;
-            if total > link::MTU {
+            if len > MAX_PACKET {
                 return None;
             }
-            let mut p = vec![0; total];
+            let mut p = zeroed(total)?;
             let repr = Ipv6Repr {
                 src_addr: Ipv6Address::from_octets(a),
                 dst_addr: Ipv6Address::from_octets(b),
@@ -340,7 +356,7 @@ pub fn reset(original: &[u8]) -> Option<Vec<u8>> {
     })
 }
 
-/// A raw socket's `data` as a packet of `protocol`. None if it won't fit.
+/// A raw socket's `data` as a packet of `protocol`. None if IP won't carry it.
 pub fn raw(from: Addr, to: Addr, protocol: u8, data: &[u8]) -> Option<Vec<u8>> {
     ip_packet(from, to, IpProtocol::from(protocol), data.len(), |b| b.copy_from_slice(data))
 }
@@ -360,6 +376,161 @@ pub fn with_header(data: &[u8]) -> Option<Vec<u8>> {
     ip.set_total_len(data.len() as u16);
     ip.fill_checksum();
     Some(p)
+}
+
+/// What goes on the link for packet `p`: itself if it fits, and if it
+/// doesn't, its fragments, in order, which `id` tells from another packet's.
+/// None if there's no memory for them.
+pub fn fragments(p: Vec<u8>, id: u32) -> Option<Vec<Vec<u8>>> {
+    if p.len() <= link::MTU {
+        return Some(vec![p]);
+    }
+    let mut pieces = Vec::new();
+    let mut piece = |make: &dyn Fn() -> Option<Vec<u8>>| -> Option<()> {
+        pieces.try_reserve(1).ok()?;
+        pieces.push(make()?);
+        Some(())
+    };
+    match p[0] >> 4 {
+        4 => {
+            let header = Ipv4Packet::new_checked(&p[..]).ok()?.header_len() as usize;
+            let body = &p[header..];
+            let each = (link::MTU - header) & !7;
+            for (i, part) in body.chunks(each).enumerate() {
+                piece(&|| {
+                    let mut f = zeroed(header + part.len())?;
+                    f[..header].copy_from_slice(&p[..header]);
+                    f[header..].copy_from_slice(part);
+                    let mut ip = Ipv4Packet::new_unchecked(&mut f[..]);
+                    ip.set_total_len((header + part.len()) as u16);
+                    ip.set_ident(id as u16);
+                    ip.clear_flags();
+                    ip.set_more_frags((i + 1) * each < body.len());
+                    ip.set_frag_offset((i * each) as u16);
+                    ip.fill_checksum();
+                    Some(f)
+                })?;
+            }
+        }
+        6 => {
+            let body = p.get(V6_HEADER..)?;
+            let each = (link::MTU - V6_HEADER - FRAGMENT_HEADER) & !7;
+            for (i, part) in body.chunks(each).enumerate() {
+                piece(&|| {
+                    let mut f = zeroed(V6_HEADER + FRAGMENT_HEADER + part.len())?;
+                    f[..V6_HEADER].copy_from_slice(&p[..V6_HEADER]);
+                    f[V6_NEXT_HEADER] = V6_FRAGMENT;
+                    f[V6_LENGTH..V6_LENGTH + 2].copy_from_slice(&((FRAGMENT_HEADER + part.len()) as u16).to_be_bytes());
+                    let more = (i + 1) * each < body.len();
+                    f[V6_HEADER] = p[V6_NEXT_HEADER];
+                    let offset = (i * each) as u16 | more as u16;
+                    f[V6_HEADER + 2..V6_HEADER + 4].copy_from_slice(&offset.to_be_bytes());
+                    f[V6_HEADER + 4..V6_HEADER + 8].copy_from_slice(&id.to_be_bytes());
+                    f[V6_HEADER + FRAGMENT_HEADER..].copy_from_slice(part);
+                    Some(f)
+                })?;
+            }
+        }
+        _ => return None,
+    }
+    Some(pieces)
+}
+
+/// Packets being put back together. The link keeps its order, and both ends
+/// send a packet's fragments one after another, so a fragment out of order
+/// was never going to complete anything and what came before it goes, as
+/// does the oldest when more are under way than there's room for: at most
+/// `MAX_PARTIAL` packets of IP's largest size, whatever arrives.
+#[derive(Default)]
+pub struct Reassembly {
+    partial: Vec<Partial>,
+}
+
+struct Partial {
+    key: (Addr, Addr, u8, u32),
+    /// Its header, the first fragment's, then what's come.
+    packet: Vec<u8>,
+    header: usize,
+}
+
+const MAX_PARTIAL: usize = 4;
+
+impl Reassembly {
+    /// Packet `p` if it's whole, the packet it completes if it's the last
+    /// fragment of one, or None for now.
+    pub fn add(&mut self, p: Vec<u8>) -> Option<Vec<u8>> {
+        let (key, offset, more, header, body, next) = match p.first()? >> 4 {
+            4 => {
+                let ip = Ipv4Packet::new_checked(&p[..]).ok()?;
+                if !ip.more_frags() && ip.frag_offset() == 0 {
+                    return Some(p);
+                }
+                if !ip.verify_checksum() {
+                    return None;
+                }
+                let (src, dst) = (ip.src_addr().octets(), ip.dst_addr().octets());
+                let key = (Addr::V4(src), Addr::V4(dst), u8::from(ip.next_header()), ip.ident() as u32);
+                let header = ip.header_len() as usize;
+                let total = ip.total_len() as usize;
+                (key, ip.frag_offset() as usize, ip.more_frags(), header, header..total, None)
+            }
+            6 => {
+                if p.get(V6_NEXT_HEADER) != Some(&V6_FRAGMENT) {
+                    return Some(p);
+                }
+                let ip = Ipv6Packet::new_checked(&p[..]).ok()?;
+                let end = V6_HEADER + ip.payload_len() as usize;
+                let f = p.get(V6_HEADER..V6_HEADER + FRAGMENT_HEADER).filter(|_| end >= V6_HEADER + 8)?;
+                let word = u16::from_be_bytes([f[2], f[3]]);
+                let id = u32::from_be_bytes([f[4], f[5], f[6], f[7]]);
+                let key = (Addr::V6(ip.src_addr().octets()), Addr::V6(ip.dst_addr().octets()), f[0], id);
+                let body = V6_HEADER + FRAGMENT_HEADER..end;
+                (key, (word & !7) as usize, word & 1 != 0, V6_HEADER, body, Some(f[0]))
+            }
+            _ => return Some(p),
+        };
+        let found = self.partial.iter().position(|e| e.key == key);
+        if offset == 0 {
+            if let Some(at) = found {
+                self.partial.remove(at);
+            }
+            if self.partial.len() == MAX_PARTIAL {
+                self.partial.remove(0);
+            }
+            self.partial.try_reserve(1).ok()?;
+            let mut packet = Vec::new();
+            packet.try_reserve(body.len() + header).ok()?;
+            packet.extend_from_slice(&p[..header]);
+            if let Some(next) = next {
+                packet[V6_NEXT_HEADER] = next;
+            }
+            self.partial.push(Partial { key, packet, header });
+        }
+        let at = self.partial.iter().position(|e| e.key == key)?;
+        let e = &mut self.partial[at];
+        let fits = e.packet.len() - e.header == offset && e.packet.len() + body.len() <= e.header + MAX_PACKET;
+        if !fits || e.packet.try_reserve(body.len()).is_err() {
+            self.partial.remove(at);
+            return None;
+        }
+        e.packet.extend_from_slice(&p[body]);
+        if more {
+            return None;
+        }
+        let Partial { mut packet, header, .. } = self.partial.remove(at);
+        if packet[0] >> 4 == 4 {
+            let total = packet.len();
+            let mut ip = Ipv4Packet::new_unchecked(&mut packet[..]);
+            ip.set_total_len(total as u16);
+            ip.clear_flags();
+            ip.set_frag_offset(0);
+            ip.fill_checksum();
+        } else {
+            let len = packet.len() - header;
+            packet[V6_LENGTH..V6_LENGTH + 2].copy_from_slice(&(len as u16).to_be_bytes());
+        }
+        Some(packet)
+    }
 }
 
 /// An IP packet's protocol and addresses, for raw sockets. None if it

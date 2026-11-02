@@ -176,6 +176,16 @@ fn send(msg: ToHost) {
     }
 }
 
+/// What of a datagram its own message holds, with what doesn't fit sent
+/// ahead of it. (A kernel's own messages wait for room, in order.)
+fn send_ahead(data: &[u8]) -> &[u8] {
+    let (ahead, last) = data.split_at(data.len().saturating_sub(link::MAX_UDP));
+    for data in ahead.chunks(link::MAX_UDP) {
+        send(ToHost::UdpMore { data });
+    }
+    last
+}
+
 /// What a connection may have on its way to the peer: what's written has
 /// to fit in the `vm` stack's socket, or in the host's window.
 fn send_window() -> u32 {
@@ -893,8 +903,14 @@ impl Udp {
         if self.charge.resize((self.bytes + cost) as u64).is_err() {
             return;
         }
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(data.len()).is_err() {
+            let _ = self.charge.resize(self.bytes as u64);
+            return;
+        }
+        copy.extend_from_slice(data);
         self.bytes += cost;
-        self.rx.push_back((from, data.to_vec()));
+        self.rx.push_back((from, copy));
         self.touch();
     }
 
@@ -999,14 +1015,16 @@ impl Udp {
             }
             return;
         }
-        send(ToHost::UdpSend { id: self.id, addr: to.addr, port: to.port, data });
+        let last = send_ahead(data);
+        send(ToHost::UdpSend { id: self.id, addr: to.addr, port: to.port, data: last });
     }
 
     /// A reply to `to`, which sent to this socket through a port forwarded
     /// from the host (`forward_peer`): it leaves from the host's port.
     pub fn reply(&self, to: SockAddr, data: &[u8]) {
         let Some(local) = self.local else { return };
-        send(ToHost::UdpReply { port: local.port, addr: to.addr, peer_port: to.port, data });
+        let last = send_ahead(data);
+        send(ToHost::UdpReply { port: local.port, addr: to.addr, peer_port: to.port, data: last });
     }
 
     /// Writable unless it waits for the host's say (level-triggered loops
@@ -1157,7 +1175,7 @@ pub fn echo_in(from: Addr, ident: u16, msg: &[u8]) {
         let u = u.lock();
         u.icmp.is_some_and(|i| i.ident == ident && i.v6 == v6).then_some(u.id)
     }) {
-        deliver(ToGuest::UdpRecv { id, addr: from, port: link::ICMP_PORT, data: msg });
+        deliver(ToGuest::UdpRecv { id, addr: from, port: link::ICMP_PORT, more: 0, data: msg });
     }
 }
 
@@ -1167,6 +1185,9 @@ pub fn from_host(payload: &[u8]) {
         deliver(msg);
     }
 }
+
+/// A datagram from the host that takes more than one message.
+static ARRIVING: Mutex<link::Arriving> = Mutex::new(link::Arriving::new());
 
 /// What the host's proxy said, or the guest's own stack in its place.
 pub fn deliver(msg: ToGuest) {
@@ -1248,7 +1269,13 @@ pub fn deliver(msg: ToGuest) {
                 u.touch();
             }
         }
-        ToGuest::UdpRecv { id, addr, port, data } => {
+        ToGuest::UdpRecv { more: 1.., .. } | ToGuest::UdpIncoming { more: 1.., .. } | ToGuest::UdpMore { .. } => {
+            let whole = ARRIVING.lock().add(&msg);
+            if let Some((to, data)) = whole {
+                deliver(to.message(&data));
+            }
+        }
+        ToGuest::UdpRecv { id, addr, port, data, .. } => {
             if let Some(u) = udp(id) {
                 let mut u = u.lock();
                 let from = SockAddr { addr, port };
@@ -1266,7 +1293,7 @@ pub fn deliver(msg: ToGuest) {
                 }
             }
         }
-        ToGuest::UdpIncoming { port, peer, peer_port, data } => {
+        ToGuest::UdpIncoming { port, peer, peer_port, data, .. } => {
             // To the socket bound at that port on the guest's own address
             // (or any), as a datagram from the network would be.
             let Some(u) = UDP_PORTS.lock().get(&port).and_then(Weak::upgrade) else { return };

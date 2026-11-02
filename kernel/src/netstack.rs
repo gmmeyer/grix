@@ -58,6 +58,9 @@ struct Guest {
     /// Connections from outside, until they're made and `inet` can have
     /// them: their local port and peer.
     accepted: BTreeMap<u32, (u16, SockAddr)>,
+    /// Fragments from the gateway, and what tells this end's apart.
+    reassembly: packet::Reassembly,
+    next_ip_id: u32,
     /// What can't be said with `STACK` held, as it may send something back.
     later: Vec<ToGuest<'static>>,
     /// Handshakes from outside that came to nothing: no `Conn` holds them,
@@ -102,6 +105,8 @@ pub fn init() {
         stack,
         charge: Charge::default(),
         accepted: BTreeMap::new(),
+        reassembly: packet::Reassembly::default(),
+        next_ip_id: 0,
         later: Vec::new(),
         failed: Vec::new(),
     });
@@ -190,8 +195,11 @@ fn own(to: Addr) -> Addr {
 fn transmit(p: Option<Vec<u8>>) {
     let mut guard = STACK.lock();
     let (Some(g), Some(p)) = (guard.as_mut(), p) else { return };
+    g.next_ip_id = g.next_ip_id.wrapping_add(1);
     // No room: lost, as on any link.
-    g.stack.transmit(p);
+    for piece in packet::fragments(p, g.next_ip_id).unwrap_or_default() {
+        g.stack.transmit(piece);
+    }
     drop(guard);
     poke();
 }
@@ -223,6 +231,8 @@ pub fn raw_out(p: Vec<u8>) {
 
 /// A packet from the host.
 pub fn received(p: Vec<u8>) {
+    let whole = STACK.lock().as_mut().and_then(|g| g.reassembly.add(p));
+    let Some(p) = whole else { return };
     inet::raw_in(&p);
     match packet::parse(&p) {
         Some(Packet::Tcp { from, to, syn }) => {

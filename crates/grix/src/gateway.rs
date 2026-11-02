@@ -98,6 +98,9 @@ impl Gateway {
             peers: VecDeque::new(),
             held_bytes: 0,
             tick: 0,
+            reassembly: packet::Reassembly::default(),
+            next_ip_id: 0,
+            arriving: link::Arriving::default(),
         };
         let thread = thread::Builder::new().spawn(move || state.run(inbox)).context("starting the network gateway")?;
         Ok(Gateway { work, thread: Mutex::new(Some(thread)) })
@@ -171,6 +174,11 @@ struct State {
     /// what goes back to them is a `UdpReply`.
     peers: VecDeque<(u16, Endpoint)>,
     held_bytes: usize,
+    /// Fragments from the guest, and what tells this end's apart.
+    reassembly: packet::Reassembly,
+    next_ip_id: u32,
+    /// A datagram from the proxy, which is a message or a few.
+    arriving: link::Arriving,
     tick: u64,
 }
 
@@ -290,7 +298,16 @@ impl State {
         id
     }
 
+    /// `p` to the guest, in pieces if it won't fit the link.
+    fn transmit(&mut self, p: Vec<u8>) {
+        self.next_ip_id = self.next_ip_id.wrapping_add(1);
+        for piece in packet::fragments(p, self.next_ip_id).unwrap_or_default() {
+            self.stack.transmit(piece);
+        }
+    }
+
     fn on_packet(&mut self, p: Vec<u8>) {
+        let Some(p) = self.reassembly.add(p) else { return };
         // A guest may say what it likes in a packet, with a raw socket or a
         // kernel of its own. It goes no further than this, and it's said so.
         if let Some((protocol, from, ..)) = packet::header(&p) {
@@ -317,7 +334,7 @@ impl State {
                 }
                 None if syn => {
                     if let Some(refused) = packet::reset(&p) {
-                        self.stack.transmit(refused);
+                        self.transmit(refused);
                     }
                 }
                 // No such connection: the stack says so.
@@ -413,7 +430,7 @@ impl State {
                 self.early.insert(id, Early::default());
                 if self.stack.accept(id, to, syn.clone(), self.ms()).is_err() {
                     if let Some(refused) = packet::reset(&syn) {
-                        self.stack.transmit(refused);
+                        self.transmit(refused);
                     }
                     self.ask(ToHost::Close { id });
                     self.forget(id);
@@ -428,7 +445,7 @@ impl State {
                         _ => packet::error(&syn, Unreachable::Host),
                     };
                     if let Some(p) = answer {
-                        self.stack.transmit(p);
+                        self.transmit(p);
                     }
                     self.forget(id);
                 }
@@ -465,7 +482,7 @@ impl State {
                 let server = s.servers.iter().find(|(q, _)| Some(*q) == query).map_or(dns, |(_, e)| *e);
                 let p = packet::udp(server, Endpoint { addr: own(server.addr), port }, answer);
                 if let Some(p) = p {
-                    self.stack.transmit(p);
+                    self.transmit(p);
                 }
             }
             ToGuest::UdpVerdict { id, addr, port, verdict } => {
@@ -490,7 +507,12 @@ impl State {
                     }
                 }
             }
-            ToGuest::UdpRecv { id, addr, port, data } => {
+            ToGuest::UdpRecv { more: 1.., .. } | ToGuest::UdpIncoming { more: 1.., .. } | ToGuest::UdpMore { .. } => {
+                if let Some((to, data)) = self.arriving.add(&msg) {
+                    self.on_message(to.message(&data));
+                }
+            }
+            ToGuest::UdpRecv { id, addr, port, data, .. } => {
                 let Some(s) = self.sockets.get(&id) else { return };
                 let p = match s.source {
                     Source::Echo { ident, .. } if port == link::ICMP_PORT && data.len() >= 8 => {
@@ -505,10 +527,10 @@ impl State {
                     _ => None,
                 };
                 if let Some(p) = p {
-                    self.stack.transmit(p);
+                    self.transmit(p);
                 }
             }
-            ToGuest::UdpIncoming { port, peer, peer_port, data } => {
+            ToGuest::UdpIncoming { port, peer, peer_port, data, .. } => {
                 let peer = Endpoint { addr: peer, port: peer_port };
                 if !self.peers.contains(&(port, peer)) {
                     if self.peers.len() >= link::MAX_FORWARD_PEERS {
@@ -517,7 +539,7 @@ impl State {
                     self.peers.push_back((port, peer));
                 }
                 if let Some(p) = packet::udp(peer, Endpoint { addr: own(peer.addr), port }, data) {
-                    self.stack.transmit(p);
+                    self.transmit(p);
                 }
             }
         }

@@ -67,7 +67,9 @@ const ARPHRD_ETHER: u16 = 1;
 const ETH0_FLAGS: u32 = 0x1 | 0x2 | 0x40 | 0x1000 | 0x1_0000;
 /// Made up, as QEMU's user networking's guest has (no frame ever has it).
 pub const ETH0_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+/// With no device under it, what a program expects of Ethernet.
 const ETH0_MTU: u32 = 1500;
+pub const LOOPBACK_MTU: u32 = 65536;
 /// The guest's address, its /24 network and the host's.
 const ETH0_IP: [u8; 4] = link::GUEST_V4;
 const ETH0_MASK: [u8; 4] = [255, 255, 255, 0];
@@ -126,13 +128,25 @@ const LO: Iface = Iface {
     flags: LO_FLAGS,
     mac: [0; 6],
     broadcast: [0; 6],
-    mtu: 65536,
+    mtu: LOOPBACK_MTU,
     oper: 0,
     ip: [127, 0, 0, 1],
     mask: [255, 0, 0, 0],
     prefix: 8,
     brd: [0; 4],
 };
+
+/// eth0's MTU: on the `vm` stack the link's own, which is a real one, as
+/// TCP's segments and a datagram's fragments go by it.
+pub fn eth0_mtu() -> u32 {
+    if crate::netstack::active() { link::MTU as u32 } else { ETH0_MTU }
+}
+
+impl Iface {
+    fn mtu(&self) -> u32 {
+        if self.index == ETH0_INDEX { eth0_mtu() } else { self.mtu }
+    }
+}
 
 const ETH0: Iface = Iface {
     index: ETH0_INDEX,
@@ -316,7 +330,7 @@ impl Netlink {
         attr(&mut b, 3, &name[..=i.name.len()]); // IFLA_IFNAME
         attr(&mut b, 1, &i.mac); // IFLA_ADDRESS
         attr(&mut b, 2, &i.broadcast); // IFLA_BROADCAST
-        attr(&mut b, 4, &i.mtu.to_le_bytes()); // IFLA_MTU
+        attr(&mut b, 4, &i.mtu().to_le_bytes()); // IFLA_MTU
         attr(&mut b, 16, &[i.oper]); // IFLA_OPERSTATE
         self.message(out, RTM_NEWLINK, flags, seq, &b);
     }
@@ -647,7 +661,7 @@ pub fn ifreq_ioctl(req: u64, ifr: &mut [u8; 40]) -> Option<Result<(), Errno>> {
             Ok(())
         }
         SIOCGIFMTU => {
-            data[..4].copy_from_slice(&iface.unwrap().mtu.to_le_bytes());
+            data[..4].copy_from_slice(&iface.unwrap().mtu().to_le_bytes());
             Ok(())
         }
         SIOCGIFADDR => {

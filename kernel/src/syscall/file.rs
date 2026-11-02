@@ -1462,6 +1462,17 @@ fn vectored_file(p: &mut Process, f: &mut OpenFile, iov: u64, cnt: u64, at: Opti
         }
     }
     let bufs = iovecs(p, iov, cnt)?;
+    // A datagram is one message, however many buffers it's in.
+    let nonblock = f.nonblocking();
+    if let FileKind::Inet(s) = &mut f.kind
+        && s.dgram
+    {
+        return if write {
+            super::net::datagram_write(p, s, &bufs, None, nonblock)
+        } else {
+            super::net::datagram_read(p, s, &bufs, nonblock, false).map(|r| r.0)
+        };
+    }
     vectored_bufs(p, f, bufs, at, write)
 }
 

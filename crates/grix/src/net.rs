@@ -740,12 +740,21 @@ impl Outbox {
     /// replies to the guest's own messages always fit, and a guest that
     /// never reads can't make it grow. Whether it was.
     pub(crate) fn offer_lossy(&self, frame: Vec<u8>) -> bool {
-        let q = self.q.lock().unwrap();
-        if !q.closed && q.bytes + frame.len() <= OUTBOX_BYTES / 2 {
-            self.push(q, frame);
-            return true;
+        self.offer_all(vec![frame])
+    }
+
+    /// `offer_lossy` for one datagram's frames: all of them, one after
+    /// another, or none.
+    fn offer_all(&self, frames: Vec<Vec<u8>>) -> bool {
+        let mut q = self.q.lock().unwrap();
+        let bytes: usize = frames.iter().map(Vec::len).sum();
+        if q.closed || q.bytes + bytes > OUTBOX_BYTES / 2 {
+            return false;
         }
-        false
+        q.bytes += bytes;
+        q.frames.extend(frames);
+        self.ready.notify_one();
+        true
     }
 
     #[cfg(test)]
@@ -842,6 +851,8 @@ impl Conn {
 struct Shared {
     policy: NetPolicy,
     outbox: Arc<Outbox>,
+    /// The start of the guest's next long datagram (`ToHost::UdpMore`).
+    ahead: Mutex<Vec<u8>>,
     conns: Mutex<HashMap<u32, Arc<Conn>>>,
     udps: Mutex<HashMap<u32, Arc<Udp>>>,
     udp_threads: AtomicU32,
@@ -870,6 +881,26 @@ impl Shared {
     /// mustn't wait on it to read its input.
     fn reply(&self, msg: ToGuest) {
         self.outbox.offer(frame(msg));
+    }
+
+    /// The datagram `last` ends, if it's more than that; what's gone
+    /// ahead of it was bounded as it came.
+    fn whole(&self, last: &[u8]) -> Option<Vec<u8>> {
+        let mut ahead = std::mem::take(&mut *self.ahead.lock().unwrap());
+        if ahead.is_empty() {
+            return None;
+        }
+        ahead.extend_from_slice(last);
+        Some(ahead)
+    }
+
+    /// Datagram `data` for the guest, in as many messages as it takes, all
+    /// of them or none.
+    fn offer_datagram(&self, data: &[u8], first: impl FnOnce(u32, &[u8]) -> ToGuest) -> bool {
+        let (head, rest) = data.split_at(data.len().min(link::MAX_UDP));
+        let mut frames = vec![frame(first(rest.len() as u32, head))];
+        frames.extend(rest.chunks(link::MAX_UDP).map(|data| frame(ToGuest::UdpMore { data })));
+        self.outbox.offer_all(frames)
     }
 
     fn deny(&self, what: &str, detail: String) {
@@ -977,6 +1008,7 @@ impl Proxy {
                 UdpFrom::Socket(s) => s.try_clone().context("forwarding a UDP socket")?,
             };
             sock.set_read_timeout(Some(UDP_FORWARD_TICK))?;
+            takes_any_datagram(&sock);
             udp_forwards.push(Arc::new(UdpForward {
                 guest: *guest,
                 sock,
@@ -988,6 +1020,7 @@ impl Proxy {
             name_rules: policy.has_name_rules(),
             policy,
             outbox,
+            ahead: Mutex::new(Vec::new()),
             conns: Mutex::new(HashMap::new()),
             udps: Mutex::new(HashMap::new()),
             udp_threads: AtomicU32::new(0),
@@ -1073,7 +1106,17 @@ impl Proxy {
             ToHost::Close { id } => self.close(id),
             ToHost::Dns { id, query } => self.lookup(id, query),
             ToHost::UdpAllow { id, addr, port } => self.udp_allow(id, addr, port),
+            ToHost::UdpMore { data } => {
+                let mut ahead = s.ahead.lock().unwrap();
+                if ahead.len() + data.len() <= link::MAX_DATAGRAM {
+                    ahead.extend_from_slice(data);
+                } else {
+                    ahead.clear();
+                }
+            }
             ToHost::UdpSend { id, addr, port, data } => {
+                let whole = s.whole(data);
+                let data = whole.as_deref().unwrap_or(data);
                 let Some(u) = s.udps.lock().unwrap().get(&id).cloned() else { return };
                 let Some(&to) = u.allowed.lock().unwrap().get(&(addr, port)) else { return };
                 if port == link::ICMP_PORT {
@@ -1091,7 +1134,10 @@ impl Proxy {
                     let _ = sock.send_to(data, to);
                 }
             }
-            ToHost::UdpReply { port, addr, peer_port, data } => self.udp_reply(port, addr, peer_port, data),
+            ToHost::UdpReply { port, addr, peer_port, data } => {
+                let whole = s.whole(data);
+                self.udp_reply(port, addr, peer_port, whole.as_deref().unwrap_or(data))
+            }
             ToHost::StdinCredit { bytes } => {
                 let mut credit = s.stdin_credit.lock().unwrap();
                 *credit = (*credit + bytes as u64).min(link::STDIN_WINDOW as u64);
@@ -1381,6 +1427,23 @@ impl StdinGate {
 /// Accept connections to a forwarded port and offer them to the guest.
 /// UDP socket `id`'s socket here for one address family, made (with a
 /// thread taking its replies in) the first time.
+/// Room to send any datagram: macOS refuses one past a socket's buffer,
+/// which starts at 9216 bytes (`net.inet.udp.maxdgram`). Linux's starts
+/// past what any datagram needs.
+fn takes_any_datagram(_sock: &UdpSocket) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let size = (link::MAX_DATAGRAM + 64) as libc::c_int;
+        // SAFETY: a socket of ours, and the value's size.
+        unsafe {
+            let value = (&raw const size).cast();
+            let len = size_of::<libc::c_int>() as libc::socklen_t;
+            libc::setsockopt(_sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, value, len);
+        }
+    }
+}
+
 fn udp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> Option<Arc<UdpSocket>> {
     let slot = if v4 { &u.v4 } else { &u.v6 };
     let mut slot = slot.lock().unwrap();
@@ -1398,19 +1461,17 @@ fn udp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> Option<Arc<Ud
         s.udp_threads.fetch_sub(1, Ordering::Relaxed);
         return None;
     };
+    takes_any_datagram(&sock);
     let (shared, udp, rx) = (s.clone(), u.clone(), sock.clone());
     let spawned = thread::Builder::new().spawn(move || {
-        // One more than a frame holds: anything that fills it is too big.
-        let mut buf = vec![0u8; link::MAX_UDP + 1];
+        let mut buf = vec![0u8; link::MAX_DATAGRAM];
         while !udp.closed.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
             match rx.recv_from(&mut buf) {
                 Ok((n, from)) => {
-                    // Only from where the guest sent, and what one frame holds.
+                    // Only from where the guest sent.
                     let from = SocketAddr::new(from.ip().to_canonical(), from.port());
                     let Some(&(addr, port)) = udp.reverse.lock().unwrap().get(&from) else { continue };
-                    if n <= link::MAX_UDP {
-                        shared.outbox.offer_lossy(frame(ToGuest::UdpRecv { id, addr, port, data: &buf[..n] }));
-                    }
+                    shared.offer_datagram(&buf[..n], |more, data| ToGuest::UdpRecv { id, addr, port, more, data });
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
                 Err(_) => break,
@@ -1452,17 +1513,16 @@ fn icmp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> bool {
     };
     let (shared, udp, rx) = (s.clone(), u.clone(), sock.clone());
     let spawned = thread::Builder::new().spawn(move || {
-        let mut buf = vec![0u8; link::MAX_UDP + 64];
+        let mut buf = vec![0u8; link::MAX_DATAGRAM + 64];
         while !udp.closed.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
             match rx.recv(&mut buf) {
                 Ok(Some((from, at))) => {
-                    // Only from where the guest sent, and what one frame holds.
+                    // Only from where the guest sent.
                     let Some(&(addr, port)) = udp.reverse.lock().unwrap().get(&SocketAddr::new(from, 0)) else {
                         continue;
                     };
-                    if at.len() <= link::MAX_UDP {
-                        shared.outbox.offer_lossy(frame(ToGuest::UdpRecv { id, addr, port, data: &buf[at] }));
-                    }
+                    let data = &buf[at];
+                    shared.offer_datagram(data, |more, data| ToGuest::UdpRecv { id, addr, port, more, data });
                 }
                 Ok(None) => {}
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
@@ -1483,8 +1543,7 @@ fn icmp_socket(s: &Arc<Shared>, id: u32, u: &Arc<Udp>, v4: bool) -> bool {
 /// room for them (dropped otherwise, as UDP may), remembering who sent
 /// them so the guest can reply.
 fn udp_forward_loop(s: &Shared, f: &UdpForward) {
-    // One more than a frame holds: anything that fills it is too big.
-    let mut buf = vec![0u8; link::MAX_UDP + 1];
+    let mut buf = vec![0u8; link::MAX_DATAGRAM];
     while !s.stop.load(Ordering::Relaxed) {
         match f.sock.recv_from(&mut buf) {
             Ok((n, from)) => {
@@ -1492,11 +1551,16 @@ fn udp_forward_loop(s: &Shared, f: &UdpForward) {
                     s.deny_capability("UDP port forward");
                     continue;
                 }
-                // Too big for a frame: dropped, as a network that can't
-                // fragment it would.
-                let Some(seen) = guest_view(from).filter(|_| n <= link::MAX_UDP) else { continue };
-                let msg = ToGuest::UdpIncoming { port: f.guest, peer: seen.0, peer_port: seen.1, data: &buf[..n] };
-                if s.outbox.offer_lossy(frame(msg)) {
+                let Some(seen) = guest_view(from) else { continue };
+                let (port, (peer, peer_port)) = (f.guest, seen);
+                let offered = s.offer_datagram(&buf[..n], |more, data| ToGuest::UdpIncoming {
+                    port,
+                    peer,
+                    peer_port,
+                    more,
+                    data,
+                });
+                if offered {
                     f.heard_from(seen, from);
                 }
             }
@@ -1809,6 +1873,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// What a guest says is the start of a datagram is held for the next
+    /// send, and no more of it than a datagram can be, whatever it sends.
+    #[test]
+    fn a_guests_long_datagram_is_bounded() {
+        let (proxy, _outbox, _) = forwarding(true);
+        let piece = vec![7; link::MAX_UDP];
+        let mut most = 0;
+        for _ in 0..100 {
+            proxy.handle(&ToHost::UdpMore { data: &piece }.encode());
+            most = most.max(proxy.shared.ahead.lock().unwrap().len());
+        }
+        assert!(most <= link::MAX_DATAGRAM, "{most}");
+        // One that ends is gone with what ended it.
+        proxy.handle(&ToHost::UdpMore { data: &piece }.encode());
+        let reply = ToHost::UdpReply { port: 1, addr: Addr::V4([1, 2, 3, 4]), peer_port: 2, data: b"" };
+        proxy.handle(&reply.encode());
+        assert!(proxy.shared.ahead.lock().unwrap().is_empty());
+    }
+
     /// Datagrams to a forwarded UDP port go to the guest from where they
     /// came (the host's loopback as the guest knows it), up to a frame's
     /// worth; replies go back from the forwarded port, and only to peers
@@ -1819,7 +1902,6 @@ pub(crate) mod tests {
         let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let port = peer.local_addr().unwrap().port();
-        peer.send_to(&[0; link::MAX_UDP + 1], host).unwrap();
         peer.send_to(b"query", host).unwrap();
         let mut got = Vec::new();
         wait_for(|| {
@@ -1829,7 +1911,7 @@ pub(crate) mod tests {
         let seen = Addr::V4(link::HOST_V4);
         assert_eq!(
             ToGuest::decode(&got[0]),
-            Ok(ToGuest::UdpIncoming { port: 53, peer: seen, peer_port: port, data: b"query" })
+            Ok(ToGuest::UdpIncoming { port: 53, peer: seen, peer_port: port, more: 0, data: b"query" })
         );
         assert_eq!(got.len(), 1, "the oversized one isn't carried");
         // A reply to it comes from the forwarded port.

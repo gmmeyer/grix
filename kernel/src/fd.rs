@@ -43,6 +43,7 @@ impl FifoFile {
 /// and what a socket's or pipe's end brings, a pipe.
 const OPEN_FILE_COST: u64 = (core::mem::size_of::<OpenFile>()
     + core::mem::size_of::<crate::ipc::Pipe>()
+    + core::mem::size_of::<crate::inet::Inet>()
     + core::mem::size_of::<crate::inet::LocalEnd>()
     + 2 * 64) as u64;
 /// Open files that fit in what's left of the heap, charged or not: with
@@ -109,7 +110,8 @@ pub enum FileKind {
     /// signalfd: reads pending signals in this mask.
     SignalFd(u64),
     /// An AF_INET/AF_INET6 socket (inet.rs).
-    Inet(crate::inet::Inet),
+    /// (Boxed: every open file would be as big, its option table and all.)
+    Inet(alloc::boxed::Box<crate::inet::Inet>),
     /// Either end of a pseudo-terminal, or the console's terminal (tty.rs).
     Pty(crate::tty::PtyEnd),
     /// An AF_UNIX socket that's named, listening, or passes messages

@@ -371,12 +371,19 @@ The CLI has `--allow-host RULE` and `-p/--publish
 [ADDR:]HOSTPORT:GUESTPORT[/udp]` (Docker's spelling: `-p 5353:53/udp`);
 manifests have `allow_hosts = [...]` and `[[forward]]` tables with `host`,
 `guest` and `protocol` (`"tcp"`, the default, or `"udp"`); Python's
-`publish` takes the CLI's specs. TCP, UDP and ICMP echo are supported (other
-raw sockets are reported as unsupported). On `native` a UDP socket's first
+`publish` takes the CLI's specs. TCP, UDP and ICMP echo are supported, and on
+`vm` raw IP sockets of any protocol, with `net_raw`: nothing but TCP, UDP and
+echo from the sandbox's own address leaves the gateway, so they forge nothing
+(on `native`, which has no IP layer, they're reported as unsupported). On `native` a UDP socket's first
 datagram to a destination waits for the host's say, and a refused one gets
 EPERM, as from a firewall; only the destinations it sent to can answer it. Datagrams
-between the sandbox's own sockets stay in it; ones larger than about 4 KiB
-get EMSGSIZE (they'd be fragments on a real network).
+between the sandbox's own sockets stay in it. Datagrams go up to IP's limit
+(65,507 bytes over IPv4) on both stacks, and `eth0`'s MTU is real on `vm` (4,092
+bytes, as it's what the link's frames hold) and Ethernet's 1,500 on `native`,
+for `IP_MTU` and `IP_PMTUDISC_DO`. `/proc/net/tcp` and the rest list a program's
+sockets, with the inodes `/proc/<pid>/fd` shows, for `netstat`, `lsof` and `psutil`.
+A connection forwarded from the host's own loopback comes from 10.0.2.2, not
+127.0.0.1, so a server that trusts its loopback isn't fooled.
 
 ## MCP server and Python
 

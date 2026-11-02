@@ -56,8 +56,8 @@ fn pad(s: &mut String, start: usize, width: usize) {
 /// socket's IPv4 address is a mapped one.
 fn address(s: &mut String, a: SockAddr, v6: bool) {
     let words = |s: &mut String, b: &[u8]| {
-        for w in b.chunks_exact(4) {
-            let _ = write!(s, "{:08X}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        for w in b.as_chunks::<4>().0 {
+            let _ = write!(s, "{:08X}", u32::from_le_bytes(*w));
         }
     };
     match a.addr {

@@ -87,6 +87,7 @@ pub enum ProcFile {
     NetIfInet6,
     NetIpv6Route,
     Sockets(crate::procnet::Table),
+    Eth0Mtu,
     /// grix's own: what each CPU counts (`smp::stats`).
     SmpStats,
     /// /proc/sys/kernel/threads-max and /sys/fs/cgroup/pids.max.
@@ -250,7 +251,7 @@ pub const ETH0_FILES: &[(&str, ProcFile)] = &[
     ("/sys/class/net/eth0/carrier", ProcFile::Text("1\n")),
     ("/sys/class/net/eth0/flags", ProcFile::Text("0x1003\n")),
     ("/sys/class/net/eth0/ifindex", ProcFile::Text("2\n")),
-    ("/sys/class/net/eth0/mtu", ProcFile::Text("1500\n")),
+    ("/sys/class/net/eth0/mtu", ProcFile::Eth0Mtu),
     ("/sys/class/net/eth0/operstate", ProcFile::Text("up\n")),
     ("/sys/class/net/eth0/type", ProcFile::Text("1\n")),
 ];
@@ -402,6 +403,9 @@ pub fn generate(p: &Process, f: ProcFile) -> Result<Vec<u8>, Errno> {
         ProcFile::NetIfInet6 => crate::netlink::proc_net_if_inet6(&mut s),
         ProcFile::NetIpv6Route => crate::netlink::proc_net_ipv6_route(&mut s),
         ProcFile::Sockets(table) => crate::procnet::generate(table, &mut s)?,
+        ProcFile::Eth0Mtu => {
+            let _ = writeln!(s, "{}", crate::netlink::eth0_mtu());
+        }
     }
     Ok(s.into_bytes())
 }
