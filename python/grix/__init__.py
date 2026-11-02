@@ -122,7 +122,8 @@ class Result:
     messages: str = ""
     #: What the guest kernel reported of its resources as the program
     #: ended: ``cpu_ms``, ``syscalls``, ``usage`` (``{resource: {"now",
-    #: "peak", "limit"}}``) and ``limits_hit`` (``{limit: count}``). None
+    #: "peak", "limit"}}``), ``limits_hit`` (``{limit: count}``) and
+    #: ``kernel`` (``{counter: n}``, as /proc/grix/smp names them). None
     #: if the VM was stopped.
     guest_stats: Optional[dict] = None
     #: What the VM's process cost the host: ``cpu_user_ms``,

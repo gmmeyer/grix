@@ -105,5 +105,9 @@ jobs:
           GRIX_NETWORK=vm GRIX_ARCH=x86_64 python3 -m unittest discover -s python/tests
       - name: Threads in parallel on 4 CPUs, in grix-vmm (KVM)
         run: GRIX_STRICT_SPEEDUP=1 GRIX_ARCH=x86_64 cargo test -p grix --test guest -- --exact threads_run_in_parallel_on_more_cpus
+      # For the log: what a locking change is measured against (the
+      # counters are `/proc/grix/smp`'s), as emulation can't say.
+      - name: What more CPUs cost (smpbench on 4 CPUs, in grix-vmm)
+        run: ./target/release/grix run --cpus 4 -a threads -a process -i fixtures/build/amd64/smpbench:/bin/smpbench -- /bin/smpbench -t 500
       - name: End-to-end tests on the x86_64 kernel with 4 CPUs, in grix-vmm (KVM)
         run: GRIX_CPUS=4 GRIX_ARCH=x86_64 cargo test -p grix --test guest --test runtimes

@@ -16,7 +16,7 @@ extern crate alloc;
 /// image, the wire format, `link` and `hostfs`. A grix image carries the
 /// kernel it was built with, and runs only with a host of the same
 /// version. Bump it with any change the other side couldn't read.
-pub const ABI_VERSION: u32 = 17;
+pub const ABI_VERSION: u32 = 18;
 
 /// The sandbox's host name unless it's given one (`Image::hostname`):
 /// uname, /etc/hostname, /etc/hosts, /proc/sys/kernel/hostname, and

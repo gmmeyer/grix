@@ -33,11 +33,15 @@ Bigger:
 
 3. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-4. Faster live-mount round trips, multi-architecture images, and the
-   rest of `/proc/grix/smp`'s counters.
+4. A lookup in a live mount's directory too big to hold is a round trip
+   each, and multi-architecture images, if a use turns up.
 5. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
-   interest.
+   interest. Under way, and not all of it can be: the pass over memory and
+   processes (`CLONE_VM`, the gate, mseal, another process's descriptors)
+   was stopped by a safety classifier before it got anywhere, so that
+   surface is NOT reviewed, and it's the newest code. It needs a person,
+   or a pass someone approves.
 
 Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
 in 32,000 runs since.
@@ -447,11 +451,10 @@ Left, none of it a way out of the sandbox:
       `grix run` and `grix mcp`). For a server in a container: no time
       limit (`--timeout 0`), output streamed without a cap or a copy,
       events printed as they happen.
-- [ ] /proc/grix/smp's per-CPU counters (kernel entries by kind, the
-      kernel lock's waits and holds, TLB flushes and their IPIs, timer
-      interrupts) in `guest_stats` too, and `stats::syscall` and
-      `page_fault` as sums of per-CPU counts rather than one shared atomic
-      on every entry (a `grix_abi::stats` change: bump `ABI_VERSION`).
+- [x] /proc/grix/smp's counters (kernel entries by kind, the kernel lock's
+      waits and holds, TLB flushes and their IPIs, timer interrupts) in
+      `guest_stats`, `--json` and the Prometheus metrics, every CPU's
+      together: one line per CPU wouldn't fit a frame at `MAX_CPUS`.
 
 ## Images
 
@@ -611,7 +614,7 @@ Left, none of it a way out of the sandbox:
       `unnamed_files_in_a_live_mount`. Left: its inode number changes
       then, and what has it open isn't pinned; naming one that's mapped
       shared is reported, as a mapping of its pages can't follow it.
-- [ ] Faster live-mount round trips (each lookup in a directory too big to hold, and each read past the read-ahead, waits for the host).
+- [~] Faster live-mount round trips. Reads: the console takes a frame's payload in one copy rather than a byte at a time, and a read going on from the last asks for all a message holds, so 64 MiB in 4 KiB reads went from 3.97 s to 0.84 s under emulation. Left: a lookup in a directory too big to hold is still a round trip each.
 - [x] `statfs`/`fstatfs`. `df` fails today; Python `shutil.disk_usage` too.
 - [x] `/proc/self/mountinfo`, `/proc/mounts`, `/etc/mtab` (df, findmnt).
 - [x] xattrs (`getxattr`/`listxattr`/…): kept on the sandbox's nodes

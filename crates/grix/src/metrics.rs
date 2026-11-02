@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use grix_abi::policy::Capability;
-use grix_abi::stats::{Limit, Resource};
+use grix_abi::stats::{Counter, Limit, Resource};
 
 use crate::sandbox::{ExitStatus, HostUsage, RunOutput, Stream};
 use crate::{GuestEvent, GuestStats};
@@ -85,6 +85,7 @@ struct Inner {
     vmm_memory: Histogram,
     guest_cpu_ns: AtomicU64,
     guest_syscalls: AtomicU64,
+    guest_kernel: [AtomicU64; Counter::ALL.len()],
     guest_faults: AtomicU64,
     guest_switches: AtomicU64,
     guest_forks: AtomicU64,
@@ -108,6 +109,7 @@ impl Metrics {
             vmm_memory: Histogram::new(MEMORY_BUCKETS),
             guest_cpu_ns: AtomicU64::new(0),
             guest_syscalls: AtomicU64::new(0),
+            guest_kernel: [const { AtomicU64::new(0) }; Counter::ALL.len()],
             guest_faults: AtomicU64::new(0),
             guest_switches: AtomicU64::new(0),
             guest_forks: AtomicU64::new(0),
@@ -264,6 +266,15 @@ impl Metrics {
             out.sample(name, &[], v.load(Relaxed) as f64);
         }
         out.family(
+            "grix_guest_kernel_total",
+            "counter",
+            "What the guests' kernels did, by what /proc/grix/smp calls it (times in microseconds).",
+        );
+        for c in Counter::ALL.into_iter().filter(|c| !c.is_peak()) {
+            let v = m.guest_kernel[c as usize].load(Relaxed);
+            out.sample("grix_guest_kernel_total", &[("counter", c.name())], v as f64);
+        }
+        out.family(
             "grix_guest_limit_hits_total",
             "counter",
             "Times a kernel limit refused a program something (ENOMEM, ENOSPC, EAGAIN, ...), by limit.",
@@ -356,6 +367,9 @@ impl Recorder {
         for l in Limit::ALL {
             m.guest_hits[l as usize].fetch_add(grew(s.hits(l), last.hits(l)), Relaxed);
         }
+        for c in Counter::ALL {
+            m.guest_kernel[c as usize].fetch_add(grew(s.kernel(c), last.kernel(c)), Relaxed);
+        }
         for r in Resource::ALL {
             let (now, then) = (s.usage(r), last.usage(r));
             m.guest_used[r as usize].fetch_add(gauge(now.now) - gauge(then.now), Relaxed);
@@ -370,6 +384,9 @@ impl Recorder {
         next.processes_started = s.processes_started.max(last.processes_started);
         for l in Limit::ALL {
             next.limits_hit[l as usize] = s.hits(l).max(last.hits(l));
+        }
+        for c in Counter::ALL {
+            next.kernel[c as usize] = s.kernel(c).max(last.kernel(c));
         }
         self.last = next;
     }
@@ -512,12 +529,17 @@ mod tests {
         run.guest(&s);
         // Counters add what's new; a report that says less adds nothing.
         s.syscalls = 25;
+        s.kernel[Counter::LockWait as usize] = 7;
+        s.kernel[Counter::LockWaitMax as usize] = 9;
         run.guest(&s);
         s.syscalls = 3;
         run.guest(&s);
         let text = m.render();
         assert!(text.contains("grix_runs_active 1\n"), "{text}");
         assert!(text.contains("grix_guest_syscalls_total 25\n"), "{text}");
+        assert!(text.contains("grix_guest_kernel_total{counter=\"lock_wait_us\"} 7\n"), "{text}");
+        // The most it ever was: nothing to add up.
+        assert!(!text.contains("lock_wait_max_us"), "{text}");
         assert!(text.contains("grix_guest_resource_used{resource=\"memory\"} 100\n"), "{text}");
         assert!(text.contains("grix_guest_limit_hits_total{limit=\"threads\"} 1\n"), "{text}");
         let out = RunOutput {

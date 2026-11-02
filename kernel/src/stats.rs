@@ -80,6 +80,7 @@ pub fn restored() {
         c.syscalls.store(0, Relaxed);
         c.page_faults.store(0, Relaxed);
     }
+    crate::smp::restart_counts();
 }
 
 /// The report, as things stand.
@@ -101,6 +102,7 @@ pub fn current() -> Stats {
         page_faults: PER_CPU.iter().map(|c| c.page_faults.load(Relaxed)).sum(),
         context_switches: SWITCHES.load(Relaxed),
         processes_started: FORKS.load(Relaxed),
+        kernel: crate::smp::totals(),
         ..Stats::default()
     };
     for r in Resource::ALL {

@@ -272,9 +272,11 @@ fn drain(c: &mut Console) -> Taken {
     let mut changed = false;
     let mut stats = false;
     let mut taken = core::mem::take(deferred);
-    dev.receive(|bytes| {
-        for &b in bytes {
-            match decoder.push(b) {
+    dev.receive(|mut bytes| {
+        while !bytes.is_empty() {
+            let (used, frame) = decoder.feed(bytes);
+            bytes = &bytes[used..];
+            match frame {
                 Some((Input::Link, msg)) if grix_abi::link::is_datagram(msg) => {
                     if taken.datagrams < MAX_HELD_DATAGRAMS {
                         taken.datagrams += msg.len() + DATAGRAM_OVERHEAD;
