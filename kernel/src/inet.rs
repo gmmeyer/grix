@@ -21,7 +21,7 @@ use grix_abi::link::{self, Addr, ToGuest, ToHost, WINDOW};
 use spin::{Mutex, Once};
 
 use crate::errno::*;
-use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, SocketEnd};
+use crate::ipc::{self, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, Pipe, PipeEnd, SocketEnd};
 use crate::kmem::Charge;
 use crate::netstack;
 
@@ -38,7 +38,10 @@ const MAX_ANSWERS: usize = 16;
 /// charged to `kmem`: `PENDING_COST`).
 const MAX_PENDING: usize = 16384;
 /// A connection's place in a queue, and a socket pair's two pipes.
-const PENDING_COST: u64 = (core::mem::size_of::<Pending>() + 2 * core::mem::size_of::<ipc::Pipe>() + 3 * 64) as u64;
+const PENDING_COST: u64 = (core::mem::size_of::<Pending>()
+    + core::mem::size_of::<LocalEnd>()
+    + 2 * core::mem::size_of::<ipc::Pipe>()
+    + 3 * 64) as u64;
 static PENDING: AtomicU32 = AtomicU32::new(0);
 /// How long an unanswered DNS query counts as something the host may
 /// still answer (it may have dropped it).
@@ -203,6 +206,7 @@ pub enum ConnState {
 /// A TCP connection the host holds for us.
 pub struct Conn {
     pub id: u32,
+    pub sock: SockId,
     pub state: ConnState,
     /// Data from the peer, at most WINDOW (charged up front).
     rx: VecDeque<u8>,
@@ -218,6 +222,17 @@ pub struct Conn {
     pub local: SockAddr,
     pub peer: SockAddr,
     pub version: u64,
+}
+
+/// A socket as /proc/net has it, and as fstat agrees.
+#[derive(Clone, Copy, Default)]
+pub struct SockId {
+    /// 0 for a connection no file has yet, waiting to be accepted.
+    pub ino: u64,
+    /// Whose it is: the effective uid of who made it, or accepted it.
+    pub uid: u32,
+    /// An AF_INET6 socket: in the tcp6 table, whatever it's connected to.
+    pub v6: bool,
 }
 
 static CONNS: Mutex<BTreeMap<u32, Weak<Mutex<Conn>>>> = Mutex::new(BTreeMap::new());
@@ -247,6 +262,17 @@ pub fn ephemeral_port() -> u16 {
 }
 
 impl Conn {
+    /// Its state in TCP's terms, and the bytes the peer hasn't taken.
+    fn tcp_state(&self) -> (u8, u32) {
+        use crate::sockopt::*;
+        let unacked = send_window().saturating_sub(self.tx_credit);
+        match self.state {
+            ConnState::Connecting => (TCP_SYN_SENT, 0),
+            ConnState::Failed(_) => (TCP_CLOSE, 0),
+            ConnState::Open => (open_state(self.tx_shut, self.rx_eof, unacked), unacked),
+        }
+    }
+
     fn register(c: Conn) -> Result<Arc<Mutex<Conn>>, Errno> {
         let mut conns = CONNS.lock();
         conns.retain(|_, w| w.strong_count() > 0);
@@ -269,6 +295,7 @@ impl Conn {
         rx.try_reserve_exact(WINDOW as usize).map_err(|_| Errno(105))?;
         Ok(Conn {
             id,
+            sock: SockId::default(),
             state,
             rx,
             _charge: charge,
@@ -285,10 +312,12 @@ impl Conn {
 
     /// Ask the host for a connection to `peer`. It's `Connecting` until the
     /// host answers.
-    pub fn connect(peer: SockAddr) -> Result<Arc<Mutex<Conn>>, Errno> {
+    pub fn connect(peer: SockAddr, sock: SockId) -> Result<Arc<Mutex<Conn>>, Errno> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) & !link::HOST_ID;
         let local = SockAddr { addr: source_for(peer.addr), port: ephemeral_port() };
-        let c = Conn::register(Conn::new(id, ConnState::Connecting, local, peer)?)?;
+        let mut c = Conn::new(id, ConnState::Connecting, local, peer)?;
+        c.sock = sock;
+        let c = Conn::register(c)?;
         if netstack::active() {
             netstack::connect(id, local, peer);
         } else {
@@ -414,12 +443,13 @@ impl Drop for Slot {
 /// A connection waiting to be accepted.
 pub enum Pending {
     /// From a socket in the guest: our end, its address and ours.
-    Local { end: SocketEnd, peer: SockAddr, local: SockAddr, _slot: Slot },
+    Local { end: SocketEnd, peer: SockAddr, local: SockAddr, listed: Listed, _slot: Slot },
     /// Through a port forwarded from the host.
     Remote(Arc<Mutex<Conn>>, #[allow(dead_code)] Slot),
 }
 
 pub struct Listener {
+    pub sock: SockId,
     pub port: u16,
     /// What it bound: which loopback connections reach it.
     pub addr: Addr,
@@ -450,7 +480,7 @@ fn listeners_on(port: u16) -> Vec<Arc<Mutex<Listener>>> {
 impl Listener {
     /// Listen on `port` of `addr` (port 0: pick one). EADDRINUSE if
     /// someone already listens there.
-    pub fn listen(addr: Addr, port: u16, v6only: bool) -> Result<Arc<Mutex<Listener>>, Errno> {
+    pub fn listen(addr: Addr, port: u16, v6only: bool, sock: SockId) -> Result<Arc<Mutex<Listener>>, Errno> {
         let port = if port != 0 {
             port
         } else {
@@ -459,7 +489,7 @@ impl Listener {
         if Listener::conflicts(addr, port, v6only) {
             return Err(Errno(98)); // EADDRINUSE
         }
-        let l = Arc::new(Mutex::new(Listener { port, addr, v6only, queue: VecDeque::new(), version: 0 }));
+        let l = Arc::new(Mutex::new(Listener { sock, port, addr, v6only, queue: VecDeque::new(), version: 0 }));
         let mut listeners = LISTENERS.lock();
         let on = listeners.entry(port).or_default();
         on.retain(|w| w.strong_count() > 0);
@@ -528,13 +558,139 @@ impl Drop for Listener {
 
 /// connect() to the guest's own address: a socket pair, one end queued on
 /// the listener. ECONNREFUSED if nothing listens there (or the queues are full).
-pub fn connect_local(peer: SockAddr) -> Result<(SocketEnd, SockAddr), Errno> {
+pub fn connect_local(peer: SockAddr, me: SockId) -> Result<(SocketEnd, SockAddr, Listed), Errno> {
     let listener = Listener::find(peer).ok_or(ECONNREFUSED)?;
     let slot = Slot::take().ok_or(ECONNREFUSED)?;
     let local = SockAddr { addr: peer.addr, port: ephemeral_port() };
     let (ours, theirs) = ipc::socketpair();
-    listener.lock().push(Pending::Local { end: theirs, peer: local, local: peer, _slot: slot });
-    Ok((ours, local))
+    let mut listener = listener.lock();
+    let queued = SockId { ino: 0, ..listener.sock };
+    let listed = Listed::new(&theirs, queued, peer, local);
+    listener.push(Pending::Local { end: theirs, peer: local, local: peer, listed, _slot: slot });
+    let listed = Listed::new(&ours, me, local, peer);
+    Ok((ours, local, listed))
+}
+
+/// One end of a connection inside the guest. It's a socket pair, which
+/// nothing else lists, and /proc/net shows both ends.
+pub struct LocalEnd {
+    sock: SockId,
+    local: SockAddr,
+    peer: SockAddr,
+    rx: Weak<Mutex<Pipe>>,
+    tx: Weak<Mutex<Pipe>>,
+}
+
+static LOCAL_ENDS: Mutex<BTreeMap<u64, LocalEnd>> = Mutex::new(BTreeMap::new());
+static NEXT_LOCAL_END: AtomicU64 = AtomicU64::new(0);
+
+/// An end's place in `LOCAL_ENDS`, for as long as there's a socket.
+pub struct Listed(u64);
+
+impl Listed {
+    fn new(end: &SocketEnd, sock: SockId, local: SockAddr, peer: SockAddr) -> Listed {
+        let weak = |e: &Option<PipeEnd>| e.as_ref().map_or_else(Weak::new, |e| Arc::downgrade(&e.pipe));
+        let id = NEXT_LOCAL_END.fetch_add(1, Ordering::Relaxed);
+        let (rx, tx) = (weak(&end.rx), weak(&end.tx));
+        LOCAL_ENDS.lock().insert(id, LocalEnd { sock, local, peer, rx, tx });
+        Listed(id)
+    }
+
+    /// A file has it now.
+    pub fn accepted(&self, sock: SockId) {
+        if let Some(e) = LOCAL_ENDS.lock().get_mut(&self.0) {
+            e.sock = sock;
+        }
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        LOCAL_ENDS.lock().remove(&self.0);
+    }
+}
+
+/// What an open connection's state is, from how each way has ended. A
+/// connection through the host may have a FIN still to go.
+fn open_state(tx_shut: bool, rx_eof: bool, unacked: u32) -> u8 {
+    use crate::sockopt::*;
+    match (tx_shut, rx_eof) {
+        (false, false) => TCP_ESTABLISHED,
+        (false, true) => TCP_CLOSE_WAIT,
+        (true, false) if unacked != 0 => TCP_FIN_WAIT1,
+        (true, false) => TCP_FIN_WAIT2,
+        (true, true) => TCP_LAST_ACK,
+    }
+}
+
+impl LocalEnd {
+    fn state(&self) -> u8 {
+        let ended = |p: &Weak<Mutex<Pipe>>| p.upgrade().is_none_or(|p| p.lock().writers == 0);
+        open_state(ended(&self.tx), ended(&self.rx), 0)
+    }
+}
+
+/// A connection's rx_queue: rcv_nxt - copied_seq on Linux, which counts
+/// sequence numbers, and a FIN has one until a read gets to it. (Nothing
+/// here keeps track of a read of nothing but the end, so that one's 0.)
+fn queued(unread: usize, eof: bool) -> u32 {
+    unread as u32 + (unread != 0 && eof) as u32
+}
+
+/// A TCP socket's line in /proc/net: one that's listening or has a
+/// connection, as a socket that's only bound has no line on Linux.
+pub struct TcpRow {
+    pub sock: SockId,
+    pub local: SockAddr,
+    pub peer: SockAddr,
+    pub state: u8,
+    /// Bytes waiting for the peer to take them.
+    pub tx: u32,
+    /// Bytes to read, or a listener's queue.
+    pub rx: u32,
+}
+
+/// What's alive in a table, each held, so no table's locked while it's
+/// looked at. It's as long as there are sockets, which a program decides.
+fn alive<'a, T: 'a>(table: impl Iterator<Item = &'a Weak<Mutex<T>>>) -> Result<Vec<Arc<Mutex<T>>>, Errno> {
+    let mut held = Vec::new();
+    for w in table {
+        if let Some(a) = w.upgrade() {
+            held.try_reserve(1).map_err(|_| ENOMEM)?;
+            held.push(a);
+        }
+    }
+    Ok(held)
+}
+
+/// Every TCP socket /proc/net shows, listeners first as on Linux.
+pub fn each_tcp(mut f: impl FnMut(TcpRow) -> Result<(), Errno>) -> Result<(), Errno> {
+    use crate::sockopt::*;
+    let listeners = alive(LISTENERS.lock().values().flatten())?;
+    for l in listeners {
+        let l = l.lock();
+        let local = SockAddr { addr: l.addr, port: l.port };
+        let (peer, rx) = (SockAddr::UNSPECIFIED_V4, l.queue.len() as u32);
+        f(TcpRow { sock: l.sock, local, peer, state: TCP_LISTEN, tx: 0, rx })?;
+    }
+    let conns = alive(CONNS.lock().values())?;
+    for c in conns {
+        let c = c.lock();
+        let (state, unacked) = c.tcp_state();
+        if state != TCP_CLOSE {
+            let rx = queued(c.rx.len(), c.rx_eof);
+            f(TcpRow { sock: c.sock, local: c.local, peer: c.peer, state, tx: unacked, rx })?;
+        }
+    }
+    for e in LOCAL_ENDS.lock().values() {
+        let (unread, eof) = e.rx.upgrade().map_or((0, true), |p| {
+            let p = p.lock();
+            (p.buf.len(), p.writers == 0)
+        });
+        let rx = queued(unread, eof);
+        f(TcpRow { sock: e.sock, local: e.local, peer: e.peer, state: e.state(), tx: 0, rx })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- UDP
@@ -563,8 +719,9 @@ pub struct Icmp {
     /// SOCK_RAW: IPv4's replies are read with their IP header, as Linux's.
     pub raw: bool,
     pub v6: bool,
-    /// The identifier of the last request: the host's socket uses its
-    /// own, and a program looks for what it sent.
+    /// A ping socket's port, which is its requests' identifier, as Linux
+    /// makes it: replies come back to it by that. A raw socket's is that of
+    /// the last request it wrote.
     pub ident: u16,
 }
 
@@ -623,6 +780,7 @@ fn checksum(parts: &[&[u8]]) -> u16 {
 
 pub struct Udp {
     pub id: u32,
+    pub sock: SockId,
     /// Datagrams in, and who sent them.
     rx: VecDeque<(SockAddr, Vec<u8>)>,
     bytes: usize,
@@ -668,10 +826,11 @@ fn udp(id: u32) -> Option<UdpRef> {
 }
 
 impl Udp {
-    pub fn new(peer: Option<SockAddr>) -> UdpRef {
+    pub fn new(peer: Option<SockAddr>, sock: SockId) -> UdpRef {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) & !link::HOST_ID;
         let u = Arc::new(Mutex::new(Udp {
             id,
+            sock,
             rx: VecDeque::new(),
             bytes: 0,
             charge: Charge::default(),
@@ -883,7 +1042,7 @@ static RAW_SOCKETS: AtomicU32 = AtomicU32::new(0);
 
 /// A raw socket for protocol `proto`.
 pub fn new_raw(s: &mut Inet, proto: u8) -> UdpRef {
-    let u = Udp::new(None);
+    let u = Udp::new(None, s.sock);
     u.lock().raw = Some(proto);
     RAW_SOCKETS.fetch_add(1, Ordering::Relaxed);
     s.raw = Some(proto);
@@ -981,6 +1140,12 @@ pub fn datagram_in(from: SockAddr, port: u16, data: &[u8]) {
         u.waiting = u.waiting.saturating_sub(1);
     }
     u.push(from, data);
+}
+
+/// Is this identifier a ping socket's already? (Raw ones have none.)
+pub fn ident_taken(ident: u16, v6: bool) -> Result<bool, Errno> {
+    let udps = alive(UDPS.lock().values())?;
+    Ok(udps.iter().any(|u| u.lock().icmp.is_some_and(|i| !i.raw && i.v6 == v6 && i.ident == ident)))
 }
 
 /// An echo reply from `from` with identifier `ident`, for the ICMP socket
@@ -1123,7 +1288,9 @@ pub fn deliver(msg: ToGuest) {
             match (listener, made.and_then(Conn::register), Slot::take()) {
                 // A refused Conn says Close as it's dropped.
                 (Some(l), Ok(c), Some(slot)) => {
-                    l.lock().push(Pending::Remote(c, slot));
+                    let mut l = l.lock();
+                    c.lock().sock = SockId { ino: 0, ..l.sock };
+                    l.push(Pending::Remote(c, slot));
                 }
                 (_, Ok(_), _) => {}
                 // Nobody listens there (yet), or no room for it.
@@ -1167,6 +1334,43 @@ pub fn host_pending() -> bool {
     udp_forwards.iter().any(|p| ports.get(p).is_some_and(|w| w.strong_count() > 0))
 }
 
+/// Which table a datagram socket is in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dgram {
+    Udp,
+    Raw,
+    Icmp,
+}
+
+/// A datagram socket's line in /proc/net. Its port is a raw socket's
+/// protocol, as Linux's inet_num, and a ping socket's identifier.
+pub struct DgramRow {
+    pub sock: SockId,
+    pub kind: Dgram,
+    pub local: SockAddr,
+    pub peer: Option<SockAddr>,
+    pub rx: u32,
+}
+
+/// Every datagram socket /proc/net shows: a UDP socket once it has a
+/// port, the others once they're used, as on Linux.
+pub fn each_dgram(mut f: impl FnMut(DgramRow) -> Result<(), Errno>) -> Result<(), Errno> {
+    let udps = alive(UDPS.lock().values())?;
+    for u in udps {
+        let u = u.lock();
+        let any = || SockAddr { port: 0, ..u.local.unwrap_or(SockAddr::UNSPECIFIED_V4) };
+        let (kind, local) = match (u.raw, u.icmp, u.local) {
+            (Some(proto), ..) => (Dgram::Raw, SockAddr { port: proto as u16, ..any() }),
+            (_, Some(i), _) if i.raw => (Dgram::Raw, SockAddr { port: if i.v6 { 58 } else { 1 }, ..any() }),
+            (_, Some(i), _) => (Dgram::Icmp, SockAddr { port: i.ident, ..any() }),
+            (_, _, Some(local)) => (Dgram::Udp, local),
+            _ => continue,
+        };
+        f(DgramRow { sock: u.sock, kind, local, peer: u.peer, rx: u.bytes as u32 })?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- sockets
 
 /// What an AF_INET/AF_INET6 socket is connected to.
@@ -1180,12 +1384,14 @@ pub enum State {
         end: SocketEnd,
         local: SockAddr,
         peer: SockAddr,
+        _listed: Listed,
     },
     /// A UDP socket that has sent DNS queries.
     Udp(UdpRef),
 }
 
 pub struct Inet {
+    pub sock: SockId,
     pub v6: bool,
     pub dgram: bool,
     pub bound: Option<SockAddr>,
@@ -1211,8 +1417,9 @@ pub struct Inet {
 }
 
 impl Inet {
-    pub fn new(v6: bool, dgram: bool) -> Inet {
+    pub fn new(v6: bool, dgram: bool, uid: u32) -> Inet {
         Inet {
+            sock: SockId { ino: crate::fd::next_ino(), uid, v6 },
             v6,
             dgram,
             bound: None,
@@ -1243,18 +1450,11 @@ impl Inet {
         use crate::sockopt::*;
         match &self.state {
             State::Listening(_) => (TCP_LISTEN, 0),
-            State::Local { .. } => (TCP_ESTABLISHED, 0),
-            State::Remote(c) => {
-                let c = c.lock();
-                let unacked = send_window().saturating_sub(c.tx_credit);
-                match c.state {
-                    ConnState::Connecting => (TCP_SYN_SENT, 0),
-                    ConnState::Failed(_) => (TCP_CLOSE, 0),
-                    ConnState::Open if c.tx_shut => (TCP_FIN_WAIT1, unacked),
-                    ConnState::Open if c.rx_eof => (TCP_CLOSE_WAIT, unacked),
-                    ConnState::Open => (TCP_ESTABLISHED, unacked),
-                }
+            State::Local { end, .. } => {
+                let eof = end.rx.as_ref().is_none_or(|r| r.pipe.lock().writers == 0);
+                (open_state(end.tx.is_none(), eof, 0), 0)
             }
+            State::Remote(c) => c.lock().tcp_state(),
             _ => (TCP_CLOSE, 0),
         }
     }

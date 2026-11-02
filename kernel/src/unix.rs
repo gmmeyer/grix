@@ -222,6 +222,8 @@ pub enum State {
 
 /// A named, listening, or message socket.
 pub struct Sock {
+    /// Its file's (`OpenFile::ino`).
+    pub ino: u64,
     pub ty: u64,
     pub name: Option<Name>,
     pub state: State,
@@ -246,6 +248,32 @@ enum Key {
 static NAMES: Mutex<BTreeMap<Key, Weak<Mutex<Sock>>>> = Mutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_AUTO: AtomicU64 = AtomicU64::new(0);
+
+/// Every socket with a name, for /proc/net/unix: (inode, type, listening,
+/// connected, name as Linux shows it).
+pub fn each_named(mut f: impl FnMut(u64, u64, bool, bool, &str) -> Result<(), Errno>) -> Result<(), Errno> {
+    let mut held = Vec::new();
+    for s in NAMES.lock().values().filter_map(Weak::upgrade) {
+        held.try_reserve(1).map_err(|_| ENOMEM)?;
+        held.push(s);
+    }
+    for s in held {
+        let s = s.lock();
+        let shown = match &s.name {
+            Some(Name::Path(path, _)) => path.clone(),
+            // Linux shows a NUL in one as an @.
+            Some(Name::Abstract(name)) => {
+                let shown: Vec<u8> = name.iter().map(|&b| if b == 0 { b'@' } else { b }).collect();
+                alloc::format!("@{}", String::from_utf8_lossy(&shown))
+            }
+            None => continue,
+        };
+        let listening = matches!(s.state, State::Listening { .. });
+        let connected = matches!(s.state, State::Messages { peer: Some(_), .. });
+        f(s.ino, s.ty, listening, connected, &shown)?;
+    }
+    Ok(())
+}
 
 /// A new socket node's id (`fs::Kind::Socket`).
 pub fn node_id() -> u64 {
@@ -290,7 +318,7 @@ impl Msg {
 
 impl Sock {
     pub fn new(ty: u64, state: State, cred: Cred) -> SockRef {
-        Arc::new(Mutex::new(Sock { ty, name: None, state, cred, peer_cred: None, passcred: false, version: 0 }))
+        Arc::new(Mutex::new(Sock { ino: 0, ty, name: None, state, cred, peer_cred: None, passcred: false, version: 0 }))
     }
 
     /// An empty message queue (a datagram socket, a seqpacket end).

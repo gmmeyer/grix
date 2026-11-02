@@ -41,8 +41,10 @@ impl FifoFile {
 }
 /// An open file description's share of the heap, charged to `kmem`: itself
 /// and what a socket's or pipe's end brings, a pipe.
-const OPEN_FILE_COST: u64 =
-    (core::mem::size_of::<OpenFile>() + core::mem::size_of::<crate::ipc::Pipe>() + 2 * 64) as u64;
+const OPEN_FILE_COST: u64 = (core::mem::size_of::<OpenFile>()
+    + core::mem::size_of::<crate::ipc::Pipe>()
+    + core::mem::size_of::<crate::inet::LocalEnd>()
+    + 2 * 64) as u64;
 /// Open files that fit in what's left of the heap, charged or not: with
 /// `kmem` full of pipes' data a program can still open a file.
 const OPEN_FILES_ANYWAY: usize = 4096;
@@ -177,6 +179,9 @@ impl FileKind {
 
 pub struct OpenFile {
     pub kind: FileKind,
+    /// A socket's inode number, which is the same whichever descriptor
+    /// asks and whatever the socket turns into.
+    pub ino: u64,
     pub offset: u64,
     /// Access mode and status flags (O_APPEND, O_NONBLOCK, ...).
     pub flags: u32,
@@ -221,7 +226,19 @@ impl Drop for OpenFile {
     }
 }
 
+/// A number for a new socket, as sockets aren't nodes.
+pub fn next_ino() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0x3000_0000);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl OpenFile {
+    /// It's this `unix::Sock` now: bound or connected, the same socket.
+    pub fn set_unix(&mut self, sock: crate::unix::SockRef) {
+        sock.lock().ino = self.ino;
+        self.kind = FileKind::Unix(sock);
+    }
+
     pub fn nonblocking(&self) -> bool {
         self.flags & O_NONBLOCK != 0
     }
@@ -398,8 +415,16 @@ pub fn walked_node(pid: u32, fd: u64) -> Result<crate::fs::Ino, Errno> {
 
 pub fn new_file(kind: FileKind, flags: u32) -> FileRef {
     OPEN_FILES.fetch_add(1, Ordering::Relaxed);
+    let ino = match &kind {
+        FileKind::Inet(s) => s.sock.ino,
+        _ => next_ino(),
+    };
+    if let FileKind::Unix(s) = &kind {
+        s.lock().ino = ino;
+    }
     Arc::new(Mutex::new(OpenFile {
         kind,
+        ino,
         offset: 0,
         flags,
         path_only: false,

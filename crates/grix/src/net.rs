@@ -1512,6 +1512,9 @@ fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &A
     while !s.stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer)) => {
+                // As for a datagram: the guest's own loopback is its own,
+                // and a server that trusts it mustn't think this is that.
+                let Some((peer, peer_port)) = guest_view(peer) else { continue };
                 let _ = stream.set_nonblocking(false);
                 let mut conns = s.conns.lock().unwrap();
                 if conns.len() >= MAX_CONNS {
@@ -1522,8 +1525,7 @@ fn accept_loop(s: &Arc<Shared>, listener: TcpListener, guest_port: u16, next: &A
                 conns.insert(id, c.clone());
                 drop(conns);
                 let shared = s.clone();
-                let incoming =
-                    ToGuest::Incoming { id, port: guest_port, peer: addr_of(peer.ip()), peer_port: peer.port() };
+                let incoming = ToGuest::Incoming { id, port: guest_port, peer, peer_port };
                 if thread::Builder::new().spawn(move || run_conn(&shared, id, &c, stream, incoming)).is_err() {
                     s.conns.lock().unwrap().remove(&id);
                 }

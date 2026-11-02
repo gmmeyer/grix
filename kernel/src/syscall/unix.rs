@@ -156,7 +156,7 @@ pub fn bind(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResult {
     let state = if ty == SOCK_DGRAM { Sock::messages() } else { State::Idle };
     let sock = existing.unwrap_or_else(|| Sock::new(ty, state, cred(p)));
     Sock::bind(&sock, name)?;
-    file.lock().kind = FileKind::Unix(sock);
+    file.lock().set_unix(sock);
     Ok(0)
 }
 
@@ -219,7 +219,7 @@ pub fn connect(p: &mut Process, file: &FileRef, addr: u64, len: u64) -> SysResul
                 if let Some(s) = &mine {
                     sock.lock().passcred = s.lock().passcred;
                 }
-                file.lock().kind = FileKind::Unix(sock);
+                file.lock().set_unix(sock);
                 Ok(0)
             }
             Err(EAGAIN) => blocked(p),

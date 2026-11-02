@@ -200,8 +200,10 @@ pub const TCP_INFO_BYTES: usize = 104;
 pub const TCP_ESTABLISHED: u8 = 1;
 pub const TCP_SYN_SENT: u8 = 2;
 pub const TCP_FIN_WAIT1: u8 = 4;
+pub const TCP_FIN_WAIT2: u8 = 5;
 pub const TCP_CLOSE: u8 = 7;
 pub const TCP_CLOSE_WAIT: u8 = 8;
+pub const TCP_LAST_ACK: u8 = 9;
 pub const TCP_LISTEN: u8 = 10;
 
 /// TCP_INFO for a connection in `state`, sending segments of `mss`.

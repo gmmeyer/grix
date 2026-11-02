@@ -5129,6 +5129,65 @@ fn raw_sockets_on_the_vm_stack() {
     assert_eq!(out.missing_capabilities(), ["net_raw"]);
 }
 
+/// /proc/net lists a program's sockets as Linux does, with the inodes fstat
+/// and /proc/self/fd give, which is how lsof and netstat -p find a process.
+/// The fixture passes on Linux as it is.
+#[test]
+fn proc_net_lists_sockets() {
+    use std::io::{Read, Write};
+    for network in [Network::Native, Network::Vm] {
+        let sandbox = || {
+            with("procnet")
+                .allow(Capability::Net)
+                .allow(Capability::Process)
+                .allow(Capability::FsWrite)
+                .network(network)
+                .user("0:0")
+        };
+        let out = run(sandbox(), &["/bin/procnet"]);
+        assert_eq!(out.stdout_str(), "procnet ok\n", "{network:?} {}", out.kernel_log);
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+
+        // A connection through the host: it says something and hangs up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            c.read_exact(&mut [0]).unwrap();
+            c.write_all(b"hello").unwrap();
+        });
+        let b = sandbox().allow_host(&format!("host.grix.internal:{port}")).unwrap();
+        let out = run(b, &["/bin/procnet", "host", &port.to_string()]);
+        assert_eq!(out.stdout_str(), "procnet ok\n", "{network:?} {}", out.kernel_log);
+        server.join().unwrap();
+
+        // One from the host, waiting to be accepted and then accepted.
+        let host_port = free_port();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        // Until something listens, a connection is turned away at once.
+        let client = std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", host_port)) {
+                    let _ = c.read(&mut [0]);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let b = sandbox().forward(&format!("127.0.0.1:{host_port}"), 8000).unwrap();
+        let out = run(b, &["/bin/procnet", "forwarded", "8000"]);
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(out.stdout_str(), "listening\nprocnet ok\n", "{network:?} {}", out.kernel_log);
+        client.join().unwrap();
+    }
+    // Raw sockets, where there are any, and ping sockets in their table.
+    let b = with("procnet").allow(Capability::NetRaw).network(Network::Vm);
+    let out = run(b, &["/bin/procnet", "raw"]);
+    assert_eq!(out.stdout_str(), "procnet ok\n", "{}", out.kernel_log);
+    assert!(out.events.is_empty(), "{:?}", out.events);
+}
+
 /// The user's groups in the sandbox's /etc/group are the program's, as
 /// Docker's are, and it can't be given what /etc/group doesn't say.
 #[test]
