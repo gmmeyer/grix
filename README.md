@@ -544,6 +544,7 @@ let sandbox = Sandbox::builder().import("./server", "/bin/server")?.metrics(&met
 | `grix_guest_resource_used{resource}`, `grix_guest_resource_limit{resource}` | what running sandboxes use now, and have (bytes, or a count for `processes` and `threads`) |
 | `grix_guest_peak_usage_ratio{resource}` | histogram of each run's peak as a fraction of its limit |
 | `grix_guest_limit_hits_total{limit}` | times a kernel limit refused a program something |
+| `grix_guest_kernel_total{counter}` | what the kernels did, by the names `/proc/grix/smp` uses: entries by kind, the kernel lock's waits and holds (µs), TLB flushes, timer interrupts |
 | `grix_guest_cpu_seconds_total`, `grix_guest_syscalls_total`, `grix_guest_page_faults_total`, `grix_guest_context_switches_total`, `grix_guest_processes_started_total` | what programs did |
 
 While a run goes on, the host asks its kernel for a report every 5

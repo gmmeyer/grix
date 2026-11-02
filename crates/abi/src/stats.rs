@@ -142,9 +142,101 @@ pub struct Usage {
     pub limit: u64,
 }
 
+/// What each CPU counts of the kernel's own work, for /proc/grix/smp and,
+/// all CPUs' together, a report: how often it enters the kernel and why, how
+/// the kernel lock costs it, and what its flushes do. Times are in
+/// microseconds, by the guest's counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Counter {
+    /// Entries: system calls, other exceptions (page faults mostly), and
+    /// interrupts from user mode.
+    Syscall,
+    Fault,
+    Irq,
+    /// Interrupts taken, from user mode or while idle: the timer's, and
+    /// of those the ones after which nothing woke or was preempted; kicks;
+    /// devices'.
+    Timer,
+    TimerIdle,
+    Kick,
+    Device,
+    /// Kicks this CPU sent.
+    KickSent,
+    /// Time spent waiting for the kernel lock, and holding it.
+    LockWait,
+    LockHeld,
+    /// The longest single wait for it (the most, not a sum).
+    LockWaitMax,
+    /// Turns this CPU skipped, their CPU not taking the lock.
+    LockSkip,
+    /// TLB flushes this CPU asked for, the IPIs they sent (x86_64), and
+    /// the time spent waiting for those to be acknowledged.
+    Flush,
+    FlushIpi,
+    FlushWait,
+    /// Entries handled without the kernel lock, counted among the system
+    /// calls and faults too.
+    Fast,
+}
+
+impl Counter {
+    pub const ALL: [Counter; 16] = [
+        Counter::Syscall,
+        Counter::Fault,
+        Counter::Irq,
+        Counter::Timer,
+        Counter::TimerIdle,
+        Counter::Kick,
+        Counter::Device,
+        Counter::KickSent,
+        Counter::LockWait,
+        Counter::LockHeld,
+        Counter::LockWaitMax,
+        Counter::LockSkip,
+        Counter::Flush,
+        Counter::FlushIpi,
+        Counter::FlushWait,
+        Counter::Fast,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Counter::Syscall => "syscall",
+            Counter::Fault => "fault",
+            Counter::Irq => "irq",
+            Counter::Timer => "timer",
+            Counter::TimerIdle => "timer_idle",
+            Counter::Kick => "kick",
+            Counter::Device => "device",
+            Counter::KickSent => "kick_sent",
+            Counter::LockWait => "lock_wait_us",
+            Counter::LockHeld => "lock_held_us",
+            Counter::LockWaitMax => "lock_wait_max_us",
+            Counter::LockSkip => "lock_skip",
+            Counter::Flush => "flush",
+            Counter::FlushIpi => "flush_ipi",
+            Counter::FlushWait => "flush_wait_us",
+            Counter::Fast => "fast",
+        }
+    }
+
+    /// In counter ticks while it's counted: shown in microseconds.
+    pub const fn is_time(self) -> bool {
+        matches!(self, Counter::LockWait | Counter::LockHeld | Counter::LockWaitMax | Counter::FlushWait)
+    }
+
+    /// The most anything was, not a running total.
+    pub const fn is_peak(self) -> bool {
+        matches!(self, Counter::LockWaitMax)
+    }
+}
+
 /// The kernel's report. Counters count from boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// What the kernel did, every CPU's together, by `Counter as usize`.
+    pub kernel: [u64; Counter::ALL.len()],
     /// CPU time the program's threads ran, in every process (to within a
     /// time slice of each CPU's).
     pub cpu_ns: u64,
@@ -166,7 +258,7 @@ pub struct Stats {
 impl Stats {
     /// Its encoding's length: a u64 for every number. One frame's worth at
     /// most, as the kernel sends it.
-    pub const LEN: usize = 8 * (5 + 3 * Resource::ALL.len() + Limit::ALL.len());
+    pub const LEN: usize = 8 * (5 + 3 * Resource::ALL.len() + Limit::ALL.len() + Counter::ALL.len());
     const FITS_A_FRAME: () = assert!(Self::LEN <= crate::wire::MAX_FRAME);
 
     pub fn usage(&self, r: Resource) -> Usage {
@@ -175,6 +267,10 @@ impl Stats {
 
     pub fn hits(&self, l: Limit) -> u64 {
         self.limits_hit[l as usize]
+    }
+
+    pub fn kernel(&self, c: Counter) -> u64 {
+        self.kernel[c as usize]
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -188,7 +284,7 @@ impl Stats {
             w.u64(u.peak);
             w.u64(u.limit);
         }
-        for &n in &self.limits_hit {
+        for &n in self.limits_hit.iter().chain(&self.kernel) {
             w.u64(n);
         }
         w.buf
@@ -210,7 +306,7 @@ impl Stats {
         for u in &mut s.usage {
             *u = Usage { now: r.u64()?, peak: r.u64()?, limit: r.u64()? };
         }
-        for n in &mut s.limits_hit {
+        for n in s.limits_hit.iter_mut().chain(&mut s.kernel) {
             *n = r.u64()?;
         }
         r.done()?;
@@ -234,12 +330,14 @@ mod tests {
         };
         s.usage[Resource::Threads as usize] = Usage { now: 6, peak: 7, limit: 8 };
         s.limits_hit[Limit::Timers as usize] = 9;
+        s.kernel[Counter::Fast as usize] = 10;
         let bytes = s.encode();
         assert_eq!(bytes.len(), Stats::LEN);
         let back = Stats::decode(&bytes).unwrap();
         assert_eq!(back, s);
         assert_eq!(back.usage(Resource::Threads).peak, 7);
         assert_eq!(back.hits(Limit::Timers), 9);
+        assert_eq!(back.kernel(Counter::Fast), 10);
         assert!(Stats::decode(&bytes[1..]).is_err());
         let mut long = bytes.clone();
         long.push(0);
@@ -254,6 +352,9 @@ mod tests {
         }
         for (i, l) in Limit::ALL.iter().enumerate() {
             assert_eq!(*l as usize, i);
+        }
+        for (i, c) in Counter::ALL.iter().enumerate() {
+            assert_eq!(*c as usize, i);
         }
         let mut names: Vec<&str> = Limit::ALL.iter().map(|l| l.name()).collect();
         names.sort();

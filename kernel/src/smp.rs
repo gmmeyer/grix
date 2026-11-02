@@ -81,62 +81,10 @@ pub fn count() -> u32 {
 static ENTRIES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static IN_KERNEL: [AtomicBool; N] = [const { AtomicBool::new(false) }; N];
 
-/// What each CPU counts, for /proc/grix/smp: how often it enters the
-/// kernel and why, and what the kernel lock and TLB flushes cost it.
-#[derive(Clone, Copy)]
-pub enum Stat {
-    /// Entries: system calls, other exceptions (page faults mostly), and
-    /// interrupts from user mode.
-    Syscall,
-    Fault,
-    Irq,
-    /// Interrupts taken, from user mode or while idle: the timer's, and
-    /// of those the ones after which nothing woke or was preempted; kicks;
-    /// devices'.
-    Timer,
-    TimerIdle,
-    Kick,
-    Device,
-    /// Kicks this CPU sent.
-    KickSent,
-    /// Counter ticks spent waiting for the kernel lock, and holding it.
-    LockWait,
-    LockHeld,
-    /// The longest single wait for it (counter ticks).
-    LockWaitMax,
-    /// Turns this CPU skipped, their CPU not taking the lock (`acquire`).
-    LockSkip,
-    /// TLB flushes this CPU asked for, the IPIs they sent (x86_64), and
-    /// counter ticks spent waiting for those to be acknowledged.
-    Flush,
-    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-    FlushIpi,
-    FlushWait,
-    /// Entries handled without the kernel lock (`fast`), counted among
-    /// the syscalls and faults too.
-    Fast,
-}
+/// What each CPU counts, for /proc/grix/smp and the host's reports.
+pub use grix_abi::stats::Counter as Stat;
 
-const STATS: usize = Stat::Fast as usize + 1;
-/// The names /proc/grix/smp shows, in `Stat`'s order (times in µs).
-const STAT_NAMES: [&str; STATS] = [
-    "syscall",
-    "fault",
-    "irq",
-    "timer",
-    "timer_idle",
-    "kick",
-    "device",
-    "kick_sent",
-    "lock_wait_us",
-    "lock_held_us",
-    "lock_wait_max_us",
-    "lock_skip",
-    "flush",
-    "flush_ipi",
-    "flush_wait_us",
-    "fast",
-];
+const STATS: usize = Stat::ALL.len();
 /// A CPU's counts, on cache lines of their own.
 #[repr(align(128))]
 struct Counts([AtomicU64; STATS]);
@@ -209,33 +157,53 @@ pub fn check_stack() {
     }
 }
 
+/// `v` of `stat`, as it's shown: times in microseconds.
+fn shown(stat: Stat, v: u64) -> u64 {
+    if !stat.is_time() {
+        return v;
+    }
+    (v as u128 * 1_000_000 / arch::counter_freq().max(1) as u128) as u64
+}
+
+/// Every CPU's counts together, as they're shown.
+pub fn totals() -> [u64; STATS] {
+    let mut all = [0; STATS];
+    for counts in &COUNTS {
+        for (stat, c) in Stat::ALL.into_iter().zip(&counts.0) {
+            let v = shown(stat, c.load(Ordering::Relaxed));
+            all[stat as usize] = if stat.is_peak() { all[stat as usize].max(v) } else { all[stat as usize] + v };
+        }
+    }
+    all
+}
+
+/// A run restored from a snapshot counts from here (`stats::restored`).
+pub fn restart_counts() {
+    COUNTS.iter().flat_map(|c| &c.0).for_each(|c| c.store(0, Ordering::Relaxed));
+}
+
 /// /proc/grix/smp: a header, a line per CPU, and their sum.
 pub fn stats(s: &mut alloc::string::String) {
     use core::fmt::Write;
-    let freq = arch::counter_freq().max(1);
-    let shown = |i: usize, v: u64| match i {
-        i if [Stat::LockWait, Stat::LockHeld, Stat::LockWaitMax, Stat::FlushWait].iter().any(|&t| t as usize == i) => {
-            (v as u128 * 1_000_000 / freq as u128) as u64
-        }
-        _ => v,
-    };
     // And the deepest each CPU's kernel stack has been (bytes).
-    let _ = writeln!(s, "cpu {} stack_max", STAT_NAMES.join(" "));
-    let (mut all, mut stack) = ([0u64; STATS], 0);
+    let _ = write!(s, "cpu");
+    for stat in Stat::ALL {
+        let _ = write!(s, " {}", stat.name());
+    }
+    let _ = writeln!(s, " stack_max");
+    let mut stack = 0;
     for (cpu, counts) in COUNTS.iter().enumerate().take(count() as usize) {
         let _ = write!(s, "{cpu}");
-        for (i, c) in counts.0.iter().enumerate() {
-            let v = c.load(Ordering::Relaxed);
-            all[i] = if i == Stat::LockWaitMax as usize { all[i].max(v) } else { all[i] + v };
-            let _ = write!(s, " {}", shown(i, v));
+        for (stat, c) in Stat::ALL.into_iter().zip(&counts.0) {
+            let _ = write!(s, " {}", shown(stat, c.load(Ordering::Relaxed)));
         }
         let used = stack_used(cpu);
         stack = stack.max(used);
         let _ = writeln!(s, " {used}");
     }
     let _ = write!(s, "all");
-    for (i, &v) in all.iter().enumerate() {
-        let _ = write!(s, " {}", shown(i, v));
+    for v in totals() {
+        let _ = write!(s, " {v}");
     }
     let _ = writeln!(s, " {stack}");
 }

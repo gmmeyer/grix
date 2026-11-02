@@ -33,11 +33,15 @@ Bigger:
 
 3. Finer locking: phase 2, a reader/writer lock with per-process
    check-out.
-4. Faster live-mount round trips, multi-architecture images, and the
-   rest of `/proc/grix/smp`'s counters.
+4. Faster live-mount round trips, and multi-architecture images if a use
+   turns up.
 5. A security review of everything since the last one, by a team of agents.
    Not an outside vendor's: this isn't worth paying for until it gets real
-   interest.
+   interest. Under way, and not all of it can be: the pass over memory and
+   processes (`CLONE_VM`, the gate, mseal, another process's descriptors)
+   was stopped by a safety classifier before it got anywhere, so that
+   surface is NOT reviewed, and it's the newest code. It needs a person,
+   or a pass someone approves.
 
 Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
 in 32,000 runs since.
@@ -447,11 +451,10 @@ Left, none of it a way out of the sandbox:
       `grix run` and `grix mcp`). For a server in a container: no time
       limit (`--timeout 0`), output streamed without a cap or a copy,
       events printed as they happen.
-- [ ] /proc/grix/smp's per-CPU counters (kernel entries by kind, the
-      kernel lock's waits and holds, TLB flushes and their IPIs, timer
-      interrupts) in `guest_stats` too, and `stats::syscall` and
-      `page_fault` as sums of per-CPU counts rather than one shared atomic
-      on every entry (a `grix_abi::stats` change: bump `ABI_VERSION`).
+- [x] /proc/grix/smp's counters (kernel entries by kind, the kernel lock's
+      waits and holds, TLB flushes and their IPIs, timer interrupts) in
+      `guest_stats`, `--json` and the Prometheus metrics, every CPU's
+      together: one line per CPU wouldn't fit a frame at `MAX_CPUS`.
 
 ## Images
 

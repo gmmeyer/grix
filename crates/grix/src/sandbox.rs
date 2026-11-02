@@ -122,9 +122,10 @@ pub struct HostUsage {
 }
 
 /// `{"cpu_ms", "syscalls", ..., "usage": {resource: {now, peak, limit}},
-/// "limits_hit": {limit: count}}`, with only the limits that were hit.
+/// "limits_hit": {limit: count}, "kernel": {counter: n}}`, with only the
+/// limits that were hit.
 fn guest_stats<S: serde::Serializer>(s: &Option<GuestStats>, ser: S) -> Result<S::Ok, S::Error> {
-    use grix_abi::stats::{Limit, Resource};
+    use grix_abi::stats::{Counter, Limit, Resource};
     let Some(s) = s else { return ser.serialize_none() };
     let usage: BTreeMap<&str, serde_json::Value> = Resource::ALL
         .iter()
@@ -135,6 +136,7 @@ fn guest_stats<S: serde::Serializer>(s: &Option<GuestStats>, ser: S) -> Result<S
         .collect();
     let hits: BTreeMap<&str, u64> =
         Limit::ALL.iter().filter(|&&l| s.hits(l) > 0).map(|&l| (l.name(), s.hits(l))).collect();
+    let kernel: BTreeMap<&str, u64> = Counter::ALL.iter().map(|&c| (c.name(), s.kernel(c))).collect();
     serde_json::json!({
         "cpu_ms": s.cpu_ns / 1_000_000,
         "syscalls": s.syscalls,
@@ -143,6 +145,7 @@ fn guest_stats<S: serde::Serializer>(s: &Option<GuestStats>, ser: S) -> Result<S
         "processes_started": s.processes_started,
         "usage": usage,
         "limits_hit": hits,
+        "kernel": kernel,
     })
     .serialize(ser)
 }

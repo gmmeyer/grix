@@ -5191,6 +5191,26 @@ fn proc_net_lists_sockets() {
     assert!(out.events.is_empty(), "{:?}", out.events);
 }
 
+/// What the kernel did is in its report: what /proc/grix/smp has, all CPUs'
+/// together.
+#[test]
+fn the_kernels_own_counters_are_reported() {
+    use grix_abi::stats::Counter;
+    let out = run(with("threads").allow(Capability::Threads).cpus(2), &["/bin/threads"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.kernel_log);
+    let stats = out.guest_stats.as_ref().expect("the kernel's report");
+    assert!(stats.kernel(Counter::Syscall) >= stats.syscalls / 2, "{stats:?}");
+    assert!(stats.kernel(Counter::Fault) > 0, "{stats:?}");
+    assert!(stats.kernel(Counter::Timer) > 0, "{stats:?}");
+    assert!(stats.kernel(Counter::LockHeld) > 0, "{stats:?}");
+    assert!(stats.kernel(Counter::Fast) <= stats.kernel(Counter::Syscall) + stats.kernel(Counter::Fault));
+    // And by name, in what --json and Python get.
+    let json = serde_json::to_value(&out).unwrap();
+    let kernel = &json["guest_stats"]["kernel"];
+    assert_eq!(kernel["syscall"], stats.kernel(Counter::Syscall), "{json}");
+    assert_eq!(kernel.as_object().unwrap().len(), Counter::ALL.len(), "{json}");
+}
+
 /// Processes of their own in one address space, however they end, and
 /// with more CPUs at it at once. The fixture passes on Linux as it is.
 #[test]

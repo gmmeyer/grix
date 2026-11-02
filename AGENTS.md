@@ -616,10 +616,11 @@ makes every other CPU running the process (or any, for GLOBAL) enter the
 kernel (`smp::barrier_others`). Processes running at once write at once:
 a fixture that checks whole lines writes each with one `write`. Secondaries start with PSCI CPU_ON (`boot.S`
 `secondary_entry`) on arm64, INIT and SIPI on x86_64. What it all
-costs is counted per CPU (`smp::Stat`: entries by kind, time waiting
+costs is counted per CPU (`smp::Stat`, `grix_abi::stats::Counter`: entries by kind, time waiting
 for and holding the lock, TLB flushes and their IPIs, timer interrupts
-that found nothing due), shown in `/proc/grix/smp` and, after a run
-with more CPUs, in the kernel log (`grix run -v`); the `smpbench`
+that found nothing due), shown in `/proc/grix/smp`, in the host's reports
+(`Stats::kernel`, every CPU's together, so `guest_stats` and the metrics)
+and, after a run with more CPUs, in the kernel log (`grix run -v`); the `smpbench`
 fixture runs each kind of load on one CPU and on n and prints the
 counters' deltas: measure with it before and after a locking change.
 
