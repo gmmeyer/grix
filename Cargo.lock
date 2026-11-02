@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "grix"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "anyhow",
  "base64",
@@ -335,11 +335,11 @@ dependencies = [
 
 [[package]]
 name = "grix-abi"
-version = "0.0.76"
+version = "0.0.77"
 
 [[package]]
 name = "grix-netstack"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "grix-abi",
  "smoltcp",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "grix-python"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "anyhow",
  "grix",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "grix-vmm"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "grix-abi",
  "libc",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "grix-web"
-version = "0.0.76"
+version = "0.0.77"
 dependencies = [
  "grix-abi",
  "serde",

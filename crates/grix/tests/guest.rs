@@ -3242,6 +3242,11 @@ fn the_alternate_stack_ends_where_it_ends() {
 }
 
 #[test]
+fn system_v_queues_pay_for_what_they_keep() {
+    hardening2(with("hardening2").memory_mb(256), "msgqueues");
+}
+
+#[test]
 fn a_full_ruleset_can_be_enforced() {
     let out = hardening2(with("hardening2"), "rules");
     assert!(out.events.is_empty(), "{:?}", out.events);

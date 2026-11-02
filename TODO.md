@@ -894,6 +894,15 @@ Left, none of it a way out of the sandbox:
       lock cheap (skipping descheduled waiters, per-CPU process slots, a
       filesystem lock that knows its holder, flushes only where needed).
       Left: phase 2, a reader/writer lock with per-process check-out.
+      The baseline to beat, `smpbench` on a 4-vCPU GitHub runner with KVM
+      (`x86.yml` prints it on every push): speedup on 4 CPUs against one
+      of compute 3.97, sleeper 3.14, syscall 2.42, procs 1.94, futex 0.75,
+      mmap 0.69. So four processes in the kernel reach twice one, and
+      threads of one process doing mmap or futexes lose ground. mmap's is
+      half the kernel lock and half the gate and flushes, which per-process
+      check-out alone wouldn't touch: threads of one process are what it
+      leaves serialized. munmap's flush is what a lockless mmap can't do
+      (fast entries may not flush), so that's the first thing to design.
 - [x] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s

@@ -237,8 +237,15 @@ pub fn msgsnd(p: &mut Process, id: u64, msgp: u64, size: u64, flags: u64) -> Sys
         drop(t);
         return wait(p, None);
     }
-    let held = q.bytes + size + (q.messages.len() as u64 + 1) * MESSAGE_COST;
-    q.charge.resize(held).map_err(|_| ENOMEM)?;
+    // What the queue keeps is its slots, as many as it's ever needed until
+    // it's next empty, not the messages in them, so that's what it pays
+    // for, and first: a thousand of them is a big allocation.
+    let slots = match q.messages.capacity() {
+        full if full == q.messages.len() => (full * 2).max(8),
+        room => room,
+    };
+    q.charge.resize(q.bytes + size + slots as u64 * MESSAGE_COST).map_err(|_| ENOMEM)?;
+    q.messages.try_reserve_exact(slots - q.messages.len()).map_err(|_| ENOMEM)?;
     q.bytes += size;
     q.messages.push_back((kind, body));
     (q.last_send, q.sent_at) = (p.pid, now());
@@ -299,8 +306,10 @@ pub fn msgrcv(p: &mut Process, id: u64, msgp: u64, size: u64, kind: u64, flags: 
         let body = q.messages.remove(i).map(|(_, b)| b).unwrap_or_default();
         q.bytes -= body.len() as u64;
         (q.last_receive, q.received_at) = (p.pid, now());
-        let held = q.bytes + q.messages.len() as u64 * MESSAGE_COST;
-        let _ = q.charge.resize(held);
+        if q.messages.is_empty() {
+            q.messages = VecDeque::new();
+        }
+        let _ = q.charge.resize(q.bytes + q.messages.capacity() as u64 * MESSAGE_COST);
     }
     drop(t);
     ipc::changed();
