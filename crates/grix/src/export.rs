@@ -119,14 +119,23 @@ fn resolve_inside(
     dirs: &BTreeSet<&str>,
     link: &str,
     target: &str,
+    work: &mut usize,
 ) -> Option<Vec<String>> {
     let mut at: Vec<String> = link.split('/').map(String::from).collect();
     at.pop();
     let mut pending: Vec<String> = Vec::new();
-    let push_target = |pending: &mut Vec<String>, t: &str| -> bool {
-        if t.starts_with('/') {
+    let mut push_target = |pending: &mut Vec<String>, t: &str| -> bool {
+        // The guest's to say, and each name of one's a host allocation:
+        // none is longer than a path, and an export has only so much to
+        // spend on them, however many links it holds.
+        if t.starts_with('/') || t.len() > MAX_LINK_TARGET {
             return false;
         }
+        let names = t.split('/').count();
+        if names > *work {
+            return false;
+        }
+        *work -= names;
         pending.extend(t.split('/').rev().map(String::from));
         true
     };
@@ -157,6 +166,12 @@ fn resolve_inside(
     }
     Some(at)
 }
+
+/// The longest link target `resolve_inside` looks at: Linux's PATH_MAX.
+const MAX_LINK_TARGET: usize = 4096;
+/// The names of link targets it'll go through in one export, far past what
+/// a tree of real links has.
+const MAX_LINK_WORK: usize = 1 << 22;
 
 /// A path the guest may name inside an export: plain components only.
 fn valid_path(path: &str) -> bool {
@@ -237,8 +252,9 @@ impl Export {
                     _ => None,
                 })
                 .collect();
+            let mut work = MAX_LINK_WORK;
             for (path, target) in &all {
-                if resolve_inside(&all, &dirs, path, target).is_none() {
+                if resolve_inside(&all, &dirs, path, target, &mut work).is_none() {
                     bail!("export of {} has a link {path:?} to {target:?}, outside it", self.dir);
                 }
             }
@@ -845,6 +861,14 @@ mod tests {
             ex.write_to(&dest).unwrap();
             fs::remove_dir_all(&dest).unwrap();
         }
+        // A target's the guest's to say, each name in it a host allocation:
+        // longer than a path can be, and more of them than any real tree
+        // has, they're refused, not walked.
+        let dest = base.join("bad");
+        let long = tree(vec![link("long", &"./".repeat(1 << 20))]);
+        assert!(long.write_to_with(&dest, Links::Inside).is_err());
+        let many = (0..3000).map(|i| link(&format!("l{i}"), &"./".repeat(2000))).collect();
+        assert!(tree(many).write_to_with(&dest, Links::Inside).is_err());
         fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -38,6 +38,7 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/msg.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -1235,6 +1236,34 @@ static void t_rules(void) {
     CHECK(domains == 40);
 }
 
+// ---- what a System V queue keeps is what it pays for
+
+// A queue's slots stay when its messages go. Filled and emptied, they cost
+// nothing; with a message left to hold them they cost what they hold, so
+// the budget says when, with an errno: the heap never does.
+static void t_msgqueues(void) {
+    struct { long type; char text[1]; } m = {.type = 1};
+    int refused = 0;
+    for (int keep = 0; keep < 2; keep++) {
+        int ids[64];
+        for (int q = 0; q < 64; q++) {
+            ids[q] = msgget(IPC_PRIVATE, 0600);
+            CHECK(ids[q] >= 0);
+            int n = 0;
+            for (; n < 16384; n++) {
+                if (msgsnd(ids[q], &m, 0, IPC_NOWAIT) == 0) continue;
+                CHECK(errno == ENOMEM || errno == EAGAIN);
+                refused += errno == ENOMEM;
+                break;
+            }
+            for (int i = keep; i < n; i++) CHECK(msgrcv(ids[q], &m, 1, 0, IPC_NOWAIT | MSG_NOERROR) == 0);
+        }
+        for (int q = 0; q < 64; q++) CHECK(msgctl(ids[q], IPC_RMID, NULL) == 0);
+    }
+    // With a slot apiece held, the budget had its say.
+    CHECK(refused > 0);
+}
+
 // ---- watches can't use up the host's descriptors
 
 // A watch on DIR and each of its directories, then what the host must
@@ -1340,7 +1369,7 @@ int main(int argc, char **argv) {
         {"execperm", t_execperm}, {"groupperm", t_groupperm}, {"interpperm", t_interpperm},
         {"timerstorm", t_timerstorm},
         {"fasync", t_fasync}, {"timerfd", t_timerfd}, {"fexec", t_fexec}, {"fdpath", t_fdpath},
-        {"altstack", t_altstack}, {"rules", t_rules},
+        {"altstack", t_altstack}, {"rules", t_rules}, {"msgqueues", t_msgqueues},
     };
     for (unsigned i = 0; i < sizeof tests / sizeof tests[0]; i++) {
         if (!strcmp(c, tests[i].name)) {

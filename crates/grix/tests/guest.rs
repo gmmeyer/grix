@@ -3242,6 +3242,11 @@ fn the_alternate_stack_ends_where_it_ends() {
 }
 
 #[test]
+fn system_v_queues_pay_for_what_they_keep() {
+    hardening2(with("hardening2").memory_mb(256), "msgqueues");
+}
+
+#[test]
 fn a_full_ruleset_can_be_enforced() {
     let out = hardening2(with("hardening2"), "rules");
     assert!(out.events.is_empty(), "{:?}", out.events);
@@ -5222,6 +5227,29 @@ fn processes_sharing_memory() {
         assert_eq!(out.status, ExitStatus::Exited(0));
         assert!(out.events.is_empty(), "{:?}", out.events);
     }
+}
+
+/// An image says how much memory it wants, within reason: it's the file's
+/// say, and past that the caller's. (`--mem` for more.)
+#[test]
+fn an_image_cant_ask_for_all_the_memory() {
+    let dir = temp_dir("memimage");
+    let image = |mb: u64| {
+        let g = grix::build::Grixfile::parse(&format!("memory_mb = {mb}\n")).unwrap();
+        let opts = grix::build::BuildOptions {
+            arch: None,
+            kernel: None,
+            on_output: &mut |_, _| {},
+            control: None,
+            policy: Default::default(),
+        };
+        g.build(&dir, opts).unwrap()
+    };
+    let asked = |mb| Sandbox::builder().image(&image(mb)).unwrap().current_memory_mb();
+    assert_eq!(asked(1024), 1024);
+    assert_eq!(asked(65536), 8192);
+    let given = Sandbox::builder().image(&image(65536)).unwrap().memory_mb(16384);
+    assert_eq!(given.current_memory_mb(), 16384);
 }
 
 /// A path goes on through another process's descriptor, as through one's

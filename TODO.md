@@ -35,13 +35,15 @@ Bigger:
    check-out.
 4. A lookup in a live mount's directory too big to hold is a round trip
    each, and multi-architecture images, if a use turns up.
-5. A security review of everything since the last one, by a team of agents.
-   Not an outside vendor's: this isn't worth paying for until it gets real
-   interest. Under way, and not all of it can be: the pass over memory and
-   processes (`CLONE_VM`, the gate, mseal, another process's descriptors)
-   was stopped by a safety classifier before it got anywhere, so that
-   surface is NOT reviewed, and it's the newest code. It needs a person,
-   or a pass someone approves.
+5. The rest of the security review of everything since 0.0.48
+   (`SECURITY-AUDIT.md`). Agents did the kernel's new calls and the host's
+   files, and what they found is fixed. Two passes were stopped by safety
+   checks: memory and processes (`CLONE_VM`, the gate, mseal, another
+   process's descriptors), which is NOT reviewed and is the newest code, and
+   the network, where whether a guest can reach what the policy refuses is
+   unanswered. Both need a person, or a pass someone approves.
+6. Report smoltcp's sequence number panics upstream (`wire/tcp.rs`), which
+   the gateway only contains: a guest can still stop its own network.
 
 Last, and only if it comes back: `rv048 extremes`, one hang at 0.0.48, none
 in 32,000 runs since.
@@ -93,6 +95,11 @@ Network:
 - [ ] `proc_net_lists_sockets`, both stacks: nothing in it is the host's, but
       the forwarded connection's peer comes through `guest_view` there too.
 - [ ] `raw_sockets_on_the_vm_stack`.
+- [ ] `a_peer_that_wont_read_cant_hold_a_closed_connection`: `write_out` relies
+      on a socket's send timeout turning a stuck `write` into `WouldBlock`, and
+      on `SO_RCVBUF` set before `listen`, which macOS may treat otherwise.
+- [ ] `a_layouts_links_lead_nowhere`: `O_NOFOLLOW` and `mkfifo` there, and a
+      layout's own path going through `/tmp`, which is a link on macOS.
 
 Time zone:
 
@@ -894,6 +901,15 @@ Left, none of it a way out of the sandbox:
       lock cheap (skipping descheduled waiters, per-CPU process slots, a
       filesystem lock that knows its holder, flushes only where needed).
       Left: phase 2, a reader/writer lock with per-process check-out.
+      The baseline to beat, `smpbench` on a 4-vCPU GitHub runner with KVM
+      (`x86.yml` prints it on every push): speedup on 4 CPUs against one
+      of compute 3.97, sleeper 3.14, syscall 2.42, procs 1.94, futex 0.75,
+      mmap 0.69. So four processes in the kernel reach twice one, and
+      threads of one process doing mmap or futexes lose ground. mmap's is
+      half the kernel lock and half the gate and flushes, which per-process
+      check-out alone wouldn't touch: threads of one process are what it
+      leaves serialized. munmap's flush is what a lockless mmap can't do
+      (fast entries may not flush), so that's the first thing to design.
 - [x] Snapshots of machines with more than one CPU.
 - [x] Our own VMM instead of QEMU: `grix-vmm` on Hypervisor.framework
       (macOS 15+) and KVM (arm64 Linux), confined after setup, about 0.1 s
